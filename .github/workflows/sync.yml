@@ -1,0 +1,26 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天 UTC 0点, 6点, 12点, 18点（北京时间 8点, 14点, 20点, 2点）每 6 小时自动同步一次
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # 支持在 GitHub Actions 页面手动点击 "Run workflow" 一键更新
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Sync upstream changes
+        run: |
+          gh repo sync ${{ github.repository }} -b main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
