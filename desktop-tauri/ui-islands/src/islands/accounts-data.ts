@@ -32,8 +32,8 @@ import {
   type AccountRecord, type ClashSnapshot, type PanelKind, type PoolItem, type UsageEntry,
 } from './accounts-shared'
 import {
-  checkinableAccounts, claimedPlanIdsToday, displayNameOf, isDesktopAccount, isEnabled, isRateLimited,
-  supportsCheckin, supportsUsage,
+  claimedPlanIdsToday, isDesktopAccount, isEnabled, isRateLimited,
+  supportsUsage,
 } from './accounts-domain'
 import * as domain from './accounts-domain'
 import { clampPriority, priorityOf } from './accounts-columns'
@@ -111,22 +111,6 @@ export function usageEntryOf(account: AccountRecord): UsageEntry {
   const changedAt = Math.max(Number(account.addedAt) || 0, Number(account.updatedAt) || 0)
   return (usageFailureAt.get(account.id) || 0) >= changedAt ? entry : undefined
 }
-
-/**
- * 上一次签到的**失败原因**（按账号 id）。
- *
- * 签到没有明细面板，结果只落在两处：成功/已领取由行上那颗按钮自己的状态表达
- * （`checkedInToday` → 「已签到」）＋ 一条 toast；失败则要留下可复看的原因 ——
- * toast 几秒后就没了，而「为什么没签上」正是需要复看的信息，所以记在这里，
- * 由按钮的 title 读出来（见 `checkinErrorOf`）。
- *
- * 成功与「今天已领取」都不进这张表：前者按钮会变「已签到」，后者是上游的正常状态，
- * 不该在按钮上挂一个「失败」提示。
- */
-const checkinErrors = new Map<string, string>()
-
-/** 该账号上一次签到的失败原因（没有则空串）—— 行上「签到」按钮的 title 读它 */
-export const checkinErrorOf = (id: string): string => checkinErrors.get(id) || ''
 
 /* ─── Clash 出口缓存（只剩代理表单的「Clash Verge」档在用）─────
  *
@@ -286,7 +270,6 @@ export function refreshCaches(validIds: Set<string>): void {
   // 失败结论的时刻表跟着条目一起清：账号删掉后同 id 可能被「重新添加」复用，
   // 留着的旧时刻会让那条新记录继承一个本该作废的失败结论
   for (const id of [...usageFailureAt.keys()]) if (!validIds.has(id)) usageFailureAt.delete(id)
-  for (const id of [...checkinErrors.keys()]) if (!validIds.has(id)) { checkinErrors.delete(id); touched = true }
   const panels = new Map(getStore().panels)
   for (const id of [...panels.keys()]) if (!validIds.has(id)) { panels.delete(id); touched = true }
   const connections = new Map(getStore().connections)
@@ -386,10 +369,12 @@ function cacheEntryOf(row: Record<string, unknown>): UsageEntry {
 }
 
 /**
- * 把一批余额结果写进列表缓存（定时快照、批量查询与外部调用共用）。返回写入条数。
+ * 把一批余额结果写进列表缓存（自动查询快照、批量查询与外部调用共用）。返回写入条数。
  *
- * 行的时间戳取 `balances.at`（后端快照自带的查询时刻），没有就按「刚刚」——
- * 手动查询的那一批结果没有 `at` 字段，而它本来就是当刻的结论。
+ * 行的时间戳取**行上的 `at`**（快照端按账号到期查询，每行各带自己的结论时刻），
+ * 没有就按外层的 `at`（手动查询的响应不带 `at`，当刻就是它的结论时刻）。
+ * 失败行的时效判定按「这条结论的取得时刻」算，不能拿别人的时刻盖 ——
+ * 那正是行级 `at` 存在的原因（见后端 `usage_query::snapshot`）。
  */
 export function applyBalances(
   balances: { results?: Array<Record<string, unknown>>; at?: unknown } | null | undefined,
@@ -399,7 +384,7 @@ export function applyBalances(
   let applied = 0
   for (const row of rows) {
     if (!row?.id) continue
-    putUsage(String(row.id), cacheEntryOf(row), at)
+    putUsage(String(row.id), cacheEntryOf(row), Number(row.at) || at)
     applied++
   }
   if (applied) bump()
@@ -407,14 +392,15 @@ export function applyBalances(
 }
 
 /**
- * 拉一次「定时查询积分」的结果快照并写进缓存，返回是否应用了新的一轮。
+ * 拉一次后端的余额快照并写进缓存，返回是否应用了新的一轮。
  *
- * 余额查询在后端有条定时任务（默认每 10 分钟查全部账号），结果存在后端快照里。
- * 界面不点按钮时也要跟着它更新 —— 否则定时任务在后台跑得好好的，用户看到的还是启动
- * 那一次的旧余额，那正是「定时查询」最容易让人觉得「没生效」的地方。
- * `at` 是那一刻的毫秒时间戳，用它判断「这一轮我应用过了没」：时间戳没变就直接返回，
- * 不做无谓的重绘。**失败的行同样会被应用**（后端快照里就带着它们），于是账号页会
- * 明确显示「查询失败」而不是悄悄留着上一个成功的旧值 —— 但后端出口会先丢掉
+ * 余额查询按账号各自的间隔在后端自动跑（账号设置里逐账号配置），结论存进
+ * 记录表；这份快照接口把它端出来。界面不点按钮时也要跟着它更新 —— 否则自动
+ * 查询在后台跑得好好的，用户看到的还是启动那一次的旧余额，那正是「自动查询」
+ * 最容易让人觉得「没生效」的地方。`at` 是最近一条结论的时刻，用它判断
+ * 「这份快照我应用过了没」：时间戳没变就直接返回，不做无谓的重绘。
+ * **失败的行同样会被应用**（后端快照里就带着它们），于是账号页会明确显示
+ * 「查询失败」而不是悄悄留着上一个成功的旧值 —— 但后端出口会先丢掉
  * 「账号记录比快照还新」的失败行（见 `usageEntryOf` 的说明），那些行这里也就收不到。
  * 失败静默（不 toast）：它是 20 秒一次的轮询，网关长时间不可用会变成刷屏。
  */
@@ -505,144 +491,6 @@ export async function queryAllUsage(): Promise<void> {
     toast(`余额查询失败：${message}`, 'err')
   } finally {
     patch({ usageBusy: false })
-  }
-}
-
-/**
- * 签到。`id` 缺省 = 全部可签到账号串行签到；指定 id = 单账号签到。
- * 目标集合只用「有签到概念 + 国内版」的账号（后端同样只把国际版排除在外，
- * **不看启用状态**）。
- *
- * 只发请求、不动任何界面缓存：结果的呈现由调用方决定（行上按钮的状态 + toast，
- * 以及顺带一次余额刷新，见 `runCheckin` / `checkinAll`）—— 签到**没有明细面板**，
- * 别在这里挂面板状态。
- */
-export async function checkinFor(id?: string | null): Promise<{
-  results?: Array<Record<string, unknown>>
-  succeeded?: number
-  total?: number
-  skipped?: number
-} | null | undefined> {
-  return shared().workbuddyDesktop?.checkinAllAccounts?.(id || null)
-}
-
-/**
- * 一行签到结果的分类。三种结局互斥，判据只看 claim 的两个布尔：
- *   - `ok`：本次真的领到了（`claim.success === true`）；
- *   - `already`：上游说今天已经领过了（`claim.alreadyCompleted === true`）——
- *     **不是失败**：一天里大部分时候点签到都是这个结果，报红会把正常状态说成故障；
- *   - `failed`：其余（`row.error` 后端分派层报的错、`claim.success === false` 且
- *     不是已领取、完全没返回结果），原因取 msg。
- */
-type CheckinOutcome = { kind: 'ok' | 'already' | 'failed'; reason: string }
-
-function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutcome {
-  if (!row) return { kind: 'failed', reason: '未返回签到结果' }
-  if (row.error) return { kind: 'failed', reason: String(row.error) }
-  const claim = row.claim as Record<string, unknown> | null | undefined
-  if (!claim) return { kind: 'failed', reason: '签到响应为空' }
-  if (claim.success === true) return { kind: 'ok', reason: '' }
-  if (claim.alreadyCompleted === true) return { kind: 'already', reason: '' }
-  return { kind: 'failed', reason: String(claim.msg || '未领取') }
-}
-
-/**
- * 批量签到（工具条「全部签到」）。结果只走 toast —— 没有明细面板可展开。
- * 签到完还会静默刷新一次余额：签到发的积分 / 权益本来就要落到余额列上。
- */
-export async function checkinAll(): Promise<void> {
-  if (getStore().checkinBusy) return
-  const targets = checkinableAccounts(allAccounts())
-  if (!targets.length) {
-    toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw / Qoder 中国版）', 'err')
-    return
-  }
-  if (!(await shared().wbConfirm?.ask?.({
-    title: '批量签到',
-    html: `将对 <strong>${targets.length}</strong> 个账号串行签到，可能需要一点时间。继续？`,
-    okText: '继续',
-    bodyClass: '',
-  }))) return
-  patch({ checkinBusy: true })
-  try {
-    const data = await checkinFor(null)
-    const rows = Array.isArray(data?.results) ? data.results : []
-    const byId = new Map(rows.map(row => [String(row?.id || ''), row]))
-    let ok = 0
-    let already = 0
-    const failed: string[] = []
-    for (const account of targets) {
-      const outcome = checkinOutcomeOf(byId.get(account.id))
-      if (outcome.kind === 'ok') {
-        ok += 1
-        checkinErrors.delete(account.id)
-      } else if (outcome.kind === 'already') {
-        already += 1
-        checkinErrors.delete(account.id)
-      } else {
-        failed.push(`${displayNameOf(account) || account.id}：${outcome.reason}`)
-        checkinErrors.set(account.id, outcome.reason)
-      }
-    }
-    bump()
-    // 失败详情：个数 + 第一条原因（各账号自己的原因记进按钮 title，可逐个悬停复看）
-    const parts = [`成功领取 ${ok} 个`]
-    if (already) parts.push(`今日已领取 ${already} 个`)
-    if (failed.length) parts.push(`未领取 ${failed.length} 个（首个：${failed[0]}）`)
-    const skipped = Number(data?.skipped) || 0
-    toast(`签到完成：${parts.join('，')}`
-      + (skipped ? `；跳过 ${skipped} 个国际版 / 所属家无签到的账号` : ''), failed.length ? 'err' : 'ok')
-    // 签到会改变余额读数（签到发的就是积分 / 权益）：静默再查一遍，余额列直接落到
-    // 新读数（不 await、不播报，理由见 refreshUsageAfterCheckin）
-    void refreshUsageAfterCheckin()
-  } catch (error) {
-    const message = errorMessage(error)
-    targets.forEach(account => checkinErrors.set(account.id, message))
-    bump()
-    toast(`签到失败：${message}`, 'err')
-  } finally {
-    patch({ checkinBusy: false })
-    // 重拉账号状态：签到时间由后端落盘，行上的签到按钮据此变成「已签到」。
-    // 不重拉的话按钮要等下一轮 20 秒轮询才跟上，那期间还显示成可点。
-    void shared().wbApp?.refresh?.()
-  }
-}
-
-/**
- * 单个账号签到：请求 → toast 结果 → 重拉账号状态（`checkinAt` 由后端落盘）。
- *
- * 三种结局各自的落点（见 `checkinOutcomeOf`）：
- *   - 成功 → toast ✅，按钮随即变成「已签到」；
- *   - 今日已领取 → 中性 toast（正常状态，不是故障），按钮同样变「已签到」；
- *   - 未领取 → toast 原因 + 把它记进按钮 title（toast 会消失，原因要能复看）。
- *
- * 请求正常返回（三种结局都算）后顺带**静默查一次该账号的余额** —— 签到会改变余额
- * 读数，见 `refreshUsageAfterCheckin`。请求本身抛错时不查：那时后端多半不可达。
- */
-export async function runCheckin(id: string): Promise<void> {
-  const label = displayNameOf(findAccount(id)) || id
-  try {
-    const data = await checkinFor(id)
-    const rows = Array.isArray(data?.results) ? data.results : []
-    const row = rows.find(item => item?.id === id) || rows[0]
-    const outcome = checkinOutcomeOf(row)
-    if (outcome.kind === 'failed') {
-      checkinErrors.set(id, outcome.reason)
-      toast(`签到失败：${label}：${outcome.reason}`, 'err')
-    } else {
-      checkinErrors.delete(id)
-      toast(outcome.kind === 'already' ? `${label}：今日已领取` : `✅ ${label} 签到成功`, 'ok')
-    }
-    bump()
-    // 签到会改变余额读数：此刻刷新余额（静默，见 refreshUsageAfterCheckin）。
-    // 只查这一行 —— 用户点的是这个账号，别的行没动过
-    void refreshUsageAfterCheckin(id)
-    void shared().wbApp?.refresh?.()
-  } catch (error) {
-    const message = errorMessage(error)
-    checkinErrors.set(id, message)
-    bump()
-    toast(`签到失败：${label}：${message}`, 'err')
   }
 }
 
@@ -940,11 +788,7 @@ export type AccountsViewApi = {
   syncBalancesSnapshot(): Promise<boolean>
   queryUsageFor(id?: string | null): Promise<unknown>
   queryAllUsage(): Promise<void>
-  checkinFor(id?: string | null): Promise<unknown>
-  checkinAll(): Promise<void>
   refreshUsageAfterCheckin(id?: string | null): Promise<void>
-  checkinableAccounts: typeof checkinableAccounts
-  supportsCheckin: typeof supportsCheckin
   supportsUsage: typeof supportsUsage
   isDesktopAccount: typeof isDesktopAccount
   isEnabled: typeof isEnabled
@@ -982,10 +826,7 @@ type AccountsModelApi = {
   isEnabled: typeof domain.isEnabled
   isRateLimited: typeof domain.isRateLimited
   accountEdition: typeof domain.accountEdition
-  supportsCheckin: typeof domain.supportsCheckin
   supportsClaim: typeof domain.supportsClaim
-  checkedInToday: typeof domain.checkedInToday
-  checkinableAccounts: typeof domain.checkinableAccounts
   matchProvider: typeof domain.matchProvider
   matchEnabled: typeof domain.matchEnabled
   matchLimit: typeof domain.matchLimit
@@ -1025,10 +866,7 @@ const ACCOUNTS_MODEL_API: AccountsModelApi = {
   isEnabled: domain.isEnabled,
   isRateLimited: domain.isRateLimited,
   accountEdition: domain.accountEdition,
-  supportsCheckin: domain.supportsCheckin,
   supportsClaim: domain.supportsClaim,
-  checkedInToday: domain.checkedInToday,
-  checkinableAccounts: domain.checkinableAccounts,
   matchProvider: domain.matchProvider,
   matchEnabled: domain.matchEnabled,
   matchLimit: domain.matchLimit,
@@ -1055,11 +893,7 @@ export function installAccountsApi(): void {
     syncBalancesSnapshot,
     queryUsageFor,
     queryAllUsage,
-    checkinFor,
-    checkinAll,
     refreshUsageAfterCheckin,
-    checkinableAccounts,
-    supportsCheckin,
     supportsUsage,
     isDesktopAccount,
     isEnabled,

@@ -38,10 +38,14 @@
  * `<th>` 里插着列宽把手，重建会把两者一起丢掉。
  *
  * 所以表骨架（colgroup + thead）在这里是**字面量 JSX**，永远按 index.html 的原始顺序渲染
- * 全部 7 列，且**不随任何状态变化**：
- *   · React 只在「同一位置、同一类型的子节点」上做属性 diff —— 这 7 个 th 的 props 与文本
- *     逐字不变，重渲染时 React 一次 DOM 写都不会发生，syncStaticHead 摘掉的列不会被 React
- *     塞回来（它压根不重新协调这几个节点）；
+ * 全部 8 列，且**不随任何状态变化**：
+ *   · React 只在「同一位置、同一类型的子节点」上做属性 diff —— 除勾选列外，其余 7 个 th
+ *     的 props 与文本逐字不变，重渲染时 React 一次 DOM 写都不会发生，syncStaticHead 摘掉的
+ *     列不会被 React 塞回来（它压根不重新协调这几个节点）；
+ *   · **勾选列是唯一内容会变的 th**：里面是 React 渲染的全选复选框（`allPickNode`）。
+ *     它安全的前提是「React 只更新复选框这个元素、从不重建 th 节点本身」—— th 的
+ *     props / 子结构除那颗复选框外逐字不变，syncStaticHead 把它连复选框一起搬去别的位置
+ *     也不会被 React 挪回来；
  *   · 隐藏列的元素在 syncStaticHead 的缓存里（按表 id 记住），切回内置家时放得回去；
  *   · 表元素本身在 JSX 里的位置固定（没有条件渲染包着它），表引用不会变，缓存不会失效。
  * 数据行（tbody）相反：完全由 React 按 `visibleColumns()` 逐列渲染，与表头读同一份配置。
@@ -69,6 +73,7 @@ import { createRoot } from 'react-dom/client'
 import {
   Badge,
   Button,
+  Checkbox,
   Dialog,
   DialogBody,
   DialogContent,
@@ -100,6 +105,7 @@ import {
 } from './model-capability'
 import { CapabilityDialog } from './model-capability-dialog'
 import { ModelTestDialog, testBlockReason, type ModelTestTarget } from './model-test-dialog'
+import { ModelBatchDialog } from './models-batch-dialog'
 import { CUSTOM_LEVEL, levels as reasoningLevels } from './models-reasoning'
 import * as customSource from './models-custom-source'
 import type { ManageModel, ManageView } from './models-custom-source'
@@ -156,6 +162,16 @@ function ModelsPage() {
    * 放在组件里就够了。值为 null = 弹窗关着。
    */
   const [testTarget, setTestTarget] = React.useState<ModelTestTarget | null>(null)
+  /** 批量操作的弹窗开关（勾选若干行后由表头旁按钮打开） */
+  const [batchOpen, setBatchOpen] = React.useState(false)
+  /**
+   * 批量勾选的行集合（`rowKeyOf` 键 = provider:id，跨提供商天然不撞）。
+   * 刻意**不进模块快照**：只有本页读它，没有从 React 之外打开的调用点 ——
+   * 放组件里就够了（与「测试」弹窗的 target 同一取舍）。
+   * 数据重载后选中的键可能已不存在（模型被删 / 上游刷新带走了）：
+   * 一律按「当前数据里还解析得出来」算（`selectedModels`），残键自然失效。
+   */
+  const [selection, setSelection] = React.useState<ReadonlySet<string>>(new Set())
   /** 选中了一个已被删除的自定义家（目录缓存里确实没有这条记录，而不是「还没加载完」） */
   const customMissing = custom && directoryReady() && !customSource.record(provider)
 
@@ -192,6 +208,34 @@ function ModelsPage() {
    * 却只有 8 行）。选「全部」这一档时恢复原来的折叠行为，一个字都不变。
    */
   const paging = useClientPaging(shown.length, 'models')
+
+  /* ─── 批量勾选（第一列 + 表头全选 + 「批量操作」按钮）────────── */
+  /** 当前视图里还解析得出来的选中行（残键随数据重载自然失效，见 selection 的说明） */
+  const selectedModels = all.filter(model => selection.has(rowKeyOf(model)))
+  const togglePick = (key: string, next: boolean): void => {
+    const nextSet = new Set(selection)
+    if (next) nextSet.add(key)
+    else nextSet.delete(key)
+    setSelection(nextSet)
+  }
+  /** 表头全选的判定范围 = 当前筛选结果（与账号页「全选当前筛选结果」同口径） */
+  const visibleKeys = shown.map(rowKeyOf)
+  const allVisiblePicked = visibleKeys.length > 0 && visibleKeys.every(key => selection.has(key))
+  const someVisiblePicked = visibleKeys.some(key => selection.has(key))
+  /** 表头那格没有文案（照账号页勾选列：列设置里才需要名字），只有全选复选框 */
+  const allPickNode = (
+    <Checkbox checked={allVisiblePicked} indeterminate={!allVisiblePicked && someVisiblePicked}
+      disabled={!visibleKeys.length} aria-label='全选当前筛选结果'
+      title='全选当前筛选出的模型（跨分页）；再点取消'
+      onCheckedChange={next => {
+        const nextSet = new Set(selection)
+        for (const key of visibleKeys) {
+          if (next === true) nextSet.add(key)
+          else nextSet.delete(key)
+        }
+        setSelection(nextSet)
+      }} />
+  )
 
   /** 左栏：内置提供商（全部 + 各家）+ 自定义提供商（每家 + 新建） */
   function rail() {
@@ -431,6 +475,14 @@ function ModelsPage() {
     }
 
     switch (column.key) {
+      case 'check':
+        return (
+          <td className={cellClass('cell-check', column.align)}>
+            <Checkbox checked={selection.has(rowKeyOf(model))} title='勾选后可批量操作'
+              aria-label='勾选后可批量操作'
+              onCheckedChange={next => togglePick(rowKeyOf(model), next === true)} />
+          </td>
+        )
       case 'model':
         return (
           <td className={cellClass('cell-model', column.align)}>
@@ -593,6 +645,13 @@ function ModelsPage() {
                 <InputGroupAddon aria-hidden='true'>⌕</InputGroupAddon>
               </InputGroup>
               <div className='head-actions'>
+                {/* 批量操作：勾选后出现在「获取模型」左边（照账号页批量栏的出现时机 ——
+                    不勾就不占位置）。弹窗里可删除 / 启用 / 禁用 / 设置思考等级 */}
+                {selectedModels.length > 0 ? (
+                  <Button id='btn-batch-models' variant='outline' size='sm'
+                    title={`对选中的 ${selectedModels.length} 个模型执行批量操作`}
+                    onClick={() => setBatchOpen(true)}>批量操作</Button>
+                ) : null}
                 {/* 「获取模型」排在最前：它是这一页的主操作（把清单拉回来），「添加模型」是补充。
                     文案与 title 只有一处事实来源（这里），index.html 里不写死 */}
                 <Button id='btn-refresh-models' variant='outline' size='sm'
@@ -607,13 +666,16 @@ function ModelsPage() {
             </div>
             <div className='models-table-wrap'>
               {/* 表骨架（colgroup + thead）是**字面量**、永远按 index.html 的原始顺序渲染全部
-                  5 列、不随任何状态变化：列的显隐与顺序由 wbColSettings.syncStaticHead 就地
+                  8 列、不随任何状态变化：列的显隐与顺序由 wbColSettings.syncStaticHead 就地
                   重排（隐藏 = 从 DOM 摘掉，不能重建 —— <col> 上带着拖出来的列宽、<th> 里插着
-                  列宽把手）。React 只在同一位置同类型的子节点上做属性 diff，这几个 th 的
-                  props 与文本逐字不变，重渲染时一次 DOM 写都不会发生，摘掉的列不会被塞回来。
+                  列宽把手）。React 只在同一位置同类型的子节点上做属性 diff，除勾选列外这几个
+                  th 的 props 与文本逐字不变，重渲染时一次 DOM 写都不会发生，摘掉的列不会被塞
+                  回来（勾选列是全选复选框，唯一内容会变的 th —— 只会被更新、不会被重建，
+                  完整论证见文件头的「静态表头」一节）。
                   数据行相反：完全按 visibleColumns() 逐列渲染，与表头读同一份配置。 */}
               <table className='models-table' ref={el => setTableEl(el)}>
                 <colgroup>
+                  <col className='c-check' data-col='check' />
                   <col className='c-model' data-col='model' />
                   <col className='c-rate' data-col='rate' />
                   <col className='c-source' data-col='source' />
@@ -623,6 +685,7 @@ function ModelsPage() {
                   <col className='c-act' data-col='act' />
                 </colgroup>
                 <thead><tr>
+                  <th data-col='check'>{allPickNode}</th>
                   <th data-col='model'>上游模型</th>
                   <th data-col='rate'>倍率</th>
                   <th data-col='source'>来源</th>
@@ -663,6 +726,10 @@ function ModelsPage() {
         : null}
       {testTarget
         ? <ModelTestDialog target={testTarget} onClose={() => setTestTarget(null)} />
+        : null}
+      {batchOpen
+        ? <ModelBatchDialog models={selectedModels} onClose={() => setBatchOpen(false)}
+          onDone={() => { setSelection(new Set()); setBatchOpen(false) }} />
         : null}
     </>
   )

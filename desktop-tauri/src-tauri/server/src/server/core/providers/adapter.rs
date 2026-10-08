@@ -983,6 +983,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // Loomy（讯飞）：无状态 OpenAI 兼容转发（token + Bearer 双头鉴权），
         // 账号管理走手机号验证码登录（见 `loomy/mod.rs` 的模块头）
         ProviderKind::Loomy => &super::loomy::LOOMY_ADAPTER,
+        // KukuAI（百度文库库库 AI）：有状态转发（请求内三步时序：建会话 →
+        // 分配算力 → SSE），账号管理走粘贴 Cookie / 导入本机登录态
+        // （见 `kuku/mod.rs` 的模块头）
+        ProviderKind::Kuku => &super::kuku::KUKU_ADAPTER,
     }
 }
 
@@ -1053,6 +1057,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 且有远程目录（`GET {网关}/api/v1/models`）—— 必须在列表里，
         // 否则目录刷新循环不会问它。
         ProviderKind::Loomy,
+        // KukuAI 已接真身（凭据 / 目录 / 转发 / 余额），且有远程目录
+        // （`/wenchain/genflowpro/model_list`）—— 必须在列表里，否则刷新循环
+        // 不会问它（与 Trae 同一理由）。
+        ProviderKind::Kuku,
     ]
 }
 

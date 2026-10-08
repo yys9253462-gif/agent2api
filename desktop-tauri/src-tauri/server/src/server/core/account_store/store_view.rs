@@ -273,6 +273,11 @@ impl AccountStore {
             // Loomy（讯飞）：单一入口（手机验证码登录），公开形态带 userId /
             // phone / session 尾四位的展示字段（见 `loomy_accounts.rs`）
             self.to_loomy_public_account(record)
+        } else if record.provider() == super::kuku_accounts::KUKU_PROVIDER_ID {
+            // KukuAI（百度文库库库 AI）：单一入口（粘贴 Cookie / 导入本机登录态），
+            // 公开形态带 uid(=uk) / loginName(=昵称) / tokenTail（见
+            // `kuku_accounts.rs`）
+            self.to_kuku_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -326,6 +331,19 @@ impl AccountStore {
                             .map(js_truthy)
                             .unwrap_or(false),
                     ),
+                );
+                // 每账号的余额查询设置（自动查询 + 余额不足处理）：跨家统一注入
+                // 的理由与 hasCredentials 相同 —— 心跳调度、选路跳过 / 禁用与前端
+                // 弹窗、徽章读的是**同一份事实**，不能各家形状一个口径。
+                // 恒为对象（未配置 = 关闭 / off 的规范化形状，与写入侧
+                // `apply_patch` 的归一化一致），读侧不必判「键缺失」。
+                fields.insert(
+                    "usageQuery".to_string(),
+                    usage_query_public(record.fields().get("usageQuery")),
+                );
+                fields.insert(
+                    "lowBalance".to_string(),
+                    low_balance_public(record.fields().get("lowBalance")),
                 );
                 Value::Object(fields)
             }
@@ -451,5 +469,55 @@ impl AccountStore {
             Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
         );
         Value::Object(public)
+    }
+}
+
+/// 记录上的 `usageQuery` → 公开形态的规范化形状（恒为对象）。
+///
+/// 读侧只做**容错展开**、不校验：合法性由写入侧（`apply_patch` 的
+/// `normalize_usage_query`）保证，这里负责把缺失 / 脏值收敛成缺省形状，让
+/// 调度与前端都按「恒定形状」读。缺省与 `usage_records::query_interval_of`
+/// 同一口径 —— **未配置 = 开启、1 分钟**（对齐全局任务时代「默认就在查」的
+/// 行为，升级后余额列不停更），只有显式 `{enabled:false}` 才是关。
+fn usage_query_public(value: Option<&Value>) -> Value {
+    use crate::server::core::usage_records::{
+        DEFAULT_QUERY_INTERVAL_SECONDS, MAX_QUERY_INTERVAL_SECONDS, MIN_QUERY_INTERVAL_SECONDS,
+    };
+    let Some(fields) = value.and_then(Value::as_object) else {
+        return json!({ "enabled": true, "interval": DEFAULT_QUERY_INTERVAL_SECONDS });
+    };
+    let enabled = fields.get("enabled").map(js_truthy).unwrap_or(true);
+    let interval = fields.get("interval").and_then(Value::as_i64).unwrap_or(0);
+    // 开着但间隔缺失 / 越界（脏值）→ 缺省间隔；关着则原样透出（0 = 未设过）
+    let interval = if enabled
+        && !(MIN_QUERY_INTERVAL_SECONDS..=MAX_QUERY_INTERVAL_SECONDS).contains(&interval)
+    {
+        DEFAULT_QUERY_INTERVAL_SECONDS
+    } else {
+        interval
+    };
+    json!({ "enabled": enabled, "interval": interval })
+}
+
+/// 记录上的 `lowBalance` → 公开形态的规范化形状。
+///
+/// 缺省（无配置）= `skip`、阈值 1（与 `usage_records::balance_blocked` 同一口径）；
+/// 显式 `off` 必须保持 off —— 那是用户关掉的，缺省不能覆盖它。skip / disable
+/// 档下阈值缺失或非法时回落缺省 1。
+fn low_balance_public(value: Option<&Value>) -> Value {
+    use crate::server::core::usage_records::DEFAULT_LOW_BALANCE_THRESHOLD;
+    let Some(fields) = value.and_then(Value::as_object) else {
+        return json!({ "mode": "skip", "threshold": DEFAULT_LOW_BALANCE_THRESHOLD });
+    };
+    let mode = fields.get("mode").and_then(Value::as_str).unwrap_or("skip");
+    let threshold = fields
+        .get("threshold")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_LOW_BALANCE_THRESHOLD);
+    match mode {
+        "skip" => json!({ "mode": "skip", "threshold": threshold }),
+        "disable" => json!({ "mode": "disable", "threshold": threshold }),
+        _ => json!({ "mode": "off", "threshold": 0.0 }),
     }
 }

@@ -179,6 +179,9 @@ export const MODEL_STATE_OPTIONS: readonly SegmentedControlOption<string>[] = MO
  * 表头 th、table-columns.js 的列宽登记三处同名，键名只有一套）。顺序即默认渲染顺序。
  */
 const COLUMNS: ColumnDecl[] = [
+  // 「选择」列：整行的批量操作入口（照账号页勾选列的口径 —— 列设置里要有名字，
+  // 表格里那格是「全选」复选框，没有表头文案）
+  { key: 'check', label: '选择', align: 'center' },
   { key: 'model', label: '上游模型' },
   { key: 'rate', label: '倍率' },
   { key: 'source', label: '来源' },

@@ -405,6 +405,34 @@ pub async fn start_autoclaw_oauth_login(
     .await
 }
 
+/// KukuAI 手机验证码登录 · 发码：开登录窗口（注入短信自动流程脚本）后立即返回。
+///
+/// 与其它短信链路（AutoClaw / Loomy）不同：百度通行证的「发码」必须在页面里
+/// 点（请求要带页面上生成的风控签名，见 `login::kuku_sms_script` 的说明），
+/// 所以这里**不是**调后端 API，而是让壳打开一个隐藏登录窗口替用户自动填号发码。
+/// 前端收到返回的 `state` 后进入「等验证码」状态，用户填码后走
+/// [`login_kuku_sms_verify`]。
+#[tauri::command]
+pub async fn login_kuku_sms_send(
+    app: AppHandle,
+    phone: String,
+) -> Result<Value, String> {
+    login::start_kuku_sms(&app, &phone).await
+}
+
+/// KukuAI 手机验证码登录 · 收码：把用户收到的验证码写入登录窗口，等登录完成。
+///
+/// 成功后返回 `{account, list}`（与 `POST /api/accounts` 添加账号的响应同形状，
+/// 前端直接走「已添加账号」收尾逻辑）。手机号在发码时已随窗口带进去，
+/// 这里只需要验证码。
+#[tauri::command]
+pub async fn login_kuku_sms_verify(
+    app: AppHandle,
+    code: String,
+) -> Result<Value, String> {
+    login::submit_kuku_sms_code(&app, &code).await
+}
+
 #[tauri::command]
 pub fn login_state(app: AppHandle) -> LoginState {
     match login::current_login(&app) {
@@ -466,6 +494,7 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
     }
     // 顺手把缓存与磁盘对齐：拦截关窗时要用到最新值
     app.state::<AppState>().window.set_close_to_tray(current.close_to_tray);
+    app.state::<AppState>().window.set_lightweight(current.lightweight_mode);
     current
 }
 
@@ -504,6 +533,7 @@ pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettin
     settings::save(&saved)?;
     // 立即生效：配置改完不用重启，下一次关窗就走新行为
     app.state::<AppState>().window.set_close_to_tray(saved.close_to_tray);
+    app.state::<AppState>().window.set_lightweight(saved.lightweight_mode);
     Ok(saved)
 }
 

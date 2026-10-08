@@ -52,7 +52,7 @@ Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
 
-Accounts sit in one **global queue** and are tried in ascending priority order, skipping accounts that are disabled, do not offer that model, or are in a rate-limit cooldown for that model; when an account hits a 429 on a model the request falls back to the next candidate, and only when every candidate is unavailable is the last real error passed through.
+Accounts sit in one **global queue** and are tried in ascending priority order, skipping accounts that are disabled, are out of balance (configured as "skip" below the threshold in account settings), do not offer that model, or are in a rate-limit cooldown for that model; when an account hits a 429 on a model the request falls back to the next candidate, and only when every candidate is unavailable is the last real error passed through.
 
 ### Verification
 
@@ -128,7 +128,7 @@ Build from source: clone the repo and run `docker compose up -d --build` (the im
 
 ### Accounts
 
-Every provider's accounts share one **global queue** (the second column from the left is the priority) and can be toggled individually. The rate-limit row shows the per-model cooldown state and when it recovers, while expiry and balance are kept fresh by background tasks such as "Credential maintenance" and the scheduled balance query.
+Every provider's accounts share one **global queue** (the second column from the left is the priority) and can be toggled individually. The rate-limit row shows the per-model cooldown state and when it recovers, expiry is kept fresh by the "Credential maintenance" background task, and balance is refreshed per account on its own schedule (account settings dialog, "Query settings"; on by default, every 1 minute), and low-balance accounts are skipped below a threshold (default 1) by default — or can be disabled instead, or off.
 
 ![Accounts page: global queue, per-model rate-limit cooldown, expiry and balance](./assets/screenshots/accounts.png)
 

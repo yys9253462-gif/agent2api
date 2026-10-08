@@ -133,6 +133,12 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::loomy::models::remote_refreshed(),
             super::loomy::models::last_refreshed_at(),
         ),
+        // KukuAI 的清单来自远程目录（`/wenchain/genflowpro/model_list`）；
+        // 静态兜底只是离线保底，「有内容」才算远程来源（与 raccoon 同判据）。
+        ProviderKind::Kuku => (
+            super::kuku::models::remote_refreshed(),
+            super::kuku::models::last_refreshed_at(),
+        ),
     }
 }
 

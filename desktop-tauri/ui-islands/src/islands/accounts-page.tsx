@@ -61,10 +61,10 @@ import {
 } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import { shared, type AccountRecord, type ColSettingsHandle } from './accounts-shared'
-import { checkinableAccounts, isDesktopAccount, isEnabled, supportsUsage } from './accounts-domain'
+import { isDesktopAccount, isEnabled, supportsUsage } from './accounts-domain'
 import { ACCOUNT_COLUMNS, bindColumnGrips, columnWidths, tableMinWidth } from './accounts-columns'
 import {
-  allAccounts, checkinAll, clearLimits, clearSelection, ensureProxyPoolOptions,
+  allAccounts, clearLimits, clearSelection, ensureProxyPoolOptions,
   getStore, installAccountsApi, normalizeFilter, openBatchDialog, panelOpen, providerSummaryList,
   queryAllUsage, rowContext, seats, segmentCounts, setAllPicked, setProviderFilter, setSegmentFilter,
   snapshot, startConnectionsPolling, subscribe, togglePick, visibleList,
@@ -310,10 +310,6 @@ function AccountsPage() {
               disabled={store.usageBusy || !all.some(supportsUsage)}
               title='查询全部账号的余额（含已禁用账号 —— 禁用只表示不参与转发）'
               onClick={() => void queryAllUsage()}>{store.usageBusy ? '查询中…' : '查询余额'}</Button>
-            <Button id='btn-checkin-all' variant='outline'
-              disabled={store.checkinBusy || !checkinableAccounts(all).length}
-              title='为全部可签到的账号串行签到'
-              onClick={() => void checkinAll()}>{store.checkinBusy ? '签到中…' : '全部签到'}</Button>
           </div>
         </div>
 

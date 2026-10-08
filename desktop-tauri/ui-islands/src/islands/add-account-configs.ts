@@ -514,6 +514,48 @@ const LOOMY: ProviderConfig = {
   desktop: false,
 }
 
+/**
+ * KukuAI（百度文库「库库 AI / GenFlowPro」）：一家一个 provider，没有地区之分。
+ *
+ * ── 凭证形态 ────────────────────────────────────────────────
+ * 三个 Cookie 就能认证：`BDUSS` / `STOKEN` / `gfprotpl=genflowpro`（后一个
+ * 恒附加，不用填）。粘贴支持三种形态（与后端 `kuku::credentials` 同口径）：
+ *   1. 整段 Cookie 头（`BDUSS=…; STOKEN=…; …`）；
+ *   2. Cookie 编辑器导出的 `[{name, value}, …]` JSON 数组；
+ *   3. `{BDUSS, STOKEN}` JSON 对象。
+ *
+ * ── 导入桌面端 ──────────────────────────────────────────────
+ * 客户端是 Electron 套壳，登录态在 `%APPDATA%\baidugenflowpro\Network\Cookies`
+ * （SQLite **明文**，无需解密）。客户端运行时该文件被独占锁，导入失败时
+ * 提示先关闭客户端（占用冲突的两段式处置与 CatPaw 导入同一交互）。
+ *
+ * ── 没有刷新机制 ────────────────────────────────────────────
+ * BDUSS 是百度通行证登录态，上游没有刷新接口，过期后重新导入/重新粘贴即可
+ * （与 CatPaw 同一处境，所以不渲染「刷新 Token」那一类控件）。
+ */
+const KUKU: ProviderConfig = {
+  provider: 'kuku',
+  label: 'KukuAI',
+  // 主站登录（最终方案）：打开 kuku.baidu.com，用户像平时用网页版一样登录
+  // （手机验证码 / 扫码都由官方页面自己处理风控 —— 不再在登录页上做任何
+  // 自动化）。登录成功后壳侧检测到 Cookie 里出现 BDUSS，自动读取**完整会话**
+  // （含 HttpOnly 的 BAIDUID_BFESS 等）交回网关，窗口自动关闭、账号落列表。
+  webLogin: {
+    noteHtml: '在打开的窗口里用百度账号登录 KukuAI 主站（手机验证码 / 扫码均可），登录成功后自动加入账号列表。网关会向百度换发 KukuAI 业务会话令牌（依赖本机已安装库库AI 客户端）。',
+    button: '打开网页登录',
+    busyText: '等待 KukuAI 登录完成…',
+  },
+  manualTitle: '粘贴 Cookie',
+  manualNote: 'BDUSS 必填；请粘贴**完整 Cookie**（Cookie 编辑器一键导出即可）—— 其中 **PTOKEN 必须保留**，网关要用它向百度换发 KukuAI 业务会话令牌，缺了它模型刷新会报「未登录」。支持整段 Cookie 头、Cookie 编辑器导出的 JSON 数组，或 {BDUSS, STOKEN} 对象。KukuAI 没有刷新机制，登录态过期后重新粘贴即可。',
+  fields: [
+    { key: 'cookie', label: 'Cookie', rows: 3, placeholder: 'BDUSS=…; STOKEN=…（或 Cookie 编辑器导出的 JSON）' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用账号 uk' },
+  ],
+  desktop: true,
+  desktopHint: '读取本机 KukuAI 客户端登录态（%APPDATA%\\baidugenflowpro\\Network\\Cookies），需已在 KukuAI 客户端登录',
+  desktopNote: '读本机客户端当前登录态（明文 Cookie，无需解密）。客户端运行时 Cookies 文件被独占占用，导入前请先关闭 KukuAI 客户端。',
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -538,6 +580,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // Loomy（讯飞）：单一入口（手机验证码登录），排在末尾 —— 与后端注册表
   // PROVIDERS 的排列一致（新增的一家加在表尾）
   LOOMY,
+  // KukuAI（百度文库库库 AI）：粘贴 Cookie / 导入本机登录态，排在末尾
+  // （与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
+  KUKU,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

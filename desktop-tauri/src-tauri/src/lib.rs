@@ -39,7 +39,7 @@ mod update;
 use agent2api_server::port_conflict;
 use agent2api_server::server;
 
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
@@ -133,6 +133,76 @@ fn report_startup_failure(app: &tauri::AppHandle, error: &str) {
     });
 }
 
+/// 创建主窗口 —— 启动建一次；轻量模式下窗口被销毁后，托盘按需重建也走这里。
+///
+/// 建窗参数（标题 / 无装饰自绘标题栏 / 尺寸 / 默认最大化 / 桥注入 /
+/// WebView2 后台保活参数）**只在这一处声明**：重建的窗口是用户「重新打开」
+/// 的界面，任何参数漂移都会表现为「托盘叫回来的窗口和原来长得不一样」，
+/// 所以启动与重建必须共用同一份。
+///
+/// `visible` 由调用方决定：启动时按「是否开机自启」静默（比先显示再隐藏
+/// 更干净，不会在任务栏闪一下），重建时恒为 true。
+fn create_main_window(app: &AppHandle, visible: bool) -> tauri::Result<tauri::WebviewWindow> {
+    // ── decorations(false)：去掉系统标题栏，换界面自绘的标题栏 ──
+    // 参考 OmniProxy 的 TitleBar：32px 高、左标题右三键，与界面
+    // 同一套配色（titlebar.js 动态创建）。无装饰之后三项原生行为
+    // 的恢复方式（Tauri 2 内建，无需额外代码）：
+    //   · 拖动 / 双击最大化：前端给标题栏元素声明 `data-tauri-drag-region`
+    //     属性 —— Tauri 的 core 脚本监听 mousedown，目标元素带该属性
+    //     才拖动（子元素不带不拖），双击（连击）切最大化；
+    //   · 边缘拖拽缩放：`resizable(true)`（默认即开）下，Windows 端
+    //     的 tao 对无装饰窗口做命中测试，边缘仍可拖拽缩放；
+    //   · 关闭：界面的 ✕ 走 window_close 命令 → CloseRequested，
+    //     与系统关闭按钮同一条事件路径，托盘拦截逻辑不变。
+    // 注：macOS 上这会一并去掉「红绿灯」，本项目面向 Windows
+    // （NSIS 安装包），macOS 如需保留要用 titleBarStyle: Overlay
+    // 另行适配，此处不做特殊处理。
+    // ── WebView2 后台保活参数（Windows 专属）──────────────────────
+    // 窗口隐藏或最小化时，Chromium 默认会对后台窗口启用定时器节流
+    // （Timer Throttling）与挂起，导致后台验证码铸造循环（ui/zcode-captcha-pool.js）
+    // 的 setTimeout 被严重降频甚至冻结。解除这三项节流限制以维持后台令牌正常补充
+    // （轻量模式下窗口整个销毁，该循环随之停止 —— 取舍见 AppSettings::lightweight_mode）。
+    //
+    // 开头的 `--disable-features=…` **不能省**：wry 对 additional_browser_args 是
+    // **替换**语义（`unwrap_or_else`，见 wry 的 webview2/mod.rs），设了它就看不到
+    // wry 的默认值 —— 而默认值里正有关掉 WebView2「⋯」溢出菜单与 SmartScreen 检查
+    // 的那三项（Tauri 在 additional_browser_args 的文档警告里说明了这一点）。
+    // 后面三项才是本 PR 新增的保活开关，与前缀互不冲突，可以并在一串里。
+    #[cfg(target_os = "windows")]
+    let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+        .additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --disable-background-timer-throttling \
+             --disable-backgrounding-occluded-windows \
+             --disable-renderer-backgrounding",
+        );
+    #[cfg(not(target_os = "windows"))]
+    let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()));
+
+    builder
+        .title(app_title())
+        .decorations(false)
+        .inner_size(WIN_WIDTH, WIN_HEIGHT)
+        .min_inner_size(WIN_MIN_WIDTH, WIN_MIN_HEIGHT)
+        .center()
+        .maximized(true)
+        .visible(visible)
+        .initialization_script(bridge::bridge_js())
+        .build()
+}
+
+/// 确保主窗口存在并返回它：没有（轻量模式销毁后 / 尚未创建）就按建窗参数重建。
+///
+/// 托盘唤起与单实例激活共用这条路径 —— 两者都只负责「把界面叫回来」，
+/// 都不该假定窗口一定还在。重建失败（WebView 起不来等）返回 None，
+/// 调用方按「窗口不可用」安静处理，绝不 panic。
+pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        return Some(window);
+    }
+    create_main_window(app, true).ok()
+}
+
 pub fn run() {
     let mut builder = tauri::Builder::default();
 
@@ -169,6 +239,8 @@ pub fn run() {
             commands::local_ip,
             commands::start_login,
             commands::start_autoclaw_oauth_login,
+            commands::login_kuku_sms_send,
+            commands::login_kuku_sms_verify,
             commands::login_state,
             commands::cancel_login,
             commands::export_logs,
@@ -290,51 +362,10 @@ pub fn run() {
             // 开机自启时不显示窗口（visible(false) 比先显示再隐藏更干净，
             // 不会在任务栏闪一下）。
             //
-            // ── decorations(false)：去掉系统标题栏，换界面自绘的标题栏 ──
-            // 参考 OmniProxy 的 TitleBar：32px 高、左标题右三键，与界面
-            // 同一套配色（titlebar.js 动态创建）。无装饰之后三项原生行为
-            // 的恢复方式（Tauri 2 内建，无需额外代码）：
-            //   · 拖动 / 双击最大化：前端给标题栏元素声明 `data-tauri-drag-region`
-            //     属性 —— Tauri 的 core 脚本监听 mousedown，目标元素带该属性
-            //     才拖动（子元素不带不拖），双击（连击）切最大化；
-            //   · 边缘拖拽缩放：`resizable(true)`（默认即开）下，Windows 端
-            //     的 tao 对无装饰窗口做命中测试，边缘仍可拖拽缩放；
-            //   · 关闭：界面的 ✕ 走 window_close 命令 → CloseRequested，
-            //     与系统关闭按钮同一条事件路径，托盘拦截逻辑不变。
-            // 注：macOS 上这会一并去掉「红绿灯」，本项目面向 Windows
-            // （NSIS 安装包），macOS 如需保留要用 titleBarStyle: Overlay
-            // 另行适配，此处不做特殊处理。
-            // ── WebView2 后台保活参数（Windows 专属）──────────────────────
-            // 关闭到托盘或窗口最小化时，Chromium 默认会对后台窗口启用定时器节流
-            // （Timer Throttling）与挂起，导致后台验证码铸造循环（ui/zcode-captcha-pool.js）
-            // 的 setTimeout 被严重降频甚至冻结。解除这三项节流限制以维持后台令牌正常补充。
-            //
-            // 开头的 `--disable-features=…` **不能省**：wry 对 additional_browser_args 是
-            // **替换**语义（`unwrap_or_else`，见 wry 的 webview2/mod.rs），设了它就看不到
-            // wry 的默认值 —— 而默认值里正有关掉 WebView2「⋯」溢出菜单与 SmartScreen 检查
-            // 的那三项（Tauri 在 additional_browser_args 的文档警告里说明了这一点）。
-            // 后面三项才是本 PR 新增的保活开关，与前缀互不冲突，可以并在一串里。
-            #[cfg(target_os = "windows")]
-            let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-                .additional_browser_args(
-                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
-                     --disable-background-timer-throttling \
-                     --disable-backgrounding-occluded-windows \
-                     --disable-renderer-backgrounding",
-                );
-            #[cfg(not(target_os = "windows"))]
-            let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()));
-
-            builder
-                .title(app_title())
-                .decorations(false)
-                .inner_size(WIN_WIDTH, WIN_HEIGHT)
-                .min_inner_size(WIN_MIN_WIDTH, WIN_MIN_HEIGHT)
-                .center()
-                .maximized(true)
-                .visible(!launched_by_autostart())
-                .initialization_script(bridge::bridge_js())
-                .build()?;
+            // 建窗参数（无装饰标题栏、WebView2 保活、桥注入等）只在
+            // create_main_window 一处声明：轻量模式下托盘重建也走它，
+            // 两边必须长得一模一样。
+            create_main_window(&handle, !launched_by_autostart())?;
 
             // 后端负责维护任务的持久化排期，桌面壳不额外触发刷新。
             tauri::async_runtime::spawn(async move {
@@ -373,7 +404,16 @@ pub fn run() {
                 if state.window.close_to_tray() && !state.window.is_exiting() {
                     api.prevent_close();
                     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                        let _ = window.hide();
+                        if state.window.lightweight() {
+                            // 轻量模式：直接销毁窗口 —— WebView2 那 6 个进程
+                            // 随之退出（释放约 200MB 常驻内存），网关在进程内
+                            // 不受影响。销毁后 `ExitRequested` 由下面的分支拦下
+                            // （close_to_tray 开着 → prevent_exit，进程留在托盘），
+                            // 托盘点击时由 `ensure_main_window` 按同一份参数重建。
+                            let _ = window.destroy();
+                        } else {
+                            let _ = window.hide();
+                        }
                     }
                 }
             }

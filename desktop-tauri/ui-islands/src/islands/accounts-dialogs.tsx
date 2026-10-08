@@ -45,9 +45,12 @@ import {
 } from './accounts-shared'
 import { clampPriority, priorityOf, PRIORITY_MAX, PRIORITY_MIN } from './accounts-columns'
 import {
-  displayNameOf, providerOf, supportsPlanChannel, zcodePlanLabel, zcodePlanOf,
+  displayNameOf, providerOf, supportsPlanChannel, supportsUsage, zcodePlanLabel, zcodePlanOf,
   ZCODE_PLAN_CODING, ZCODE_PLAN_START,
 } from './accounts-domain'
+import {
+  readUsageChanges, UsageSettingsSection, usageDraftOf, type UsageDraft,
+} from './accounts-dialog-usage'
 import {
   allAccounts, clashOptions, closeDialog, findAccount, getStore, proxyPoolOptions,
 } from './accounts-data'
@@ -639,6 +642,9 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   /** 自定义账号的凭证草稿：新 Key（留空 = 不改，走「清除」按钮）与「无需鉴权」勾选 */
   const [apiKeyDraft, setApiKeyDraft] = React.useState('')
   const [noAuthDraft, setNoAuthDraft] = React.useState(account?.noAuth === true)
+  // 「查询设置」段的草稿（自动查询间隔 + 余额不足处理）：只在真的有余额概念的
+  // 家渲染，草稿仍无条件初始化 —— 与 planChannel 同一形态，省一个条件分支
+  const [usageDraft, setUsageDraft] = React.useState<UsageDraft>(() => usageDraftOf(account))
 
   // 「提供商」那一段：目录里查得到才算自定义家（id 前缀只说明「长得像」，而记录本身
   // 才带着协议 / Base URL 的现值 —— 三个字段要拿它预填）。
@@ -778,6 +784,13 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       setStatus(<span className='text-destructive'>{providerPatch.error}</span>)
       return
     }
+    // 查询设置段（自动查询间隔 + 余额不足处理）：与凭证段同一层，跟着这次保存
+    // 一起落库；校验不过先在前端挡住（后端 apply_patch 对同一规则也会 400）
+    const usageChanges = supportsUsage(target) ? readUsageChanges(target, usageDraft) : null
+    if (usageChanges && 'error' in usageChanges) {
+      setStatus(<span className='text-destructive'>{usageChanges.error}</span>)
+      return
+    }
     // 凭证段（自定义账号）：与代理 / 套餐同一层，跟着这次保存一起落库
     // （它走的是 PATCH /api/accounts 的自定义分支，见后端 `update_custom_credentials`）
     const credentialPatch = readCredentialPatch() || {}
@@ -803,6 +816,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
         ...balancePatch,
         ...planPatch,
         ...credentialPatch,
+        ...(usageChanges && 'patch' in usageChanges ? usageChanges.patch : {}),
       })
       // 提供商那一段排在账号之后（账号是本弹窗的主角，先落库）。它失败时账号已经存下了，
       // 所以留在弹窗里把那句话说清楚 —— 笼统报成「保存失败」会把两件事混成一件
@@ -891,6 +905,9 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
             {supportsPlanChannel(target) ? (
               <PlanChannelField plan={planChannel} hasJwt={account.canClaim === true}
                 onChange={setPlanChannel} />
+            ) : null}
+            {supportsUsage(target) ? (
+              <UsageSettingsSection account={target} draft={usageDraft} onChange={setUsageDraft} />
             ) : null}
           </DialogSection>
 

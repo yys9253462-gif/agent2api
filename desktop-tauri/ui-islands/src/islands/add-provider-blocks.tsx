@@ -313,10 +313,14 @@ function WebLoginSection({
         modeRef.current || 'embedded',
         prefix,
       ),
-      onSuccess: async () => {
+      onSuccess: async result => {
         closeAddModals()
         await shared().wbApp?.refresh?.()
-        toast(`✅ ${config.label}账号已添加`)
+        // 任务载荷里的警告（如 KukuAI「账号未通过上游复核」）：账号已入库，
+        // 但要让用户立刻知道可能需要换一个百度账号，而不是等刷新模型才发现。
+        const warning = (result as { payload?: { warning?: string } } | null)?.payload?.warning
+        if (warning) toast(`账号已添加，但请留意：${warning}`, 'err')
+        else toast(`✅ ${config.label}账号已添加`)
       },
     }) ?? null
   }, [])

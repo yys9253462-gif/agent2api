@@ -299,10 +299,13 @@ fn message_count(body: &Value) -> usize {
 /// 把发送体里的 model 字段换成该 provider 认识的真名（仅当需要换时才复制）。
 ///
 /// `requested` 是请求名、`wire` 是 `catalog::wire_target_for_provider` 已经算好
-/// 的该家真名（调用方算一次，这里不再查目录）；只有两者不同时才把 `Cow`
-/// 升级成 Owned —— 常规路径（本名该家认识）保持借用零拷贝。
+/// 的该家真名（调用方算一次，这里不再查目录）；只有两者**逐字节相同**时才保持
+/// 借用零拷贝 —— 大小写不同**也必须改写**：目录里返回的精确大小写是上游认的
+/// id（Loomy 目录就是 `GLM-5.3-Flash`，客户端常发小写），只差大小写时不改，
+/// 上游会当成未知模型静默回落（实测：`glm-5.3-flash` 被回落成
+/// `deepseek-v4-flash-0731`，图片能力随之丢失）。
 fn rewrite_model(body: &mut Cow<'_, Value>, requested: &str, wire: &str, provider_id: &str) {
-    if wire.eq_ignore_ascii_case(requested) {
+    if wire == requested {
         return;
     }
     logging::verbose(

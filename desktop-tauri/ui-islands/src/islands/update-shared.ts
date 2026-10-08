@@ -107,6 +107,16 @@ export type UpdateBridge = {
   getUpdateToken(): Promise<UpdateTokenStatus | null | undefined>
   /** 保存 / 清除 GitHub 令牌（token 传 null = 清除） */
   setUpdateToken(payload: { token: string | null }): Promise<UpdateTokenStatus | null | undefined>
+  /** 间隔型任务清单：「自动检查更新」（任务 id 'updateCheck'）的开关与间隔读它 ——
+   *  那条任务的配置入口收进了「更新设置」弹窗（update-settings.tsx） */
+  getScheduledTasks?: () => Promise<{
+    tasks?: Array<{ id?: string; enabled?: boolean; interval?: number }>
+  } | null | undefined>
+  /** 保存间隔型任务配置（PATCH /api/scheduled-tasks/{id}，响应是改完的那条） */
+  saveScheduledTask?: (
+    id: string,
+    patch: Record<string, unknown>,
+  ) => Promise<{ id?: string; enabled?: boolean; interval?: number } | null | undefined>
   /** 「网络代理」页的池条目（出网代理下拉的选项只来自它，与账号页同一条链） */
   getProxyPool(): Promise<{ items?: PoolItem[] } | null | undefined>
   downloadUpdate(payload: { url: string; name?: string }): Promise<DownloadTask | null | undefined>

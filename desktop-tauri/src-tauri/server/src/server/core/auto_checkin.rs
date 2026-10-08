@@ -64,12 +64,16 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     触发刷新（`POST /api/v1/points/first-login`，见 `providers::loomy::checkin`）。
 ///     自动签到对它就是每天替账号打一次这个接口，长期不登录的账号也能把
 ///     赠送积分续上。
+///   - **KukuAI**：「免费领积分」活动的每日任务（每日登录 / 完成一次对话，
+///     `freepoint/taskComplete`，见 `providers::kuku::checkin`）。接口幂等，
+///     重复领取只返回 reward_point=0；业务会话由换发的 genflowpro STOKEN
+///     保障（`kuku::engine`）。
 ///
 /// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw 有积分查询但
 /// 没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 6] =
-    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder", "loomy"];
+pub const CHECKIN_PROVIDERS: [&str; 7] =
+    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder", "loomy", "kuku"];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {
@@ -78,27 +82,26 @@ pub fn default_providers() -> Vec<String> {
 
 /// 提供商的展示名（从注册表查，查不到就原样回显 id）。
 ///
-/// 这个标签只出现在**签到语境**（提供商复选框、配置错误提示、签到范围变更日志），
-/// 而清单里有两家的签到是**有版本限定**的 —— 标签要在用户勾选时就把这件事讲清楚，
-/// 而不是让他签完发现被跳过了才回来查。两家的处理方式不同，原因也不同：
+/// 这是**签到语境**的展示名（签到中心的分组、定时任务的提供商勾选共用这一份），
+/// 两家的签到有版本限定，标签要在用户看到分组时就把这件事讲清楚：
 ///
-/// ── WorkBuddy：注册表里就叫「WorkBuddy 国内版」，这里不用再覆盖 ──
-/// 拆家后国内版与国际版是两家独立提供商（见 `providers::workbuddy::region`），
-/// 注册表的展示名**必须**带版本，否则「WorkBuddy」读起来像「两地通吃的那一家」。
-/// 而它在 `CHECKIN_PROVIDERS` 里只列国内版 —— 签到只有国内站有（上游事实：
-/// 腾讯的每日签到接口），国际版账号由 `billing::checkin::supports_checkin`
-/// 按 edition 排除。于是注册名正好就是签到语境想要的那句话，不需要第二处覆盖。
+///   - **WorkBuddy**：注册表里就叫「WorkBuddy 国内版」，这里不用再覆盖 ──
+///     拆家后国内版与国际版是两家独立提供商（见 `providers::workbuddy::region`），
+///     注册表的展示名**必须**带版本，否则「WorkBuddy」读起来像「两地通吃的那一家」。
+///     而它在 `CHECKIN_PROVIDERS` 里只列国内版 —— 签到只有国内站有（上游事实：
+///     腾讯的每日签到接口），国际版账号由 `billing::checkin::supports_checkin`
+///     按 edition 排除。于是注册名正好就是签到语境想要的那句话，不需要第二处覆盖。
 ///
-/// ── Qoder：注册表是通用名，这里补成「中国版」──────────────────
-/// 与 WorkBuddy 同理但方向相反：注册表里是通用的「Qoder」（它没有拆家，
-/// 一个 id 覆盖两个地区，展示名不该自带地区），而签到**只在中国版成立**
-/// （国际版没有签到计划，见 `providers::qoder::checkin`）。所以这里覆盖成
-/// 「Qoder 中国版」。
+///   - **Qoder**：注册表是通用名，这里补成「中国版」──────────────────
+///     与 WorkBuddy 同理但方向相反：注册表里是通用的「Qoder」（它没有拆家，
+///     一个 id 覆盖两个地区，展示名不该自带地区），而签到**只在中国版成立**
+///     （国际版没有签到计划，见 `providers::qoder::checkin`）。所以这里覆盖成
+///     「Qoder 中国版」。
 ///
 /// 另外几家不需要后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
 /// AutoClaw 两地的签到链路都存在且同形 —— 它的展示名在注册表里已经带
 /// 「国内版 / 国际版」。
-fn provider_label(id: &str) -> &str {
+pub fn provider_label(id: &str) -> &str {
     match id {
         "qoder" => "Qoder 中国版",
         other => crate::server::core::providers::PROVIDERS
@@ -447,6 +450,7 @@ impl AutoCheckin {
             &self.billing,
             read_state().providers.as_slice(),
             None,
+            reason,
         )
         .await
         {

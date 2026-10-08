@@ -211,6 +211,8 @@ type SwitchRowProps = {
   label: string
   checked: boolean
   disabled?: boolean
+  /** 行内问号提示（与 PanelHead 同款 `[data-tip]`，tooltip.js 统一服务） */
+  tip?: string
   onCheckedChange: (next: boolean) => void
 }
 
@@ -218,11 +220,12 @@ type SwitchRowProps = {
  * 一行开关。开关与文字同在一个 `<label class="switch">` 里（与旧模板同构）：Base UI 的
  * Switch 会渲染一个隐藏 checkbox，label 的原生激活行为照样把点击转给它 —— 点文字也能拨动。
  */
-function SwitchRow({ id, label, checked, disabled, onCheckedChange }: SwitchRowProps) {
+function SwitchRow({ id, label, checked, disabled, tip, onCheckedChange }: SwitchRowProps) {
   return (
     <label className='switch'>
       <Switch id={id} checked={checked} disabled={disabled} onCheckedChange={next => onCheckedChange(next)} />
       <span>{label}</span>
+      {tip ? <span className='tip-q' data-tip={tip}></span> : null}
     </label>
   )
 }
@@ -306,11 +309,15 @@ function lanStateText(snap: SettingsSnapshot): string {
 
 function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
   const app = snap.app
+  // 轻量模式只挂在「关闭到托盘」上（关闭即退出时没有窗口可轻量），
+  // 状态行按 未开启托盘 → 开启托盘 → 轻量模式 三级派生
   const appState = app.status === 'unavailable'
     ? STATES.appUnavailable
     : app.status === 'loading'
       ? STATES.appLoading
-      : app.closeToTray ? STATES.appTrayOn : STATES.appTrayOff
+      : !app.closeToTray
+        ? STATES.appTrayOff
+        : app.lightweightMode ? STATES.appLightOn : STATES.appTrayOn
 
   return (
     <>
@@ -334,6 +341,15 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
               checked={app.closeToTray}
               disabled={snap.busy === 'app'}
               onCheckedChange={next => void saveToggle('tray', next)}
+            />
+            {/* 轻量模式依赖「关闭到托盘」：关掉托盘时该开关无意义，置灰并提示 */}
+            <SwitchRow
+              id='settings-lightweight'
+              label='轻量模式（关窗释放界面内存）'
+              tip={TIPS.lightweight}
+              checked={app.lightweightMode}
+              disabled={snap.busy === 'app' || !app.closeToTray}
+              onCheckedChange={next => void saveToggle('lightweight', next)}
             />
             <SwitchRow
               id='settings-autostart'

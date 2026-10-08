@@ -130,7 +130,7 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
     let full_path = request.uri().path().to_string();
     // 原始查询串（未解码的原文，由用到它的分支自行 `query_param` 解码）。
     // 目前只有 `GET /api/accounts/usage?id=<id>` 用它 —— 那一支是「用户手点某一行
-    // 的积分按钮」，与批量的区别见 `core::usage_query::query_all` 的说明。
+    // 的余额按钮」，与批量的区别见 `core::usage_query::query_all` 的说明。
     let query = request.uri().query().unwrap_or("").to_string();
     let body = match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE)
         .await
@@ -296,6 +296,25 @@ pub async fn dispatch(
             let id = decode_segment(id);
             if !id.is_empty() {
                 return super::zcode_claim::claim_plan(&state, &id, body).await;
+            }
+        }
+        // Loomy 新手任务一键领取：把该账号全部未完成的 key 串行上报（幂等，
+        // 重复点不会重复加分；执行体见 `core::providers::loomy::onboarding`）。
+        if let Some(id) = rest.strip_suffix("/onboarding/claim") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::onboarding::claim(&state, &id).await;
+            }
+        }
+    }
+
+    // ③' GET + /onboarding 结尾 → Loomy 新手任务状态（只读，签到后弹窗的查询口）。
+    // 与上面 POST 段同一写法：后缀互不包含，先后不影响命中。
+    if method == Method::GET {
+        if let Some(id) = rest.strip_suffix("/onboarding") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::onboarding::status(&state, &id).await;
             }
         }
     }
@@ -585,6 +604,46 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 );
             }
             store.add_loomy_account(&payload, import_name)
+        }
+        // KukuAI（百度文库库库 AI）：**粘贴 Cookie**（Cookie 头 / Cookie 编辑器
+        // JSON / `{BDUSS, STOKEN}` 对象）→ 解析并向上游验证（userreport 换
+        // 会话三件套 + uk）→ 落账号。
+        //
+        // `importDesktop: true` → 读本机客户端登录态（`%APPDATA%\baidugenflowpro\
+        // Network\Cookies`，明文 SQLite 无需解密，见 `kuku::credentials` 模块头）
+        // → 同样验证 → 落账号。
+        //
+        // 验证失败（凭证无效 / 客户端占用 Cookies 文件）→ 400，不落空记录。
+        Some(crate::server::core::providers::ProviderKind::Kuku) => {
+            let parsed = if import_desktop {
+                match crate::server::core::providers::kuku::credentials::read_desktop_credentials()
+                {
+                    Ok(credentials) => credentials,
+                    Err(reason) => return management_error(400, reason),
+                }
+            } else {
+                match crate::server::core::providers::kuku::credentials::credentials_from_payload(
+                    &payload,
+                ) {
+                    Ok(credentials) => credentials,
+                    Err(reason) => return management_error(400, reason),
+                }
+            };
+            let verified = match crate::server::core::providers::kuku::credentials::enrich_identity(
+                &parsed,
+                None,
+                true,
+            )
+            .await
+            {
+                Ok(credentials) => credentials,
+                Err(error) => return management_error(error.status_code, error.message),
+            };
+            store.add_kuku_account(
+                &verified,
+                import_name,
+                if import_desktop { "desktop" } else { "manual" },
+            )
         }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
@@ -936,7 +995,7 @@ pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
 
 /// ── 两条路径的目标解析都不在本文件了 ─────────────────────
 /// · 余额查询的目标集合：`core::usage_query::resolve_batch_targets`
-///   （它跟着查询逻辑一起下沉 —— 「定时查询积分」要用同一份口径）；
+///   （它跟着查询逻辑一起下沉 —— 每账号自动查询与手动批量共用同一份口径）；
 /// · 签到的目标集合：`core::billing::checkin::resolve_checkin_targets`
 ///   （定时签到与手动签到必须共用同一段逻辑）。
 /// 本文件只剩 `accounts_checkin` 一个转发壳。
@@ -966,8 +1025,17 @@ pub async fn accounts_checkin(state: &ServerState, body: &Bytes) -> Response {
     // 批量路径的提供商范围取自动签到的同一份配置（两处入口一个口径）；
     // 指定 id 的单签不受范围限制（见 resolve_checkin_targets 的说明）
     let providers = state.auto_checkin().configured_providers();
-    match checkin::run_checkin(state.store(), state.billing(), providers.as_slice(), id.as_deref())
-        .await
+    // reason 进签到历史台账（仅批量轮次记账，见 checkin_history 的说明）：
+    // 账号页「全部签到」与签到中心的批量动作都从这条路由走，与定时触发的
+    // 「到点触发 / 启动补签」在时间线上区分开。
+    match checkin::run_checkin(
+        state.store(),
+        state.billing(),
+        providers.as_slice(),
+        id.as_deref(),
+        "手动签到",
+    )
+    .await
     {
         Ok(result) => ok_json(result),
         Err(error) => management_error(error.status_code, error.message),

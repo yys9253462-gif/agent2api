@@ -99,6 +99,8 @@ export type AppState = {
   lanAccess: boolean
   /** 局域网访问开启时是否同时托管网页管理面板 */
   lanPanel: boolean
+  /** 轻量模式：关窗销毁界面进程（释放 WebView2 内存），托盘按需重建 */
+  lightweightMode: boolean
   /** 本机在局域网里的 IP（查不到为 null，地址展示退化为占位符） */
   lanIp: string | null
   /** 网关端口（0 = 还没查到），拼局域网地址用 */
@@ -263,6 +265,7 @@ const INITIAL: SettingsSnapshot = {
     autostart: false,
     lanAccess: false,
     lanPanel: false,
+    lightweightMode: false,
     lanIp: null,
     port: 0,
     adminRegistered: null,
@@ -449,6 +452,7 @@ export function renderSettings(data?: unknown): void {
     autostart: record.autostart === true,
     lanAccess: record.lanAccess === true,
     lanPanel: record.lanPanel === true,
+    lightweightMode: record.lightweightMode === true,
   })
 }
 
@@ -485,11 +489,11 @@ async function loadLanExtras(): Promise<void> {
 }
 
 /**
- * 拨动启动 / 托盘开关。patch 是**全量覆盖**（契约要求），另一项取快照里的当前值
- * —— 旧实现读的是 DOM 里那个 checkbox 的 checked，等价。
+ * 拨动启动 / 托盘开关。patch 是**全量覆盖**（契约要求），其余项取快照里的
+ * 当前值 —— 旧实现读的是 DOM 里那个 checkbox 的 checked，等价。
  * 忙碌中早退时什么都不写：受控开关的 checked 来自快照，界面自动「还原这一下拨动」。
  */
-export async function saveToggle(kind: 'tray' | 'autostart', next: boolean): Promise<void> {
+export async function saveToggle(kind: 'tray' | 'autostart' | 'lightweight', next: boolean): Promise<void> {
   if (busyScope) { repaint(); return }
   const previous = snapshot.app
   const patch: AppSettings = {
@@ -499,10 +503,15 @@ export async function saveToggle(kind: 'tray' | 'autostart', next: boolean): Pro
     // 全量覆盖的 patch 里原样带上磁盘现值，避免把它悄悄抹掉
     lanAccess: previous.lanAccess,
     lanPanel: previous.lanPanel,
+    lightweightMode: kind === 'lightweight' ? next : previous.lightweightMode,
   }
   beginBusy('app')
   publishApp(patch)
-  const label = kind === 'autostart' ? '开机自动启动' : '关闭窗口时最小化到托盘'
+  const label = kind === 'autostart'
+    ? '开机自动启动'
+    : kind === 'lightweight'
+      ? '轻量模式'
+      : '关闭窗口时最小化到托盘'
   try {
     const api = shared().workbuddyDesktop
     if (!api) throw new Error('主进程桥不可用')

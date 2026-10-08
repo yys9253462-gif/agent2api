@@ -4,7 +4,7 @@
  *
  * ── 从 accounts-data.ts 拆出来的理由 ──────────────────────────
  * 「状态怎么存」与「动作怎么发」是两件事，混在一个文件里已经九百多行（约定单文件 ≤800）。
- * 拆开之后：本文件只回答「现在是什么状态、怎么改」，actions（余额 / 签到 / 连接数 /
+ * 拆开之后：本文件只回答「现在是什么状态、怎么改」，actions（余额 / 连接数 /
  * Clash 缓存 / 行内动作 / 弹窗 / 对外契约）在 accounts-data.ts —— 那个文件再
  * `export * from './accounts-store'`，于是视图侧的 import 路径一行不用改。
  *
@@ -18,6 +18,10 @@
  *   · 高频小改动（连接数每 2 秒一轮）走 `patch({...})` 换新 Map / Set；
  *   · 少量原地可变的结构由各自的动作层维护（见 accounts-data.ts 的说明）。
  * 两条路都经过同一个订阅者集合，React 侧看不出差别。
+ *
+ * （签到相关状态曾在这里：`checkinBusy` 与新手任务弹窗 `onboarding`。签到动作
+ * 迁到「签到中心」后两样都随之离开 —— 新手任务的查询 / 领取缓存现在在
+ * checkin-state.ts，签到完成后自动处理的那条链也在那边。）
  */
 
 import { shared, type AccountRecord, type AccountsSnapshot, type ClashSnapshot, type PanelKind } from './accounts-shared'
@@ -44,9 +48,8 @@ export type AccountsStore = {
   clash: ClashSnapshot | null
   dialog: AccountsDialog
   namesHidden: boolean
-  /** 批量查询余额 / 签到在途（工具条按钮的文案与禁用态） */
+  /** 批量查询余额在途（工具条按钮的文案与禁用态） */
   usageBusy: boolean
-  checkinBusy: boolean
   /** 余额查询在途的账号（行上那颗「余额」按钮的去重闸） */
   usageInflight: ReadonlySet<string>
 }
@@ -83,7 +86,6 @@ let store: AccountsStore = {
   dialog: null,
   namesHidden: loadNamesHidden(),
   usageBusy: false,
-  checkinBusy: false,
   usageInflight: new Set<string>(),
 }
 

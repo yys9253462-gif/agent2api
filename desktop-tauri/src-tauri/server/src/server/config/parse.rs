@@ -146,8 +146,7 @@ pub(super) fn interval_field(task: &Map<String, Value>, default: i64, min: i64, 
 /// 从一条任务的子对象里取开关。
 ///
 /// **缺字段按开启**：这些任务在本次改造前都是无条件运行的（凭证维护每 10 分钟、
-/// 两个前端面板每 10 秒、模型刷新随 /v1/models 触发；定时查询积分是后来新增的，
-/// 它没有「改造前」—— 缺字段同样按开启，与新装用户第一次打开的行为一致），
+/// 两个前端面板每 10 秒、模型刷新随 /v1/models 触发），
 /// 升级上来的 config.json 里没有 `scheduledTasks` —— 若把「没配过」读成「关闭」，
 /// 用户什么也没动，凭证却不再自动续期了。写侧（`PUT /api/scheduled-tasks`）
 /// 则要求显式布尔值。
@@ -155,7 +154,9 @@ pub(super) fn task_enabled(task: &Map<String, Value>, default: bool) -> bool {
     task.get("enabled").and_then(Value::as_bool).unwrap_or(default)
 }
 
-/// 由原始 JSON 解析六条间隔型任务（缺字段各自用默认值）
+/// 由原始 JSON 解析六条间隔型任务（缺字段各自用默认值）。
+/// 旧配置里可能残留 `usageQuery` 子键（已退役的全局余额查询任务）：
+/// 解析按**未知键忽略**处理，读不到就是不存在，首次保存设置时会被自然清掉。
 pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
     let defaults = ScheduledSettings::default();
     let task = |key: &str, interval: i64, min: i64, max: i64| {
@@ -199,12 +200,6 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
         update_check: task(
             KEY_UPDATE_CHECK,
             defaults.update_check.interval,
-            INTERVAL_MIN_MINUTES,
-            INTERVAL_MAX_MINUTES,
-        ),
-        usage_query: task(
-            KEY_USAGE_QUERY,
-            defaults.usage_query.interval,
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),

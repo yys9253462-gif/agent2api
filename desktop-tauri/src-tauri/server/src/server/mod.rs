@@ -336,6 +336,9 @@ impl ServerState {
         // 下面日志裁剪天数与旧文件候选目录才不会用错值。
         let snapshot = config::init(db.clone());
         core::task_state::install(db.clone());
+        // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
+        // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
+        core::usage_records::install(db.clone());
         // 出网代理池（「网络代理」页维护的命名代理；账号按 id 引用它们）：
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
@@ -674,6 +677,11 @@ impl ServerState {
         // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
+
+        // 每账号自动余额查询的心跳循环：与上面的间隔型任务同一形态（一个进程
+        // 一个循环，到点判定全在「记录 + 配置」上），只是排期按账号各自算，
+        // 不再是全局任务（见 `core::usage_query` 的模块头）。
+        core::usage_query::spawn_sweeper(state.store.clone());
 
         Ok(state)
     }

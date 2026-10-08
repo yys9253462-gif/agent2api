@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Json, Query, State};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
@@ -132,10 +132,20 @@ fn routed_account_id(accounts: &Value, model: Option<&str>, counts: &HashMap<Str
     // 候选链是 id 空间（内置家 + 自定义家同列，见 `router` 的模块头）；
     // 自定义家的账号同样在全局队列里，`pick_for_model` 按 provider 字符串
     // 过滤候选，两种 id 天然可比。
-    let candidates = router::route_for_forward(model);
-    let providers: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let provider_chain = router::route_for_forward(model);
+    let providers: Vec<&str> = provider_chain.iter().map(String::as_str).collect();
+    // 余额不足软跳过的账号先剔除（与转发选路同一判据，见
+    // `upstream::rotate::filter_balance_blocked`）：★ 标的是「下一个请求会先用
+    // 谁」，被余额挡住的账号不该标 ★ —— 否则两边说的又不是一件事了。
+    let facts = crate::server::core::usage_records::balance_facts();
+    let candidate_accounts: Vec<Value> = routing::accounts_of(accounts)
+        .into_iter()
+        .filter(|account| {
+            !crate::server::core::usage_records::balance_blocked(account, &facts)
+        })
+        .collect();
     routing::pick_for_model(
-        &routing::accounts_of(accounts),
+        &candidate_accounts,
         model,
         &providers,
         counts,
@@ -857,9 +867,7 @@ pub async fn login_loomy_sms_send(body: Bytes) -> Response {
         Ok(result) => ok_json(result),
         Err(error) => management_error(error.status_code, error.message),
     }
-}
-
-/// 用手机号 + 验证码登录并**直接落成账号**（**Loomy 专用**）。
+}/// 用手机号 + 验证码登录并**直接落成账号**（**Loomy 专用**）。
 ///
 /// body `{phone, code, msgid, name?}` → `{account, list}` —— 响应形状与
 /// `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，落盘、
@@ -901,6 +909,42 @@ pub async fn login_loomy_sms_verify(State(state): State<ServerState>, body: Byte
             ok_json(json!({ "account": account, "list": store.list_accounts() }))
         }
         Err(error) => super::accounts::store_error(error),
+    }
+}
+
+// ─── KukuAI 短信登录收尾（百度通行证）──────────────────────────
+
+/// `POST /api/session/login/kuku/complete` —— 壳侧交回登录态。
+///
+/// 百度通行证登录成功后的跳转**不携带授权码**（凭证在 `.baidu.com` 域的
+/// Cookie 里，跨域跳转不会带过去），而 `BDUSS` 是 **HttpOnly** Cookie，
+/// 登录窗口的页面脚本 `document.cookie` 读不到 —— 因此交回由**壳侧进程**
+/// 完成：登录窗口跳转 `success.html` 后，壳用 WebView2 的 Cookie 存储
+/// （`cookies()` 含 HttpOnly）读出 `BDUSS` / `STOKEN`，拼成 Cookie 头
+/// POST 到这里（`state` + `cookie` 在请求体里，不走 URL）。
+///
+/// 该路由**免鉴权**：调用方是壳侧进程（登录窗口），不带 API Key；安全性由
+/// 登录任务的一次性 state 承担（与 raccoon 回调同口径）。
+pub async fn login_kuku_complete(
+    State(state): State<ServerState>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let task_state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let cookie = payload
+        .get("cookie")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if task_state.is_empty() || cookie.is_empty() {
+        return management_error(400, "登录失败：回调缺少 state 或登录态 Cookie，请重新发起短信登录。");
+    }
+    match state.login().finish_kuku_login(task_state, cookie).await {
+        Ok(_) => ok_json(json!({ "ok": true })),
+        Err(error) => management_error(error.status_code, &format!("登录失败：{}", error.message)),
     }
 }
 

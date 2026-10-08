@@ -43,16 +43,16 @@ import {
 } from '@ui'
 import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type UsageEntry } from './accounts-shared'
 import {
-  accountTags, activeLimits, checkedInToday, checkinDoneTitle, claimDoneTitle, claimedToday,
+  accountTags, activeLimits, claimDoneTitle, claimedToday,
   displayNameOf, editionSuffix, expiryMillis, formatResetText, identifierOf, isDesktopAccount, isEnabled,
-  providerFeatures, providerOf, RESET_UNKNOWN, supportsCheckin, supportsClaim, supportsUsage,
-  supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
+  lowBalanceBlockedOf, lowBalanceOf, providerFeatures, providerOf, RESET_UNKNOWN,
+  supportsClaim, supportsUsage, supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
 } from './accounts-domain'
 import { PRIORITY_MAX, PRIORITY_MIN, priorityOf } from './accounts-columns'
 import {
-  PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick, checkinErrorOf,
+  PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
   commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, poolError,
-  proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled, setPanelOpen,
+  proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen,
   startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
@@ -424,11 +424,26 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   // 的失败结论，理由与后端快照出口一致
   const entry = usageEntryOf(account)
   const summary = usageSummary(entry)
+  // 「余额不足已跳过」徽章：与后端选路过滤同一判据（lowBalanceBlockedOf），
+  // 让「为什么这个账号不接请求」在界面上有处可看。禁用档不标 —— 那一档
+  // 状态列的「已禁用」开关就是答案；跳过档账号仍是启用的，不标就看不出。
+  const blocked = lowBalanceBlockedOf(account, entry)
   // 失败 / 未配置那些档不画进度条：读数本身就不是「还剩多少」，
   // 给它配个进度条会把一句错误装饰成一条可信的读数
   const pool = summary.kind === 'ok' || summary.kind === 'warn' ? usagePool(entry) : null
+  const blockedBadge = blocked ? (
+    <Badge variant='warning' shape='tag'
+      title={`余额低于阈值 ${lowBalanceOf(account).threshold}，转发时会跳过该账号（余额回升自动恢复）`}>
+      余额不足 · 已跳过
+    </Badge>
+  ) : null
   if (!pool) {
-    return <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+    return (
+      <span className='usage-sum-wrap'>
+        <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+        {blockedBadge}
+      </span>
+    )
   }
   return (
     <span className='usage-pool' title={summary.title}>
@@ -437,6 +452,7 @@ export function UsageCell({ account }: { account: AccountRecord }) {
         {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
         <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
       </span>
+      {blockedBadge}
     </span>
   )
 }
@@ -624,28 +640,23 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
 /* ─── 操作列 ────────────────────────────────── */
 
 /**
- * 操作：签到 / 领套餐 / 领福利 / 余额 / 设置 / ⋯，顺序固定。
+ * 操作：领套餐 / 领福利 / 余额 / 设置 / ⋯，顺序固定。
  *
- * 顺序按「点的频次」排，签到排头：它是这张表里唯一**每天都会做一次**的动作，
- * 排在第一位让手指有固定的落点 —— 按钮的显隐会随账号状态变，但**顺序不跟着变**。
+ * 顺序按「点的频次」排，按钮的显隐会随账号状态变，但**顺序不跟着变**。
  * 「设为首选」不在这里：它在 ⋯ 菜单的第二项（行上留一颗按钮去重复隔壁优先级列的
  * 信息，代价是操作列多留 50px，而那 50px 全是从账号列挤出来的）。
  *
- * 签到今天已签过时显示为**「已签到」并置灰**（这天再点也只能拿到上游「今天已签到」）。
- * `disabled` 是真的禁用属性：这才同时挡住点击与键盘操作，也让读屏念出「不可用」。
- * **禁用账号也渲染签到按钮**：签到与转发是两件事，后端单账号签到路径同样不看 enabled。
+ * （签到曾是这排的第一颗按钮，已随签到功能整体迁到「签到中心」——
+ * checkin-page.tsx 的每日签到卡承接了它的职责，含单账号签到与重签。）
  */
 export function ActionsCell({ account, atFront }: { account: AccountRecord; atFront: boolean }) {
   const [claimBusy, setClaimBusy] = React.useState(false)
   const [welfareBusy, setWelfareBusy] = React.useState(false)
   const [usageBusy, setUsageBusy] = React.useState(false)
-  const checkedIn = checkedInToday(account)
-  const canCheckin = supportsCheckin(account)
   const canUsage = supportsUsage(account)
   const canClaim = supportsClaim(account)
   const canWelfare = supportsWelfare(account)
   const welfareTaken = welfareStateOf(account)
-  const checkinFailed = checkinErrorOf(account.id)
 
   async function claim(): Promise<void> {
     // 一次领取要拖一次滑块，重复点击会开出第二个验证码流程（共用的求解器一次只允许
@@ -670,19 +681,6 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
 
   return (
     <div className='acct-actions'>
-      {canCheckin ? (
-        checkedIn ? (
-          <Button variant='outline' size='xs' disabled title={checkinDoneTitle(account)}>已签到</Button>
-        ) : (
-          // 上一次失败的原因挂在这颗按钮的 title 上（toast 几秒就没了，
-          // 而「为什么没签上」要能复看）—— 签到没有明细面板，见 accounts-data.ts
-          <Button variant='outline' size='xs'
-            title={checkinFailed ? `上次签到失败：${checkinFailed}（点此重试）` : '为该账号签到'}
-            onClick={() => void runCheckin(account.id)}>
-            签到
-          </Button>
-        )
-      ) : null}
       {canClaim ? (
         // 按钮**不因「今天领过」置灰**：同一个账号可能同时挂着几份可领套餐
         // （活动大额包 + 每日包），而上游的「已领取过」是按套餐判的 —— 领了 A
@@ -784,7 +782,7 @@ export function MoreMenu({ account, atFront }: { account: AccountRecord; atFront
   )
 }
 
-/* ─── 展开的明细行（限流 / 签到）───────────────── */
+/* ─── 展开的明细行（限流）──────────────────── */
 
 /**
  * 限流明细面板：这个账号**当前限流中的模型**逐行列出 —— 模型名、恢复时间、上游给的

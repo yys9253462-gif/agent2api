@@ -410,6 +410,70 @@ impl LoginService {
         Ok(handle)
     }
 
+    /// KukuAI 网页登录收尾：校验任务 → 从登录态 Cookie 提取凭证 → 落账号。
+    ///
+    /// ── 与其它网页登录回调的差别（为什么单独一个入口）────────────
+    /// 百度通行证登录成功后的跳转**不携带授权码**（凭证在 `.baidu.com` 域的
+    /// Cookie 里，跨域跳转不会带过去），因此无法走「回调 URL 里解析 code」的
+    /// 通用链路。本家由壳侧登录窗口的注入脚本把 Cookie 直接 POST 到
+    /// `POST /api/session/login/kuku/complete`，这里完成「任务校验 → 提取 →
+    /// 落账号 → 写任务状态」四步。任务状态的写回与 raccoon 分支同款
+    /// （`finish_task`），前端 `/wait` 轮询拿到的结果与其它家一致。
+    pub async fn finish_kuku_login(
+        &self,
+        state: &str,
+        cookie: &str,
+    ) -> Result<String, GatewayError> {
+        let state = state.trim();
+        if state.is_empty() {
+            return Err(GatewayError::with_status(400, "缺少 state，无法确认这次回调归属"));
+        }
+        let Some(handle) = self.tasks.get(state) else {
+            return Err(GatewayError::with_status(
+                404,
+                "登录任务不存在或已过期，请重新发起网页登录",
+            ));
+        };
+        let task = handle.snapshot();
+        if task.canceled {
+            return Err(GatewayError::with_status(400, "登录已取消，请重新发起"));
+        }
+        if task.done {
+            // 幂等：同一个回调被送来两次（脚本重入 + 页面重载各触发一次）不是错误
+            return Ok(String::new());
+        }
+        if task.provider != crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Kuku) {
+            return Err(GatewayError::with_status(
+                400,
+                "该登录任务不属于 KukuAI，请重新发起",
+            ));
+        }
+        let (credentials, warning) =
+            crate::server::core::providers::kuku::login::complete_login(cookie).await?;
+        let store = self.store.clone();
+        let account = store
+            .add_kuku_account(&credentials, None, "web")
+            .map_err(|error| GatewayError::with_status(error.status_code, error.message))?;
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let label = account
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("KukuAI 账号")
+            .to_string();
+        let mut payload = json!({ "account": account, "edition": task.edition });
+        // 复核未通过的警告随任务载荷透传前端（账号已落库；提示换正确账号）
+        if let Some(warning) = warning {
+            payload["warning"] = Value::String(warning);
+        }
+        finish_task(&handle, &payload);
+        logging::log("[Login]", &format!("✅ KukuAI 网页登录成功: {label}"));
+        Ok(account_id)
+    }
+
     /// 发起一次 **Cline 设备授权登录**（WorkOS RFC 8628）。
     ///
     /// ── 与前两条链路的区别（为什么是第三种形态）─────────────────

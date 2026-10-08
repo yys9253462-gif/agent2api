@@ -28,7 +28,8 @@ import { UpdateSettingsDialog } from './update-settings'
  *                       的外边距与圆角裁切多出一层盒子，布局与接入前不等价。
  *   update-modal.tsx    「检测到更新」弹窗：按需建的命令式外壳（照 port-panel），
  *                       弹与不弹的判定也归它。
- *   update-settings.tsx 「更新设置」弹窗（出网代理 + GitHub 令牌）。
+ *   update-settings.tsx 「更新设置」弹窗（自动检查更新 + 出网代理 + GitHub 令牌；
+ *   定时任务页的「软件版本检查」配置入口也收在这个弹窗里）。
  *   update-shared.ts    三个 tsx 共用的类型、桥读取与工具（.ts 不被当岛挂载）。
  *
  * ── 两条贯穿全文件的约定（细节见各自函数）────────────────────

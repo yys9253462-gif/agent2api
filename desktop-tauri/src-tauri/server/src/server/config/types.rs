@@ -363,10 +363,10 @@ pub struct RetentionPatch {
 
 // ─── 定时任务设置的键名与边界（config.json 里的字段名**就是契约**）─────
 //
-// 间隔型任务（凭证维护 / 定时查询积分 / 模型刷新 / 软件版本检查 / 两个前端
-// 自动刷新）打包在 `scheduledTasks`
-// 对象下；自动签到不在其中 —— 它是**每天定点**型，时刻与上次执行结果由
-// `core::auto_checkin` 自己管（`autoCheckin` 字段），本模块不重复持有。
+// 间隔型任务（凭证维护 / 模型刷新 / 软件版本检查 / 两个前端自动刷新）打包在
+// `scheduledTasks` 对象下；自动签到不在其中 —— 它是**每天定点**型，时刻与上次
+// 执行结果由 `core::auto_checkin` 自己管（`autoCheckin` 字段），本模块不重复持有。
+// 余额查询已退役成每账号各自配置的自动查询（`core::usage_query`），不在其中。
 // 页面上的这些间隔型任务是「同一个形状」，所以配置也写成同一形状，
 // 免得读侧要按任务名各写一套解析。
 
@@ -384,8 +384,6 @@ pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
 pub const KEY_REPORT_AUTO_REFRESH: &str = "reportAutoRefresh";
 /// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向 GitHub 查最新发布版本）
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
-/// 定时查询积分在 `scheduledTasks` 下的子键（后端定时查全部账号的余额 / 积分）
-pub const KEY_USAGE_QUERY: &str = "usageQuery";
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -412,12 +410,6 @@ pub const DEFAULT_REPORT_AUTO_REFRESH_SECONDS: i64 = 1;
 /// `scheduledTasks.updateCheck.interval` 的配置按原值跑（`interval_field`
 /// 只在键缺失或越界时才回落到默认），所以调整它不会改写老用户的设置。
 pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 20;
-/// 定时查询积分的默认间隔（分钟）：每 10 分钟查一次全部账号的余额。
-///
-/// 与凭证维护同档：一条余额查询就是逐账号打一次上游的积分接口，
-/// 10 分钟一次（每小时 6 轮）对这个「看一眼还剩多少」的需求足够，
-/// 也不会因为间隔过密给上游添负担、触发风控。
-pub const DEFAULT_USAGE_QUERY_MINUTES: i64 = 10;
 
 /// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
 /// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（1 秒～10 分钟）。
@@ -441,7 +433,7 @@ pub struct IntervalTask {
     pub interval: i64,
 }
 
-/// 七条间隔型任务的配置（设置页「定时任务」区域）。
+/// 六条间隔型任务的配置（设置页「定时任务」区域）。
 ///
 /// 与 `RetentionSettings` 同一取舍：几个值总是一起用（GET 一次返回、各自循环
 /// 各取所需），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
@@ -453,7 +445,6 @@ pub struct ScheduledSettings {
     pub requests_auto_refresh: IntervalTask,
     pub report_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
-    pub usage_query: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -482,10 +473,6 @@ impl Default for ScheduledSettings {
             update_check: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_UPDATE_CHECK_MINUTES,
-            },
-            usage_query: IntervalTask {
-                enabled: true,
-                interval: DEFAULT_USAGE_QUERY_MINUTES,
             },
         }
     }

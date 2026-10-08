@@ -117,6 +117,15 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/session/login/raccoon-callback",
             get(api::session::login_raccoon_callback),
         )
+        // KukuAI 短信登录收尾（百度通行证）：壳侧在登录窗口跳转 success.html
+        // 后读取 WebView2 Cookie 存储（BDUSS 是 HttpOnly，页面脚本读不到），
+        // 把 state + 登录态 Cookie 一并 POST 交到这里。**免鉴权**：调用方是
+        // 壳侧进程（登录窗口），不带 API Key；安全性由登录任务的一次性 state
+        // 承担（与 raccoon-callback 同款）。
+        .route(
+            "/api/session/login/kuku/complete",
+            post(api::session::login_kuku_complete),
+        )
         // AutoClaw OAuth（国际版）的 loopback 回调：**浏览器 302 到这里**
         // （授权页完成后顶层导航到我们交给上游的 navigate_uri，见
         // `providers::autoclaw::oauth`），所以同样必须免鉴权 —— 调用方是用户的
@@ -482,6 +491,11 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::auto_checkin::get_state).post(api::auto_checkin::configure),
         )
         .route("/api/auto-checkin/run", post(api::auto_checkin::run_now))
+        // ── 签到中心的聚合快照 ──
+        // 只读一条：分组与「今日已签」的判定复用批量签到同一对判据
+        // （CHECKIN_PROVIDERS ∩ supports_checkin），见 api::checkin_center 的模块头。
+        // 挂 protected：它能列出全部账号及其签到时间，敏感度与 /api/accounts 一致。
+        .route("/api/checkin-center", get(api::checkin_center::get_center))
         // ── 间隔型定时任务（凭证自动维护 / 模型目录刷新 / 两个前端自动刷新）──
         // 挂 protected：它能改后端后台任务的执行节奏（间隔 1 分钟会让网关持续
         // 打上游），并触发真打上游的刷新，敏感度与 /api/retention 同级。

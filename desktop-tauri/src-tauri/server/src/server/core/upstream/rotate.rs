@@ -86,13 +86,13 @@ pub(super) async fn session_for(
 
 /// 本次请求使用的账号（对照 Node 的 selectTargetAccount，三级顺序）。
 ///
-///   1. 按**全局**优先级选（跳过禁用、限额冷却中与已达并发上限的账号），
-///      逐个向前找——跳过没有可用凭证的记录（避免选到空账号）；
+///   1. 按**全局**优先级选（跳过禁用、余额不足、限额冷却中与已达并发上限的
+///      账号），逐个向前找——跳过没有可用凭证的记录（避免选到空账号）；
 ///   2. 剩下的启用账号都在限额冷却期 / 已达并发上限 → 先在「未达并发上限」
 ///      的账号里挑恢复最早的一个试一次；一个都没有（全部达到并发上限）→
 ///      按**余量**挤占账号强塞（取舍见下方代码处的说明），
 ///      把上游真实的 429（含恢复时间）返回给客户端；
-///   3. 全部禁用 → 明确报 503，绝不回退到已禁用账号。
+///   3. 全部禁用（或全部余额不足）→ 明确报 503，绝不回退到已禁用 / 欠费账号。
 ///
 /// 候选集合 = `providers` 里各家的全部账号（见模块头）。`providers` 非空。
 ///
@@ -124,13 +124,16 @@ pub(super) async fn select_target_account(
         });
     }
 
+    // 余额不足软跳过的候选先剔除（见 `filter_balance_blocked`），三级选择共用
+    let (candidates, balance_blocked_ids) = filter_balance_blocked(&accounts, pinned);
+
     // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
     // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
     let counts = connection_counts(service);
     let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
     loop {
-        let picked = routing::pick_account_by_priority(&accounts, keys, &counts, &excluded, now);
+        let picked = routing::pick_account_by_priority(&candidates, keys, &counts, &excluded, now);
         let Some(picked) = picked else {
             break;
         };
@@ -143,12 +146,27 @@ pub(super) async fn select_target_account(
         excluded.push(id);
     }
 
-    let enabled: Vec<Value> = accounts
+    let enabled: Vec<Value> = candidates
         .iter()
         .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
         .cloned()
         .collect();
     if enabled.is_empty() {
+        // 剔除后一个可试的都没有：先分辨是不是余额不足造成的 —— 那与「全禁用」
+        // 是两件不同的事，用户要做的事也不一样（等余额回升 / 去启用账号）。
+        let enabled_total = accounts
+            .iter()
+            .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
+            .count();
+        if !balance_blocked_ids.is_empty() && enabled_total > 0 {
+            return Err(GatewayError::with_status(
+                503,
+                format!(
+                    "所有启用中的账号余额都低于阈值（已跳过 {} 个账号），无账号可转发：请等余额回升，或到账号设置里调整「余额不足处理」",
+                    balance_blocked_ids.len()
+                ),
+            ));
+        }
         return Err(GatewayError::with_status(
             503,
             "所有账号均已禁用，无账号可转发：请在账号页启用至少一个账号",
@@ -444,8 +462,53 @@ pub(super) fn pick_next_account(
     pinned: Option<&str>,
 ) -> Option<Value> {
     let accounts = accounts_in_providers(service, providers, pinned);
+    // 换号顺延与第一级选路同一份候选剔除：余额不足的账号不会在 429 之后
+    // 被当作「下一个」重新塞进来
+    let (candidates, _balance_blocked) = filter_balance_blocked(&accounts, pinned);
     let counts = connection_counts(service);
-    routing::pick_account_by_priority(&accounts, keys, &counts, tried_ids, logging::now_ms())
+    routing::pick_account_by_priority(&candidates, keys, &counts, tried_ids, logging::now_ms())
+}
+
+/// 余额不足软跳过的候选剔除：`lowBalance.mode == "skip"` 且最近读数低于阈值的
+/// 账号在进选路**之前**整体拿掉 —— 三级选择（正常选路 / 兜底等恢复 / 并发挤占）
+/// 共用这一份候选。余额不足与限流不同，是「等不起」的：限流有明确的恢复时间、
+/// 到点自然回来，硬塞一次还能把真实 429 带回来；余额不足硬塞只会吃上游的
+/// 402 / 403，拿不到任何有用的信息。
+///
+/// 判定读 `usage_records::balance_facts` 的内存事实表（零 IO，纳秒级查表），
+/// 数字是心跳 / 手动查询落库的最新读数 —— 余额回升后下一轮查询会刷新事实，
+/// 账号自动恢复参与，无需任何人手动清理。
+///
+/// `pinned`（模型测试）不剔除：测试要的是**那个账号**的真实反应 —— 余额不足时
+/// 把上游的拒绝原样带回来，与「限流中的账号仍会被钉住测试」同一取舍。
+/// 返回 `(剔除后的候选, 被剔除的账号 id 集合)`：调用方在「一个可试的都没有」时
+/// 用后者分辨 503 的原因（余额不足 vs 全禁用）。
+fn filter_balance_blocked(
+    accounts: &[Value],
+    pinned: Option<&str>,
+) -> (Vec<Value>, std::collections::HashSet<String>) {
+    if pinned.is_some() {
+        return (accounts.to_vec(), Default::default());
+    }
+    let facts = crate::server::core::usage_records::balance_facts();
+    let blocked_ids: std::collections::HashSet<String> = accounts
+        .iter()
+        .filter(|account| crate::server::core::usage_records::balance_blocked(account, &facts))
+        .filter_map(|account| routing::account_id(account).map(str::to_string))
+        .collect();
+    if blocked_ids.is_empty() {
+        return (accounts.to_vec(), blocked_ids);
+    }
+    let candidates = accounts
+        .iter()
+        .filter(|account| {
+            routing::account_id(account)
+                .map(|id| !blocked_ids.contains(id))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    (candidates, blocked_ids)
 }
 
 /// 该账号对该模型此前是否处于限额状态（用于「已恢复可用」日志的去噪）。
