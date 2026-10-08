@@ -313,11 +313,46 @@ pub const MAX_QUERY_INTERVAL_SECONDS: i64 = 86_400;
 /// 「缺省」必须与全局任务时代的行为对齐：那时「定时查询积分」默认开启
 /// （每 10 分钟），账号什么都不配也在查；因此每账号化的缺省同样是**开启**
 /// （间隔取 1 分钟 —— 用户升级反馈指定的值），而不是「未配置 = 不查」——
-/// 否则升级后所有人的余额列都会静默停更。余额不足的缺省处理同理：全局
-/// 任务时代没有这个概念，跳过（阈值 1）是最温和的兜底 —— 没钱的账号让路，
-/// 有钱的照常，且余额回升自动恢复，不需要任何人善后。
+/// 否则升级后所有人的余额列都会静默停更。
+///
+/// 余额不足的缺省处理按 provider 区分（见 [`default_low_balance_mode`]）：
+/// 大多数家沿用跳过（阈值 1）—— 全局任务时代没有这个概念，它是最温和的
+/// 兜底；唯独 Cline 免费池缺省**不处理**，原因见那边的文档。
 pub const DEFAULT_QUERY_INTERVAL_SECONDS: i64 = 60;
 pub const DEFAULT_LOW_BALANCE_THRESHOLD: f64 = 1.0;
+
+/// Cline 免费池的 provider id（从注册表推导，与 `account_store::CLINE_FREE_PROVIDER_ID`
+/// 同源 —— 注册表改了 id 这里跟着变）。
+const CLINE_FREE_PROVIDER: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::ClineFree,
+);
+
+/// 各 provider 缺省的「余额不足处理」档（记录上没有 `lowBalance` 配置时用）。
+///
+/// - **Cline 免费池（`cline-free`）→ `off`（不处理）**：免费池的 credit 长期
+///   贴着 0 走、用超了还是负数（欠费是常态），跳过档的缺省阈值 1 会把几乎
+///   整个池从选路里剔掉。免费池能不能用交给上游裁决（真没钱时 402 自会按
+///   错误处置轮换），不靠余额读数预判。
+/// - **其余 provider → `skip`（跳过）**：没钱让路、有钱照常、余额回升自动
+///   恢复，不需要任何人善后（历史缺省，不变）。
+pub fn default_low_balance_mode(provider: &str) -> &'static str {
+    if provider == CLINE_FREE_PROVIDER {
+        "off"
+    } else {
+        "skip"
+    }
+}
+
+/// 缺省档的完整形状（mode + threshold）：公开形态（store_view）与写入侧
+/// 归一化（store_crud）共用，保证三处「缺省」永远是同一个对象。
+/// off 档阈值归零存放（与 `apply_patch` 的 off 形态一致）。
+pub fn default_low_balance(provider: &str) -> Value {
+    if default_low_balance_mode(provider) == "off" {
+        serde_json::json!({ "mode": "off", "threshold": 0.0 })
+    } else {
+        serde_json::json!({ "mode": "skip", "threshold": DEFAULT_LOW_BALANCE_THRESHOLD })
+    }
+}
 
 /// 账号配置的自动查询间隔（秒）。
 ///
@@ -356,16 +391,22 @@ pub fn low_balance_disable_threshold(account: &Value) -> Option<f64> {
 /// 账号是否应因「余额不足」在选路时被跳过（软跳过档）。
 ///
 /// 条件：处理方式为 `skip` + 阈值合法 + 内存事实里有这个账号的读数且**严格小于**
-/// 阈值（等于阈值仍可用，与 OmniProxy 同口径）。缺省（无配置）= skip、阈值 1：
-/// 没钱的账号让路、有钱的照常、回升自动恢复，是无需善后的缺省档。
+/// 阈值（等于阈值仍可用，与 OmniProxy 同口径）。缺省（无配置）按 provider 区分
+/// （见 [`default_low_balance_mode`]）：Cline 免费池不处理（free 池余额贴 0 是
+/// 常态，跳过会把整个池剔掉），其余 skip、阈值 1。
 /// 判不出的情况 —— 显式 off、无读数、unlimited、账号已删 —— 一律放行：
 /// 跳过是对「这个账号此刻没钱」的断言，断言拿不出证据就不能拦请求。
 pub fn balance_blocked(account: &Value, facts: &HashMap<String, BalanceFact>) -> bool {
+    let provider = account.get("provider").and_then(Value::as_str).unwrap_or("");
+    let default_mode = default_low_balance_mode(provider);
     let (mode, threshold) = match account.get("lowBalance") {
-        // 缺省：跳过、阈值 1（见 DEFAULT_* 的模块级说明）
-        None => ("skip", DEFAULT_LOW_BALANCE_THRESHOLD),
+        // 缺省：Cline 免费池不处理、其余跳过阈值 1（见 default_low_balance_mode）
+        None => (default_mode, DEFAULT_LOW_BALANCE_THRESHOLD),
         Some(config) => {
-            let mode = config.get("mode").and_then(Value::as_str).unwrap_or("skip");
+            let mode = config
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or(default_mode);
             let threshold = valid_threshold(config.get("threshold"))
                 .unwrap_or(DEFAULT_LOW_BALANCE_THRESHOLD);
             (mode, threshold)

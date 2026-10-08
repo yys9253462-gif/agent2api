@@ -18,7 +18,7 @@ import type { CustomProviderRecord } from './add-account-bridge'
 import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
 import { ADD_SEG_CLASS } from './add-provider-blocks'
 
-/** 第 1 步的账号类型：反代（内置八家）/ 预置 API / 自定义 / 导入 */
+/** 第 1 步的账号类型：Agent（内置八家）/ 预置 API / 自定义 / 导入 */
 export type AccountType = 'proxy' | 'preset' | 'custom' | 'import'
 
 export const TYPE_PROXY: AccountType = 'proxy'
@@ -41,7 +41,7 @@ export const PRESET_CARD_PREFIX = 'preset:'
 /** 「新建自定义提供商」那张卡片的取值（不是 provider id，只是卡片自己的标记） */
 export const NEW_PROVIDER_CARD_ID = '__new__'
 
-/** 分段值归一：四个取值之外的一律按「反代」处理（DOM 被人改坏时的保守落点） */
+/** 分段值归一：四个取值之外的一律按「Agent」处理（DOM 被人改坏时的保守落点） */
 export function typeValueOf(value: string): AccountType {
   if (value === TYPE_PRESET || value === TYPE_CUSTOM) return value
   if (IMPORT_SEGMENT_ENABLED && value === TYPE_IMPORT) return TYPE_IMPORT
@@ -89,7 +89,7 @@ type CardItem = {
 
 /**
  * 第 1 步的卡片列表数据，按账号类型分三段：
- *   · 反代 —— 内置家来自 providers 摘要（现有八家）；
+ *   · Agent —— 内置家来自 providers 摘要（现有八家）；
  *   · 预置 API —— 预置目录的官方与托管端点，点一张卡 = 创建这一家并预填；
  *     **已建过同名家的预置卡不再出现**（那张已建卡就在「自定义」段里）；
  *   · 自定义 —— 已建的自定义家（customList），每张卡是「给这家加账号」的对象。
@@ -263,7 +263,7 @@ export function PickStep({
           aria-label='账号类型'
           className={ADD_SEG_CLASS}
           options={[
-            { value: TYPE_PROXY, label: '反代' },
+            { value: TYPE_PROXY, label: 'Agent' },
             { value: TYPE_PRESET, label: '预置 API' },
             { value: TYPE_CUSTOM, label: '自定义' },
             // 「导入」分段暂时收起（见 IMPORT_SEGMENT_ENABLED）：整段不生成

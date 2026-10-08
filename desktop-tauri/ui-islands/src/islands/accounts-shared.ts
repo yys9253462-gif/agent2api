@@ -95,8 +95,9 @@ export type AccountRecord = {
    */
   usageQuery?: { enabled?: boolean; interval?: number }
   /**
-   * 余额不足时的处理（后端公开形态恒为对象；**缺省 = 跳过、阈值 1**，显式
-   * `off` 才是关；见 `lowBalanceOf`）。`threshold` 与余额列同一数字口径
+   * 余额不足时的处理（后端公开形态恒为对象；**缺省按 provider 区分**——
+   * Cline 免费池不处理、其余跳过阈值 1，显式配置一律原样尊重；见
+   * `lowBalanceOf`）。`threshold` 与余额列同一数字口径
    * （`available` / workbuddy 家的 `totalLeft`）。
    */
   lowBalance?: { mode?: 'off' | 'skip' | 'disable'; threshold?: number }

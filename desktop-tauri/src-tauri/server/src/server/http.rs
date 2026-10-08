@@ -317,6 +317,13 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/activity/ambassador",
             get(api::billing::activity_ambassador),
         )
+        // WorkBuddy 国际版日活保活的模型链（签到中心「自动签到」卡里编辑）
+        .route(
+            "/api/checkin-keepalive",
+            get(api::billing::get_keepalive).post(api::billing::save_keepalive),
+        )
+        // WorkBuddy 国际版日活任务的手动粒度入口（保活 / 领取 / 保活+领取）
+        .route("/api/checkin-activity", post(api::billing::run_activity))
         // ── 会话与登录 ──
         .route("/api/session/login/start", post(api::session::login_start))
         .route("/api/session/login/wait", get(api::session::login_wait))

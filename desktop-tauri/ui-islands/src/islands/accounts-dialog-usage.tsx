@@ -52,7 +52,7 @@ function splitInterval(seconds: number): { value: string; unit: IntervalUnit } {
   return { value: '5', unit: 'minutes' }
 }
 
-/** 账号现有配置 → 草稿（读侧缺省：开启、1 分钟、跳过、阈值 1 —— 见 accounts-domain） */
+/** 账号现有配置 → 草稿（读侧缺省：开启、1 分钟；余额不足按 provider 缺省档 —— 见 accounts-domain） */
 export function usageDraftOf(account: AccountRecord | null | undefined): UsageDraft {
   const { enabled, interval } = usageQueryOf(account)
   // 关着的时候间隔输入给个 5 分钟的落点值：重新拨开时不用面对空输入框

@@ -11,8 +11,7 @@
 //! Rust 侧的 core 不能依赖 api（core 不认识 axum，见 core/mod.rs 的约定），
 //! 于是把这段共享逻辑放到这里：api/accounts.rs 与 core/auto_checkin 各自持有
 //! store / billing 句柄调用它，规则依旧只有一份。调用方负责把 `CheckinError`
-//! 翻成响应（api 层用管理信封，调度器只取 message 记进 lastResult）。
-//!
+//! 翻成响应（api 层用管理信封，调度器只取 message 记进 lastResult）。//!
 //! ── 签到不看 `enabled`（本次改动；此前两轮口径相反）─────────
 //! `enabled` 管的是「别让这个账号承接转发」，签到则是用户对某个账号显式发起的
 //! 一次动作（定时签到则是调度器对所有账号的统一动作），与转发无关：一个被禁用的
@@ -28,17 +27,18 @@
 //!
 //! 仍然要看的只剩两处，两条路径各自一致：`available`（批量路径过滤，单账号不看 ——
 //! Node 版既定语义：账号暂时不可用不影响手动操作）与 `supports_checkin`
-//! （国际版没有签到活动，两条路径都排除）。
+//! （没有签到/活跃任务的家，两条路径都排除；WorkBuddy 国际版由活跃任务链放行）。
 //!
 //! ── `skipped` 的分母 ────────────────────────────────────────
-//! 「可用账号总数 − 可签到数」，只可能由**国际版**与**范围外的提供商**两类构成
-//! （`enabled` 不再参与），与 /api/accounts/usage 的「只算被禁用的」口径不同 ——
-//! 两个动作的「不适用」集合本来就不一样。
+//! 「可用账号总数 − 可签到数」，只可能由**不支持签到/活跃任务的版本**与**范围外
+//! 提供商**两类构成（`enabled` 不再参与），与 /api/accounts/usage 的「只算被禁用的」
+//! 口径不同 —— 两个动作的「不适用」集合本来就不一样。
 
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::billing::BillingService;
+use crate::server::core::billing::WorkbuddyActivity;
 use crate::server::logging;
 
 /// 签到路径上的错误。对应 Node 版抛出的 AccountStoreError：
@@ -77,22 +77,30 @@ impl std::fmt::Display for CheckinError {
 /// 这一步是**必需的**：不在范围的家会落到 `checkin_for` 的分派里，拿另一家的
 /// 令牌去打错的签到接口只会稳定报错（见那里的最后两条分支）。
 pub fn supports_checkin(account: &Value) -> bool {
-    if account.get("edition").and_then(Value::as_str) == Some("intl") {
-        return false;
-    }
     let provider = account
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
-    // CodeArts 与 Trae 两家都没有「签到」链路，必须先排除：
-    // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这两家
-    // 的按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
+    // WorkBuddy 国际版没有国内版的普通签到接口，但上游客户端把它接到同一条
+    // 「每日活跃」调度上（活动探测 + 条件领取 + 免费模型保活），所以它**参与**
+    // 签到目标集合，执行形态在 `checkin_for` 按 provider 分派（workbuddy-intl）。
+    // 它的 provider id 是拆家后的独立 id，不与国内版共用 —— 放行必须写在
+    // 下面的 edition 判定之前，否则会被「intl 一刀切」挡掉。
+    if provider == crate::server::core::providers::workbuddy::Region::Intl.provider_id() {
+        return true;
+    }
+    if account.get("edition").and_then(Value::as_str) == Some("intl") {
+        return false;
+    }
+    // CodeArts 没有「签到」链路，必须先排除：`checkin_for` 的分派 match 把
+    // 「不在范围里的家」报成「未接入」，签到中心那边则按 `CHECKIN_PROVIDERS`
+    // 分桶（本家不在清单里，落到「没有签到链路」那组）—— 这一层是批量路径
     // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
     // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
     // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
-    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID
-        || provider == crate::server::core::account_store::TRAE_PROVIDER_ID
-    {
+    // Trae 曾与 CodeArts 同列排除表；SOLO 转积分制后模型调用花的就是签到钱包
+    // 那份钱，它已在 `providers::trae::checkin` 接入本链，不要再加回来。
+    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID {
         return false;
     }
     !crate::server::core::account_store::is_accio_family(provider)
@@ -165,12 +173,11 @@ pub fn resolve_checkin_targets(
         if found.is_empty() {
             return Err(CheckinError::new("账号不存在", 404));
         }
-        // 唯一的拒绝理由：上游这一站根本没有签到活动（国际版）。
-        // 文案与账号页明细面板里那句「国际版暂无签到活动」同源同义
-        // （见 ui/accounts-model.js 的 checkinPanelHtml）—— 两处说法不一致
-        // 会让用户以为遇到的是两个不同的问题。
+        // 唯一的拒绝理由：上游这一站根本没有签到/活跃任务（Qoder 等的国际版）。
+        // 文案与签到中心「范围外」分组那句同义 —— 两处说法不一致会让用户以为
+        // 遇到的是两个不同的问题。WorkBuddy 国际版已由活跃任务分支放行。
         if !supports_checkin(&found[0]) {
-            return Err(CheckinError::new("国际版账号暂不支持签到", 400));
+            return Err(CheckinError::new("该账号暂不支持签到或每日活跃任务", 400));
         }
         return Ok((found, 0));
     }
@@ -188,18 +195,21 @@ pub fn resolve_checkin_targets(
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
 /// 前端把「今天已签到」显示成一条 warn 提示。
 ///
-/// ── 按提供商分派（四家的接口互不相通）────────────────────────
-///   - **WorkBuddy**：计费服务的每日签到（`billing.claim_daily_checkin`）；
+/// ── 按提供商分派（各家的接口互不相通）────────────────────────
+///   - **WorkBuddy 国内版**：计费服务的每日签到（`billing.claim_daily_checkin`）；
+///   - **WorkBuddy 国际版**：活跃探测、条件领取与免费模型保活
+///     （`billing.workbuddy_daily_activity`，模型链可在签到中心自定义）；
 ///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin::claim_daily_signin`）；
 ///   - **Qoder**：活动（campaign）领取链路，只有中国版有
-///     （`providers::qoder::checkin::claim_daily_checkin`）。
+///     （`providers::qoder::checkin::claim_daily_checkin`）；
+///   - **Trae**：SOLO 的 `checkin_credits` 领取（`providers::trae::checkin`）。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
 /// 各家的 claim 都由各自的实现对齐成 `{success, msg}` 形状。最后的兜底**只认**
-/// 默认那家（WorkBuddy），未知家明确报「未接入」——见那里的说明。
+/// 默认那家（WorkBuddy 国内版），未知家明确报「未接入」——见那里的说明。
 pub async fn checkin_for(
     store: &AccountStore,
     billing: &BillingService,
@@ -242,6 +252,54 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "trae" => {
+            // SOLO 那一条通道的每日签到（`providers::trae::checkin`）。它的
+            // `alreadyCompleted` / 中性结果都由实现自己给：活动未下发、
+            // 凭据没有 deviceId、国际版谱系这三格都不算失败，也不落当日台账
+            // （除"已签"那格），免得定时链把一次"没得签"当成"没签成"反复重打。
+            let claim = crate::server::core::providers::trae::checkin::claim_daily_checkin(
+                store, &id,
+            )
+            .await
+            .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "workbuddy-intl" => {
+            // WorkBuddy 国际版：没有国内版的普通签到接口，走「每日活跃」链路 ——
+            // 探测活动 → 条件领取 → 免费模型保活（`billing::activity` 的
+            // `workbuddy_daily_activity`，模型链配置见 `billing::keepalive`）。
+            // 活跃保活成功不伪造普通签到成功：只有 claim 的 success /
+            // alreadyCompleted 才会落 `checkinAt`，保活读数在行的 `activity` 格。
+            let Some(entry) = store.get_session_by_id(&id) else {
+                return json!({
+                    "id": id,
+                    "name": name,
+                    "claim": Value::Null,
+                    "error": "没有可用凭证",
+                });
+            };
+            let activity = billing
+                .workbuddy_daily_activity(&entry.session, WorkbuddyActivity::Full)
+                .await;
+            let claim = activity
+                .get("claim")
+                .cloned()
+                .unwrap_or_else(|| json!({ "success": false, "code": -1, "msg": "活跃任务未返回领取结果" }));
+            let claim_success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
+            if claim_success {
+                logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
+            } else {
+                logging::log("[Accounts]", &format!("账号 {display}: WorkBuddy 国际版 {message}"));
+            }
+            json!({
+                "id": id,
+                "name": name,
+                "claim": claim,
+                "activity": activity.get("activity").cloned().unwrap_or(Value::Null),
+                "error": Value::Null,
+            })
+        }
         "loomy" => {
             // Loomy 没有独立的签到接口：「每日赠送积分」由**每日首次登录**
             // 触发刷新（`POST /api/v1/points/first-login`，见 `loomy::checkin`
@@ -262,10 +320,11 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
-        // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
+        // 兜底只服务默认那家（WorkBuddy 国内版）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
-        // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露。
+        // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露
+        // （WorkBuddy 国际版拆家后是独立 id，走上面的 workbuddy-intl 分支）。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
             let Some(entry) = store.get_session_by_id(&id) else {
                 return json!({
@@ -401,11 +460,22 @@ pub async fn run_checkin(
         }
         results.push(row);
     }
+    // 「真实领取」与「今日已领取」都表示本日签到已完成；只有活跃保活不计入
+    // succeeded，避免把普通签到时间与活跃任务混为一谈 —— 保活读数单独统计在
+    // `active`（`activity.pokeSucceeded`），它的成功不落 `checkinAt`。
     let succeeded = results
         .iter()
         .filter(|item| {
             item.get("claim")
-                .and_then(|claim| claim.get("success"))
+                .map(checkin_completed_today)
+                .unwrap_or(false)
+        })
+        .count();
+    let active = results
+        .iter()
+        .filter(|item| {
+            item.get("activity")
+                .and_then(|activity| activity.get("pokeSucceeded"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         })
@@ -413,12 +483,15 @@ pub async fn run_checkin(
     if skipped > 0 {
         logging::log(
             "[Accounts]",
-            &format!("已跳过 {skipped} 个账号（国际版无签到活动或不在签到范围内）"),
+            &format!("已跳过 {skipped} 个账号（不支持签到/活跃任务或不在签到范围内）"),
         );
     }
     logging::log(
         "[Accounts]",
-        &format!("签到完成: {succeeded}/{} 个账号成功领取", results.len()),
+        &format!(
+            "签到完成: {succeeded}/{} 个账号成功领取，{active} 个账号完成活跃保活",
+            results.len()
+        ),
     );
     // 批量轮次进台账（签到中心时间线）。写盘失败只记日志：上游那边积分已经
     // 领到，台账缺一条不该让这次签到的响应报错。
@@ -426,6 +499,7 @@ pub async fn run_checkin(
         crate::server::core::checkin_history::record(
             &json!({
                 "succeeded": succeeded,
+                "active": active,
                 "total": results.len(),
                 "skipped": skipped,
                 "results": results,
@@ -436,6 +510,7 @@ pub async fn run_checkin(
     Ok(json!({
         "results": results,
         "succeeded": succeeded,
+        "active": active,
         "total": results.len(),
         "skipped": skipped,
     }))

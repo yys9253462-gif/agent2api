@@ -260,11 +260,22 @@ export type LowBalanceMode = 'off' | 'skip' | 'disable'
 /**
  * 缺省口径（记录上没有 usageQuery / lowBalance 字段时）—— 与后端
  * `usage_records::DEFAULT_*` 同一对数值：自动查询**开启**、1 分钟；余额不足
- * **跳过**、阈值 1。缺省必须对齐全局任务时代「默认就在查」的行为，否则升级
- * 后所有人的余额列会静默停更；跳过@1 是最温和的兜底（没钱的让路、回升自愈）。
+ * 按 provider 区分（见 `defaultLowBalanceMode`）。自动查询的缺省必须对齐
+ * 全局任务时代「默认就在查」的行为，否则升级后所有人的余额列会静默停更。
  */
 export const DEFAULT_USAGE_INTERVAL_SECONDS = 60
 export const DEFAULT_LOW_BALANCE_THRESHOLD = 1
+
+/**
+ * 各 provider 缺省的「余额不足处理」档 —— 与后端
+ * `usage_records::default_low_balance_mode` 同一口径：Cline 免费池缺省
+ * **不处理**（free 池的 credit 长期贴着 0 走、欠费是常态，缺省跳过@阈值 1
+ * 会把几乎整个池从选路里剔掉），其余 provider 缺省**跳过**（没钱让路、
+ * 回升自愈，历史缺省不变）。
+ */
+export function defaultLowBalanceMode(provider: string | undefined | null): LowBalanceMode {
+  return provider === 'cline-free' ? 'off' : 'skip'
+}
 
 /**
  * 自动余额查询设置的规范化读取。缺省（字段缺失）= 开启、1 分钟；显式
@@ -286,21 +297,25 @@ export function usageQueryOf(account: AccountRecord | null | undefined): {
 }
 
 /**
- * 余额不足处理的规范化读取。缺省（字段缺失）= 跳过、阈值 1；显式 `off` 必须
- * 保持 off（那是用户关掉的）；skip / disable 档下阈值缺失或非法回落缺省 1。
+ * 余额不足处理的规范化读取。缺省（字段缺失 / mode 缺失）按 provider 区分
+ * （见 `defaultLowBalanceMode`）；显式 `off` 必须保持 off（那是用户关掉的）；
+ * skip / disable 档下阈值缺失或非法回落缺省 1。
  */
 export function lowBalanceOf(account: AccountRecord | null | undefined): {
   mode: LowBalanceMode
   threshold: number
 } {
   const config = account?.lowBalance
+  const fallbackMode = defaultLowBalanceMode(providerOf(account))
   if (!config || typeof config !== 'object') {
-    return { mode: 'skip', threshold: DEFAULT_LOW_BALANCE_THRESHOLD }
+    return fallbackMode === 'off'
+      ? { mode: 'off', threshold: 0 }
+      : { mode: 'skip', threshold: DEFAULT_LOW_BALANCE_THRESHOLD }
   }
   const mode: LowBalanceMode =
     config.mode === 'skip' || config.mode === 'disable' || config.mode === 'off'
       ? config.mode
-      : 'skip'
+      : fallbackMode
   const threshold = Number(config.threshold) || 0
   if (mode === 'off') return { mode, threshold: 0 }
   return { mode, threshold: threshold > 0 ? threshold : DEFAULT_LOW_BALANCE_THRESHOLD }

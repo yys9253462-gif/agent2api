@@ -298,8 +298,8 @@ pub async fn dispatch(
                 return super::zcode_claim::claim_plan(&state, &id, body).await;
             }
         }
-        // Loomy 新手任务一键领取：把该账号全部未完成的 key 串行上报（幂等，
-        // 重复点不会重复加分；执行体见 `core::providers::loomy::onboarding`）。
+        // 新手任务一键领取（执行体按账号的提供商分派：Loomy 任务表 / 小浣熊
+        // 首次登录奖励，见 `api::onboarding`；幂等，重复点不会重复加分）。
         if let Some(id) = rest.strip_suffix("/onboarding/claim") {
             let id = decode_segment(id);
             if !id.is_empty() {
@@ -308,7 +308,7 @@ pub async fn dispatch(
         }
     }
 
-    // ③' GET + /onboarding 结尾 → Loomy 新手任务状态（只读，签到后弹窗的查询口）。
+    // ③' GET + /onboarding 结尾 → 新手任务状态（只读，签到后弹窗的查询口）。
     // 与上面 POST 段同一写法：后缀互不包含，先后不影响命中。
     if method == Method::GET {
         if let Some(id) = rest.strip_suffix("/onboarding") {
@@ -1003,9 +1003,10 @@ pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
 
 /// POST /api/accounts/checkin
 ///
-/// 串行签到：避免多账号同时打上游触发 11128 风控。
+/// 串行签到：避免多账号同时打上游触发 11-128 风控。
 /// id 为空时签全部符合条件的账号，给了 id 则只签该账号；
-/// 返回 `{results, succeeded, total, skipped}`。
+/// 返回 `{results, succeeded, active, total, skipped}`；`active` 是 WorkBuddy
+/// 国际版完成免费模型保活的数量，不等同于普通签到领取成功数。
 ///
 /// 执行体是 `core::billing::checkin::run_checkin` —— 与定时签到共用同一段逻辑
 /// （Node 版也是 `createAutoCheckin({ runCheckin: accountRoutes.runCheckin })`）。

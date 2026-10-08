@@ -49,8 +49,15 @@ pub const DEFAULT_TIME: &str = "00:01";
 
 /// 可勾选的签到提供商（界面上的复选框）。默认全选。
 ///
-///   - **WorkBuddy**：腾讯的每日签到接口；
+///   - **WorkBuddy 国内版**：腾讯的每日签到接口；
+///   - **WorkBuddy 国际版**：每日活跃任务（活动探测 + 条件领取 + 免费模型保活，
+///     `billing::activity` 的 `workbuddy_daily_activity`）。国际版没有国内版的
+///     普通签到接口，但上游客户端把这条活跃链接在同一个每日调度上 —— 保活的
+///     成功不落 `checkinAt`、单独统计在 `active`；免费模型链可在签到中心自定义
+///     （`billing::keepalive`）。
 ///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
+///     首次登录奖励（电脑端 / 手机端各一条端点）是一次性新手福利，不在这条
+///     每日链路里（见 `providers::raccoon::onboarding`，挂新手任务分组）；
 ///   - **AutoClaw 国内版 / 国际版**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
 ///     两地是同一套路径、同一套任务 id，只是站点不同（已实测），因此两家
@@ -60,6 +67,14 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 edition
 ///     排除。中国版里 Free 套餐账号也可能没有被下发活动（实测如此），那种情况
 ///     实现返回一条中性结果（「当前没有可领取的签到活动」），不算失败。
+///   - **Trae**：SOLO 的 `checkin_credits` 领取（`providers::trae::checkin`）。
+///     加它不是因为"别家有"，而是这条链**有钱**：SOLO 转积分制后，模型调用花的
+///     正是签到钱包那份积分，不签就是每天白丢一笔额度。它的风险不在"该不该签"
+///     而在"怎么签"：设备号每轮全新（复用是风控可疑项）、请求体恒空对象、
+///     claim 的 `code:0` 要用同设备号回查确认（幂等假成功）。三条都在那个
+///     模块里钉着。⚠️ 本清单同时是**缺省全选**的来源：老配置的 `autoCheckin`
+///     里没有 `providers` 字段时，读出来就是"包括 trae"——上线后第二天零点
+///     就会多发一轮签到请求。不想要就在签到中心「自动签到」里取消勾选。
 ///   - **Loomy**：**没有独立签到接口** —— 它的「每日赠送积分」由每日首次登录
 ///     触发刷新（`POST /api/v1/points/first-login`，见 `providers::loomy::checkin`）。
 ///     自动签到对它就是每天替账号打一次这个接口，长期不登录的账号也能把
@@ -69,11 +84,20 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     重复领取只返回 reward_point=0；业务会话由换发的 genflowpro STOKEN
 ///     保障（`kuku::engine`）。
 ///
-/// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw 有积分查询但
-/// 没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
+/// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
+/// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 7] =
-    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder", "loomy", "kuku"];
+pub const CHECKIN_PROVIDERS: [&str; 9] = [
+    "workbuddy",
+    "workbuddy-intl",
+    "raccoon",
+    "autoclaw",
+    "autoclaw-intl",
+    "qoder",
+    "trae",
+    "loomy",
+    "kuku",
+];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {
@@ -82,25 +106,14 @@ pub fn default_providers() -> Vec<String> {
 
 /// 提供商的展示名（从注册表查，查不到就原样回显 id）。
 ///
-/// 这是**签到语境**的展示名（签到中心的分组、定时任务的提供商勾选共用这一份），
-/// 两家的签到有版本限定，标签要在用户看到分组时就把这件事讲清楚：
-///
-///   - **WorkBuddy**：注册表里就叫「WorkBuddy 国内版」，这里不用再覆盖 ──
-///     拆家后国内版与国际版是两家独立提供商（见 `providers::workbuddy::region`），
-///     注册表的展示名**必须**带版本，否则「WorkBuddy」读起来像「两地通吃的那一家」。
-///     而它在 `CHECKIN_PROVIDERS` 里只列国内版 —— 签到只有国内站有（上游事实：
-///     腾讯的每日签到接口），国际版账号由 `billing::checkin::supports_checkin`
-///     按 edition 排除。于是注册名正好就是签到语境想要的那句话，不需要第二处覆盖。
-///
-///   - **Qoder**：注册表是通用名，这里补成「中国版」──────────────────
-///     与 WorkBuddy 同理但方向相反：注册表里是通用的「Qoder」（它没有拆家，
-///     一个 id 覆盖两个地区，展示名不该自带地区），而签到**只在中国版成立**
-///     （国际版没有签到计划，见 `providers::qoder::checkin`）。所以这里覆盖成
-///     「Qoder 中国版」。
-///
-/// 另外几家不需要后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
-/// AutoClaw 两地的签到链路都存在且同形 —— 它的展示名在注册表里已经带
-/// 「国内版 / 国际版」。
+/// 这是**签到语境**的展示名（签到中心的分组、自动签到的提供商勾选共用这一份）。
+/// WorkBuddy 两个地区在注册表里就叫「WorkBuddy 国内版 / 国际版」（拆家后的
+/// 既定口径），签到语境沿用注册名即可 —— 国际版执行的是活跃任务而不是普通
+/// 签到，这件事由签到中心 `PROVIDER_DESC` 的链路说明与它的分组描述讲清楚，
+/// 不在标签里堆字。唯一要覆盖的是 **Qoder**：注册表是通用名（它没有拆家，
+/// 一个 id 覆盖两个地区），而签到**只在中国版成立**（国际版没有签到计划），
+/// 所以这里补成「Qoder 中国版」。其余几家不需要后缀：小浣熊没有版本区分，
+/// AutoClaw 两地的签到链路都存在且同形 —— 展示名已带「国内版 / 国际版」。
 pub fn provider_label(id: &str) -> &str {
     match id {
         "qoder" => "Qoder 中国版",
@@ -463,6 +476,7 @@ impl AutoCheckin {
                         "date": today,
                         "reason": reason,
                         "succeeded": 0,
+                        "active": 0,
                         "total": 0,
                         "skipped": 0,
                         "failed": [error.message.clone()],
@@ -486,6 +500,7 @@ impl AutoCheckin {
                 .unwrap_or(0)
         };
         let succeeded = number("succeeded");
+        let active = number("active");
         let total = number("total");
         let skipped = number("skipped");
         // 失败明细：`名字（错误）`，名字缺失时退到 id，再退到「未知账号」
@@ -513,6 +528,7 @@ impl AutoCheckin {
             "date": today,
             "reason": reason,
             "succeeded": succeeded,
+            "active": active,
             "total": total,
             "skipped": skipped,
             // 只留前 5 条：面板展示用，避免 config.json 被长列表撑大（Node 同）
@@ -523,12 +539,17 @@ impl AutoCheckin {
         logging::log(
             "[Checkin]",
             &format!(
-                "定时签到完成: {succeeded}/{total} 个账号成功领取{}{}",
+                "定时签到完成: {succeeded}/{total} 个账号成功领取{}{}{}",
                 if skipped > 0 { format!("，跳过 {skipped} 个") } else { String::new() },
                 if failures.is_empty() {
                     String::new()
                 } else {
                     format!("，失败 {} 个", failures.len())
+                },
+                if active > 0 {
+                    format!("，活跃保活 {active} 个")
+                } else {
+                    String::new()
                 },
             ),
         );

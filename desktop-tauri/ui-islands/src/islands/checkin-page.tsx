@@ -9,8 +9,9 @@ import { claimedPlanIdsToday } from './accounts-domain'
 import {
   claimOnboarding, getCheckinStore, groupTone, historyLine, loadCheckinCenter,
   nextRunText, onboardingExpanded, queryOnboarding, runAllCheckin, saveAutoCheckin,
-  setAutoTimeDraft, signSingleAccount, subscribeCheckinStore, submitAutoTime,
-  toggleAutoProvider, toggleOnboardingExpand, toggleProviderExpand,
+  setAutoTimeDraft, setKeepaliveDraft, signSingleAccount, submitAutoTime,
+  submitKeepaliveModels, subscribeCheckinStore, toggleAutoProvider,
+  toggleOnboardingExpand, toggleProviderExpand,
   type AutoCheckinState, type CheckinProviderGroup, type CheckinStore,
 } from './checkin-state'
 
@@ -18,9 +19,11 @@ import {
  * 签到中心（React 岛）。
  *
  * ── 这页管什么 ──────────────────────────────────────────────
- * 全部签到类动作的统一入口：每日签到（7 家提供商，判定在后端）、自动签到设置
- * （自定时任务页迁入）、签到历史时间线、新手任务（Loomy，惰性查询）与活动福利
- * （CodeArts / ZCode，沿用既有领取流程）。原型见 prototype/checkin-center.html。
+ * 全部签到类动作的统一入口：每日签到（提供商清单与「能不能签」的判定都在后端，
+ * 见 `core::auto_checkin::CHECKIN_PROVIDERS`）、自动签到设置（含 WorkBuddy
+ * 国际版日活保活的模型链）、签到历史时间线、新手任务（Loomy / 小浣熊，
+ * 惰性查询）与活动福利（CodeArts / ZCode，沿用既有领取流程）。
+ * 原型见 prototype/checkin-center.html。
  *
  * ── 数据从哪来 ──────────────────────────────────────────────
  * 快照走 `GET /api/checkin-center` 一次拉全（load）；新手任务的任务状态是上游
@@ -36,25 +39,35 @@ import {
 
 /** 各提供商的一句链路说明（与 core::auto_checkin 模块头的口径一致） */
 const PROVIDER_DESC: Record<string, string> = {
-  workbuddy: '腾讯每日签到接口 · 仅国内站',
+  workbuddy: '腾讯每日签到接口 · 仅国内版',
+  'workbuddy-intl': '每日活跃任务 · 领取才加积分，保活只维持活跃 · 两者可分开执行',
   raccoon: '桌面端每日积分链路',
   autoclaw: '官方客户端的每日签到任务',
   'autoclaw-intl': '与国内版同一套任务接口 · 站点不同',
   qoder: '活动（campaign）领取 · 每天 10:00 刷新 · 仅中国版',
+  trae: 'SOLO 的 checkin_credits 领取 · 按自然日 0 点刷新',
   loomy: '无独立签到接口 · 每天替账号打一次首次登录积分',
   kuku: '「免费领积分」的每日任务 · 逐个领取',
 }
 
 /** 问号提示全文（沿用 tasks-panel 的 CHECKIN_DESC，签到口径没变） */
 const AUTO_CHECKIN_DESC =
-  '到点后自动签到勾选提供商的可用账号（WorkBuddy 走每日签到接口，仅限国内版；' +
+  '到点后自动签到勾选提供商的可用账号（WorkBuddy 国内版走每日签到接口，' +
+  '国际版走每日活跃任务：探测活动、领日活奖励、再用免费模型保活；' +
   '小浣熊走桌面端每日积分链路；AutoClaw 走官方客户端的每日签到任务；' +
   'Qoder 中国版走活动领取，没被下发活动的账号会得到中性提示；' +
+  'Trae 领 SOLO 的每日签到积分（按自然日 0 点重置），上游没对该账号开活动、' +
+  '或凭据里没有设备号时得到的是「未领取 + 具体原因」而不是报错；' +
   'Loomy 每天替账号打一次首次登录积分；KukuAI 领「免费领积分」的每日任务）。' +
   '错过时点开机后会自动补签，不会因为当时没开机而漏掉。' +
   '各家签到接口都是幂等的，重复执行不会重复领取。'
 
 /* ─── 小组件 ───────────────────────────────── */
+
+/** 新手任务分组的提供商展示名（缺省回落 provider id 本身） */
+function onboardingProviderLabel(provider: string): string {
+  return provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy' : provider
+}
 
 function useCheckinStore(): CheckinStore {
   const [store, setStore] = React.useState(getCheckinStore())
@@ -73,7 +86,8 @@ function GroupBadge({ group }: { group: CheckinProviderGroup }) {
 
 /** 提供商图标：收录过的用真实图标，否则首字母徽章（与添加账号弹窗同一回落） */
 function ProviderLogo({ id, label }: { id: string; label: string }) {
-  const icon = PROVIDER_ICONS[id]
+  // WorkBuddy 国际版没有专属图标文件，回落到同品牌那张（两家本来就是一条产品线）
+  const icon = PROVIDER_ICONS[id === 'workbuddy-intl' ? 'workbuddy' : id]
   return (
     <span className='ck-prov-logo'>
       {icon ? <img src={icon} alt='' /> : (label.slice(0, 1) || '·')}
@@ -84,6 +98,8 @@ function ProviderLogo({ id, label }: { id: string; label: string }) {
 /** 展开区里的账号明细行（每日签到） */
 function AccountRows({ group }: { group: CheckinProviderGroup }) {
   const signing = getCheckinStore().signing
+  // 在途判定按 `${id}:${mode}`：三颗按钮各自的转圈互不牵连
+  const busy = (id: string, mode: string) => signing.has(`${id}:${mode}`)
   return (
     <table className='ck-table'>
       <thead>
@@ -95,27 +111,64 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
         </tr>
       </thead>
       <tbody>
-        {group.accounts.map(account => (
-          <tr key={account.id}>
-            <td>{account.name || account.id}</td>
-            <td>
-              {account.checkedInToday
-                ? <Badge variant='success' shape='tag'>已签</Badge>
-                : <Badge variant='brand' shape='tag'>待签</Badge>}
-            </td>
-            <td className='text-subtle'>{account.checkinAt ? formatTime(account.checkinAt) : '—'}</td>
-            <td className='text-right'>
-              <Button
-                size='sm'
-                variant='ghost'
-                disabled={signing.has(account.id)}
-                onClick={() => void signSingleAccount(account.id)}
-              >
-                {signing.has(account.id) ? '签到中…' : account.checkedInToday ? '重签' : '签到'}
-              </Button>
-            </td>
-          </tr>
-        ))}
+        {group.accounts.map(account => {
+          // WorkBuddy 国际版执行的是「每日活跃任务」：三颗按钮对应三档手动粒度
+          // （保活 / 领取 / 保活+领取）—— 领取才会加积分，保活只维持活跃，
+          // 分开是当初一颗按钮混做两件事留下的教训
+          const dailyActivity = account.edition === 'intl'
+          return (
+            <tr key={account.id}>
+              <td>{account.name || account.id}</td>
+              <td>
+                {account.checkedInToday
+                  ? <Badge variant='success' shape='tag'>已签</Badge>
+                  : <Badge variant='brand' shape='tag'>待签</Badge>}
+              </td>
+              <td className='text-subtle'>{account.checkinAt ? formatTime(account.checkinAt) : '—'}</td>
+              <td className='text-right'>
+                {dailyActivity ? (
+                  <span className='inline-flex items-center gap-1'>
+                    <Button
+                      size='sm' variant='ghost'
+                      disabled={busy(account.id, 'keepalive')}
+                      title='用免费模型维持账号活跃 · 不领取奖励'
+                      onClick={() => void signSingleAccount(account.id, 'keepalive')}
+                    >
+                      {busy(account.id, 'keepalive') ? '保活中…' : '保活'}
+                    </Button>
+                    <Button
+                      size='sm' variant='ghost'
+                      disabled={busy(account.id, 'claim')}
+                      title='探测活动并领取日活奖励 · 不做保活'
+                      onClick={() => void signSingleAccount(account.id, 'claim')}
+                    >
+                      {busy(account.id, 'claim') ? '领取中…' : '领取'}
+                    </Button>
+                    <Button
+                      size='sm' variant='ghost'
+                      disabled={busy(account.id, 'full')}
+                      title='探测 + 领取 + 保活 · 与定时签到同一套组合'
+                      onClick={() => void signSingleAccount(account.id, 'full')}
+                    >
+                      {busy(account.id, 'full') ? '执行中…' : '保活+领取'}
+                    </Button>
+                  </span>
+                ) : (
+                  <Button
+                    size='sm'
+                    variant='ghost'
+                    disabled={busy(account.id, 'checkin')}
+                    onClick={() => void signSingleAccount(account.id)}
+                  >
+                    {busy(account.id, 'checkin')
+                      ? '签到中…'
+                      : account.checkedInToday ? '重签' : '签到'}
+                  </Button>
+                )}
+              </td>
+            </tr>
+          )
+        })}
       </tbody>
     </table>
   )
@@ -162,7 +215,8 @@ function ProviderRow({ group, expanded }: { group: CheckinProviderGroup; expande
 }
 
 /** 新手任务一行（含惰性查询 / 一键领取 / 可展开收起的行级任务清单） */
-function OnboardingRow({ row }: { row: { id: string; name: string } }) {
+function OnboardingRow({ row }: { row: { id: string; name: string; provider?: string } }) {
+  const provider = row.provider ?? 'loomy'
   const cache = getCheckinStore().onboarding.get(row.id)
   const tasks: OnboardingTask[] = cache?.tasks ?? []
   const unclaimed = cache?.unclaimed ?? 0
@@ -183,7 +237,7 @@ function OnboardingRow({ row }: { row: { id: string; name: string } }) {
         tabIndex={hasDetail ? 0 : -1}
         aria-expanded={hasDetail ? expanded : undefined}
       >
-        <ProviderLogo id='loomy' label='Loomy' />
+        <ProviderLogo id={provider} label={onboardingProviderLabel(provider)} />
         <div className='ck-prov-info'>
           <div className='ck-prov-name'>{row.name || row.id}</div>
           <div className='ck-prov-desc'>
@@ -296,6 +350,7 @@ function HistoryItem({ entry }: {
     at?: number | null
     reason?: string | null
     succeeded?: number | null
+    active?: number | null
     total?: number | null
     failedCount?: number | null
     failed?: string[] | null
@@ -318,7 +373,7 @@ function HistoryItem({ entry }: {
   )
 }
 
-/** 自动签到设置卡（自 tasks-panel 迁入：开关 / 时刻 / 范围 / 上次执行） */
+/** 自动签到设置卡（自 tasks-panel 迁入：开关 / 时刻 / 范围 / 保活链 / 上次执行） */
 function AutoCheckinCard({ store }: { store: CheckinStore }) {
   const auto: AutoCheckinState | null = store.snapshot?.auto ?? null
   const enabled = auto?.enabled === true
@@ -327,6 +382,12 @@ function AutoCheckinCard({ store }: { store: CheckinStore }) {
   const locked = !auto || store.autoSaving
   const checkinTime = store.autoTimeDraft ?? auto?.time ?? ''
   const last = auto?.lastResult
+  // 保活模型链：WorkBuddy 国际版日活任务用的免费模型，按顺序回退；
+  // 清空提交 = 恢复缺省链（提示里写明，别让用户以为清空是关掉保活）
+  const keepalive = store.snapshot?.keepalive
+  const keepaliveModels = Array.isArray(keepalive?.models) ? keepalive!.models : []
+  const defaultModels = Array.isArray(keepalive?.defaultModels) ? keepalive!.defaultModels : []
+  const keepaliveText = store.keepaliveDraft ?? keepaliveModels.join('、')
   return (
     <section className='panel'>
       <div className='panel-head'>
@@ -391,6 +452,29 @@ function AutoCheckinCard({ store }: { store: CheckinStore }) {
           <span className='ck-set-k'>下次执行</span>
           <span className='ck-set-v'>{nextRunText(auto)}</span>
         </div>
+        <div className='ck-set-line'>
+          <span className='ck-set-k'>保活模型链</span>
+          <span className='ck-set-v flex items-center gap-2'>
+            <Input
+              type='text'
+              className='max-w-[300px] font-mono text-xs'
+              placeholder='WorkBuddy 国际版保活模型，按顺序回退'
+              value={keepaliveText}
+              disabled={store.keepaliveSaving}
+              onChange={event => setKeepaliveDraft(event.currentTarget.value)}
+              onBlur={event => void submitKeepaliveModels(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') event.currentTarget.blur()
+              }}
+            />
+          </span>
+        </div>
+        <div className='ck-note'>
+          「保活模型链」是 WorkBuddy 国际版领日活时用来保活的免费模型，按顺序逐个尝试、
+          第一个成功即止；清空提交恢复缺省（{defaultModels.join('、')}）。
+          当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。
+          自动签到的设置以这里为准，「定时任务」页只保留间隔型任务。
+        </div>
         {last ? (
           <div className='ck-set-line'>
             <span className='ck-set-k'>上次执行</span>
@@ -398,6 +482,7 @@ function AutoCheckinCard({ store }: { store: CheckinStore }) {
               {last.at ? formatTime(last.at) : '—'}
               {last.reason ? ` · ${last.reason}` : ''}
               {` —— 成功 ${Number(last.succeeded) || 0}`}
+              {(Number(last.active) || 0) > 0 ? ` · 保活 ${Number(last.active)}` : ''}
               {(Number(last.skipped) || 0) > 0 ? ` · 跳过 ${Number(last.skipped) || 0}` : ''}
               {(Number(last.failedCount) || 0) > 0
                 ? <span className='text-destructive'> · 失败 {Number(last.failedCount) || 0}</span>
@@ -522,8 +607,8 @@ function CheckinPage() {
           </div>
           <div className='ck-stat-foot'>
             {onboardingRows.length
-              ? `已查 ${onboardingChecked.length} / 共 ${onboardingRows.length} 个 Loomy 账号`
-              : '没有 Loomy 账号'}
+              ? `已查 ${onboardingChecked.length} / 共 ${onboardingRows.length} 个账号`
+              : '没有支持新手任务的账号'}
           </div>
         </div>
       </div>
@@ -580,7 +665,7 @@ function CheckinPage() {
                 {onboardingRows.map(row => <OnboardingRow key={row.id} row={row} />)}
               </div>
             ) : (
-              <div className='ck-tl-empty'>没有 Loomy 账号 —— 新手任务目前只有 Loomy 一家提供。</div>
+              <div className='ck-tl-empty'>没有支持新手任务的账号 —— 目前有 Loomy、小浣熊两家。</div>
             )}
           </section>
 

@@ -8,7 +8,7 @@
 //! 会抄一份判定逻辑 —— 那正是「两套行为」的开头。所以这里在服务端聚合成一份，
 //! 一次请求拉全，页面打开只打这一条。
 //!
-//! 惰性查询的**上游资格类状态**（Loomy 新手任务清单、CodeArts 福利资格、
+//! 惰性查询的**上游资格类状态**（Loomy / 小浣熊的新手任务、CodeArts 福利资格、
 //! ZCode 可领套餐）**不在**这份快照里：它们每查一个账号就要打一次上游，
 //! 聚合快照必须保持「打开页面零上游请求」。快照只给账号入口清单，前端拿到
 //! 清单后按需调既有的查询接口（/onboarding、/codearts-welfare/preview、
@@ -32,9 +32,9 @@
 //!     "todayDone": 6, "todayEligible": 9
 //!   },
 //!   "extras": {
-//!     "onboarding": [ { "id", "name" } ],
-//!     "welfare":    [ { "id", "name" } ],
-//!     "plans":      [ { "id", "name", "claimAt" } ]
+//!     "onboarding": [ { "id", "name", "provider" } ],
+//!     "welfare":    [ { "id", "name", "provider" } ],
+//!     "plans":      [ { "id", "name", "provider", "claimAt" } ]
 //!   },
 //!   "auto": { …与 GET /api/auto-checkin 同形… },
 //!   "history": [ { "at", "date", "reason", "succeeded", "total", "skipped",
@@ -127,6 +127,9 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
                 "checkedInToday": checked_in_today(
                     account.get("checkinAt").and_then(Value::as_i64),
                 ),
+                // 版本（cn / intl，缺失 null）：WorkBuddy 国际版在这张表里执行的是
+                // 「领日活」（活跃保活），按钮文案与提示要跟国内版的「签到」分开
+                "edition": account.get("edition").cloned().unwrap_or(Value::Null),
             }));
         } else {
             let label = crate::server::core::providers::label_of(&provider);
@@ -169,8 +172,10 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         .collect();
 
     // ── 一次性 / 手动项的账号入口清单（资格状态由前端惰性查询）──
-    // 三家的账号行都是 {id, name}；ZCode 额外带公开的 `claimAt`（上次领取时间，
-    // 与 checkinAt 同一处置：给原始时间戳，不给布尔，见 zcode_accounts 的说明）。
+    // 各家的账号行都是 {id, name, provider}；provider 供界面选图标与文案
+    // （新手任务分组里 Loomy 与小浣熊共用一张卡）。ZCode 额外带公开的
+    // `claimAt`（上次领取时间，与 checkinAt 同一处置：给原始时间戳，
+    // 不给布尔，见 zcode_accounts 的说明）。
     let extra_rows = |provider: &str, with_claim_at: bool| -> Vec<Value> {
         accounts
             .iter()
@@ -179,6 +184,7 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
                 let mut row = json!({
                     "id": account_text(account, "id"),
                     "name": Value::from(account_text(account, "name")),
+                    "provider": provider,
                 });
                 if with_claim_at {
                     if let Some(map) = row.as_object_mut() {
@@ -192,7 +198,11 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
             })
             .collect()
     };
-    let onboarding_rows = extra_rows("loomy", false);
+    // 新手任务分组：Loomy（任务表）+ 小浣熊（首次桌面登录奖励，见
+    // `providers::raccoon::onboarding`），执行体按 provider 分派
+    // （api::onboarding）。
+    let mut onboarding_rows = extra_rows("loomy", false);
+    onboarding_rows.extend(extra_rows("raccoon", false));
     let welfare_rows = extra_rows("codearts", false);
     let plan_rows: Vec<Value> = accounts
         .iter()
@@ -226,6 +236,8 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
             "plans": plan_rows,
         },
         "auto": state.auto_checkin().state(),
+        // WorkBuddy 国际版日活保活的模型链（签到中心可编辑；空清单回落缺省链）
+        "keepalive": crate::server::core::billing::keepalive::state(),
         "history": checkin_history::list(),
     }))
 }

@@ -71,7 +71,7 @@ type IslandState = {
   showToken: number
 }
 
-/** 打开弹窗（以及点「添加账号」）时的复位落点：第 1 步 + 反代段 + WorkBuddy */
+/** 打开弹窗（以及点「添加账号」）时的复位落点：第 1 步 + Agent 段 + WorkBuddy */
 const INITIAL: IslandState = {
   step: 'pick',
   accountType: TYPE_PROXY,

@@ -335,7 +335,7 @@ impl AccountStore {
                 // 每账号的余额查询设置（自动查询 + 余额不足处理）：跨家统一注入
                 // 的理由与 hasCredentials 相同 —— 心跳调度、选路跳过 / 禁用与前端
                 // 弹窗、徽章读的是**同一份事实**，不能各家形状一个口径。
-                // 恒为对象（未配置 = 关闭 / off 的规范化形状，与写入侧
+                // 恒为对象（未配置 = 各家缺省档的规范化形状，与写入侧
                 // `apply_patch` 的归一化一致），读侧不必判「键缺失」。
                 fields.insert(
                     "usageQuery".to_string(),
@@ -343,7 +343,7 @@ impl AccountStore {
                 );
                 fields.insert(
                     "lowBalance".to_string(),
-                    low_balance_public(record.fields().get("lowBalance")),
+                    low_balance_public(&record.provider(), record.fields().get("lowBalance")),
                 );
                 Value::Object(fields)
             }
@@ -501,15 +501,17 @@ fn usage_query_public(value: Option<&Value>) -> Value {
 
 /// 记录上的 `lowBalance` → 公开形态的规范化形状。
 ///
-/// 缺省（无配置）= `skip`、阈值 1（与 `usage_records::balance_blocked` 同一口径）；
-/// 显式 `off` 必须保持 off —— 那是用户关掉的，缺省不能覆盖它。skip / disable
+/// 缺省（无配置）按 provider 区分（与 `usage_records::balance_blocked` 同一口径，
+/// 见 `default_low_balance_mode`）：Cline 免费池 = `off`（不处理），其余 = `skip`、
+/// 阈值 1；显式配置一律原样尊重 —— 那是用户选过的，缺省不能覆盖它。skip / disable
 /// 档下阈值缺失或非法时回落缺省 1。
-fn low_balance_public(value: Option<&Value>) -> Value {
-    use crate::server::core::usage_records::DEFAULT_LOW_BALANCE_THRESHOLD;
+fn low_balance_public(provider: &str, value: Option<&Value>) -> Value {
+    use crate::server::core::usage_records::{default_low_balance, default_low_balance_mode, DEFAULT_LOW_BALANCE_THRESHOLD};
+    let default_mode = default_low_balance_mode(provider);
     let Some(fields) = value.and_then(Value::as_object) else {
-        return json!({ "mode": "skip", "threshold": DEFAULT_LOW_BALANCE_THRESHOLD });
+        return default_low_balance(provider);
     };
-    let mode = fields.get("mode").and_then(Value::as_str).unwrap_or("skip");
+    let mode = fields.get("mode").and_then(Value::as_str).unwrap_or(default_mode);
     let threshold = fields
         .get("threshold")
         .and_then(Value::as_f64)

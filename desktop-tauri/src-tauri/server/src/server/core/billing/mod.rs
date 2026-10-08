@@ -26,13 +26,15 @@
 //!   mod.rs       服务句柄、错误类型、`call_billing` 请求核心、签到（本文件）
 //!   checkin.rs   账号级签到（目标集合 + 串行执行，向定时签到暴露同一条路径）
 //!   usage.rs     积分/额度查询与简报（get-user-resource / enterprise-usage）
-//!   activity.rs  运营 banner / 大使状态 / 签到组合动作
+//!   activity.rs  运营 banner / 大使状态 / 签到组合动作 / 国际版每日活跃任务
+//!   keepalive.rs 国际版日活保活的模型链配置（config.json 的 checkinKeepalive）
 //!   request.rs   端点表、调用选项、请求头、JS 语义工具
 //!   commodity.rs 积分包商品码与套餐分类
 
 pub mod checkin;
 mod activity;
 pub mod commodity;
+pub mod keepalive;
 mod request;
 mod usage;
 
@@ -48,8 +50,10 @@ use crate::server::logging;
 // 请求构造素材对同层子模块可见（`super::X`），对外仍是模块私有
 use request::{
     build_headers, whitelist_headers, BillingCall, BillingSpec, CallOptions,
-    BILLING_CHECKIN_STATUS, BILLING_DAILY_CHECKIN,
+    BILLING_ACTIVITY_CHECKIN_STATUS, BILLING_CHECKIN_STATUS, BILLING_DAILY_CHECKIN,
 };
+use activity::normalize_activity_status;
+pub use activity::WorkbuddyActivity;
 
 /// 计费接口单请求总超时（对照 Node 版 REQUEST_TIMEOUT_MS）
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -341,11 +345,28 @@ impl BillingService {
 
     /// 签到活动状态（AuthService.getCheckinStatus）。
     /// 成功但 data 为空时返回 null（与桌面端一致）。
+    ///
+    /// 国际版没有国内版的签到状态接口：它走每日活跃探测
+    /// （`BILLING_ACTIVITY_CHECKIN_STATUS`，不带 `/v2` 的那条），响应归一成
+    /// 同一套键（`active` / `todayCheckedIn`），调用方不用分版本读字段。
     pub async fn get_checkin_status(&self, session: Option<&Value>) -> Result<Value, BillingError> {
         let active = match session {
             Some(session) => session.clone(),
             None => self.require_session().await?,
         };
+        if is_international(&active) {
+            let result = self
+                .call_billing(
+                    BILLING_ACTIVITY_CHECKIN_STATUS,
+                    CallOptions {
+                        session: Some(&active),
+                        expect_code_ok: false,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            return Ok(normalize_activity_status(&result));
+        }
         assert_checkin_supported(&active)?;
         let result = self
             .call_billing(
@@ -363,11 +384,37 @@ impl BillingService {
     ///
     /// 幂等：已领取时上游返回非 0 code，这里原样返回 `{success:false, code, msg}` ——
     /// 「今天已签到」不是错误，前端面板会把它显示成一条 warn 提示。
+    ///
+    /// 国际版没有"领取签到"这个动作：走每日活跃任务链
+    /// （`workbuddy_daily_activity`，见 `activity.rs`），并把领取结果、活动
+    /// 状态与保活读数一并装进 claim 返回 —— 组合入口与签到链两条路都从这进，
+    /// 一次调用不重复打上游。
     pub async fn claim_daily_checkin(&self, session: Option<&Value>) -> Result<Value, BillingError> {
         let active = match session {
             Some(session) => session.clone(),
             None => self.require_session().await?,
         };
+        if is_international(&active) {
+            let activity = self.workbuddy_daily_activity(&active, WorkbuddyActivity::Full).await;
+            let mut claim = activity.get("claim").cloned().unwrap_or_else(|| {
+                json!({
+                    "success": false,
+                    "code": -1,
+                    "msg": "活跃任务未返回领取结果",
+                })
+            });
+            if let Some(object) = claim.as_object_mut() {
+                object.insert(
+                    "activity".to_string(),
+                    activity.get("activity").cloned().unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "status".to_string(),
+                    activity.get("status").cloned().unwrap_or(Value::Null),
+                );
+            }
+            return Ok(claim);
+        }
         assert_checkin_supported(&active)?;
         let result = self
             .call_billing(
@@ -375,28 +422,7 @@ impl BillingService {
                 CallOptions { session: Some(&active), expect_code_ok: false, ..Default::default() },
             )
             .await?;
-        if result.code == Some(RESPONSE_CODE_OK) && !result.data.is_null() {
-            return Ok(json!({
-                "success": true,
-                "code": 0,
-                "data": request::normalize_checkin(&result.data),
-                "raw": result.data,
-            }));
-        }
-        // Node 的失败分支：`{ success:false, code, msg, requestId: result.requestId }`。
-        // `requestId` 在上游没给时是 undefined → JSON.stringify 会**丢掉这个键**，
-        // 所以这里也用 Map 组装，None 时不出键（而不是给 null）
-        let mut failure = Map::new();
-        failure.insert("success".to_string(), Value::Bool(false));
-        failure.insert("code".to_string(), Value::from(result.code.unwrap_or(-1)));
-        failure.insert(
-            "msg".to_string(),
-            Value::String(result.msg.unwrap_or_else(|| "签到失败".to_string())),
-        );
-        if let Some(request_id) = result.request_id {
-            failure.insert("requestId".to_string(), request_id);
-        }
-        Ok(Value::Object(failure))
+        Ok(normalize_daily_claim(result))
     }
 
     /// 默认语言下的积分简报（路由层入口，对照 server.mjs
@@ -422,8 +448,46 @@ fn has_access_token(session: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// 国际版（www.workbuddy.ai）目前没有签到活动，调用上游只会拿到无意义的结果。
-/// 这里统一拦截，避免各入口（CLI / HTTP / 桌面端）分别判断漏掉。
+/// 国际版会话判定（拆家后账号落盘仍带 `edition`，session 从账号派生时继承它）。
+/// 国内版与国际版的签到语义不同（前者有签到接口、后者只有活跃任务），
+/// 这条判定是两条链分流的唯一闸口。
+fn is_international(session: &Value) -> bool {
+    resolve_edition(session.get("edition").and_then(Value::as_str)).id == "intl"
+}
+
+/// 将每日领取接口的原始返回转换成统一 claim 形状（国内版路径）。
+///
+/// 成功：`{success, code:0, data(归一), raw}`；失败：`{success:false, code, msg,
+/// requestId?}` —— Node 的失败分支里 `requestId` 缺失时整个键不出现在 JSON 中
+/// （undefined → JSON.stringify 丢键），所以这里也用 Map 组装，None 时不出键。
+fn normalize_daily_claim(result: BillingCall) -> Value {
+    if result.code == Some(RESPONSE_CODE_OK) && !result.data.is_null() {
+        return json!({
+            "success": true,
+            "code": 0,
+            "data": request::normalize_checkin(&result.data),
+            "raw": result.data,
+        });
+    }
+    let mut failure = Map::new();
+    failure.insert("success".to_string(), Value::Bool(false));
+    failure.insert("code".to_string(), Value::from(result.code.unwrap_or(-1)));
+    failure.insert(
+        "msg".to_string(),
+        Value::String(result.msg.unwrap_or_else(|| "签到失败".to_string())),
+    );
+    if let Some(request_id) = result.request_id {
+        failure.insert("requestId".to_string(), request_id);
+    }
+    Value::Object(failure)
+}
+
+/// 国内版通用计费签到的版本守卫。
+///
+/// WorkBuddy 国际版不走这条通用接口（它没有国内版语义的签到活动），而由
+/// `workbuddy_daily_activity` 负责活动探测与保活 —— 分流在两个入口
+/// （`get_checkin_status` / `claim_daily_checkin`）按 `is_international` 先行。
+/// 其它绕过分流直接调到这里的国家版仍保持明确拒绝，避免误打国内活动接口。
 fn assert_checkin_supported(session: &Value) -> Result<(), BillingError> {
     let info = resolve_edition(session.get("edition").and_then(Value::as_str));
     if info.id == "intl" {

@@ -323,6 +323,30 @@ impl StoredAccount {
             .insert("claimPlans".to_string(), Value::Object(ledger));
     }
 
+    /// 小浣熊新手任务的**结算台账**：`{ "<task_key>": <毫秒时刻> }`。
+    ///
+    /// 键是 `providers::raccoon::onboarding` 的任务 key（`desktop_login_grant` /
+    /// `mobile_login_grant`），值是这条**一次性**登录奖励结算的时刻 —— 「本轮刚
+    /// 领到」（granted=true）与「探测确认早已发放过」（granted=false）都算结算：
+    /// 一次性福利落定后不会再变，之后状态查询直接按「已领取」展示。不记的话，
+    /// 奖励早被官方客户端领掉的老账号每次打开面板都是「待领取」，点一次领取拿回
+    /// 一句「早已发放过」—— 与 `mark_zcode_claim` 头上那段是同一个教训。
+    ///
+    /// 读不懂的形状（数组 / 字符串这类脏值）一律当空表：台账只服务「这条结算过没」
+    /// 的展示，按「没结算过」处理最多让用户多点一次领取（上游幂等，不会重复加分），
+    /// 领取一步会顺手把台账补上。
+    pub fn onboarding_grants(&self) -> Map<String, Value> {
+        match self.fields.get("onboardingGrants") {
+            Some(Value::Object(map)) => map.clone(),
+            _ => Map::new(),
+        }
+    }
+
+    pub fn set_onboarding_grants(&mut self, ledger: Map<String, Value>) {
+        self.fields
+            .insert("onboardingGrants".to_string(), Value::Object(ledger));
+    }
+
     /// 账号级出网代理配置（缺失返回 Value::Null）
     pub fn proxy(&self) -> Value {
         self.fields.get("proxy").cloned().unwrap_or(Value::Null)

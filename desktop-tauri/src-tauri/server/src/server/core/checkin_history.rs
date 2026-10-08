@@ -74,6 +74,10 @@ pub fn record(summary: &Value, reason: &str) {
         "date": auto_checkin::local_date_key(chrono::Local::now()),
         "reason": reason,
         "succeeded": number("succeeded"),
+        // 活跃保活数（WorkBuddy 国际版）：与 succeeded 分开统计 —— 保活的
+        // 成功不落 checkinAt，台账里也要单独一列，时间线才读得出这一轮
+        // 「国际版那边发生了什么」
+        "active": number("active"),
         "total": number("total"),
         "skipped": number("skipped"),
         "failed": failures.iter().take(5).cloned().collect::<Vec<_>>(),

@@ -56,6 +56,9 @@ fn raccoon_id() -> &'static str {
 /// 身份字段（office_*）的长度上限（源项目 `MAX_IDENTITY_LENGTH`）
 const MAX_IDENTITY_LENGTH: usize = 1024;
 
+/// 新手任务结算台账键的长度上限（任务 key 就两个固定串，这是脏值兜底）
+const MAX_ONBOARDING_KEY_LENGTH: usize = 64;
+
 impl AccountStore {
     // ─── 读：账号记录 ────────────────────────────────────────
 
@@ -497,6 +500,46 @@ impl AccountStore {
     /// 形参改名 `_id`：本函数不再读它，留着原名会有 unused 警告（调用方不受影响）。
     pub(crate) fn protected_from_removal(&self, _id: &str) -> Option<String> {
         None
+    }
+
+    /// 记一批小浣熊新手任务的结算时刻（台账见 [`StoredAccount::onboarding_grants`]）。
+    ///
+    /// 「本轮刚领到」与「探测确认早已发放过」**都该写**：后者意味着这条一次性
+    /// 奖励已经被领掉了（多半是官方客户端或旧版签到链领的），不落台账的话界面
+    /// 每次都显示「待领取」，用户每次都点一遍「领取」，每次拿回同一句
+    /// 「早已发放过」—— 那正是这台账要消灭的多余动作。
+    ///
+    /// 与 `mark_checkin` / `mark_zcode_claim` 同一口径：写盘失败不致命（返回
+    /// bool，上游那边奖励已经结清，调用方最多记一条日志），**不**动 `updatedAt`
+    /// （理由见 `mark_checkin` 的说明）；一次领取写一条记录（两条任务一次探测
+    /// 流程里可能同时结算，分开写会造成两次读-改-写）。键集由
+    /// `raccoon::onboarding` 的任务表定义，这里不做自由 KV，也不校验键名合法性
+    /// （唯一调用方就在那个模块里）；非法键（空白 / 超长）整批拒绝。
+    pub fn mark_onboarding_grant_batch(
+        &self,
+        account_id: &str,
+        entries: &Map<String, Value>,
+    ) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+        for key in entries.keys() {
+            let key = key.trim();
+            if key.is_empty() || key.len() > MAX_ONBOARDING_KEY_LENGTH {
+                return false;
+            }
+        }
+        let guard = self.guard();
+        let Some(mut record) = self.record_by_id(&guard, account_id) else {
+            return false;
+        };
+        let mut ledger = record.onboarding_grants();
+        for (key, at) in entries {
+            ledger.insert(key.trim().to_string(), at.clone());
+        }
+        record.set_onboarding_grants(ledger);
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))
+            .is_ok()
     }
 
     // ─── 公开形态（小浣熊）───────────────────────────────────

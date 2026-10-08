@@ -98,6 +98,18 @@ pub(super) const BILLING_DAILY_CHECKIN: BillingSpec = BillingSpec {
     whitelist_headers: false,
 };
 
+/// WorkBuddy 国际版每日活跃探测端点。
+///
+/// 国际版客户端与国内版的路径不同：参考客户端调用的是**不带 `/v2`** 的
+/// `/billing/meter/checkin-activity-status`（上面那条带 `/v2` 的是国内版签到
+/// 状态在读的），领取端点则沿用同一条 `BILLING_DAILY_CHECKIN`。
+pub(super) const BILLING_ACTIVITY_CHECKIN_STATUS: BillingSpec = BillingSpec {
+    method: "POST",
+    path: "/billing/meter/checkin-activity-status",
+    body: empty_body,
+    whitelist_headers: false,
+};
+
 pub(super) const BILLING_USER_RESOURCE: BillingSpec = BillingSpec {
     method: "POST",
     path: "/v2/billing/meter/get-user-resource",

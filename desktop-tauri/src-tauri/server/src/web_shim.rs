@@ -815,6 +815,11 @@ pub fn shim_js() -> &'static str {
     getAutoCheckin: function () { return call('GET', '/api/auto-checkin'); },
     saveAutoCheckin: function (patch) { return call('POST', '/api/auto-checkin', patch); },
     runAutoCheckinNow: function () { return call('POST', '/api/auto-checkin/run', {}); },
+    // WorkBuddy 国际版日活保活的模型链（与 bridge.rs 的同名方法成对维护）
+    getCheckinKeepalive: function () { return call('GET', '/api/checkin-keepalive'); },
+    saveCheckinKeepalive: function (models) { return call('POST', '/api/checkin-keepalive', { models: models }); },
+    // WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive）
+    runCheckinActivity: function (id, mode) { return call('POST', '/api/checkin-activity', { id: id, mode: mode }); },
     // 签到中心的聚合快照（与 bridge.rs 的同名方法同一路径）
     getCheckinCenter: function () { return call('GET', '/api/checkin-center'); },
 
