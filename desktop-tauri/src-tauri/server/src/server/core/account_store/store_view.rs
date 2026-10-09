@@ -247,7 +247,9 @@ impl AccountStore {
             // 账号字段、桌面端判定、deviceId 语义两地完全一致，
             // 差别只在域名（那是转发与凭证层的事，公开形态不体现）
             self.to_autoclaw_public_account(record)
-        } else if record.provider() == super::QODER_PROVIDER_ID {
+        } else if super::is_qoder_family(&record.provider()) {
+            // 两个地区（`qoder` / `qoder-intl`）共用这一份公开形态：地区由
+            // provider id（兜底 `mode` 字段）派生进 `edition` / `editionLabel`
             self.to_qoder_public_account(record)
         } else if record.provider() == super::codearts_accounts::CODEARTS_PROVIDER_ID {
             self.to_codearts_public_account(record)
@@ -344,6 +346,14 @@ impl AccountStore {
                 fields.insert(
                     "lowBalance".to_string(),
                     low_balance_public(&record.provider(), record.fields().get("lowBalance")),
+                );
+                // 每账号的「限制器」有效规则（余额 / Token 规则列表）：恒为数组 ——
+                // 记录上没有 `limiters` 键（旧版写的记录）时由 lowBalance / provider
+                // 缺省**推导**（见 `limiter::effective_rules`），前端因此不必自带
+                // 推导逻辑，弹窗、徽章与后端选路读到的永远是同一份规则。
+                fields.insert(
+                    "limiters".to_string(),
+                    crate::server::core::limiter::effective_rules_json_in(record.fields()),
                 );
                 Value::Object(fields)
             }

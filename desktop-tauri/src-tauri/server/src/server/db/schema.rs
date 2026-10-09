@@ -126,6 +126,14 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // —— 下次点「升级」会重复导入一遍历史明细。
     "requestsMigrated",
     "dailyMigrated",
+    // 模型用量口径订正的完成标记（request_stats::aggregate 的
+    // `MODEL_UPSTREAM_MARKER`）—— #139 的根因就是这个键漏登记：
+    // 它在 `remap_model_days` 里**直接写库**（与重算同一事务，有意的：
+    // 中断后标记必然没写、下次整批重跑），而 `config::init` 把全库读进内存
+    // 快照发生在那之前 —— 不登记的话，用户改任意一项配置时 `save_raw` 会把
+    // 它当「配置里已删掉的键」清掉，下次启动同一批历史被重算第二遍
+    // （日期键未变时是幂等覆盖、静默；变过日期键就留下重复的聚合行）。
+    "modelUsageUpstreamRemapped",
     // 远程模型清单的持久化缓存（core::providers::catalog_cache）：整份
     // 「各家上次成功拉到的清单」一个键（十份清单挤一个键的理由见那个模块头）。
     // 属于「其它零散状态」——它不是配置项，配置写入绝不能动它。
@@ -206,7 +214,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 退役后查询按账号各自到期触发，一行一账号才能逐条更新、逐条被选路读取
 /// （kv 整份读改写撑不住这个粒度）。旧快照的数据由 `core::usage_records`
 /// 启动时导入，升级后余额列不会变空白。
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -591,6 +599,27 @@ CREATE TABLE IF NOT EXISTS account_usage_records (
 );
 ";
 
+/// 版本 9：给 `requests` 补「按账号 + 时间」的聚合索引。
+///
+/// ── 它服务什么 ──────────────────────────────────────────────
+/// 账号限制器的 **Token 消耗规则**：每条规则问的是「这个账号在当前重置窗口
+/// （对齐自然时间的固定窗口，30 分钟 ~ 24 小时）内一共消耗了多少 Token」——
+/// 一次 `SELECT account_id, SUM(total_tokens) FROM requests
+/// WHERE account_id = ? AND ts >= ?` 的聚合。没有这个索引它只能走
+/// `idx_requests_ts` 全表扫到过滤条件上，限制器的心跳刷新（每 10 秒一轮）
+/// 会把请求明细表整个翻一遍。
+///
+/// 为什么是复合索引 `(account_id, ts)` 而不是只补 `account_id`：窗口过滤
+/// （`ts >= 窗口起点`）要在**同一账号内**做范围扫描，复合索引让聚合变成
+/// 一次有序的范围读；单独的 account_id 索引拿到行号后还得回表逐行比 ts。
+///
+/// 聚合查询的全部调用方：`core::limiter` 的窗口刷新（按 distinct 周期分组
+/// 查）与单账号即时复查（自动禁用判定）。
+const V9_SCHEMA: &str = "
+-- ── requests 补按账号聚合的索引（schema v9）──────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -654,6 +683,8 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         7 => conn.execute_batch(V7_SCHEMA),
         // v8：account_usage_records 每账号余额记录表（取代旧 kv 快照，见 V8_SCHEMA）
         8 => conn.execute_batch(V8_SCHEMA),
+        // v9：requests 补按账号聚合的索引（限制器的 Token 周期消耗聚合，见 V9_SCHEMA）
+        9 => conn.execute_batch(V9_SCHEMA),
         _ => Ok(()),
     }
 }

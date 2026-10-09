@@ -27,7 +27,7 @@
 import { shared, type AccountRecord, type AccountsSnapshot, type ClashSnapshot, type PanelKind } from './accounts-shared'
 import {
   byPriorityOrder, filterCounts, positionMap, providerSummaries, visibleAccounts,
-  type AccountFilter,
+  type AccountFilter, type TokenUsageLookup, type UsageLookup,
 } from './accounts-domain'
 
 /** 弹窗状态：账号设置（单个）/ 批量操作（多选 + 动作），关闭即 null */
@@ -126,17 +126,20 @@ export function findAccount(id: string): AccountRecord | null {
   return allAccounts().find(account => account.id === id) || null
 }
 
-/** 当前可见账号（筛选三维度）与分段计数共用 accounts-domain 的同一份口径 */
-export function visibleList(): AccountRecord[] {
-  return visibleAccounts(allAccounts(), store.filter).slice().sort(byPriorityOrder)
+/** 当前可见账号（筛选三维度）与分段计数共用 accounts-domain 的同一份口径。
+ *  `usageOf`（余额读数查找）与 `tokenUsageOf`（Token 周期消耗读数查找）由调用方
+ *  注入：限流维度把「余额不足已跳过 / Token 限额已跳过」都算进已限流，而两份缓存
+ *  都在 accounts-data（本文件不反向依赖它，避免 store⇄data 成环） */
+export function visibleList(usageOf?: UsageLookup, tokenUsageOf?: TokenUsageLookup): AccountRecord[] {
+  return visibleAccounts(allAccounts(), store.filter, usageOf, tokenUsageOf).slice().sort(byPriorityOrder)
 }
 
 export function providerSummaryList(): Array<{ id: string; label: string; count: number }> {
   return providerSummaries(snapshot())
 }
 
-export function segmentCounts(): Record<string, number> {
-  return filterCounts(allAccounts(), store.filter, providerSummaryList())
+export function segmentCounts(usageOf?: UsageLookup, tokenUsageOf?: TokenUsageLookup): Record<string, number> {
+  return filterCounts(allAccounts(), store.filter, providerSummaryList(), usageOf, tokenUsageOf)
 }
 
 /** 该账号在**全局队列**里的位置（序号与 ↑/↓ 的边界同源） */

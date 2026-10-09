@@ -327,16 +327,27 @@ const CLINE_FREE_PROVIDER: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::ClineFree,
 );
 
+/// CodeArts 的 provider id（缺省「不处理」，真正的缺省限制是 Token 规则，见上）。
+const CODEARTS_PROVIDER: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::CodeArts,
+);
+
 /// 各 provider 缺省的「余额不足处理」档（记录上没有 `lowBalance` 配置时用）。
+///
+/// 这个函数只描述**旧 `lowBalance` 字段**的缺省视图；限制器上线后真正的缺省
+/// 规则（含 CodeArts 的 Token 自然日规则）在 `limiter::default_rules`。
 ///
 /// - **Cline 免费池（`cline-free`）→ `off`（不处理）**：免费池的 credit 长期
 ///   贴着 0 走、用超了还是负数（欠费是常态），跳过档的缺省阈值 1 会把几乎
 ///   整个池从选路里剔掉。免费池能不能用交给上游裁决（真没钱时 402 自会按
 ///   错误处置轮换），不靠余额读数预判。
+/// - **CodeArts（`codearts`）→ `off`**：它的有效缺省限制是一条 Token 自然日
+///   规则（见 `limiter::default_rules`，余额读数常判不出、余额规则形同虚设）；
+///   旧字段表达不了 Token 规则，显示 off 比显示一个不会生效的「跳过」诚实。
 /// - **其余 provider → `skip`（跳过）**：没钱让路、有钱照常、余额回升自动
 ///   恢复，不需要任何人善后（历史缺省，不变）。
 pub fn default_low_balance_mode(provider: &str) -> &'static str {
-    if provider == CLINE_FREE_PROVIDER {
+    if provider == CLINE_FREE_PROVIDER || provider == CODEARTS_PROVIDER {
         "off"
     } else {
         "skip"
@@ -376,59 +387,25 @@ pub fn query_interval_of(account: &Value) -> Option<i64> {
     }
 }
 
-/// 「余额不足自动禁用」档的阈值。仅 `lowBalance.mode == "disable"` 的账号有值
-/// —— **缺省（无配置）不启用禁用**：自动禁用是不自动恢复的硬动作，缺省必须是
-/// 用户显式选过才会发生；缺省档只有软跳过（见 [`balance_blocked`]）。
-/// 阈值非法（非正 / 非有限数）一律 None —— 判不出就放行，不猜。
+/// 「余额不足自动禁用」档的阈值。判定读**限制器的有效规则**（`core::limiter`）：
+/// 记录上有显式 `limiters` 时按其中的余额 disable 规则取最大阈值；没有时按旧
+/// `lowBalance` / provider 缺省推导 —— 与升级前逐字一致。**缺省（推导结果为空）
+/// 不启用禁用**：自动禁用是不自动恢复的硬动作，缺省必须是用户显式选过才会发生。
+/// 阈值非法（非正 / 非有限数）在规则解析层已拦，这里不再重复判。
 pub fn low_balance_disable_threshold(account: &Value) -> Option<f64> {
-    let config = account.get("lowBalance")?;
-    if config.get("mode").and_then(Value::as_str) != Some("disable") {
-        return None;
-    }
-    valid_threshold(config.get("threshold"))
+    crate::server::core::limiter::balance_disable_threshold(account)
 }
 
 /// 账号是否应因「余额不足」在选路时被跳过（软跳过档）。
 ///
-/// 条件：处理方式为 `skip` + 阈值合法 + 内存事实里有这个账号的读数且**严格小于**
-/// 阈值（等于阈值仍可用，与 OmniProxy 同口径）。缺省（无配置）按 provider 区分
-/// （见 [`default_low_balance_mode`]）：Cline 免费池不处理（free 池余额贴 0 是
-/// 常态，跳过会把整个池剔掉），其余 skip、阈值 1。
-/// 判不出的情况 —— 显式 off、无读数、unlimited、账号已删 —— 一律放行：
+/// 判定读**限制器的有效规则**（`core::limiter::balance_skip_blocked`）：任一
+/// 启用的余额 skip 规则满足「最近读数**严格小于**阈值（等于阈值仍可用，与
+/// OmniProxy 同口径）」即拦。缺省（无 `limiters` 键）按旧配置推导：Cline 免费池
+/// 不处理（free 池余额贴 0 是常态，跳过会把整个池剔掉），其余 skip、阈值 1。
+/// 判不出的情况 —— 无读数、unlimited、账号已删 —— 一律放行：
 /// 跳过是对「这个账号此刻没钱」的断言，断言拿不出证据就不能拦请求。
 pub fn balance_blocked(account: &Value, facts: &HashMap<String, BalanceFact>) -> bool {
-    let provider = account.get("provider").and_then(Value::as_str).unwrap_or("");
-    let default_mode = default_low_balance_mode(provider);
-    let (mode, threshold) = match account.get("lowBalance") {
-        // 缺省：Cline 免费池不处理、其余跳过阈值 1（见 default_low_balance_mode）
-        None => (default_mode, DEFAULT_LOW_BALANCE_THRESHOLD),
-        Some(config) => {
-            let mode = config
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or(default_mode);
-            let threshold = valid_threshold(config.get("threshold"))
-                .unwrap_or(DEFAULT_LOW_BALANCE_THRESHOLD);
-            (mode, threshold)
-        }
-    };
-    if mode != "skip" {
-        return false;
-    }
-    let Some(id) = account.get("id").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(fact) = facts.get(id) else {
-        return false;
-    };
-    matches!(fact.remaining, Some(remaining) if remaining < threshold)
-}
-
-/// 阈值的合法性口径：有限且 > 0。DB / JSON 里可能有手工脏值，宁可放行也不猜。
-fn valid_threshold(value: Option<&Value>) -> Option<f64> {
-    value
-        .and_then(Value::as_f64)
-        .filter(|threshold| threshold.is_finite() && *threshold > 0.0)
+    crate::server::core::limiter::balance_skip_blocked(account, facts)
 }
 
 // ─── 旧 kv 快照的一次性迁移 ─────────────────────────────────

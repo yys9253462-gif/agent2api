@@ -124,8 +124,9 @@ pub(super) async fn select_target_account(
         });
     }
 
-    // 余额不足软跳过的候选先剔除（见 `filter_balance_blocked`），三级选择共用
-    let (candidates, balance_blocked_ids) = filter_balance_blocked(&accounts, pinned);
+    // 限制器软跳过的候选先剔除（余额不足 / Token 限额，见 `filter_limiter_blocked`），
+    // 三级选择共用
+    let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, pinned);
 
     // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
     // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
@@ -152,8 +153,8 @@ pub(super) async fn select_target_account(
         .cloned()
         .collect();
     if enabled.is_empty() {
-        // 剔除后一个可试的都没有：先分辨是不是余额不足造成的 —— 那与「全禁用」
-        // 是两件不同的事，用户要做的事也不一样（等余额回升 / 去启用账号）。
+        // 剔除后一个可试的都没有：先分辨是不是限制器拦截造成的 —— 那与「全禁用」
+        // 是两件不同的事，用户要做的事也不一样（等余额回升 / 等窗口重置 / 去启用账号）。
         let enabled_total = accounts
             .iter()
             .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
@@ -162,7 +163,7 @@ pub(super) async fn select_target_account(
             return Err(GatewayError::with_status(
                 503,
                 format!(
-                    "所有启用中的账号余额都低于阈值（已跳过 {} 个账号），无账号可转发：请等余额回升，或到账号设置里调整「余额不足处理」",
+                    "所有启用中的账号都被限制器拦下（已跳过 {} 个账号），无账号可转发：请检查余额读数与 Token 周期用量，或到账号设置的「限制器」里调整规则",
                     balance_blocked_ids.len()
                 ),
             ));
@@ -462,28 +463,30 @@ pub(super) fn pick_next_account(
     pinned: Option<&str>,
 ) -> Option<Value> {
     let accounts = accounts_in_providers(service, providers, pinned);
-    // 换号顺延与第一级选路同一份候选剔除：余额不足的账号不会在 429 之后
+    // 换号顺延与第一级选路同一份候选剔除：被限制器拦下的账号不会在 429 之后
     // 被当作「下一个」重新塞进来
-    let (candidates, _balance_blocked) = filter_balance_blocked(&accounts, pinned);
+    let (candidates, _balance_blocked) = filter_limiter_blocked(&accounts, pinned);
     let counts = connection_counts(service);
     routing::pick_account_by_priority(&candidates, keys, &counts, tried_ids, logging::now_ms())
 }
 
-/// 余额不足软跳过的候选剔除：`lowBalance.mode == "skip"` 且最近读数低于阈值的
-/// 账号在进选路**之前**整体拿掉 —— 三级选择（正常选路 / 兜底等恢复 / 并发挤占）
-/// 共用这一份候选。余额不足与限流不同，是「等不起」的：限流有明确的恢复时间、
-/// 到点自然回来，硬塞一次还能把真实 429 带回来；余额不足硬塞只会吃上游的
-/// 402 / 403，拿不到任何有用的信息。
+/// 限制器软跳过的候选剔除：**余额不足**（限制器余额 skip 规则命中：最近读数
+/// 低于阈值）或 **Token 限额**（Token skip 规则命中：当前重置窗口内消耗已达
+/// 阈值）的账号在进选路**之前**整体拿掉 —— 三级选择（正常选路 / 兜底等恢复 /
+/// 并发挤占）共用这一份候选。两类与限流不同，都是「等不起」或「等了也没用」的：
+/// 限流有明确的恢复时间、到点自然回来，硬塞一次还能把真实 429 带回来；余额不足
+/// 硬塞只会吃上游的 402 / 403，Token 限额硬塞是在跟自己的保护规则对着干。
 ///
-/// 判定读 `usage_records::balance_facts` 的内存事实表（零 IO，纳秒级查表），
-/// 数字是心跳 / 手动查询落库的最新读数 —— 余额回升后下一轮查询会刷新事实，
-/// 账号自动恢复参与，无需任何人手动清理。
+/// 判定全读**内存事实表**（余额：`usage_records::balance_facts`；Token：
+/// `core::limiter::token_facts`，心跳 10 秒全量刷新 + 请求收尾增量记账）——
+/// 零 IO，纳秒级查表。余额回升后下一轮查询刷新事实、Token 窗口翻页后下一轮
+/// 刷新归零，账号自动恢复参与，无需任何人手动清理。
 ///
-/// `pinned`（模型测试）不剔除：测试要的是**那个账号**的真实反应 —— 余额不足时
+/// `pinned`（模型测试）不剔除：测试要的是**那个账号**的真实反应 —— 被限制时
 /// 把上游的拒绝原样带回来，与「限流中的账号仍会被钉住测试」同一取舍。
 /// 返回 `(剔除后的候选, 被剔除的账号 id 集合)`：调用方在「一个可试的都没有」时
-/// 用后者分辨 503 的原因（余额不足 vs 全禁用）。
-fn filter_balance_blocked(
+/// 用后者分辨 503 的原因（限制器拦截 vs 全禁用）。
+fn filter_limiter_blocked(
     accounts: &[Value],
     pinned: Option<&str>,
 ) -> (Vec<Value>, std::collections::HashSet<String>) {
@@ -491,9 +494,14 @@ fn filter_balance_blocked(
         return (accounts.to_vec(), Default::default());
     }
     let facts = crate::server::core::usage_records::balance_facts();
+    let token_facts = crate::server::core::limiter::token_facts();
+    let now = logging::now_ms();
     let blocked_ids: std::collections::HashSet<String> = accounts
         .iter()
-        .filter(|account| crate::server::core::usage_records::balance_blocked(account, &facts))
+        .filter(|account| {
+            crate::server::core::usage_records::balance_blocked(account, &facts)
+                || crate::server::core::limiter::token_skip_blocked(account, &token_facts, now)
+        })
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
     if blocked_ids.is_empty() {

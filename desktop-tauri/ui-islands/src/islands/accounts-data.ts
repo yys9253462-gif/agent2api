@@ -16,7 +16,8 @@
  *                       :811 与 tasks-panel.tsx 的 syncBalancesSnapshot / providers.js:138 render；
  *                       tasks-panel.tsx 的「立即签到一次」还调 refreshUsageAfterCheckin
  *                       —— 那条路径的签到不在账号页里，但积分同样会变，余额得跟着刷
- *   · `wbAccountsModel` app.js:178 isRateLimited / :663 isDesktopAccount / report.js:307
+ *   · `wbAccountsModel` app.js:236 isLimited（顶栏「已限流」计数，含余额不足档）/
+ *                       :663 isDesktopAccount / report.js:307
  *                       editionSuffix / models-fetch-modal.tsx:245 providerFeatures、:255 byPriorityOrder
  *   · `wbAccountPanel`  app.js:623 invalidate / :645 open
  * 注册必须在**模块求值时**完成：app.js 的 refresh() 是异步的（首个 await 之后才轮到渲染），
@@ -29,10 +30,11 @@
 
 import {
   errorMessage, POOL_VALUE_PREFIX, shared, toast,
-  type AccountRecord, type ClashSnapshot, type PanelKind, type PoolItem, type UsageEntry,
+  type AccountRecord, type ClashSnapshot, type PanelKind, type PoolItem,
+  type TokenReading, type UsageEntry,
 } from './accounts-shared'
 import {
-  claimedPlanIdsToday, isDesktopAccount, isEnabled, isRateLimited,
+  claimedPlanIdsToday, isDesktopAccount, isEnabled, isLimitedNow, isRateLimited,
   supportsUsage,
 } from './accounts-domain'
 import * as domain from './accounts-domain'
@@ -110,6 +112,72 @@ export function usageEntryOf(account: AccountRecord): UsageEntry {
   if (!usageFailureOf(entry)) return entry
   const changedAt = Math.max(Number(account.addedAt) || 0, Number(account.updatedAt) || 0)
   return (usageFailureAt.get(account.id) || 0) >= changedAt ? entry : undefined
+}
+
+/* ─── Token 限制器的周期消耗读数（快照轮询带来的窗口读数）───
+ *
+ * 「限制器」的 Token 规则要显示「本周期已用多少 / 什么时候重置」，读数来自
+ * 用量快照的 `tokenUsage` 段（后端 `usage_query::snapshot` 从内存事实表投影，
+ * 心跳 10 秒刷新 + 请求收尾增量记账，前端 20 秒轮询拿到）。与余额缓存分开存：
+ * 余额只在查询到期时变化（`at` 不动 = 没新东西），Token 随每条请求变化，两边
+ * 的「应用过了没」各判各的（见 syncBalancesSnapshot）。
+ */
+
+/** Token 周期消耗读数缓存（账号 id → 启用中的每个周期一条；没配规则 = 空数组） */
+const tokenUsageMap = new Map<string, TokenReading[]>()
+
+/** 最近一次应用的 `tokenAt`（快照里 Token 读数的计算时刻；0 = 还没应用过） */
+let lastTokenAt = 0
+
+/**
+ * Token 周期消耗读数的读入口（状态列 / 余额格 / 弹窗限制器段共用）。
+ * 没有读数（还没轮询到 / 后端没有这个段）返回空数组 —— 判定按 0 算（放行）。
+ */
+export function tokenUsageOf(account: AccountRecord | null | undefined): TokenReading[] {
+  if (!account) return []
+  return tokenUsageMap.get(account.id) || []
+}
+
+/**
+ * 把快照里的 `tokenUsage` 段写进缓存。返回是否有变化（变了才 bump 重绘）。
+ * 行的形状由后端保证（`{period, windowStart, used}`），这里只做容错整形 ——
+ * 脏行丢弃，不让一条坏数据污染整个账号的读数。
+ */
+function applyTokenUsage(
+  snapshot: { tokenAt?: unknown; tokenUsage?: Record<string, unknown> } | null | undefined,
+): boolean {
+  const tokenAt = Number(snapshot?.tokenAt) || 0
+  if (!tokenAt || tokenAt === lastTokenAt) return false
+  const usage = snapshot?.tokenUsage
+  if (!usage || typeof usage !== 'object') return false
+  lastTokenAt = tokenAt
+  const fresh = new Map<string, TokenReading[]>()
+  for (const [id, rows] of Object.entries(usage)) {
+    if (!Array.isArray(rows)) continue
+    const readings: TokenReading[] = []
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue
+      const kind = Number((row as Record<string, unknown>).kind)
+      const windowStart = Number((row as Record<string, unknown>).windowStart)
+      const used = Number((row as Record<string, unknown>).used)
+      if (!Number.isFinite(kind) || kind < 0) continue
+      if (!Number.isFinite(windowStart) || windowStart <= 0) continue
+      if (!Number.isFinite(used) || used < 0) continue
+      readings.push({ kind, windowStart, used })
+    }
+    fresh.set(id, readings)
+  }
+  // 引用比较足够：Map 整体替换，账号数量与每行内容有任一变化就会体现在新对象上
+  const changed = fresh.size !== tokenUsageMap.size
+    || [...fresh].some(([id, readings]) => {
+      const current = tokenUsageMap.get(id)
+      return !current || current.length !== readings.length
+        || readings.some((row, index) => row.used !== current[index]?.used
+          || row.windowStart !== current[index]?.windowStart)
+    })
+  tokenUsageMap.clear()
+  for (const [id, readings] of fresh) tokenUsageMap.set(id, readings)
+  return changed
 }
 
 /* ─── Clash 出口缓存（只剩代理表单的「Clash Verge」档在用）─────
@@ -387,7 +455,13 @@ export function applyBalances(
     putUsage(String(row.id), cacheEntryOf(row), Number(row.at) || at)
     applied++
   }
-  if (applied) bump()
+  if (applied) {
+    bump()
+    // 余额结论会翻转「已限流」归类（余额不足跳过档，isLimitedNow 的口径），顶栏那枚
+    // 计数徽标住在岛外（app.js 渲染）—— 这里顺手重画一次，别让它停在旧数字上
+    // （keys-page 改完自己的徽标也是这么同步顶栏的）
+    shared().wbApp?.renderTopbarStatus?.()
+  }
   return applied
 }
 
@@ -408,11 +482,21 @@ let lastSnapshotAt = 0
 export async function syncBalancesSnapshot(): Promise<boolean> {
   try {
     const data = await shared().workbuddyDesktop?.getBalancesSnapshot?.()
+    // Token 限制器的读数**先于**余额的早退判定应用：余额只在查询到期时变化
+    // （`at` 不动说明没有新结论），而 Token 周期消耗随每条请求变化 —— 先判
+    // 余额的 `at` 就返回会让 Token 读数停在最后一次余额查询那会儿。
+    const tokenApplied = applyTokenUsage(data)
+    if (tokenApplied) {
+      bump()
+      // Token 结论会翻转「已限流」归类（isLimitedNow 的口径），顶栏那枚计数
+      // 徽标住在岛外（app.js 渲染）—— 与余额结论应用后的同步同一形态
+      shared().wbApp?.renderTopbarStatus?.()
+    }
     const at = Number(data?.at) || 0
     // at = 0 表示本进程还没定时查过（刚启动、或任务被关掉）—— 不覆盖已有缓存
-    if (!at || at === lastSnapshotAt) return false
+    if (!at || at === lastSnapshotAt) return tokenApplied
     lastSnapshotAt = at
-    if (!applyBalances(data)) return false
+    if (!applyBalances(data)) return tokenApplied
     return true
   } catch {
     // 静默：下一次轮询自然重试；账号页保持上一轮的结果不变
@@ -724,7 +808,8 @@ export const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__'
  * 领到的是 token 额度：余额列的读数立刻就变了，而那颗按钮的悬停提示也跟着变
  * （后端落的领取台账由重拉账号拿到）。两件事都是本页的 store / 动作
  * （legacy 脚本拿不到），所以脚本只把结果交回来，由这里刷新 ——
- * 与 CodeArts 那条（脚本自己调 `wbApp.refresh()`）不同，是因为这条还得顺带刷余额。
+ * 与 CodeArts 那条不同（它的入口在签到中心，脚本领完自己调 `wbApp.refresh()`），
+ * 是因为这条还得顺带刷本页的余额。
  *
  * `already_claimed` 同样算「已领」：上游说这份套餐已经被领掉了（可能是另一台
  * 设备领的），台账该补上它，否则用户会一直点它、每次拿回同一句话。
@@ -745,16 +830,10 @@ export async function startZcodeClaim(id: string): Promise<void> {
 }
 
 /**
- * CodeArts 的「领福利」：整条流程（只读探测 → 用户确认 → 领取 → 等官方回读）
- * 住在 legacy 脚本 `ui/codearts-welfare.js` 里，这里只把账号对象递过去。
- *
- * 与上面那颗「领套餐」是**两件事**（判据位 `welfare` vs `claim`、本家不要验证码、
- * 端点也不同），所以是另一个全局对象而不是 `wbZcodeClaim` 的一个参数。
- * 台账刷新由那侧负责（它领完自己调 `wbApp.refresh()`）。
+ * CodeArts 的「领福利」入口已整体迁到「签到中心」的活动福利卡（checkin-page.tsx
+ * 直接调 legacy 脚本 `ui/codearts-welfare.js` 的 `wbCodeArtsWelfare.start`），
+ * 账号页不再有这颗按钮 —— 这里不再中转。
  */
-export async function startCodeArtsWelfare(id: string): Promise<void> {
-  await shared().wbCodeArtsWelfare?.start?.(findAccount(id) || undefined)
-}
 
 /* ─── 对外契约（window）────────────────────── */
 
@@ -809,6 +888,8 @@ export type AccountsPanelApi = {
  * 只少了五个**生成 HTML 字符串**的成员（statusTag / accountTags / moreMenuHtml /
  * limitPanelHtml / checkinPanelHtml）—— 它们随表格一起变成了 React 组件，页外无任何
  * 引用（见最终报告）。accountTags 的等价物在域层（返回结构化标签，由视图渲染成 Badge）。
+ * 后补的 `isLimited`（顶栏「已限流」计数从 isRateLimited 换过来）是唯一的加项：
+ * 余额读数缓存在本文件里，域层拿不到 —— 逐字清单只对「迁移时点」负责，口径演进在此处接线。
  */
 type AccountsModelApi = {
   DEFAULT_PROVIDER_ID: string
@@ -825,6 +906,8 @@ type AccountsModelApi = {
   typeLabel: typeof domain.typeLabel
   isEnabled: typeof domain.isEnabled
   isRateLimited: typeof domain.isRateLimited
+  /** 「已限流」的完整口径（isLimitedNow：模型限流或限制器跳过档），余额与 Token 读数由本文件的缓存出 */
+  isLimited: (account: AccountRecord | null | undefined) => boolean
   accountEdition: typeof domain.accountEdition
   supportsClaim: typeof domain.supportsClaim
   matchProvider: typeof domain.matchProvider
@@ -865,6 +948,11 @@ const ACCOUNTS_MODEL_API: AccountsModelApi = {
   typeLabel: domain.typeLabel,
   isEnabled: domain.isEnabled,
   isRateLimited: domain.isRateLimited,
+  isLimited: account => isLimitedNow(
+    account,
+    account ? usageEntryOf(account) : undefined,
+    tokenUsageOf(account),
+  ),
   accountEdition: domain.accountEdition,
   supportsClaim: domain.supportsClaim,
   matchProvider: domain.matchProvider,

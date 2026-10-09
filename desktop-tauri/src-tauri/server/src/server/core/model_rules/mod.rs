@@ -1299,8 +1299,8 @@ pub const QODER_DEFAULT_ENABLED: &[&str] = &["Qwen3.8-Flash"];
 /// 目录从上游拉回来时），以及编排入口对**当前缓存清单**的补种（见
 /// `providers::adapter` 的 `seed_current_qoder_defaults` —— 覆盖「有账号但远程
 /// 刷新失败，手里只有静态兜底清单」与升级用户首次打开管理页的情形）。
-pub fn seed_qoder_defaults(ids: &[String]) -> Option<String> {
-    seed_default_enabled("qoder", "Qoder", QODER_DEFAULT_ENABLED, ids)
+pub fn seed_qoder_defaults(provider: &str, label: &str, ids: &[String]) -> Option<String> {
+    seed_default_enabled(provider, label, QODER_DEFAULT_ENABLED, ids)
 }
 
 /// 「默认启用白名单」种子的公共实现（WorkBuddy 与 Qoder 共用）。

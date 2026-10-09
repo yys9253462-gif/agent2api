@@ -81,8 +81,11 @@ export type CheckinCenterSnapshot = {
     todayEligible: number
   }
   extras: {
-    onboarding: Array<{ id: string; name: string; provider?: string }>
-    welfare: Array<{ id: string; name: string; provider?: string }>
+    /** 新手任务行；`settled` 是后端的一次性福利结算记忆（已结清才非空） */
+    onboarding: Array<{ id: string; name: string; provider?: string; settled?: OnboardingSettledRaw }>
+    /** CodeArts 福利行：`welfare` 是后端落盘的本地领取台账（day/accepted/…，原样透传），
+     *  「已领取」标记按它判（见 accounts-domain 的 welfareStateOf） */
+    welfare: Array<{ id: string; name: string; provider?: string; welfare?: unknown }>
     plans: Array<{ id: string; name: string; provider?: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
   }
   auto: AutoCheckinState
@@ -91,7 +94,19 @@ export type CheckinCenterSnapshot = {
   history: CheckinHistoryEntry[]
 }
 
-/** 一个新手任务账号的任务缓存（Loomy / 小浣熊；status: idle = 还没查过） */
+/**
+ * 后端的一次性福利**结算记忆**（`settled` / `settledAt` / 快照行上的 `settled` 对象）：
+ * 一次性福利全部领完那一刻落盘，之后查询零上游、恒是「已领完」这个结论
+ * （见 server 的 `core::providers::onboarding_memory`）。
+ */
+export type OnboardingSettledRaw = {
+  at?: unknown
+  tasks?: unknown
+  earned?: unknown
+  total?: unknown
+}
+
+/** 一个新手任务账号的任务缓存（Loomy / 小浣熊 / CodeArts；status: idle = 还没查过） */
 export type OnboardingCache = {
   status: 'idle' | 'loading' | 'loaded' | 'error'
   error?: string
@@ -101,6 +116,14 @@ export type OnboardingCache = {
   earned: number
   total: number
   claiming: boolean
+  /**
+   * 这份结果来自**结算记忆**（后端已确认这条一次性福利领完）：进页面直接用
+   * 快照渲染，不必再查上游；「查询任务」按钮仍可强制实查（`refresh`）。
+   * 记忆路径不写 `checkedAt`（那是「查询于」，记忆是「结算于」，见 `settledAt`）。
+   */
+  settled?: boolean
+  /** 结算时刻（后端记忆里的 `at`；仅 `settled` 时有） */
+  settledAt?: number
 }
 
 /* ─── 本岛用到的桥（在 accounts-shared 的 AccountsBridge 之上补签到两组）─── */
@@ -121,11 +144,13 @@ type CheckinBridge = {
     active?: number
     total?: number
   } | null | undefined>
-  getOnboardingTasks?(id: string): Promise<{
+  getOnboardingTasks?(id: string, refresh?: boolean): Promise<{
     tasks?: OnboardingTaskRaw[]
     earned?: unknown
     total?: unknown
     unclaimed?: unknown
+    settled?: unknown
+    settledAt?: unknown
   } | null | undefined>
   claimOnboardingTasks?(id: string): Promise<{
     results?: Array<Record<string, unknown>>
@@ -133,6 +158,8 @@ type CheckinBridge = {
     earned?: unknown
     total?: unknown
     unclaimed?: unknown
+    settled?: unknown
+    settledAt?: unknown
   } | null | undefined>
 }
 
@@ -223,6 +250,7 @@ function normalizeTask(raw: OnboardingTaskRaw): OnboardingTask | null {
     group: typeof raw.group === 'string' && raw.group ? raw.group : '',
     points: Number(raw.points) || 0,
     done: raw.done === true,
+    blocked: raw.blocked === true,
   }
 }
 
@@ -254,8 +282,45 @@ export async function loadCheckinCenter(): Promise<void> {
       autoTimeDraft: null,
       keepaliveDraft: null,
     })
+    // 快照带回了结算记忆 ⇒ 直接用它铺缓存，页面不必为已领完的账号再查一次上游
+    seedSettledCaches(data.extras?.onboarding ?? [])
   } catch (error) {
     patch({ loaded: true, loadError: errorMessage(error) })
+  }
+}
+
+/**
+ * 用快照里的结算记忆铺新手任务缓存（`settled` 非空的那些账号）。
+ *
+ * ── 为什么直接铺而不是「查一次再确认」───────────────────────
+ * 记忆本身就是后端的结论（一次性福利已全部领完，见 onboardingSettled 的说明），
+ * 再问一次上游只会得到同一个答案。这也是本功能的初衷：进页面不该为一条早就
+ * 领完的福利反复查询。用户想实查仍可点「查询任务」（`refresh`），那时记忆若与
+ * 上游不符会被后端覆盖 —— 铺在这里的只是当前这份快照。
+ *
+ * 界面这边**刚实查过、且查出了待领项**的账号不动：那说明记忆已被后端清掉
+ * （上游出了新一期活动），只是手上这份快照还是旧的。
+ */
+function seedSettledCaches(rows: Array<{ id: string; settled?: OnboardingSettledRaw }>): void {
+  for (const row of rows) {
+    const memory = row.settled
+    if (!memory || typeof memory !== 'object') continue
+    const current = store.onboarding.get(row.id)
+    if (current?.status === 'loaded' && current.unclaimed > 0) continue
+    const tasks = normalizeTasks(memory.tasks)
+    const at = numberOf(memory.at)
+    patchOnboarding(row.id, {
+      status: 'loaded',
+      error: undefined,
+      // 记忆不是「查询」来的：checkedAt 留空，界面按 settledAt 显示「结算于」
+      checkedAt: undefined,
+      settled: true,
+      settledAt: at > 0 ? at : undefined,
+      tasks,
+      unclaimed: 0,
+      earned: numberOf(memory.earned),
+      total: numberOf(memory.total),
+    })
   }
 }
 
@@ -377,7 +442,7 @@ export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | '
     patch({ signing: rest })
     await loadCheckinCenter()
     // 只处理刚签的这个账号：从快照的新手任务清单里过滤，账号不在清单里则数组为空
-    // （清单由后端按 provider 组装：Loomy / 小浣熊，别的家不发无意义的查询）
+    // （清单由后端按 provider 组装：Loomy / 小浣熊 / CodeArts，别的家不发无意义的查询）
     const onboardingRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
       .filter(row => row.id === id)
     void autoProcessOnboarding(onboardingRows)
@@ -485,20 +550,41 @@ export async function submitKeepaliveModels(value: string): Promise<void> {
  * 全部领完后查询结果 unclaimed=0，之后签到就只是签到。逐账号串行
  * （与签到同一条防风控口径），单账号查询失败不拖累其它账号。
  *
+ * ── CodeArts 为什么也在自动补领里 ──────────────────────────
+ * 它的新手任务只有「新人注册礼」这一条，且是**一次性**的：领过一次之后上游就
+ * 不再回 `claimable`，于是下一轮查询的 `unclaimed=0`，之后每次签到都只是签到
+ * —— 自动补领在这里只会发一次写请求，与 Loomy 同构。
+ * 边界仍然留着：本家**不进** `auto_checkin` 的提供商清单（那是后端的定时任务，
+ * 无人看守），这里的"自动"只发生在用户刚点过签到之后。另外两类一次性活动
+ * （学生认证 / 邀请礼）连入口都没有，判据见 `Campaign::is_newbie_gift`。
+ *
  * `rows` 传快照的 `extras.onboarding`（全部支持新手任务的账号）；单账号签到时
  * 传只含该账号的数组（用户点的是谁就处理谁）。领取完成后 claimOnboarding
  * 内部会重拉快照，「待领新手任务」总览卡随之归零。
+ *
+ * ── 已结算的账号跳过 ────────────────────────────────────────
+ * 快照带结算记忆、或缓存里 `settled` 已置位的账号**不发查询**（这正是本功能
+ * 要消灭的那次多余上游请求）；真出了新一期活动，用户手点「查询任务」时会被
+ * 实查发现（`refresh`），后端届时也会清掉记忆。
  */
-async function autoProcessOnboarding(rows: Array<{ id: string }>): Promise<void> {
+async function autoProcessOnboarding(
+  rows: Array<{ id: string; settled?: OnboardingSettledRaw }>,
+): Promise<void> {
   for (const row of rows) {
+    if (settledOf(row.id)) continue
     await queryOnboarding(row.id)
   }
   for (const row of rows) {
     const cache = getCheckinStore().onboarding.get(row.id)
-    if (cache?.status === 'loaded' && cache.unclaimed > 0 && !cache.claiming) {
+    if (cache?.status === 'loaded' && cache.unclaimed > 0 && !cache.claiming && !cache.settled) {
       await claimOnboarding(row.id)
     }
   }
+}
+
+/** 这个账号的一次性福利是否已结算（缓存里的 `settled`；铺缓存见 `seedSettledCaches`） */
+function settledOf(id: string): boolean {
+  return store.onboarding.get(id)?.settled === true
 }
 
 function onboardingOf(id: string): OnboardingCache {
@@ -519,27 +605,39 @@ function patchOnboarding(id: string, next: Partial<OnboardingCache>): void {
  * `expand: true`（界面上点「查询任务」）在查到任务后**默认展开**清单 ——
  * 查询这个动作本身就是「我要看」，让它多付一次点击才能看到结果是反的；
  * 签到后的自动处理不展开（autoProcessOnboarding），不让后台动作替用户动界面。
+ *
+ * `refresh: true`（只有界面上点「查询任务」才传）要求后端**实查上游**：一次性
+ * 福利结算过之后后端默认吃记忆（零上游），手点那颗按钮的语义就是「我不信缓存，
+ * 现在去问一次」—— 上游真出了新一期活动，这一次就会看到，后端也会同步清掉记忆。
  */
-export async function queryOnboarding(id: string, options?: { expand?: boolean }): Promise<void> {
+export async function queryOnboarding(
+  id: string,
+  options?: { expand?: boolean; refresh?: boolean },
+): Promise<void> {
   const current = onboardingOf(id)
   if (current.status === 'loading' || current.claiming) return
-  patchOnboarding(id, { status: 'loading', error: undefined })
+  patchOnboarding(id, { status: 'loading', error: undefined, settled: false })
   try {
-    const data = await bridge().getOnboardingTasks?.(id)
+    const data = await bridge().getOnboardingTasks?.(id, options?.refresh === true)
     const tasks = normalizeTasks(data?.tasks)
+    const settled = data?.settled === true
     patchOnboarding(id, {
       status: 'loaded',
       checkedAt: Date.now(),
       tasks,
-      unclaimed: tasks.filter(task => !task.done).length,
+      // blocked（前置没满足，如 CodeArts 新人礼未到门槛）不算待领：把它们计入
+      // 待领数会让「一键领取（N）」承诺一件点成失败的事，而一次性的东西失败不起
+      unclaimed: tasks.filter(task => !task.done && !task.blocked).length,
       earned: numberOf(data?.earned),
       total: numberOf(data?.total),
+      settled,
+      settledAt: settled ? numberOf(data?.settledAt) || undefined : undefined,
     })
     if (options?.expand === true && tasks.length > 0 && !onboardingExpanded(id)) {
       toggleOnboardingExpand(id)
     }
   } catch (error) {
-    patchOnboarding(id, { status: 'error', error: errorMessage(error) })
+    patchOnboarding(id, { status: 'error', error: errorMessage(error), settled: false })
   }
 }
 
@@ -573,13 +671,18 @@ export async function claimOnboarding(id: string): Promise<void> {
       error: failedKeys.get(task.key),
     }))
     const claimedCount = merged.filter(task => task.done && !failedKeys.has(task.key)).length
+    // 后端在这一轮把一次性福利结清了（响应带 settled）⇒ 本地也置位：此后进页面
+    // 直接用记忆渲染，不再为这个账号发查询（要实查仍可手点「查询任务」）。
+    const settled = data?.settled === true
     patchOnboarding(id, {
       claiming: false,
       checkedAt: Date.now(),
       tasks: merged,
-      unclaimed: merged.filter(task => !task.done).length,
+      unclaimed: merged.filter(task => !task.done && !task.blocked).length,
       earned: numberOf(data?.earned),
       total: numberOf(data?.total),
+      settled,
+      settledAt: settled ? numberOf(data?.settledAt) || undefined : undefined,
     })
     const failed = merged.filter(task => task.error && !task.done).length
     if (failed) {

@@ -212,6 +212,25 @@ pub struct ForwardRequest {
     /// 它没有「账号被禁用 / 已被删除时换一个」的兜底语义（见
     /// `rotate::accounts_in_providers` 的说明）。
     pub pinned_account: Option<String>,
+    /// **跳过按模型路由的启停门禁**，候选提供商直接取 [`Self::allowed_providers`]
+    /// 白名单（目前也是模型测试的专用开关，与 `pinned_account` 同一调用方）。
+    ///
+    /// ── 为什么要有它 ─────────────────────────────────────────
+    /// 模型管理页那颗「测试」的用法是「先测通、再决定要不要启用」：被测的行
+    /// 往往就是关着的。生产链路上「承载家全被关闭」的模型以 404
+    /// 「模型已在网关中关闭」拒之门外（`route_for_forward` 不回落默认家），
+    /// 那道门对测试是把被测对象挡在门外 —— 测试已经把家与账号都钉死了，
+    /// 它问的正是「这一家、这个账号、这个名字现在通不通」，路由门禁在语义上
+    /// 不参与这个问题。
+    ///
+    /// 发送侧的按家改写**照常生效**：关闭的默认绑定解析不出目标（
+    /// `builtin_target` 要求启用），回落成「名字原样直发」—— 这正是测试要的
+    /// 形态（目录里的原始 ID 发给被钉住的那家），思考等级也因此不注入，
+    /// 与「映射关闭 = 这条别名不存在」的生产语义一致。
+    ///
+    /// 生产链路一律传 `false`；白名单为空（未限制）时本标记给不出候选链，
+    /// 会走「没有可用的提供商」—— 唯一调用方恒带 `provider_only`，不会触发。
+    pub ignore_model_gate: bool,
 }
 
 /// 转发结果：要么是可直接下发的流，要么是聚合好的 JSON
@@ -348,6 +367,8 @@ impl UpstreamService {
             prompt,
             key_scope: key_scope.as_ref(),
             pinned_account: pinned_account.as_deref(),
+            // bool 是 Copy，直接读：不存在上面那两条的借用问题
+            ignore_model_gate: request.ignore_model_gate,
         };
         provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await
     }

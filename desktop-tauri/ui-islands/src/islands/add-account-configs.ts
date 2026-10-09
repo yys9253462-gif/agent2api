@@ -203,33 +203,44 @@ const AUTOCLAW_INTL: ProviderConfig = {
   desktopWindowsOnly: true,
 }
 
-/** Qoder：没有「桌面端实时登录态」可导入，因此不生成那一段 */
-const QODER: ProviderConfig = {
-  provider: 'qoder',
-  label: 'Qoder',
-  desktop: false,
-  regionOptions: [
-    { value: 'global', label: '国际版' },
-    { value: 'cn', label: '中国版' },
-  ],
-  webLogin: {
-    // 国际版 / 中国版都有网页登录：两站是同一套 PKCE 设备授权协议，只有站点主机不同。
-    // 因此不设 region 限制 —— 地区分段切到哪一站，这段就登录哪一站。
-    noteHtml: '打开官方授权页完成设备码授权，登录的是「地区」所选那一站的账号。',
-    button: '打开 Qoder 网页登录',
-    busyText: '等待 Qoder 授权完成…',
-    modes: [
-      { value: 'embedded', label: '内嵌窗口（推荐）', hint: '内嵌窗口用全新环境，多账号互不影响；关窗即取消等待' },
-      { value: 'external', label: '系统浏览器', hint: '系统浏览器打开（复用已登录账号）；完成后自动加入列表' },
+/**
+ * Qoder 两个地区（中国版 / 国际版）：同一套设备授权协议，只有站点主机不同。
+ *
+ * 为什么不是一个配置带一个「地区」下拉（拆家，2026-10）：与 AutoClaw / Accio /
+ * ZCode 同一思路 —— 地区是 **provider 身份**而不是账号属性。拆家前两地区账号
+ * 混在一个「模型来源」下拉里、一次「获取模型」只能刷到队首账号所属地区的目录；
+ * 按两家建模后各自有独立的账号、清单与启停（除 id / 标签 / 文案外同构）。
+ */
+function qoderForm(spec: { provider: string; label: string; siteNote: string }): ProviderConfig {
+  const { provider, label, siteNote } = spec
+  return {
+    provider,
+    label,
+    desktop: false,
+    // 地区写死在 provider 身份里（后端按 provider id 反查），不再走地区分段
+    webLogin: {
+      // 两站是同一套 PKCE 设备授权协议，只有站点主机不同；edition 由 provider
+      // 身份决定（后端按 provider id 反查地区，请求里的 edition 只是回显字段）
+      noteHtml: `打开官方授权页完成设备码授权，登录的是${label}（${siteNote}）的账号。`,
+      button: '打开 Qoder 网页登录',
+      busyText: '等待 Qoder 授权完成…',
+      edition: provider === 'qoder' ? 'cn' : 'global',
+      modes: [
+        { value: 'embedded', label: '内嵌窗口（推荐）', hint: '内嵌窗口用全新环境，多账号互不影响；关窗即取消等待' },
+        { value: 'external', label: '系统浏览器', hint: '系统浏览器打开（复用已登录账号）；完成后自动加入列表' },
+      ],
+    },
+    manualTitle: '使用个人访问令牌（PAT）',
+    manualNote: `在${label}的 Qoder 账号设置 → Integrations 生成 PAT（别填 Google / GitHub 的令牌）。两个地区的账号与凭证不通用。`,
+    fields: [
+      { key: 'pat', label: 'Qoder PAT', rows: 3, placeholder: '粘贴 Qoder 个人访问令牌（pt-…）' },
+      { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空使用账号昵称或邮箱' },
     ],
-  },
-  manualTitle: '使用个人访问令牌（PAT）',
-  manualNote: '在 Qoder 账号设置 → Integrations 生成 PAT（别填 Google / GitHub 的令牌）。',
-  fields: [
-    { key: 'pat', label: 'Qoder PAT', rows: 3, placeholder: '粘贴 Qoder 个人访问令牌（pt-…）' },
-    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空使用账号昵称或邮箱' },
-  ],
+  }
 }
+
+const QODER = qoderForm({ provider: 'qoder', label: '中国版', siteNote: 'qoder.com.cn' })
+const QODER_INTL = qoderForm({ provider: 'qoder-intl', label: '国际版', siteNote: 'qoder.com' })
 
 /**
  * Cline 是两个提供商（Cline Free / Cline Pass）。
@@ -562,7 +573,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   CATPAW,
   AUTOCLAW,
   AUTOCLAW_INTL,
+  // Qoder 两个地区相邻（拆家后是两家 provider，与 AutoClaw / Accio / ZCode
+  // 同一理由）：中国版在前，与存量账号的归属一致
   QODER,
+  QODER_INTL,
   // Cline 顺序即界面上「提供商」分段的顺序：免费池在前（无门槛，更常用）
   clineForm({ provider: 'cline-free', label: 'Cline Free', poolNote: '（免费额度池，模型名带 cline-free/ 前缀）。' }),
   clineForm({ provider: 'cline-pass', label: 'Cline Pass', poolNote: '（订阅池，模型名带 cline-pass/ 前缀，需要账号有对应订阅）。' }),

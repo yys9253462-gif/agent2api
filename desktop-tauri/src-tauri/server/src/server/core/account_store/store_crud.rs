@@ -48,6 +48,7 @@ use crate::server::core::account_store::store_util::{
 };
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
+use crate::server::core::limiter;
 use crate::server::core::providers::DEFAULT_PROVIDER_ID;
 use crate::server::core::proxies::describe_account_proxy;
 use crate::server::logging;
@@ -727,6 +728,10 @@ impl AccountStore {
             // 缺省档按 provider 区分（Cline 免费池不处理，其余跳过阈值 1，
             // 见 usage_records::default_low_balance_mode），比较基准同源 ——
             // 对着缺省值保存不会凭空多一条变更日志、不会物化进记录。
+            //
+            // 限制器上线后这只是**兼容入口**（旧版前端 / 手工 API 调用还在用）：
+            // 新界面只发 `limiters`；同一请求里两个键都出现时，下面 limiters
+            // 块会按规则列表重写 lowBalance（限制器是源真值，见那里的说明）。
             let provider = record.provider();
             let next = Self::normalize_low_balance(value, &provider)?;
             let current = Self::normalize_low_balance_lenient(record.get("lowBalance"), &provider);
@@ -736,7 +741,44 @@ impl AccountStore {
             }
         }
 
+        if let Some(value) = patch.get("limiters") {
+            // 每账号的「限制器」（余额 / Token 规则列表，源真值）：界面每次保存
+            // 都整块发回，与 usageQuery 同一形态。写入侧归一化校验（校验即权威），
+            // 比较基准 = 有效规则（记录上没有 limiters 键时由旧 lowBalance /
+            // provider 缺省推导）—— 对着现状保存不会凭空多一条变更日志。
+            //
+            // ── 顺手同步 lowBalance（降级兼容）───────────────────
+            // 首条余额规则回写成旧的 {mode, threshold}，没有余额规则就写 off：
+            // 用户降级回旧版本时余额限制不丢（Token 规则旧版不认识，忽略即可，
+            // 多条余额规则只保首条 —— 旧形状本来就表达不了第二条）。
+            let next_rules = limiter::normalize_rules(value, record.fields())
+                .map_err(AccountStoreError::bad_request)?;
+            let next = limiter::rules_to_json(&next_rules);
+            let current = limiter::effective_rules_json_in(record.fields());
+            if next != current {
+                record.set("limiters", next);
+                changes.push(limiter::describe_rules(&next_rules));
+                record.set("lowBalance", Self::legacy_low_balance_of(&next_rules));
+            }
+        }
+
         Ok(changes)
+    }
+
+    /// 规则列表 → 旧 `lowBalance` 形状（降级兼容的同步目标）：首条余额规则的
+    /// (action, threshold)，没有余额规则 = off（阈值归零，与旧 off 形态一致）。
+    fn legacy_low_balance_of(rules: &[limiter::LimiterRule]) -> Value {
+        let Some(rule) = rules
+            .iter()
+            .find(|rule| rule.kind == limiter::LimiterKind::Balance)
+        else {
+            return json!({ "mode": "off", "threshold": 0.0 });
+        };
+        let mode = match rule.action {
+            limiter::LimiterAction::Skip => "skip",
+            limiter::LimiterAction::Disable => "disable",
+        };
+        json!({ "mode": mode, "threshold": rule.threshold })
     }
 
     /// `usageQuery` 的写入侧归一化（校验即权威：读侧只做容错展开，见 store_view）。

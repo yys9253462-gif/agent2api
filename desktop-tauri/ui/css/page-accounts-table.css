@@ -626,6 +626,253 @@
 .usage-pool-view.ok { color: var(--ok); font-weight: 600; }
 .usage-pool-view.warn { color: var(--warn); font-weight: 600; }
 
+/* ─── 余额列：套餐徽标 + 明细弹层的两行形态（usageDetail 能力位，CodeArts）───
+   第一行是套餐徽标（试用版 / 免费版 —— 两个权益不同的账号第一眼就能分开），
+   第二行「可用 N 积分」可点击，点开逐项读数（样式在下面的 .usage-pop 一组）。
+   交互对齐 ⋯ 菜单：点开、点外关闭、Esc 收起（组件库 Popover 负责）。
+   悬停提示仍是 summary.title 那份单行摘要，弹层是「要看构成」时的入口。 */
+.usage-cell { display: block; min-width: 0; font-variant-numeric: tabular-nums; }
+
+.usage-plan {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  min-width: 0;
+}
+
+.plan-chip {
+  flex: none;
+  font-size: 10.5px;
+  line-height: 1;
+  font-weight: 600;
+  padding: 3px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--primary-bd);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+  white-space: nowrap;
+}
+
+/* 免费版没有付费套餐，徽标走中性灰 —— 不让它看起来像一份「更好的套餐」 */
+.plan-chip.free {
+  border-color: var(--border-strong);
+  background: var(--control-bg);
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.plan-sub {
+  font-size: 10.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 读数按钮：整行可点（那格本来就是「一眼看出还剩多少」，加一个点击态不换语义），
+   视觉上与 .usage-sum 同字号同色，只加一个 caret 提示「点开还有明细」 */
+.usage-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: calc(100% + 16px);
+  margin: 0 -8px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  background: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.usage-toggle:hover { background: var(--row-hover); border-color: var(--hairline); }
+.usage-toggle .val {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.usage-toggle .caret {
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: 9px;
+  line-height: 1;
+  transition: transform 0.15s;
+  flex: none;
+}
+.usage-toggle.ok .val { color: var(--ok); font-weight: 600; }
+.usage-toggle.warn .val { color: var(--warn); font-weight: 600; }
+.usage-toggle.bad .val { color: var(--danger); }
+.usage-toggle.muted .val { color: var(--text-3); }
+.usage-cell.open .usage-toggle { background: var(--primary-soft); border-color: var(--primary-bd); }
+.usage-cell.open .usage-toggle .caret { transform: rotate(180deg); }
+
+/* ── token 组的平铺行（对话 token / 福利模型日额度）───
+   这两行是「这账号现在能不能跑」的直接标志，直接住在余额格里不折叠；
+   积分类的构成才进弹层。标签短名（福利模型日额度 → 福利日额度），
+   读数万/亿缩写（3541691 → 354 万），原值都在悬停 title。
+   条与积分明细同款：6px 胶囊、画**剩余**比例、超额整条走红 ——
+   但只在**真总量**（allowance > 1）时画，无上限 / 占位包不画。 */
+.usage-flat-line {
+  display: block;
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.usage-flat-head {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.usage-flat-name {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.usage-flat-view {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-flat-view.ok { color: var(--ok); font-weight: 600; }
+.usage-flat-view.warn { color: var(--warn); font-weight: 600; }
+.usage-flat-view.bad { color: var(--danger); font-weight: 600; }
+.usage-flat-view.muted { color: var(--text-3); }
+
+.usage-flat-track {
+  display: block;
+  height: 5px;
+  margin-top: 3px;
+  border-radius: 999px;
+  background: var(--surface-inset);
+  overflow: hidden;
+}
+.usage-flat-track i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+}
+.usage-flat-track.over i { background: var(--danger); }
+
+/* ─── 余额明细弹层的内容（portal 渲染，样式挂在 PopoverContent 上）───
+   结构照原型 prototype/codearts-balance.html：两组（积分 / token 额度）、
+   每行「名称 + 读数 (+ 剩余进度条)」、可选合计行。长解释只在悬停 title，
+   界面上不放句子 —— 弹层本来就是扫一眼的。 */
+.usage-pop { padding: 10px 14px 12px; gap: 0; }
+
+.usage-pop-missing {
+  margin: 0 0 8px;
+  padding: 6px 9px;
+  border-radius: var(--r-xs);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-bd);
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 弹层的兜底行：没有积分类读数的账号（免费版额度全在福利 token 池）——
+   一句中性说明，别渲染成一个空框让人怀疑是故障 */
+.usage-pop-empty {
+  padding: 8px 0 2px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+.usage-pop-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 2px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.usage-pop-group::after { content: ""; flex: 1; height: 1px; background: var(--hairline); }
+.usage-pop-group:first-child { margin-top: 0; }
+
+.usage-pop-row { padding: 7px 0; }
+.usage-pop-row + .usage-pop-row { border-top: 1px dashed var(--hairline); }
+
+.usage-pop-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.usage-pop-name {
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-pop-view {
+  margin-left: auto;
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.usage-pop-view.ok { color: var(--ok); }
+.usage-pop-view.warn { color: var(--warn); }
+.usage-pop-view.bad { color: var(--danger); }
+.usage-pop-view.muted { color: var(--text-3); font-weight: 500; }
+
+/* 剩余进度条：6px 胶囊、轨道 surface-inset；画的是**剩余**比例（与 usage-pool 同向）。
+   超额整条走红 —— 画不满的「剩余 0%」读起来像「没用过」，与事实相反。 */
+.usage-pop-track {
+  display: block;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: var(--surface-inset);
+  overflow: hidden;
+}
+.usage-pop-track i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+}
+.usage-pop-track.over i { background: var(--danger); }
+
+.usage-pop-total {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 11px;
+  border-radius: var(--r-xs);
+  background: var(--surface-inset);
+}
+.usage-pop-total .k { font-size: 11.5px; color: var(--text-3); }
+.usage-pop-total .v {
+  margin-left: auto;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--ok);
+  font-variant-numeric: tabular-nums;
+}
+.usage-pop-total .v small { font-size: 11px; font-weight: 500; color: var(--text-3); }
+
 /* ─── 操作列 ─── */
 
 /* 定位祖先：⋯ 菜单挂在它下面（菜单仍是「点击才插入 DOM」，见 accounts-view.js） */

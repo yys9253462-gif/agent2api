@@ -159,13 +159,9 @@ pub(crate) const AUTOCLAW_INTL_PROVIDER_ID: &str = crate::server::core::provider
 /// [`RACCOON_PROVIDER_ID`] 的口径）。Qoder 的账号形态与推理转发见
 /// `qoder_accounts.rs` 与 `providers::qoder` 的模块头。
 /// Trae provider id（账号存储内部多处要用；**从注册表推导**，同
-/// [`QODER_PROVIDER_ID`] 的口径）。账号形态见 `trae_accounts.rs`。
+/// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `trae_accounts.rs`。
 pub(crate) const TRAE_PROVIDER_ID: &str =
     crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Trae);
-
-pub(crate) const QODER_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
-    crate::server::core::providers::ProviderKind::Qoder,
-);
 
 /// Loomy（讯飞）provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`TRAE_PROVIDER_ID`] 的口径）。账号形态见 `loomy_accounts.rs`。
@@ -225,6 +221,17 @@ pub(crate) fn is_accio_family(provider_id: &str) -> bool {
 /// （那种写法对国际版恒为假，是个不会报错的静默失配）。
 pub(crate) fn is_zcode_family(provider_id: &str) -> bool {
     crate::server::core::providers::zcode::region::Region::from_provider_id(provider_id).is_some()
+}
+
+/// 这个 provider 是不是 **Qoder 系**（`qoder` 中国版 / `qoder-intl` 国际版）。
+///
+/// 与 [`is_accio_family`] / [`is_zcode_family`] 同一形态、同一理由：账号层有
+/// 几处判断只关心「是不是 Qoder」（公开形态、身份字段），不关心哪个地区 ——
+/// 那些分支走本函数，于是加地区或改名时只改这里一处，而不是散在各文件里的
+/// `id == "qoder"`（那种写法对国际版恒为假，是个不会报错的静默失配）。
+pub(crate) fn is_qoder_family(provider_id: &str) -> bool {
+    crate::server::core::providers::qoder::endpoints::Region::from_provider_id(provider_id)
+        .is_some()
 }
 
 /// 小浣熊 provider id（账号存储内部多处要用）。

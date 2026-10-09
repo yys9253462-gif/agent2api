@@ -71,7 +71,9 @@ pub fn record(summary: &Value, reason: &str) {
     let now_ms = logging::now_ms();
     let entry = json!({
         "at": now_ms,
-        "date": auto_checkin::local_date_key(chrono::Local::now()),
+        // 日期键按北京时间（上游自然日口径，见 core::beijing）：台账的
+        // 「今天」与签到的「今天」必须是同一天，否则海外部署下时间线会错位
+        "date": auto_checkin::today_key(),
         "reason": reason,
         "succeeded": number("succeeded"),
         // 活跃保活数（WorkBuddy 国际版）：与 succeeded 分开统计 —— 保活的

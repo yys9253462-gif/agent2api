@@ -118,6 +118,7 @@ pub mod content_block;
 pub mod custom;
 pub mod kuku;
 pub mod loomy;
+pub mod onboarding_memory;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -198,12 +199,25 @@ pub enum ProviderKind {
     /// 的互查在 `autoclaw::region::Region`（`kind` / `provider_id` /
     /// `from_provider_id`），别处不要再写 `"autoclaw-intl"` 这类字面量。
     AutoClawIntl,
-    /// Qoder。适配实现在 `qoder/`：账号管理（国际版设备授权登录 / PAT /
-    /// 凭证续期 / 额度查询）**加推理转发**。上游鉴权不是 Bearer 而是一套自签名
-    /// 的 COSY 头、请求体要先编码再签名、响应还多包一层信封，因此
-    /// `is_stateful()` 为 true（一次发送由适配器自己完成，见 `qoder/mod.rs`）；
-    /// 它参与全局队列与模型广告，`supports_chat()` 为 true。
+    /// Qoder **中国版**（`qoder`，历史 id 不改名：存量账号的落盘契约）。适配实现
+    /// 在 `qoder/`：账号管理（设备授权登录 / PAT / 凭证续期 / 额度查询）**加推理
+    /// 转发**。上游鉴权不是 Bearer 而是一套自签名的 COSY 头、请求体要先编码再
+    /// 签名、响应还多包一层信封，因此 `is_stateful()` 为 true（一次发送由适配器
+    /// 自己完成，见 `qoder/mod.rs`）；它参与全局队列与模型广告，`supports_chat()`
+    /// 为 true。
+    ///
+    /// ── 与 [`ProviderKind::QoderIntl`] 是同一套协议的两个地区（2026-10 拆家）──
+    /// 与 AutoClaw / Accio / ZCode 同一思路：地区是**provider 身份**而不是账号
+    /// 属性。拆家前「地区是账号上的 `mode` 字段」的后果：模型管理里两地区账号
+    /// 混在一个「模型来源」下拉里、一次刷新只能刷到队首账号所属地区的目录、
+    /// 「获取模型」弹窗也只有一个 Qoder 行。地区互查在
+    /// `qoder::endpoints::Region`（`kind` / `provider_id` / `from_provider_id`）。
     Qoder,
+    /// Qoder **国际版**（`qoder-intl`）。与 [`ProviderKind::Qoder`] 同一套协议、
+    /// 不同站点（`openapi.qoder.sh` / `api3.qoder.sh`，见 `qoder::endpoints`）。
+    /// 国际版有独立的「每日 100 Credits」签到链路（需要设备风控身份，见
+    /// `qoder::checkin` 与 `qoder::risk`）。
+    QoderIntl,
     /// Cline **免费额度池**（`cline-free/...`）。官方 `api.cline.bot`。
     ///
     /// ── 为什么两池是两家而不是「一家的一个选项」（本次改动的核心）────
@@ -394,7 +408,12 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 合并时同名模型先归谁家 —— 国内版在前，与存量账号的归属一致。
     ProviderMeta { id: "autoclaw", label: "AutoClaw 国内版" },
     ProviderMeta { id: "autoclaw-intl", label: "AutoClaw 国际版" },
-    ProviderMeta { id: "qoder", label: "Qoder" },
+    // Qoder 两个地区**相邻**排列（与 AutoClaw / Accio / ZCode 同一理由）：拆家后
+    // 是**两家独立的提供商**，国内版保持裸 `qoder`（存量账号的落盘契约，只改
+    // 展示名），国际版取 `qoder-intl`。顺序也决定模型目录合并时同名模型先归
+    // 谁家 —— 国内版在前，与存量账号的归属一致。
+    ProviderMeta { id: "qoder", label: "Qoder 中国版" },
+    ProviderMeta { id: "qoder-intl", label: "Qoder 国际版" },
     ProviderMeta { id: "cline-free", label: "Cline Free" },
     ProviderMeta { id: "cline-pass", label: "Cline Pass" },
     // Accio 两个地区**相邻**排列（与 AutoClaw 同一理由：同一条产品线的两个
@@ -481,6 +500,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "autoclaw" => Some(ProviderKind::AutoClaw),
         "autoclaw-intl" => Some(ProviderKind::AutoClawIntl),
         "qoder" => Some(ProviderKind::Qoder),
+        "qoder-intl" => Some(ProviderKind::QoderIntl),
         "cline-free" => Some(ProviderKind::ClineFree),
         "cline-pass" => Some(ProviderKind::ClinePass),
         "accio" => Some(ProviderKind::Accio),
@@ -516,6 +536,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::AutoClaw => "autoclaw",
         ProviderKind::AutoClawIntl => "autoclaw-intl",
         ProviderKind::Qoder => "qoder",
+        ProviderKind::QoderIntl => "qoder-intl",
         ProviderKind::ClineFree => "cline-free",
         ProviderKind::ClinePass => "cline-pass",
         ProviderKind::Accio => "accio",

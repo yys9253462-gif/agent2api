@@ -231,9 +231,12 @@ function renderTopbarStatus() {
   const session = state?.session || {};
   const accounts = state?.accounts?.accounts || [];
   const enabled = accounts.filter(a => a.enabled !== false).length;
-  // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链
-  const isRateLimited = window.wbAccountsModel?.isRateLimited;
-  const limited = isRateLimited ? accounts.filter(a => a.enabled !== false && isRateLimited(a)).length : 0;
+  // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链。
+  // 计数用 isLimited（含「余额不足已跳过」档，与账号页「已限流」分段同一口径）；
+  // 契约上没有该成员时退回 isRateLimited（只数模型限流），宁少报不报错
+  const modelApi = window.wbAccountsModel;
+  const isLimited = modelApi?.isLimited || modelApi?.isRateLimited;
+  const limited = isLimited ? accounts.filter(a => a.enabled !== false && isLimited(a)).length : 0;
   // 「网关运行中」用的是**网关进程**的判据（壳侧 is_ready 探测，见 port-panel.js），
   // 不是 upstreamConfigured（那个说的是有没有账号）。两者会独立变化：没账号不影响
   // 网关监听，端口被占也不影响账号存在 —— 混用会让用户对着「未就绪」去查账号。

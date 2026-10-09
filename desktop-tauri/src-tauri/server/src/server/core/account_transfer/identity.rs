@@ -187,13 +187,23 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
     }
     // Qoder：地区 + userId 两段身份（与 `qoder_accounts` 添加路径的判重口径
     // 一致 —— 只按 userId 会把同一个人在两个地区的账号并成一条）。
-    if provider == kind_id(ProviderKind::Qoder) {
+    // 拆家后两个地区是两家 provider（`qoder` / `qoder-intl`），判据按家族走；
+    // 地区仍从记录字段读（`mode` / `edition`），与 provider id 互为印证 ——
+    // 迁移保证了存量记录两者一致。
+    if crate::server::core::account_store::is_qoder_family(provider) {
         if user_id.is_empty() {
             return Err("缺少 userId（无法标识 Qoder 账号）".to_string());
         }
         let region = match qoder_region(item) {
             Ok(Some(region)) => region,
-            Ok(None) => "global".to_string(),
+            Ok(None) => {
+                // 键缺失：按 **provider id** 推（拆家后它是权威；导入条目
+                // 一律带 provider），provider 也不认识时按国际版兜底（与
+                // 添加路径对缺失 mode 的旧缺省一致）。
+                crate::server::core::providers::qoder::endpoints::Region::from_provider_id(provider)
+                    .map(|region| region.id().to_string())
+                    .unwrap_or_else(|| "global".to_string())
+            }
             Err(()) => {
                 return Err("Qoder 地区无法识别（mode / edition 必须是 global 或 cn）".to_string())
             }
@@ -277,16 +287,19 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
         return (!account.is_empty()).then_some(account);
     }
     // Qoder：地区 + userId（与 `identity_of_item` 同口径，地区取 `mode` /
-    // `edition`，键缺失按国际版 —— 两处缺省必须一致）。地区值非法的记录视为
-    // 无法识别身份（不参与匹配，导入按新增走；正常数据不会出现这种记录）。
-    if provider == kind_id(ProviderKind::Qoder) {
+    // `edition`，键缺失按 provider id 推、再退国际版 —— 两处缺省必须一致）。
+    // 地区值非法的记录视为无法识别身份（不参与匹配，导入按新增走；正常数据
+    // 不会出现这种记录）。
+    if crate::server::core::account_store::is_qoder_family(provider) {
         let user_id = record.user_id().trim().to_string();
         if user_id.is_empty() {
             return None;
         }
         let region = match qoder_region(record.fields()) {
             Ok(Some(region)) => region,
-            Ok(None) => "global".to_string(),
+            Ok(None) => crate::server::core::providers::qoder::endpoints::Region::from_provider_id(provider)
+                .map(|region| region.id().to_string())
+                .unwrap_or_else(|| "global".to_string()),
             Err(()) => return None,
         };
         return Some(format!("{region}:{user_id}"));

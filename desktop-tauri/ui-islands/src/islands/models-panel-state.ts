@@ -111,6 +111,12 @@ export type SharedWindow = {
     labelOf?: (id: string) => string
     refreshCustom?: () => Promise<unknown>
   }
+  /** 预置提供商目录（preset-providers.js）：自定义家记录不带图标，按名字回match预置图标用 */
+  wbPresetProviders?: {
+    list?: Array<{ key?: string; name?: string; icon?: string }>
+    presetOf?: (key: string) => { key?: string; name?: string; icon?: string } | null
+    iconOf?: (key: string) => string
+  }
   wbCustomProvidersUi?: { remove?: (providerId: string) => Promise<boolean> }
   wbAccountAddForms?: { openNewCustomForm?: () => void }
   wbModelsFetchModal?: {

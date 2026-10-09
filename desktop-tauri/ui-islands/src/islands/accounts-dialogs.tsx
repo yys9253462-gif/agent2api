@@ -30,6 +30,7 @@ import {
   DialogTitle,
   Input,
   Label,
+  NavItem,
   RadioGroup,
   RadioGroupItem,
   Select,
@@ -41,16 +42,17 @@ import {
 } from '@ui'
 import {
   errorMessage, esc, poolItemLabel, shared, toast,
-  type AccountRecord, type ClashSnapshot, type PoolItem,
+  type AccountRecord, type ClashSnapshot, type LimiterRule, type PoolItem,
 } from './accounts-shared'
 import { clampPriority, priorityOf, PRIORITY_MAX, PRIORITY_MIN } from './accounts-columns'
 import {
-  displayNameOf, providerOf, supportsPlanChannel, supportsUsage, zcodePlanLabel, zcodePlanOf,
-  ZCODE_PLAN_CODING, ZCODE_PLAN_START,
+  displayNameOf, providerFeatures, providerOf, supportsPlanChannel, supportsUsage,
+  zcodePlanLabel, zcodePlanOf, ZCODE_PLAN_CODING, ZCODE_PLAN_START,
 } from './accounts-domain'
 import {
   readUsageChanges, UsageSettingsSection, usageDraftOf, type UsageDraft,
 } from './accounts-dialog-usage'
+import { limiterDraftOf, LimiterSection, readLimiterChanges } from './accounts-dialog-limiter'
 import {
   allAccounts, clashOptions, closeDialog, findAccount, getStore, proxyPoolOptions,
 } from './accounts-data'
@@ -59,6 +61,12 @@ import {
 const MAX_PROVIDER_NAME_CHARS = 64
 
 type AccountLike = AccountRecord
+
+/** 账号设置弹窗的分组（左侧导航）。 */
+type PaneId = 'basic' | 'credential' | 'query' | 'limiter' | 'network'
+
+/** 并发上限的封顶值（与后端 apply_patch 的 MAX_CONCURRENT_LIMIT 一致） */
+const CONC_MAX = 999
 
 /** 同 provider 的其它账号：优先级唯一性的作用域就是这一组 */
 function peersOf(account: AccountLike, all: AccountLike[]): AccountLike[] {
@@ -642,9 +650,15 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   /** 自定义账号的凭证草稿：新 Key（留空 = 不改，走「清除」按钮）与「无需鉴权」勾选 */
   const [apiKeyDraft, setApiKeyDraft] = React.useState('')
   const [noAuthDraft, setNoAuthDraft] = React.useState(account?.noAuth === true)
-  // 「查询设置」段的草稿（自动查询间隔 + 余额不足处理）：只在真的有余额概念的
-  // 家渲染，草稿仍无条件初始化 —— 与 planChannel 同一形态，省一个条件分支
+  // 「查询设置」段的草稿（自动查询间隔）：只在真的有余额概念的家渲染，草稿仍
+  // 无条件初始化 —— 与 planChannel 同一形态，省一个条件分支
   const [usageDraft, setUsageDraft] = React.useState<UsageDraft>(() => usageDraftOf(account))
+  // 「限制器」段的草稿（余额 / Token 规则列表）：与查询设置同一 gating
+  const [limiterDraft, setLimiterDraft] = React.useState<LimiterRule[]>(() => limiterDraftOf(account))
+  // 分组导航的当前页（弹窗按账号 id 挂载，切账号自然回到「基本」）
+  const [pane, setPane] = React.useState<PaneId>('basic')
+  // 并发上限草稿（原列表 ⋯ 菜单的 conc-dialog 迁入「基本」分组）：0~999，0 = 不限
+  const [concDraft, setConcDraft] = React.useState(() => String(Number(account?.maxConcurrent) || 0))
 
   // 「提供商」那一段：目录里查得到才算自定义家（id 前缀只说明「长得像」，而记录本身
   // 才带着协议 / Base URL 的现值 —— 三个字段要拿它预填）。
@@ -784,16 +798,30 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       setStatus(<span className='text-destructive'>{providerPatch.error}</span>)
       return
     }
-    // 查询设置段（自动查询间隔 + 余额不足处理）：与凭证段同一层，跟着这次保存
-    // 一起落库；校验不过先在前端挡住（后端 apply_patch 对同一规则也会 400）
+    // 查询设置段（自动查询间隔）：与凭证段同一层，跟着这次保存一起落库；
+    // 校验不过先在前端挡住（后端 apply_patch 对同一规则也会 400）
     const usageChanges = supportsUsage(target) ? readUsageChanges(target, usageDraft) : null
     if (usageChanges && 'error' in usageChanges) {
       setStatus(<span className='text-destructive'>{usageChanges.error}</span>)
       return
     }
+    // 限制器段（余额 / Token 规则列表）：与查询设置同一层；编辑器保存时已校验过，
+    // 这里只负责「真改了才带上」（对着现状保存不会凭空多一条变更日志，与后端一致）
+    const limiterChanges = readLimiterChanges(target, limiterDraft)
     // 凭证段（自定义账号）：与代理 / 套餐同一层，跟着这次保存一起落库
     // （它走的是 PATCH /api/accounts 的自定义分支，见后端 `update_custom_credentials`）
     const credentialPatch = readCredentialPatch() || {}
+    // 并发上限（「基本」分组）：本地先归一（number 输入挡不住手工脏值），后端
+    // 400 只该是最后防线 —— 与原 conc-dialog 同一套 clamp（0~999，0 = 不限；
+    // CodeArts 家 0 由上游解释成默认并发，见能力表 concurrencyDefault）
+    const concRaw = Number(concDraft)
+    if (!Number.isFinite(concRaw) || concRaw < 0) {
+      toast(`并发上限必须是 0~${CONC_MAX} 的整数`, 'err')
+      return
+    }
+    const concNext = Math.min(CONC_MAX, Math.round(concRaw))
+    const concCurrent = Number(target.maxConcurrent) || 0
+    const concPatch: Record<string, unknown> = concNext !== concCurrent ? { maxConcurrent: concNext } : {}
 
     setBusy(true)
     try {
@@ -816,7 +844,9 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
         ...balancePatch,
         ...planPatch,
         ...credentialPatch,
+        ...concPatch,
         ...(usageChanges && 'patch' in usageChanges ? usageChanges.patch : {}),
+        ...(limiterChanges && 'patch' in limiterChanges ? limiterChanges.patch : {}),
       })
       // 提供商那一段排在账号之后（账号是本弹窗的主角，先落库）。它失败时账号已经存下了，
       // 所以留在弹窗里把那句话说清楚 —— 笼统报成「保存失败」会把两件事混成一件
@@ -854,94 +884,156 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
     ? <span className='text-destructive'>已被「{labelOf(holder)}」占用</span>
     : (used.length ? `同提供商已占用：${used.join('、')}` : '同提供商内暂无其他账号占用优先级')
 
+  // 「凭证与套餐」按家出现：有什么配什么（CatPaw 余额凭证 / 自定义账号凭证与
+  // 提供商 / ZCode 套餐通道）。内置家什么都没有时整组不出现。
+  const concDefault = Number(providerFeatures(providerOf(target)).concurrencyDefault) || 0
+  const hasCredentialPane = isCatpaw || isCustomAccount || supportsPlanChannel(target)
+
   return (
     <Dialog open onOpenChange={next => {
       // 保存中不许关：关掉会让「到底存没存进去」变成未知状态
       if (next || busy) return
       onClose()
     }}>
-      <DialogContent>
+      <DialogContent className='w-[min(900px,calc(100vw-48px))]'>
         <DialogHeader><DialogTitle>账号设置 · {labelOf(account)}</DialogTitle></DialogHeader>
-        <DialogBody>
-          <DialogSection>
-            <h3>转发路由</h3>
-            <p>
-              优先级是转发顺序，数值越小越先用。<strong>同提供商内每个账号的优先级不能重号</strong>
-              ——保存时会拒绝已被占用的数值。调整顺序也可以直接在账号列表里用「↑ / ↓」与相邻账号交换。
-            </p>
-            <div className='field-row'>
-              <label htmlFor='account-priority-input'>优先级</label>
-              <Input id='account-priority-input' type='number' min={PRIORITY_MIN} max={PRIORITY_MAX} step={1}
-                className='max-w-[110px]' value={priority}
-                onChange={event => setPriority(event.currentTarget.value)} />
-              <span className='detail'>{hint}</span>
-            </div>
-            <div className='field-row mt-2.5'>
-              <Label className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
-                <Switch checked={enabled} onCheckedChange={setEnabled} aria-label='启用该账号' />
-                <span className='text-xs text-subtle'>启用该账号（关闭则不参与转发）</span>
-              </Label>
-            </div>
-            <div className='field-row mt-2.5'>
-              <label htmlFor='account-name-input'>备注名</label>
-              <Input id='account-name-input' maxLength={100} placeholder='账号显示名称' className='min-w-[220px]'
-                value={name} onChange={event => setName(event.currentTarget.value)} />
-            </div>
-            {isCatpaw ? (
-              <BalanceTokenField configured={account.hasBalanceToken === true} value={balanceToken}
-                onChange={setBalanceToken} clearBusy={busy}
-                onClear={() => void clearBalanceToken()} />
-            ) : null}
-            {isCustomAccount ? (
-              <CustomCredentialFields
-                hasApiKey={target.hasApiKey === true}
-                noAuth={noAuthDraft}
-                value={apiKeyDraft}
-                onValue={setApiKeyDraft}
-                onToggleNoAuth={setNoAuthDraft}
-                onClear={() => void clearApiKey()}
-                clearBusy={busy} />
-            ) : null}
-            {supportsPlanChannel(target) ? (
-              <PlanChannelField plan={planChannel} hasJwt={account.canClaim === true}
-                onChange={setPlanChannel} />
-            ) : null}
-            {supportsUsage(target) ? (
-              <UsageSettingsSection account={target} draft={usageDraft} onChange={setUsageDraft} />
-            ) : null}
-          </DialogSection>
+        <DialogBody className='p-0'>
+          <div className='acct-dlg'>
+            {/* 分组导航复用模型管理左栏的形态（.prov-rail 容器 + NavItem，见 page-gateway.css）：
+                选中态 / 悬浮态 / 字重都在组件里，这里只给弹窗内的栏宽 */}
+            <aside className='prov-rail acct-dlg-rail' aria-label='账号设置分组'>
+              <div className='rail-scroll'>
+                <div className='rail-label'>账号设置</div>
+                {([['basic', '基本'], ...(hasCredentialPane ? [['credential', '凭证与套餐'] as const] : []),
+                  ...(supportsUsage(target) ? [['query', '查询设置'] as const, ['limiter', '限制器'] as const] : []),
+                  ['network', '网络']] as Array<[PaneId, string]>).map(([id, label]) => (
+                    <NavItem key={id} active={pane === id} title={label} className='shadow-none'
+                      onClick={() => setPane(id)}>{label}</NavItem>
+                  ))}
+              </div>
+            </aside>
+            <div className='acct-dlg-main'>
+              {pane === 'basic' ? (
+                <div>
+                  <div className='acct-dlg-pane-head'>
+                    <h3>基本</h3>
+                    <p>这条账号是谁、排第几、能不能接请求。</p>
+                  </div>
+                  <div className='field-row'>
+                    <label>启用</label>
+                    <Switch checked={enabled} onCheckedChange={setEnabled} aria-label='启用该账号' />
+                    <span className='detail'>关闭则不参与转发（余额查询照常，见「查询设置」）</span>
+                  </div>
+                  <div className='field-row'>
+                    <label htmlFor='account-name-input'>备注名</label>
+                    <Input id='account-name-input' maxLength={100} placeholder='账号显示名称' className='max-w-[280px]'
+                      value={name} onChange={event => setName(event.currentTarget.value)} />
+                  </div>
+                  <div className='field-row'>
+                    <label htmlFor='account-priority-input'>转发优先级</label>
+                    <Input id='account-priority-input' type='number' min={PRIORITY_MIN} max={PRIORITY_MAX} step={1}
+                      className='max-w-[110px]' value={priority}
+                      onChange={event => setPriority(event.currentTarget.value)} />
+                    <span className='detail'>数值越小越先用；{hint}</span>
+                  </div>
+                  <div className='field-row'>
+                    <label htmlFor='account-conc-input'>并发上限</label>
+                    <Input id='account-conc-input' type='number' min={0} max={CONC_MAX} step={1}
+                      className='max-w-[110px]' value={concDraft}
+                      onChange={event => setConcDraft(event.currentTarget.value)} />
+                    <span className='detail'>{concDefault > 0 ? `0 = 按本家默认 ${concDefault}` : '0 = 不限'}</span>
+                  </div>
+                  <p className='detail acct-dlg-hint'>
+                    并发上限 {concDefault > 0
+                      ? `受上游硬顶约束，达到上限的账号跳过、请求转给其他账号（原列表 ⋯ 菜单的「并发上限」入口已并入这里）`
+                      : `0~${CONC_MAX}；达到上限的账号跳过、请求转给其他账号（原列表 ⋯ 菜单的「并发上限」入口已并入这里）`}
+                  </p>
+                </div>
+              ) : null}
 
-          {provider ? (
-            <ProviderSection provider={provider} count={peers.length + 1}
-              name={providerName} protocol={providerProtocol} baseUrl={providerBaseUrl}
-              emulation={providerEmulation}
-              onName={setProviderName} onProtocol={setProviderProtocol} onBaseUrl={setProviderBaseUrl}
-              onEmulation={setProviderEmulation}
-              onRemove={() => {
-                if (busy) return
-                // 删掉了就把本弹窗一起关掉（账号也没了）
-                void Promise.resolve(shared().wbCustomProvidersUi?.remove?.(provider.id)).then(removed => {
-                  if (removed) onClose()
-                })
-              }} />
-          ) : null}
+              {pane === 'credential' && hasCredentialPane ? (
+                <div>
+                  <div className='acct-dlg-pane-head'>
+                    <h3>凭证与套餐</h3>
+                    <p>这一段按提供商出现：有什么配什么。</p>
+                  </div>
+                  {isCatpaw ? (
+                    <BalanceTokenField configured={account.hasBalanceToken === true} value={balanceToken}
+                      onChange={setBalanceToken} clearBusy={busy}
+                      onClear={() => void clearBalanceToken()} />
+                  ) : null}
+                  {isCustomAccount ? (
+                    <CustomCredentialFields
+                      hasApiKey={target.hasApiKey === true}
+                      noAuth={noAuthDraft}
+                      value={apiKeyDraft}
+                      onValue={setApiKeyDraft}
+                      onToggleNoAuth={setNoAuthDraft}
+                      onClear={() => void clearApiKey()}
+                      clearBusy={busy} />
+                  ) : null}
+                  {supportsPlanChannel(target) ? (
+                    <PlanChannelField plan={planChannel} hasJwt={account.canClaim === true}
+                      onChange={setPlanChannel} />
+                  ) : null}
+                  {provider ? (
+                    <ProviderSection provider={provider} count={peers.length + 1}
+                      name={providerName} protocol={providerProtocol} baseUrl={providerBaseUrl}
+                      emulation={providerEmulation}
+                      onName={setProviderName} onProtocol={setProviderProtocol} onBaseUrl={setProviderBaseUrl}
+                      onEmulation={setProviderEmulation}
+                      onRemove={() => {
+                        if (busy) return
+                        // 删掉了就把本弹窗一起关掉（账号也没了）
+                        void Promise.resolve(shared().wbCustomProvidersUi?.remove?.(provider.id)).then(removed => {
+                          if (removed) onClose()
+                        })
+                      }} />
+                  ) : null}
+                </div>
+              ) : null}
 
-          <DialogSection>
-            <h3>出网代理</h3>
-            <p>默认无代理（直连上游）。需要经代理访问时可选择 Clash Verge 里的出口；端口由 Clash Verge 管理，这里每次实时读取。</p>
-            <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix='account-proxy' />
-          </DialogSection>
+              {pane === 'query' && supportsUsage(target) ? (
+                <div>
+                  <div className='acct-dlg-pane-head'>
+                    <h3>查询设置</h3>
+                    <p>余额列读数的自动刷新；也是「限制器」余额规则的数据来源。</p>
+                  </div>
+                  <UsageSettingsSection account={target} draft={usageDraft} onChange={setUsageDraft} />
+                </div>
+              ) : null}
 
-          {account.proxy?.error ? (
-            <div className='detail text-destructive'>
-              当前代理不可用：{account.proxy.error}（转发时会回退直连）
+              {pane === 'limiter' && supportsUsage(target) ? (
+                <div>
+                  <div className='acct-dlg-pane-head'>
+                    <h3>限制器</h3>
+                    <p>
+                      按规则限制该账号参与转发：没有规则（或全部停用）= 不限制；跳过档自动恢复，禁用档需手动启用。
+                    </p>
+                  </div>
+                  <LimiterSection account={target} draft={limiterDraft} onChange={setLimiterDraft} />
+                </div>
+              ) : null}
+
+              {pane === 'network' ? (
+                <div>
+                  <div className='acct-dlg-pane-head'>
+                    <h3>网络</h3>
+                    <p>这条账号访问上游走哪条线路。</p>
+                  </div>
+                  <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix='account-proxy' />
+                  {account.proxy?.error ? (
+                    <p className='detail text-destructive'>
+                      当前代理不可用：{account.proxy.error}（转发时会回退直连）
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
-          ) : null}
-
-          <div className='detail' style={{ minHeight: 18 }}>{status}</div>
+          </div>
         </DialogBody>
         <DialogFooter>
-          <div className='mr-auto' />
+          <div className='detail mr-auto' style={{ minHeight: 18 }}>{status}</div>
           <Button variant='outline' disabled={busy} onClick={onClose}>取消</Button>
           <Button variant='default' disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存'}</Button>
         </DialogFooter>

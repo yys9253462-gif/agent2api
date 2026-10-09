@@ -41,19 +41,21 @@ import {
   TooltipTrigger,
   cn,
 } from '@ui'
-import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type UsageEntry } from './accounts-shared'
+import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
 import {
-  accountTags, activeLimits, claimDoneTitle, claimedToday,
-  displayNameOf, editionSuffix, expiryMillis, formatResetText, identifierOf, isDesktopAccount, isEnabled,
-  lowBalanceBlockedOf, lowBalanceOf, providerFeatures, providerOf, RESET_UNKNOWN,
-  supportsClaim, supportsUsage, supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
+  accountTags, activeLimits, balanceBlockedOf, claimDoneTitle, claimedToday,
+  displayNameOf, editionSuffix, expiryMillis, formatIntervalSeconds, formatResetText,
+  formatTokenCount, identifierOf, isDesktopAccount, isEnabled, planBadgeLabel, providerFeatures,
+  providerOf, RESET_UNKNOWN, supportsClaim, supportsUsage, supportsUsageDetail,
+  tokenBlockedOf, tokenCountdownText, tokenDisableTriggeredOf, tokenReadingForRule,
+  tokenRulesOf, tokenWindowInfo,
 } from './accounts-domain'
 import { PRIORITY_MAX, PRIORITY_MIN, priorityOf } from './accounts-columns'
 import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
   commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, poolError,
-  proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen,
-  startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
+  proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen, tokenUsageOf,
+  startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
 function iconHtml(name: string, size: number): string {
@@ -155,6 +157,16 @@ export function PriorityStepper({ account, seat }: {
 export function StatusCell({ account }: { account: AccountRecord }) {
   const enabled = isEnabled(account)
   const tags = accountTags(account)
+  // Token 限额的禁用档命中且账号已被禁用：补一枚红色徽章回答「为什么是禁的」
+  // —— 禁用动作本身不带「为什么」的标记，当前窗口的消耗读数就是证据（与后端
+  // 自动禁用钩子同判据，见 tokenDisableTriggeredOf）。
+  if (!enabled && tokenDisableTriggeredOf(account, tokenUsageOf(account))) {
+    tags.push({
+      text: 'Token 限额 · 已禁用',
+      kind: 'bad' as const,
+      title: '本周期 Token 消耗达到限制器的上限，账号已被自动禁用（窗口重置也不恢复，需手动启用）',
+    })
+  }
   const who = displayNameOf(account) || account.id
   return (
     <>
@@ -179,10 +191,30 @@ export function StatusCell({ account }: { account: AccountRecord }) {
  * 限流：这个账号**当前限流中的模型**。限额在后端按「账号 × 模型」记，四家通用 ——
  * 所以这一列对四家都成立，不再需要「选个模型看队列」的筛选器。
  * 有限流时是一枚可点的黄色徽章（点开 / 收起行下的明细面板），正常时是绿点「正常」。
+ *
+ * 「已限流」分段把限制器的跳过档也算进来（isLimitedNow 的口径），这一列必须同口径：
+ * 没有模型限额但被限制器拦下的账号不亮绿点，给一枚黄色「余额不足 / Token 限额」
+ * 说明它为何归入已限流（跳过的细节仍由余额列的徽章承载，这里不复述）。
  */
 export function LimitsCell({ account, open }: { account: AccountRecord; open: boolean }) {
   const entries = activeLimits(account)
   if (!entries.length) {
+    if (balanceBlockedOf(account, usageEntryOf(account))) {
+      return (
+        <Badge variant='warning' shape='tag'
+          title='余额低于限制器的阈值，转发时会跳过该账号（余额回升自动恢复）'>
+          余额不足
+        </Badge>
+      )
+    }
+    if (tokenBlockedOf(account, tokenUsageOf(account))) {
+      return (
+        <Badge variant='warning' shape='tag'
+          title='本周期 Token 消耗达到限制器的上限，转发时会跳过该账号（窗口重置自动恢复）'>
+          Token 限额
+        </Badge>
+      )
+    }
     return (
       <Badge variant='success' shape='tag' title='当前没有任何模型处于限流中'>
         <BadgeDot />正常
@@ -403,19 +435,231 @@ function numberOrNull(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+/* ─── 余额明细弹层（usageDetail 能力位的那几家，现役只有 CodeArts）─── */
+
+/** 明细弹层里的一行读数（`UsageDetailCell` 的渲染输入） */
+type UsageDetailRow = {
+  name: string
+  /** 右侧读数：积分类「剩 x / y」，token 类用后端的 balanceView（口径在后端） */
+  view: string
+  tone: 'ok' | 'warn' | 'bad' | 'muted'
+  /** **剩余**百分比（条画的是剩余，与 usage-pool 同方向）；null = 不画条 */
+  percent: number | null
+  /** 超额：条画满走红 + 数值变红（上游到达上限后仍继续计数，如实显示） */
+  over: boolean
+  /** 悬停说明（为什么没条 / 超额口径 / 4004 的含义 —— 界面上不放长句的原因） */
+  title?: string
+}
+
+/** token 组的平铺行（余额格里直接显示的那两行；比弹层行更紧凑） */
+type UsageFlatRow = {
+  /** 短标签（余额列只有 132px，「福利模型日额度」放不下，平铺用短名） */
+  name: string
+  /** 紧凑读数（万/亿缩写；「剩 0 / 1000 万」比 8 位原数好读得多） */
+  view: string
+  tone: 'ok' | 'warn' | 'bad' | 'muted'
+  /** **剩余**百分比（画条用，与积分明细同向）；null = 无真总量，不画条 */
+  percent: number | null
+  /** 超额：条画满走红 */
+  over: boolean
+  /** 悬停全文（后端 balanceView + 行的口径说明） */
+  title?: string
+}
+
+/** 明细弹层的数据形状（`usageDetailOf` 的产物） */
+type UsageDetail = {
+  credit: UsageDetailRow[]
+  /** token 组：**平铺在余额格里**（对话 token / 福利日额度是转发可用的直接标志，
+   *  不该折叠进弹层；积分类的构成才是「要看才展开」的） */
+  token: UsageFlatRow[]
+  /** 可用合计（各积分池剩余之和；读不出数时 null，不画合计行） */
+  total: number | null
+  unit: string
+  /** 套餐徽标文案（试用版 / 免费版 / 原名）与积分重置日期 */
+  plan: string
+  resetDate: string
+  /** 半次失败（两台网关有一台没回话）与「没有福利池」的中性说明 */
+  missing: string[]
+  benefitAbsent: boolean
+}
+
+/**
+ * 数值 → 紧凑读数：`3541691 → 354 万`、`10000000 → 1000 万`、`172 → 172`。
+ *
+ * token 数常是七位八位的整数，余额列没有那么多像素（列宽 132px），
+ * 也没有人逐位读它 —— 万/亿缩写保留一位小数（整万去尾），数值的
+ * **数量级**才是这格要传达的东西；原值始终在悬停全文里。
+ */
+function compactNumber(value: number): string {
+  const abs = Math.abs(value)
+  if (abs >= 1e8) return `${(value / 1e8).toFixed(1).replace(/\.0$/, '')} 亿`
+  if (abs >= 1e4) return `${(value / 1e4).toFixed(abs >= 1e6 ? 0 : 1).replace(/\.0$/, '')} 万`
+  return String(value)
+}
+
+/** 后端 displayName → 平铺短标签（映射不到的原样显示，不硬造） */
+function flatMeterName(name: string): string {
+  if (name.includes('福利')) return '福利日额度'
+  if (name.includes('对话')) return '对话 token'
+  return name
+}
+
+/**
+ * 余额文档 → 明细弹层 + 平铺行的数据。**只做形状归一，不做 provider 判断**（那在能力位）。
+ *
+ * ── 为什么积分类的读数在前端拼 ─────────────────────────────
+ * 后端 `Meter::view()` 对「只有剩余没有总量」的行（赠送积分常这样）会回落成
+ * 「已用 0%」—— 那是它的已知边界（见 balance.rs 那边的 TODO 注释）。弹层这边
+ * 自行按 creditTotal / creditRemaining 拼「剩 x / y」，把口径收拢在积分字段上，
+ * 不依赖那条展示串。
+ *
+ * ── token 组为什么单独一份紧凑形状 ─────────────────────────
+ * 平铺在格子里读，空间只有 132px：短标签 + 万/亿缩写的读数放得下；
+ * 后端的 balanceView 是全量串（「剩 0 / 10000000 token」），留给悬停。
+ * 条只在**真总量**（allowance > 1，与后端 view() 的占位包口径一致）时画 ——
+ * 上游给过 `package_token_amount=1` 的占位形状，照它画条是「永远满格」的假信息。
+ *
+ * ── 语义色的口径 ───────────────────────────────────────────
+ * 条画**剩余**比例（与 usage-pool 同向）：≥20% 绿、<20% 黄（贴底要留意）、
+ * 超额红。剩 0 而没有超额的（按需付费积分未开通）是灰 —— 「0 但不是故障」；
+ * 无总量不画条（画不出比例就不装作有），上游没给就是没给。
+ */
+function usageDetailOf(entry: UsageEntry): UsageDetail | null {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const data = entry as Record<string, unknown>
+  const wallets = Array.isArray(data.wallets) ? data.wallets as Array<Record<string, unknown>> : []
+  if (!wallets.length) return null
+  const unit = String(data.unit || '积分')
+  const credit: UsageDetailRow[] = []
+  const token: UsageFlatRow[] = []
+  for (const wallet of wallets) {
+    const name = String(wallet.displayName || wallet.type || '明细')
+    const remaining = numberOrNull(wallet.creditRemaining)
+    const total = numberOrNull(wallet.creditTotal)
+    const view = String(wallet.balanceView || '') || numberText(wallet.balance)
+    const usedPercent = numberOrNull(wallet.usedPercent)
+    if (remaining !== null) {
+      // 积分类（套餐赠送积分口径）：总量缺失时不画条
+      const hasTotal = total !== null && total > 0
+      const percent = hasTotal ? Math.max(0, Math.min(100, remaining / total * 100)) : null
+      credit.push({
+        name,
+        view: hasTotal ? `剩 ${numberText(remaining)} / ${numberText(total)}` : `剩 ${numberText(remaining)}`,
+        tone: remaining <= 0 ? 'muted' : percent !== null && percent < 20 ? 'warn' : 'ok',
+        percent,
+        over: false,
+        title: hasTotal ? undefined : '上游未给总量，画不出剩余比例',
+      })
+      continue
+    }
+    if (usedPercent !== null || numberOrNull(wallet.allowanceTokens) !== null) {
+      // token 类：对话 token / 福利模型日额度 —— 平铺到格子里直接看
+      const used = numberOrNull(wallet.usedTokens) ?? 0
+      const allowance = numberOrNull(wallet.allowanceTokens)
+      const hasTotal = allowance !== null && allowance > 1
+      const over = hasTotal && used > allowance
+      const unlimited = wallet.unlimited === true
+      // 条与积分明细同款：画**剩余**比例，口径自算（used / allowance，与读数同一
+      // 来源，不依赖上游的 value 百分比）；无真总量（含占位包 ≤1、无上限）不画 ——
+      // 画不出比例就不装作有
+      const percent = hasTotal
+        ? Math.max(0, Math.min(100, (1 - used / allowance) * 100))
+        : null
+      const flat = unlimited
+        ? `无上限 · 已用 ${compactNumber(used)}`
+        : hasTotal
+          ? `剩 ${compactNumber(Math.max(0, allowance - used))} / ${compactNumber(allowance)}`
+          : used > 0
+            ? `已用 ${compactNumber(used)}`
+            : '未使用'
+      token.push({
+        name: flatMeterName(name),
+        view: flat,
+        tone: over ? 'bad' : !hasTotal && !unlimited ? 'muted'
+          : percent !== null && percent < 20 ? 'warn' : 'ok',
+        percent,
+        over,
+        title: [view, unlimited ? '无上限按日计（上游到达上限后仍继续计数，超额如实显示）' : null]
+          .filter(Boolean).join(' · '),
+      })
+      continue
+    }
+    // 既无积分也无 token 量（理论不该出现）：退回一句读数，不静默丢行
+    token.push({ name, view, tone: 'muted', percent: null, over: false, title: view })
+  }
+  const subscription = (data.subscription && typeof data.subscription === 'object'
+    ? data.subscription : {}) as Record<string, unknown>
+  const missing = [
+    data.statisticsError ? `订阅统计未读到：${String(data.statisticsError)}` : '',
+    data.benefitError ? `福利网关未读到：${String(data.benefitError)}` : '',
+  ].filter(Boolean)
+  return {
+    credit,
+    token,
+    total: numberOrNull(data.available),
+    unit,
+    plan: planBadgeLabel(subscription.planName),
+    resetDate: String(subscription.resetDate || ''),
+    missing,
+    benefitAbsent: data.benefitAbsent === true,
+  }
+}
+
 /**
  * 余额列：**只放读数**（不可点）—— 查询按钮住在操作列，这一列纯粹是
  * 「一眼看出还剩多少」。刻意不换成组件库的 Badge：它是读数而不是状态徽章，
  * 样式全在 `.usage-sum` 里（四档语义色：ok / bad / muted / warn —— `warn` 是
  * 「读到了但不完整」那一档，见上面 `usageSummary` 的半次失败分支）。
  *
- * ── 两行形态（有声明的总额度桶时）───────────────────────────
+ * ── 两行形态一：主额度桶（`usagePool`，ZCode 那家）──────────
  * 第一行是套餐名（用户问得最多的一句是「这 1 亿是哪个活动给的」），
  * 第二行是进度条 + 「剩余 / 总量」。进度条画的是**剩余**比例 ——
  * 与相邻的读数同一方向，否则「条快满了」与「剩 8800 万」会互相打架。
  * 完整明细（每个桶、到期、可用合计）仍在悬停提示里，这里只抢最基本的两个问题：
  * 哪个套餐、还剩多少。
+ *
+ * ── 两行形态二：套餐徽标 + 明细弹层（`usageDetail` 能力位，CodeArts）──
+ * 本家的余额是两台网关两组口径的**加总**，一行读数分不出「试用版」与「免费版」
+ * 的权益差别。第一行徽标标套餐，第二行「可用 N 积分」可点击，点开逐项读数
+ * （积分池 / token 池各一组，见 `UsageDetailCell`）。悬停提示保留 —— 弹层是
+ * 「要看构成」的入口，悬停仍是「顺眼一看」的那份摘要。
  */
+/**
+ * 余额格里 Token 限制器的**第二行读数**：配了 Token 规则的账号显示
+ * 「周期 Token 已用 / 上限 · 剩 N 分」。多条规则取「最值得关注的那条」——
+ * 已触发的优先，否则取用量比例最高的一条；其余规则在设置弹窗里看全貌。
+ */
+function prominentTokenLimit(account: AccountRecord): React.ReactNode {
+  const readings = tokenUsageOf(account)
+  let best: { rule: LimiterRule; reading: TokenReading; ratio: number } | null = null
+  for (const rule of tokenRulesOf(account)) {
+    if (rule.enabled === false) continue
+    const reading = tokenReadingForRule(rule, readings)
+    if (!reading) continue
+    const ratio = rule.threshold > 0 ? reading.used / rule.threshold : 0
+    if (ratio >= 1) {
+      best = { rule, reading, ratio }
+      break
+    }
+    if (!best || ratio > best.ratio) best = { rule, reading, ratio }
+  }
+  if (!best) return null
+  const { rule, reading } = best
+  const hit = reading.used >= rule.threshold
+  const info = tokenWindowInfo(rule)
+  const countdown = !hit ? ` · ${tokenCountdownText(info.remainingMs, info.daily)}` : ''
+  const scope = info.daily ? '今日已用' : '周期 Token'
+  const title = `限制器：${rule.reset === 'daily' ? '今天（本地 0 点重置）' : `${formatIntervalSeconds(rule.period ?? 0)}窗口`}已用 `
+    + `${Math.round(reading.used).toLocaleString('en-US')} / ${Math.round(rule.threshold).toLocaleString('en-US')} Token`
+    + (hit ? '，已达到上限' : `，${tokenCountdownText(info.remainingMs, info.daily)}重置`)
+  return (
+    <span className='usage-token-sub' title={title}>
+      {scope} <span className={hit ? 'hit' : undefined}>{formatTokenCount(reading.used)}</span>
+      {' '}/ {formatTokenCount(rule.threshold)}{countdown}
+    </span>
+  )
+}
+
 export function UsageCell({ account }: { account: AccountRecord }) {
   if (!supportsUsage(account)) {
     return <span className='muted' title='该提供商没有余额查询'>—</span>
@@ -424,24 +668,45 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   // 的失败结论，理由与后端快照出口一致
   const entry = usageEntryOf(account)
   const summary = usageSummary(entry)
-  // 「余额不足已跳过」徽章：与后端选路过滤同一判据（lowBalanceBlockedOf），
+  // 限制器的跳过徽章：与后端选路过滤同一判据（balanceBlockedOf / tokenBlockedOf），
   // 让「为什么这个账号不接请求」在界面上有处可看。禁用档不标 —— 那一档
   // 状态列的「已禁用」开关就是答案；跳过档账号仍是启用的，不标就看不出。
-  const blocked = lowBalanceBlockedOf(account, entry)
+  const blockedBadge = balanceBlockedOf(account, entry) ? (
+    <Badge variant='warning' shape='tag'
+      title='余额低于限制器的阈值，转发时会跳过该账号（余额回升自动恢复）'>
+      余额不足 · 已跳过
+    </Badge>
+  ) : tokenBlockedOf(account, tokenUsageOf(account)) ? (
+    <Badge variant='warning' shape='tag'
+      title='本周期 Token 消耗达到限制器的上限，转发时会跳过该账号（窗口重置自动恢复）'>
+      Token 限额 · 已跳过
+    </Badge>
+  ) : null
+  const tokenSub = prominentTokenLimit(account)
+  if (supportsUsageDetail(account)) {
+    const usable = summary.kind === 'ok' || summary.kind === 'warn'
+    const detail = usable ? usageDetailOf(entry) : null
+    if (detail) {
+      return <UsageDetailCell summary={summary} detail={detail} blockedBadge={blockedBadge} tokenSub={tokenSub} />
+    }
+    // 还没查到 / 查询失败 / 没拼出明细：维持单行读数的老样子
+    return (
+      <span className='usage-sum-wrap'>
+        <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+        {blockedBadge}
+        {tokenSub}
+      </span>
+    )
+  }
   // 失败 / 未配置那些档不画进度条：读数本身就不是「还剩多少」，
   // 给它配个进度条会把一句错误装饰成一条可信的读数
   const pool = summary.kind === 'ok' || summary.kind === 'warn' ? usagePool(entry) : null
-  const blockedBadge = blocked ? (
-    <Badge variant='warning' shape='tag'
-      title={`余额低于阈值 ${lowBalanceOf(account).threshold}，转发时会跳过该账号（余额回升自动恢复）`}>
-      余额不足 · 已跳过
-    </Badge>
-  ) : null
   if (!pool) {
     return (
       <span className='usage-sum-wrap'>
         <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
         {blockedBadge}
+        {tokenSub}
       </span>
     )
   }
@@ -453,7 +718,119 @@ export function UsageCell({ account }: { account: AccountRecord }) {
         <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
       </span>
       {blockedBadge}
+      {tokenSub}
     </span>
+  )
+}
+
+/**
+ * 余额格的明细形态（`usageDetail` 能力位）。
+ *
+ * hooks 只住在这个子组件里：`UsageCell` 对失败 / 未查询档有早退分支，
+ * 把 useState 留在这里才不会踩「条件渲染后调 hook」的规则。
+ *
+ * ── 什么平铺、什么进弹层 ──────────────────────────────────
+ * **token 组平铺**（对话 token / 福利模型日额度）：它们是「这账号现在能不能跑」
+ * 的直接标志——转发的失败多半是这两行的问题，折进弹层等于让人每回都多点一下；
+ * **积分类进弹层**（外面只留总额）：积分池的构成（套餐/基础包/赠送）是「对账才看」
+ * 的信息，总额 + 弹层足够。弹层走组件库的 Popover（Portal + 贴边翻转都是现成的），
+ * 锚点就是那颗积分读数按钮，与 ⋯ 菜单同一个交互语言。
+ */
+function UsageDetailCell({ summary, detail, blockedBadge, tokenSub }: {
+  summary: { text: string; kind: string; title: string }
+  detail: UsageDetail
+  blockedBadge: React.ReactNode
+  /** Token 限制器的周期读数（余额格第二行；配了规则才有） */
+  tokenSub: React.ReactNode
+}) {
+  const [open, setOpen] = React.useState(false)
+  const usable = summary.kind === 'ok' || summary.kind === 'warn'
+  return (
+    <span className={open ? 'usage-cell open' : 'usage-cell'}>
+      <span className='usage-plan'>
+        {detail.plan
+          ? <span className={`plan-chip${detail.plan === '免费版' ? ' free' : ''}`}>{detail.plan}</span>
+          : null}
+        {detail.resetDate
+          ? <span className='plan-sub' title='套餐积分的重置日期'>重置 {detail.resetDate}</span>
+          : null}
+      </span>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger
+          render={<button type='button' className={`usage-toggle ${summary.kind}`}
+            title={summary.title} aria-label='积分明细' />}
+        >
+          <span className='val'>{summary.text}</span>
+          <span className='caret' aria-hidden>▾</span>
+        </PopoverTrigger>
+        <PopoverContent align='end' sideOffset={6} className='usage-pop w-[288px]'>
+          {usable && detail.missing.length
+            ? detail.missing.map(line => <div key={line} className='usage-pop-missing' title={line}>{line}</div>)
+            : null}
+          {detail.credit.length ? (
+            <>
+              <div className='usage-pop-group'>积分</div>
+              {detail.credit.map(row => <UsageDetailRowView key={row.name} row={row} />)}
+            </>
+          ) : null}
+          {detail.total !== null ? (
+            <div className='usage-pop-total'>
+              <span className='k'>可用合计</span>
+              <span className='v'>{numberText(detail.total)} <small>{detail.unit}</small></span>
+            </div>
+          ) : null}
+          {/* 兜底：没有积分类读数的账号（免费版的统计里没有积分类计量表，额度全在
+              福利 token 池 —— available 为 null，摘要那行显示「可用 —」）不加这句
+              弹层就是一个空框，「弹不出来」的观感比缺数据更让人怀疑是故障 */}
+          {!detail.credit.length && detail.total === null ? (
+            <div className='usage-pop-empty' title='该账号的额度只有福利 token 池（见余额格那两行），订阅统计没有积分类计量表'>
+              该账号没有积分类读数（额度只有福利 token 池）
+            </div>
+          ) : null}
+        </PopoverContent>
+      </Popover>
+      {/* token 组平铺（对话 token / 福利模型日额度）：转发能不能跑，看这两行。
+          条与积分明细同款（画剩余比例）；无真总量不画 —— 上游没给就不装作有 */}
+      {detail.token.map(row => (
+        <span className='usage-flat-line' key={row.name} title={row.title}>
+          <span className='usage-flat-head'>
+            <span className='usage-flat-name'>{row.name}</span>
+            <span className={`usage-flat-view ${row.tone}`}>{row.view}</span>
+          </span>
+          {row.percent !== null ? (
+            <span className={`usage-flat-track${row.over ? ' over' : ''}`}>
+              <i style={{ width: `${row.percent}%` }} aria-label={`剩余 ${Math.round(row.percent)}%`} />
+            </span>
+          ) : null}
+        </span>
+      ))}
+      {detail.benefitAbsent ? (
+        <span className='usage-flat-line'
+          title='福利按限时活动下发，不是每个账号都有 —— 正常状态，不是查询失败'>
+          <span className='usage-flat-name'>福利日额度</span>
+          <span className='usage-flat-view muted'>无福利额度</span>
+        </span>
+      ) : null}
+      {blockedBadge}
+      {tokenSub}
+    </span>
+  )
+}
+
+/** 明细弹层里的一行（名称 + 读数 + 可选的剩余进度条；长说明只在悬停里） */
+function UsageDetailRowView({ row }: { row: UsageDetailRow }) {
+  return (
+    <div className='usage-pop-row' title={row.title}>
+      <div className='usage-pop-line'>
+        <span className='usage-pop-name'>{row.name}</span>
+        <span className={`usage-pop-view ${row.tone}`}>{row.view}</span>
+      </div>
+      {row.percent !== null ? (
+        <span className={`usage-pop-track${row.over ? ' over' : ''}`}>
+          <i style={{ width: `${row.percent}%` }} aria-label={`剩余 ${Math.round(row.percent)}%`} />
+        </span>
+      ) : null}
+    </div>
   )
 }
 
@@ -640,23 +1017,22 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
 /* ─── 操作列 ────────────────────────────────── */
 
 /**
- * 操作：领套餐 / 领福利 / 余额 / 设置 / ⋯，顺序固定。
+ * 操作：领套餐 / 余额 / 设置 / ⋯，顺序固定。
  *
  * 顺序按「点的频次」排，按钮的显隐会随账号状态变，但**顺序不跟着变**。
  * 「设为首选」不在这里：它在 ⋯ 菜单的第二项（行上留一颗按钮去重复隔壁优先级列的
  * 信息，代价是操作列多留 50px，而那 50px 全是从账号列挤出来的）。
  *
  * （签到曾是这排的第一颗按钮，已随签到功能整体迁到「签到中心」——
- * checkin-page.tsx 的每日签到卡承接了它的职责，含单账号签到与重签。）
+ * checkin-page.tsx 的每日签到卡承接了它的职责，含单账号签到与重签。
+ * CodeArts 的「领福利」同一场收敛：入口只留签到中心的「活动福利」卡
+ * （领取状态也在那里标记），账号页不再放第二颗一样的按钮。）
  */
 export function ActionsCell({ account, atFront }: { account: AccountRecord; atFront: boolean }) {
   const [claimBusy, setClaimBusy] = React.useState(false)
-  const [welfareBusy, setWelfareBusy] = React.useState(false)
   const [usageBusy, setUsageBusy] = React.useState(false)
   const canUsage = supportsUsage(account)
   const canClaim = supportsClaim(account)
-  const canWelfare = supportsWelfare(account)
-  const welfareTaken = welfareStateOf(account)
 
   async function claim(): Promise<void> {
     // 一次领取要拖一次滑块，重复点击会开出第二个验证码流程（共用的求解器一次只允许
@@ -666,16 +1042,6 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
       await startZcodeClaim(account.id)
     } finally {
       setClaimBusy(false)
-    }
-  }
-
-  async function welfare(): Promise<void> {
-    // 领取是外部服务的**写操作**：流程期间全程禁用，否则连点会发两次 claim。
-    setWelfareBusy(true)
-    try {
-      await startCodeArtsWelfare(account.id)
-    } finally {
-      setWelfareBusy(false)
     }
   }
 
@@ -691,21 +1057,6 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
             ? claimDoneTitle(account)
             : '探测并领取官方限时体验套餐（每天一期，需要过一次人机验证）'}
           onClick={() => void claim()}>领套餐</Button>
-      ) : null}
-      {/* CodeArts 的「领福利」：与上面那颗「领套餐」是**两件事**（判据位不同、流程也不同
-          —— 本家不要验证码，但领取前有一次只读探测、领取后有一次回读确认）。
-          今天已经到账（台账 `accepted`）时显示「已领」并置灰，与签到那颗同一套语义：
-          再点也只是让后端回一句「已领取并确认」，留着可点会让人以为还能再领一次。
-          **试过但没到账**不置灰 —— 手动点击在后端是绕过限流闸的（那条闸只管自动那一类），
-          幂等键按活动存而不是按轮次存，重试不会变成第二笔领取。 */}
-      {canWelfare ? (
-        welfareTaken.today && welfareTaken.accepted ? (
-          <Button variant='outline' size='xs' disabled title={welfareDoneTitle(welfareTaken)}>已领</Button>
-        ) : (
-          <Button variant='outline' size='xs' disabled={welfareBusy}
-            title={welfareTodoTitle(welfareTaken)}
-            onClick={() => void welfare()}>领福利</Button>
-        )
       ) : null}
       {canUsage ? (
         <Button variant='outline' size='xs' disabled={usageBusy}
@@ -758,8 +1109,8 @@ export function MoreMenu({ account, atFront }: { account: AccountRecord; atFront
             设为首选
           </Button>
           <Button variant='ghost' size='sm' className={itemClass}
-            title='设置该账号同时最多处理的请求数（0 = 不限制）'
-            onClick={() => { setOpen(false); shared().wbAccountConcDialog?.open?.(account) }}>
+            title='在账号设置的「基本」分组里设置该账号同时最多处理的请求数'
+            onClick={() => { setOpen(false); openSettingsDialog(account.id) }}>
             并发上限：{maxConcurrent > 0 ? maxConcurrent : '不限'}
           </Button>
           {account.hasRefreshToken ? (

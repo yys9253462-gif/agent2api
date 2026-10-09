@@ -280,7 +280,19 @@ pub(super) async fn forward_with_providers(
     // 候选家来自 `route_for_forward`（目录里没有这个模型名时会回落成默认
     // provider 一家；模型有家承载但全被禁用时**不回落**，见那个函数）——
     // 本函数是唯一消费方，日志也打在这里。
-    let candidates = route_for_forward(&model);
+    //
+    // 例外：`ignore_model_gate`（模型测试的直达跳）不走按模型路由 —— 被测的行
+    // 可能还没启用（先测通、再决定启不启用是测试的用法），「全被关闭 → 空链」
+    // 的门禁会把被测对象挡在门外。候选直接取 Key 白名单（测试恒带
+    // `provider_only`，就是被钉住的那一家）；发送侧的按家改写照常走生产语义，
+    // 关闭的默认绑定解析不出目标、名字原样直发，见 `ForwardRequest` 的说明。
+    let candidates = if ctx.ignore_model_gate {
+        ctx.key_scope
+            .map(crate::server::core::key_scope::KeyScope::allowed_provider_ids)
+            .unwrap_or_default()
+    } else {
+        route_for_forward(&model)
+    };
     if crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {
         logging::verbose(
             "[Upstream]",

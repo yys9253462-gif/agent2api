@@ -74,6 +74,8 @@ type AttemptDetail = {
   /** 内部重试链：原因 + 退避间隔（毫秒） */
   retries?: { reason?: unknown; delayMs?: unknown }[]
   notice?: unknown
+  /** 这一轮实际发给上游的体字节数（缺 = 没发出去过）*/
+  bodyBytes?: unknown
 }
 
 /** 敏感词命中：词 + 次数 */
@@ -396,7 +398,7 @@ function AttemptsTable({ row }: { row: RequestRow }) {
     <Table className='text-[11.5px]'>
       <TableHeader>
         <TableRow className={NO_HOVER}>
-          {['轮次', '提供商', '账号', '结果', '内部重试', '提示'].map(label => (
+          {['轮次', '提供商', '账号', '结果', '体积', '内部重试', '提示'].map(label => (
             <TableHead key={label} className={ATTEMPT_HEAD}>{label}</TableHead>
           ))}
         </TableRow>
@@ -412,6 +414,19 @@ function AttemptsTable({ row }: { row: RequestRow }) {
             return `${String(retry?.reason || '未知原因')}${delay}`
           }).join('\n')
           const notice = String(item?.notice ?? '').trim()
+          // 体积：上游那两道墙都按请求体字节判（413 / PARSE_REQUEST_DATA_EXCEPTION），
+          // 「这次到底多大」是排查它们时第一个要问的数，库里那份原文却在 128 KB 处截断。
+          const bodyRaw = Number(item?.bodyBytes)
+          const bodyText = Number.isFinite(bodyRaw) && bodyRaw > 0
+            ? bodyRaw >= 1024 * 1024
+              ? `${(bodyRaw / 1024 / 1024).toFixed(1)} MB`
+              : bodyRaw >= 1024
+                ? `${Math.round(bodyRaw / 1024)} KB`
+                : `${bodyRaw} B`
+            : '—'
+          const bodyTitle = Number.isFinite(bodyRaw) && bodyRaw > 0
+            ? `实际发给上游 ${bodyRaw.toLocaleString()} 字节`
+            : undefined
           return (
             <TableRow key={index} className={NO_HOVER}>
               <TableCell className={ATTEMPT_CELL}>{index + 1}</TableCell>
@@ -420,6 +435,9 @@ function AttemptsTable({ row }: { row: RequestRow }) {
               </TableCell>
               <TableCell className={ATTEMPT_CELL}>{item?.account ? String(item.account) : '—'}</TableCell>
               <TableCell className={ATTEMPT_CELL}>{attemptResult(item)}</TableCell>
+              <TableCell className={`${ATTEMPT_CELL} whitespace-nowrap`} title={bodyTitle}>
+                {bodyText}
+              </TableCell>
               <TableCell className={`${ATTEMPT_CELL} whitespace-nowrap`} title={retryTitle || undefined}>
                 {retries.length ? `↻ ${retries.length} 次` : '-'}
               </TableCell>
@@ -429,7 +447,7 @@ function AttemptsTable({ row }: { row: RequestRow }) {
         })}
         {details.length < attempts ? (
           <TableRow className={NO_HOVER}>
-            <TableCell colSpan={6} className={`${ATTEMPT_CELL} text-muted-foreground`}>
+            <TableCell colSpan={7} className={`${ATTEMPT_CELL} text-muted-foreground`}>
               另有 {attempts - details.length} 次尝试未记录明细（只保留最早的 {details.length} 条）
             </TableCell>
           </TableRow>

@@ -42,6 +42,50 @@ export type RateLimitInfo = {
 }
 
 /**
+ * 限制器规则（后端 `core::limiter::LimiterRule` 的公开形态）。每账号一条数组
+ * （`limiters`），规则可自定义增删：类型（余额 / Token）+ 阈值 + 触发动作 +
+ * 启用开关，Token 规则另带重置周期。
+ *
+ * 后端公开形态**恒为数组**：记录上没有 `limiters` 键（旧版写的记录）时由旧
+ * `lowBalance` / provider 缺省**推导**（见 accounts-domain 的 `limitersOf`），
+ * 前端弹窗、徽章与后端选路读到的永远是同一份有效规则。
+ */
+export type LimiterRule = {
+  /** 余额 = 读数低于阈值触发（严格小于）；Token = 重置窗口内累计消耗达到阈值触发（≥） */
+  type: 'balance' | 'token'
+  /** 跳过 = 自动恢复（余额回升 / 窗口重置）；禁用 = 不自动恢复，需手动启用 */
+  action: 'skip' | 'disable'
+  /** 阈值：余额与余额列同一数字口径；Token 原始个数（界面以「万」输入） */
+  threshold: number
+  /**
+   * 仅「固定周期」的 Token 规则：重置周期（整数秒，30 分钟 ~ 24 小时，
+   * 对齐自然时间的固定窗口）；自然日规则不带这个键。
+   */
+  period?: number
+  /**
+   * 仅 Token 规则的重置方式：固定周期（每 N 分钟/小时）或自然日（每天本地
+   * 时区 0 点重置 —— 有的账号过了 0 点额度就回来）。余额规则恒 fixed。
+   * 缺省（旧记录没有这个键）= fixed。
+   */
+  reset?: 'fixed' | 'daily'
+  /** 停用中的规则不参与判定；后端归一化后恒显式给出 */
+  enabled?: boolean
+}
+
+/**
+ * 一个 Token 规则窗口在**当前窗口**的消耗读数（用量快照 `tokenUsage` 的行，
+ * 后端 `core::limiter` 的内存事实表投影）。`kind` 是窗口种类：固定周期 =
+ * 周期秒数，自然日 = 0。`windowStart` 是窗口起点（毫秒）：与按种类现算的
+ * 窗口起点对不上 = 读数已翻页，判定按 0 算（见 accounts-domain 的
+ * `tokenReadingForRule`）。
+ */
+export type TokenReading = {
+  kind: number
+  windowStart: number
+  used: number
+}
+
+/**
  * 账号记录。后端公开形态字段很多、且随 provider 不同（identifier / expiry 的键名
  * 由能力表决定），所以留一条索引签名兜底 —— 能力表指向的字段（uid / userId / account）
  * 只能按动态键读。
@@ -95,12 +139,16 @@ export type AccountRecord = {
    */
   usageQuery?: { enabled?: boolean; interval?: number }
   /**
-   * 余额不足时的处理（后端公开形态恒为对象；**缺省按 provider 区分**——
-   * Cline 免费池不处理、其余跳过阈值 1，显式配置一律原样尊重；见
-   * `lowBalanceOf`）。`threshold` 与余额列同一数字口径
-   * （`available` / workbuddy 家的 `totalLeft`）。
+   * 余额不足时的处理（**旧字段，限制器上线后只是兼容形态**：写入侧由后端在
+   * 保存 `limiters` 时同步，读侧的有效规则见 `limiters`）。`threshold` 与余额列
+   * 同一数字口径（`available` / workbuddy 家的 `totalLeft`）。
    */
   lowBalance?: { mode?: 'off' | 'skip' | 'disable'; threshold?: number }
+  /**
+   * 限制器规则列表（后端公开形态恒为数组，未显式配置 = 由旧 lowBalance /
+   * provider 缺省推导的有效规则；形状见 `LimiterRule`）。
+   */
+  limiters?: LimiterRule[]
   addedAt?: number
   updatedAt?: number
   tokenTail?: string
@@ -145,6 +193,8 @@ export type OnboardingTaskRaw = {
   group?: unknown
   points?: unknown
   done?: unknown
+  /** 前置没满足 ⇒ 这一条现在领不动（CodeArts 新人礼未到门槛 / 活动未开始） */
+  blocked?: unknown
 }
 
 /** 渲染用的归一形状（claiming / error 是前端运行态，后端没有） */
@@ -154,6 +204,8 @@ export type OnboardingTask = {
   group: string
   points: number
   done: boolean
+  /** 见 {@link OnboardingTaskRaw.blocked}：既不计入待领数，也不发领取 */
+  blocked: boolean
   claiming?: boolean
   error?: string
 }
@@ -181,7 +233,18 @@ export type AccountsBridge = {
     failed?: Array<{ id?: string; error?: string }>
   } | null | undefined>
   getAllBalances(id?: string): Promise<{ results?: Array<Record<string, unknown>> } | null | undefined>
-  getBalancesSnapshot(): Promise<{ at?: number; results?: Array<Record<string, unknown>> } | null | undefined>
+  /**
+   * 用量快照（后端 `usage_query::snapshot`）：余额结论之外还带 Token 限制器的
+   * 周期读数 —— `tokenAt` 是这批读数的计算时刻（与余额的 `at` 各走各的，前端
+   * 按它判断要不要应用），`tokenUsage` 按账号给启用中的每个 Token 周期一条
+   * `{period, windowStart, used}`（没配规则的账号不出现）。
+   */
+  getBalancesSnapshot(): Promise<{
+    at?: number
+    results?: Array<Record<string, unknown>>
+    tokenAt?: number
+    tokenUsage?: Record<string, unknown>
+  } | null | undefined>
   getProxies(): Promise<{ clash?: ClashSnapshot } | null | undefined>
   /** 代理池列表（「网络代理」页维护的命名代理）：账号代理表单的
    *  「已保存的代理」下拉读它；写侧（增删改）只有那一页用，不在这份桥里 */
@@ -316,6 +379,8 @@ export type SharedWindow = {
     refresh?: () => Promise<unknown> | unknown
     runAccountAction?: (action: string, id: string) => void
     getState?: () => { accounts?: AccountsSnapshot } | null | undefined
+    /** 顶栏状态区重画：余额结论会翻转「已限流」计数，应用完读数后调它跟上 */
+    renderTopbarStatus?: () => void
     readonly currentPage?: string
   }
   wbConfirm?: { ask?: (options: ConfirmOptions) => Promise<boolean> }
@@ -350,10 +415,7 @@ export type SharedWindow = {
     }) => Promise<unknown>
     remove?: (id: string) => Promise<boolean>
   }
-  /** 并发上限小对话框（已迁的岛，见 conc-dialog.tsx） */
-  wbAccountConcDialog?: { open?: (account: AccountRecord) => void; close?: () => void }
-  /**
-   * ZCode「领套餐」流程（ui/zcode-claim.js，本页把账号对象与「今天领过的套餐 id」
+  /** ZCode「领套餐」流程（ui/zcode-claim.js，本页把账号对象与「今天领过的套餐 id」
    * 递过去）。第二个参数是**逐份**的领取状态：一个账号可能同时挂着几份可领套餐，
    * 而上游的「已领取过」是按套餐判的 —— 弹窗据此把已领的那几份标出来、只让选没领的。
    */

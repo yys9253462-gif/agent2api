@@ -67,7 +67,7 @@ import {
   allAccounts, clearLimits, clearSelection, ensureProxyPoolOptions,
   getStore, installAccountsApi, normalizeFilter, openBatchDialog, panelOpen, providerSummaryList,
   queryAllUsage, rowContext, seats, segmentCounts, setAllPicked, setProviderFilter, setSegmentFilter,
-  snapshot, startConnectionsPolling, subscribe, togglePick, visibleList,
+  snapshot, startConnectionsPolling, subscribe, tokenUsageOf, togglePick, usageEntryOf, visibleList,
 } from './accounts-data'
 import {
   AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, LimitsCell, PanelsRow, PriorityStepper,
@@ -137,8 +137,11 @@ function AccountsPage() {
   const loaded = Boolean(snapshot())
   const all = allAccounts()
   const summaries = providerSummaryList()
-  const counts = segmentCounts()
-  const visible = visibleList()
+  // 限流维度的分段把「余额不足已跳过 / Token 限额已跳过」都算进已限流
+  // （isLimitedNow 的口径），所以筛选与计数要带上余额与 Token 两份读数的查找口
+  // —— 缓存每次 bump 后这里重算
+  const counts = segmentCounts(usageEntryOf, tokenUsageOf)
+  const visible = visibleList(usageEntryOf, tokenUsageOf)
   const seatMap = seats()
   const columns = visibleColumns()
   /**

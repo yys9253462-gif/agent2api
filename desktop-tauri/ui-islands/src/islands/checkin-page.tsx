@@ -5,7 +5,7 @@ import {
 } from '@ui'
 import { PROVIDER_ICONS } from './add-provider-pick'
 import { formatTime, shared, type OnboardingTask } from './accounts-shared'
-import { claimedPlanIdsToday } from './accounts-domain'
+import { claimedPlanIdsToday, welfareDoneTitle, welfareStateOf, welfareTodoTitle } from './accounts-domain'
 import {
   claimOnboarding, getCheckinStore, groupTone, historyLine, loadCheckinCenter,
   nextRunText, onboardingExpanded, queryOnboarding, runAllCheckin, saveAutoCheckin,
@@ -44,10 +44,58 @@ const PROVIDER_DESC: Record<string, string> = {
   raccoon: '桌面端每日积分链路',
   autoclaw: '官方客户端的每日签到任务',
   'autoclaw-intl': '与国内版同一套任务接口 · 站点不同',
-  qoder: '活动（campaign）领取 · 每天 10:00 刷新 · 仅中国版',
+  qoder: '活动（campaign）领取 · 每天 10:00 刷新',
+  'qoder-intl': '带设备风控身份领取「每日 100 Credits」 · 需要 UMID 组件',
   trae: 'SOLO 的 checkin_credits 领取 · 按自然日 0 点刷新',
   loomy: '无独立签到接口 · 每天替账号打一次首次登录积分',
   kuku: '「免费领积分」的每日任务 · 逐个领取',
+}
+
+/**
+ * Qoder 国际版的 UMID 组件提示（展开后的分组详情顶部）。
+ *
+ * 国际版签到依赖本机的设备风控身份（`Cosy-MachineToken` 三件套），组件来源
+ * 三种：本机 Qoder 客户端、qodercli 解压、网关数据目录安装（Linux 一键装）。
+ * 这里只读一次状态：装了就说明来源，没装且平台支持安装就给按钮（Linux/Docker
+ * 用户唯一能自助的路径）；不支持安装的平台只说明怎么补 —— Windows/macOS 装
+ * 客户端或 qodercli 后无需重启网关（组件发现按次执行）。
+ */
+function UmidHint(): React.ReactElement | null {
+  const [state, setState] = React.useState<{ available?: boolean; source?: string | null; installSupported?: boolean; installing?: boolean } | null>(null)
+  const load = React.useCallback(async (): Promise<void> => {
+    try {
+      const response = await fetch('/api/qoder-umid')
+      if (response.ok) setState(await response.json())
+    } catch { /* 状态是锦上添花，拉不到不挡签到 */ }
+  }, [])
+  React.useEffect(() => { void load() }, [load])
+  if (!state || state.available) return null
+  const install = async (): Promise<void> => {
+    try {
+      setState(prev => prev ? { ...prev, installing: true } : prev)
+      const response = await fetch('/api/qoder-umid/install', { method: 'POST' })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null)
+        shared().wbApp?.toast?.(`UMID 组件安装失败：${payload?.error ?? response.status}`, 'err')
+      } else {
+        shared().wbApp?.toast?.('✅ UMID 组件已安装，下轮签到即可领取国际版积分')
+      }
+    } catch (error) {
+      shared().wbApp?.toast?.(`UMID 组件安装失败：${error instanceof Error ? error.message : String(error)}`, 'err')
+    } finally {
+      void load()
+    }
+  }
+  return (
+    <div className='flex flex-wrap items-center gap-2 px-[2px] pb-1 text-[12px] text-muted-foreground'>
+      <span>国际版签到需要 UMID 组件生成设备风控身份（本机未检测到）。</span>
+      {state.installSupported
+        ? <Button variant='outline' size='sm' disabled={state.installing === true} onClick={() => { void install() }}>
+            {state.installing ? '安装中…' : '一键安装组件'}
+          </Button>
+        : <span>安装 Qoder 客户端或 qodercli 后即可（无需重启网关）。</span>}
+    </div>
+  )
 }
 
 /** 问号提示全文（沿用 tasks-panel 的 CHECKIN_DESC，签到口径没变） */
@@ -56,6 +104,8 @@ const AUTO_CHECKIN_DESC =
   '国际版走每日活跃任务：探测活动、领日活奖励、再用免费模型保活；' +
   '小浣熊走桌面端每日积分链路；AutoClaw 走官方客户端的每日签到任务；' +
   'Qoder 中国版走活动领取，没被下发活动的账号会得到中性提示；' +
+  'Qoder 国际版要先带设备风控身份（本机 Qoder 客户端 / qodercli 的 UMID 组件生成）' +
+  '才能看到「每日 100 Credits」活动，缺组件时会得到明确的说明而不是报错；' +
   'Trae 领 SOLO 的每日签到积分（按自然日 0 点重置），上游没对该账号开活动、' +
   '或凭据里没有设备号时得到的是「未领取 + 具体原因」而不是报错；' +
   'Loomy 每天替账号打一次首次登录积分；KukuAI 领「免费领积分」的每日任务）。' +
@@ -66,7 +116,8 @@ const AUTO_CHECKIN_DESC =
 
 /** 新手任务分组的提供商展示名（缺省回落 provider id 本身） */
 function onboardingProviderLabel(provider: string): string {
-  return provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy' : provider
+  return provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy'
+    : provider === 'codearts' ? 'CodeArts' : provider
 }
 
 function useCheckinStore(): CheckinStore {
@@ -114,8 +165,12 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
         {group.accounts.map(account => {
           // WorkBuddy 国际版执行的是「每日活跃任务」：三颗按钮对应三档手动粒度
           // （保活 / 领取 / 保活+领取）—— 领取才会加积分，保活只维持活跃，
-          // 分开是当初一颗按钮混做两件事留下的教训
-          const dailyActivity = account.edition === 'intl'
+          // 分开是当初一颗按钮混做两件事留下的教训。
+          // 判据用**分组 id** 而不是账号的 `edition`：Qoder 国际版拆家后公开
+          // 形态同样带 `edition: "intl"`，按 edition 判会把它的账号派去
+          // WorkBuddy 的日活接口（上游稳定 400「该账号不是 WorkBuddy 国际版
+          // 账号」）。只有 `workbuddy-intl` 这一组执行日活链。
+          const dailyActivity = group.id === 'workbuddy-intl'
           return (
             <tr key={account.id}>
               <td>{account.name || account.id}</td>
@@ -207,6 +262,7 @@ function ProviderRow({ group, expanded }: { group: CheckinProviderGroup; expande
       </div>
       {expanded ? (
         <div className='ck-prov-detail'>
+          {group.id === 'qoder-intl' ? <UmidHint /> : null}
           <AccountRows group={group} />
         </div>
       ) : null}
@@ -244,7 +300,11 @@ function OnboardingRow({ row }: { row: { id: string; name: string; provider?: st
             {cache?.status === 'loaded'
               ? `已领 ${tasks.length - unclaimed}/${tasks.length} · 累计 ${cache.earned}${cache.total ? ` / ${cache.total}` : ''} 积分`
               : '尚未查询任务状态'}
-            {cache?.checkedAt ? ` · 查询于 ${formatTime(cache.checkedAt)}` : ''}
+            {/* 记忆路径没有「查询于」（那是后端结算时刻，不是这一次查询）：
+                一次性福利领完后按「结算于」如实交代这份结果从哪来 */}
+            {cache?.settled && cache.settledAt
+              ? ` · 结算于 ${formatTime(cache.settledAt)}`
+              : cache?.checkedAt ? ` · 查询于 ${formatTime(cache.checkedAt)}` : ''}
           </div>
         </div>
         {/* stopPropagation：右侧按钮不触发行的展开 / 收起（点「查询任务」不该顺手折起清单） */}
@@ -256,11 +316,13 @@ function OnboardingRow({ row }: { row: { id: string; name: string; provider?: st
               : cache?.status === 'error'
                 ? <Badge variant='destructive' shape='tag'>查询失败</Badge>
                 : null}
+          {/* 手点「查询任务」= 强制实查（refresh）：结算过的账号进页面走记忆、
+              零上游，这颗按钮是唯一的"现在去问一次上游"入口（见 checkin-state） */}
           <Button
             size='sm'
             variant='outline'
             disabled={cache?.status === 'loading' || cache?.claiming === true}
-            onClick={() => void queryOnboarding(row.id, { expand: true })}
+            onClick={() => void queryOnboarding(row.id, { expand: true, refresh: true })}
           >
             {cache?.status === 'loading' ? '查询中…' : '查询任务'}
           </Button>
@@ -292,9 +354,11 @@ function OnboardingRow({ row }: { row: { id: string; name: string; provider?: st
                   ? <Badge variant='warning' shape='tag'>领取中</Badge>
                   : task.done
                     ? <Badge variant='success' shape='tag'>已领取</Badge>
-                    : task.error
-                      ? <Badge variant='destructive' shape='tag'>{task.error}</Badge>
-                      : <Badge variant='brand' shape='tag'>可领取</Badge>}
+                    : task.blocked
+                      ? <Badge variant='outline' shape='tag'>暂不可领</Badge>
+                      : task.error
+                        ? <Badge variant='destructive' shape='tag'>{task.error}</Badge>
+                        : <Badge variant='brand' shape='tag'>可领取</Badge>}
               </span>
             </div>
           ))}
@@ -304,11 +368,25 @@ function OnboardingRow({ row }: { row: { id: string; name: string; provider?: st
   )
 }
 
-/** 活动福利一行（CodeArts / ZCode；领取沿用既有流程，本页只提供入口） */
+/**
+ * 活动福利一行（CodeArts / ZCode；领取沿用既有流程，本页只提供入口）。
+ *
+ * ── 「已领取」标记（CodeArts）───────────────────────────────
+ * 快照的福利行带着本地领取台账（`row.welfare`，后端 checkin_center 落盘事实），
+ * 用账号页同款的 `welfareStateOf` 判「今天已领取且已受理」—— 判据只有一处，
+ * 两页不会一个说领了一个说没领。已领时按钮置灰、行上加绿徽章：再点也只是
+ * 让后端回一句「已领取并确认」，留着可点会让人以为还能再领一次。
+ * **试过但没到账不置灰**：手动点击在后端是绕过限流闸的，重试不会变成第二笔领取。
+ * ZCode 那行的领取状态本来就是逐份的（claimPlans），交给领取弹窗自己标，行上不动。
+ */
 function WelfareRow({ row, kind }: {
-  row: { id: string; name: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }
+  row: { id: string; name: string; welfare?: unknown; claimAt?: number | null; claimPlans?: Record<string, number> | null }
   kind: 'welfare' | 'plan'
 }) {
+  const state = kind === 'welfare'
+    ? welfareStateOf({ welfare: row.welfare } as never)
+    : null
+  const taken = state !== null && state.today && state.accepted
   /** 领取完成后刷新快照与主状态（账号页的余额读数也在那一轮里跟上） */
   const start = async () => {
     const account = { id: row.id, name: row.name }
@@ -326,19 +404,30 @@ function WelfareRow({ row, kind }: {
     <div className='ck-welfare-row'>
       <ProviderLogo id={kind === 'welfare' ? 'codearts' : 'zcode'} label={kind === 'welfare' ? 'CodeArts' : 'ZCode'} />
       <div className='ck-prov-info'>
-        <div className='ck-prov-name'>{row.name || row.id}</div>
+        <div className='ck-prov-name'>
+          {row.name || row.id}
+          {taken ? <Badge variant='success' shape='tag' title={welfareDoneTitle(state!)}>已领取</Badge> : null}
+        </div>
         <div className='ck-prov-desc'>
           {kind === 'welfare'
-            ? '运营活动交付（领取 → 确认 → 回读核实）· 领的是套餐赠送积分'
+            ? taken
+              ? `今天（北京时间 ${state!.day}）已领取 · 官方确认到账 ${state!.confirmed} 项 · 明天可再领`
+              : '运营活动交付（领取 → 确认 → 回读核实）· 领的是套餐赠送积分'
             : row.claimAt
               ? `上次领取 ${formatTime(row.claimAt)} · 领取需通过滑块验证码`
               : '限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码'}
         </div>
       </div>
       <div className='ck-prov-right'>
-        <Button size='sm' variant='outline' onClick={() => void start()}>
-          {kind === 'welfare' ? '去领取' : '去领取（需验证码）'}
-        </Button>
+        {kind === 'welfare' && taken ? (
+          <Button size='sm' variant='outline' disabled title={welfareDoneTitle(state!)}>已领取</Button>
+        ) : (
+          <Button size='sm' variant='outline'
+            title={state && !taken ? welfareTodoTitle(state) : undefined}
+            onClick={() => void start()}>
+            {kind === 'welfare' ? '去领取' : '去领取（需验证码）'}
+          </Button>
+        )}
       </div>
     </div>
   )
@@ -607,7 +696,7 @@ function CheckinPage() {
           </div>
           <div className='ck-stat-foot'>
             {onboardingRows.length
-              ? `已查 ${onboardingChecked.length} / 共 ${onboardingRows.length} 个账号`
+              ? `已有结果 ${onboardingChecked.length} / 共 ${onboardingRows.length} 个账号`
               : '没有支持新手任务的账号'}
           </div>
         </div>
@@ -639,7 +728,7 @@ function CheckinPage() {
               {(daily?.outOfScope ?? []).length > 0 ? (
                 <div className='ck-fold-note'>
                   不参与每日签到：{daily!.outOfScope.map(item => `${item.label} ×${item.count}（${item.reason}）`).join('；')}
-                  。CodeArts 与 ZCode 的福利领取见下方「活动福利」。
+                  。CodeArts 的一次性奖励在上方「新手任务」，它与 ZCode 的每日/套餐福利领取见下方「活动福利」。
                 </div>
               ) : null}
             </div>
@@ -648,13 +737,23 @@ function CheckinPage() {
           <section className='panel'>
             <div className='panel-head'>
               <h2>新手任务</h2>
-              <span className='panel-sub'>一次性福利 · 签到后自动查询并领取 · 点击行展开任务清单</span>
+              <span className='panel-sub'>
+                一次性福利 · 签到后自动查询并领取，领完记在本机不再查上游 · 点击行展开任务清单
+              </span>
               {onboardingRows.length > 0 ? (
                 <Button
                   size='sm'
                   variant='outline'
                   className='ml-auto'
-                  onClick={() => { for (const row of onboardingRows) void queryOnboarding(row.id) }}
+                  onClick={() => {
+                    for (const row of onboardingRows) {
+                      // 已结算的账号（快照带回了记忆）不进这一轮：它们的结论不会变，
+                      // 「全部查询」的语义是「把还没查的查一遍」。真要重问上游，
+                      // 逐行那颗「查询任务」才是强制实查的入口（refresh）。
+                      if (row.settled && typeof row.settled === 'object') continue
+                      void queryOnboarding(row.id)
+                    }
+                  }}
                 >
                   全部查询
                 </Button>
@@ -665,7 +764,7 @@ function CheckinPage() {
                 {onboardingRows.map(row => <OnboardingRow key={row.id} row={row} />)}
               </div>
             ) : (
-              <div className='ck-tl-empty'>没有支持新手任务的账号 —— 目前有 Loomy、小浣熊两家。</div>
+              <div className='ck-tl-empty'>没有支持新手任务的账号 —— 目前有 Loomy、小浣熊、CodeArts 三家。</div>
             )}
           </section>
 

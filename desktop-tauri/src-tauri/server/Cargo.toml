@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "2.9.8"
+version = "2.9.9"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -41,8 +41,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # rt-multi-thread/macros 起运行时，net 监听端口，sync 传停机信号，
 # fs/io-util 读写配置与日志文件；signal 供 headless 二进制接 SIGTERM
-# （容器 stop 的优雅停机路径）
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "signal"] }
+# （容器 stop 的优雅停机路径）；process 供 Qoder 国际版签到的 UMID 组件
+# 子进程调用（providers/qoder/risk.rs，runtime-info 的 stdout 要异步读）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "signal", "process"] }
+# Qoder 国际版签到的 UMID 组件安装（providers/qoder/risk.rs）：官方 qodercli
+# npm 包是 .tgz（gzip + tar），解出内嵌的 runtime-info 二进制。flate2 已在
+# 依赖树里（image 拉的），声明出来直接复用；tar 解析手写（几十行，见 risk.rs）
+flate2 = "1"
 url = "2"
 axum = "0.8"
 # 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理
@@ -111,3 +116,6 @@ windows = { version = "0.61", features = [
 # 路由级测试用 `ServiceExt::oneshot` 直接打 Router（不占端口、不跑 serve），
 # 见 `server/http.rs` 的 CORS 用例。util 是 oneshot 所在的那个 feature。
 tower = { version = "0.5", features = ["util"] }
+# 尺寸墙探针要给同一个请求体做 gzip 对照（`codearts/chat.rs` 的 size_wall 用例）。
+# 只在测试目标里链，不进 release 产物；锁文件里本来就有这个包，没有新增解析结果。
+flate2 = "1"

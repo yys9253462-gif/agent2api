@@ -762,8 +762,11 @@ pub fn shim_js() -> &'static str {
     // ── Loomy 新手任务（查询 / 一键领取）──
     // 与桌面 `bridge.rs` 的同名方法成对维护：签到后界面查询任务状态、有未领取才
     // 弹窗领取（accounts-dialog-onboarding）。
-    getOnboardingTasks: function (id) {
-      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding');
+    // `refresh` = 界面手点「查询任务」→ `?refresh=1` 强制实查上游；不带则吃后端
+    // 的结算记忆（一次性福利领完就不再问上游，见 api::onboarding 的模块说明）。
+    getOnboardingTasks: function (id, refresh) {
+      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding'
+        + (refresh ? '?refresh=1' : ''));
     },
     claimOnboardingTasks: function (id) {
       return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding/claim', {});

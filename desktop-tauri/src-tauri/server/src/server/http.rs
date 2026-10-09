@@ -503,6 +503,15 @@ pub fn panel_router(state: ServerState) -> Router {
         // （CHECKIN_PROVIDERS ∩ supports_checkin），见 api::checkin_center 的模块头。
         // 挂 protected：它能列出全部账号及其签到时间，敏感度与 /api/accounts 一致。
         .route("/api/checkin-center", get(api::checkin_center::get_center))
+        // ── Qoder UMID 组件（设备风控身份）──
+        // GET 状态 / POST 安装（安装仅 Linux，见 api::qoder_umid 的模块头）。
+        // 挂 protected：安装会向 npm 下载并落地一个可执行组件，敏感度与
+        // /api/scheduled-tasks 同级。
+        .route(
+            "/api/qoder-umid",
+            get(api::qoder_umid::get_status).post(api::qoder_umid::get_status),
+        )
+        .route("/api/qoder-umid/install", post(api::qoder_umid::install))
         // ── 间隔型定时任务（凭证自动维护 / 模型目录刷新 / 两个前端自动刷新）──
         // 挂 protected：它能改后端后台任务的执行节奏（间隔 1 分钟会让网关持续
         // 打上游），并触发真打上游的刷新，敏感度与 /api/retention 同级。

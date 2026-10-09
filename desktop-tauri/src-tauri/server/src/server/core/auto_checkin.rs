@@ -8,9 +8,17 @@
 //! Node 版用 `setInterval(tick, 30s)`：单个 setTimeout 在系统休眠、锁屏、时钟被改
 //! 之后会漂移甚至整段错过，而每 30 秒比一次「当前是否已过今天的触发点」，
 //! 唤醒后自然补上。Rust 侧用等价的 `sleep(30s)` 循环，每个 tick 都从**墙上时钟**
-//! （`chrono::Local::now()`）重新判定，因此与 Node 一样具备自愈能力：
+//! （北京时间，见 `core::beijing`）重新判定，因此与 Node 一样具备自愈能力：
 //! libuv 与 tokio 的定时器都基于单调时钟，机器休眠期间都不推进，
 //! 醒来的第一次 tick 会把错过的时点补上 —— 两者在这点上是同一套语义。
+//!
+//! ── 时区口径：固定 UTC+8，不跟机器时区（issue #138）────────────
+//! 「今天是否已触发」与触发时刻都按**北京时间**算（`core::beijing`）：
+//! 签到的自然日是上游的自然日（北京时间零点重置），网关跑在 NAS / Docker /
+//! 海外 VPS 上时跟机器时区走会让定时整体漂移 —— 美西机器上 00:01 的签到
+//! 实际发生在北京时间 15:01，当天额度可能已被更早的调用用掉，面板的
+//! 「今日已签到」也按错误的日期显示。移植自 Node 版（作者在国内，`Local`
+//! 恰好等于 UTC+8）时没有显式钉住这个前提，这里补上。
 //!
 //! ── 补签（有意的行为，别「顺手优化」）────────────────────────
 //! Node 版 `start()` 的条件是**「今天还没签过」**，并不判「时间点是否已过」：
@@ -32,11 +40,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, FixedOffset, TimeZone};
 use serde_json::{json, Map, Value};
 
 use crate::server::config;
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::beijing;
 use crate::server::core::billing::checkin;
 use crate::server::core::billing::BillingService;
 use crate::server::logging;
@@ -63,10 +72,13 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     两地是同一套路径、同一套任务 id，只是站点不同（已实测），因此两家
 ///     都列进来；地区由 `billing::checkin` 从账号的 provider 反查。
 ///   - **Qoder 中国版**：活动（campaign）领取链路（`providers::qoder::checkin`）。
-///     只有中国版有每日签到 —— 国际版这个地区没有签到计划（legacy 路径 404、
-///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 edition
-///     排除。中国版里 Free 套餐账号也可能没有被下发活动（实测如此），那种情况
-///     实现返回一条中性结果（「当前没有可领取的签到活动」），不算失败。
+///     Free 套餐账号也可能没有被下发活动（实测如此），那种情况实现返回一条
+///     中性结果（「当前没有可领取的签到活动」），不算失败。
+///   - **Qoder 国际版**（2026-10，issue #140）：同一条 campaign 链路，但上游
+///     **只对带设备风控头的请求**下发「每天领 100 Credits」—— 风控身份由本机
+///     Qoder 客户端 / qodercli 的 UMID 组件生成（`providers::qoder::risk`），
+///     Linux/Docker 可一键安装组件。缺组件时得到的是明确的说明而不是报错
+///     （也不落当日台账，第二天组件就位后照常领）。
 ///   - **Trae**：SOLO 的 `checkin_credits` 领取（`providers::trae::checkin`）。
 ///     加它不是因为"别家有"，而是这条链**有钱**：SOLO 转积分制后，模型调用花的
 ///     正是签到钱包那份积分，不签就是每天白丢一笔额度。它的风险不在"该不该签"
@@ -87,13 +99,14 @@ pub const DEFAULT_TIME: &str = "00:01";
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 9] = [
+pub const CHECKIN_PROVIDERS: [&str; 10] = [
     "workbuddy",
     "workbuddy-intl",
     "raccoon",
     "autoclaw",
     "autoclaw-intl",
     "qoder",
+    "qoder-intl",
     "trae",
     "loomy",
     "kuku",
@@ -110,24 +123,26 @@ pub fn default_providers() -> Vec<String> {
 /// WorkBuddy 两个地区在注册表里就叫「WorkBuddy 国内版 / 国际版」（拆家后的
 /// 既定口径），签到语境沿用注册名即可 —— 国际版执行的是活跃任务而不是普通
 /// 签到，这件事由签到中心 `PROVIDER_DESC` 的链路说明与它的分组描述讲清楚，
-/// 不在标签里堆字。唯一要覆盖的是 **Qoder**：注册表是通用名（它没有拆家，
-/// 一个 id 覆盖两个地区），而签到**只在中国版成立**（国际版没有签到计划），
-/// 所以这里补成「Qoder 中国版」。其余几家不需要后缀：小浣熊没有版本区分，
+/// 不在标签里堆字。Qoder 拆家（2026-10）后注册名就是「Qoder 中国版 /
+/// 国际版」，不再需要这里的覆盖。其余几家不需要后缀：小浣熊没有版本区分，
 /// AutoClaw 两地的签到链路都存在且同形 —— 展示名已带「国内版 / 国际版」。
 pub fn provider_label(id: &str) -> &str {
-    match id {
-        "qoder" => "Qoder 中国版",
-        other => crate::server::core::providers::PROVIDERS
-            .iter()
-            .find(|meta| meta.id == other)
-            .map(|meta| meta.label)
-            .unwrap_or(other),
-    }
+    crate::server::core::providers::PROVIDERS
+        .iter()
+        .find(|meta| meta.id == id)
+        .map(|meta| meta.label)
+        .unwrap_or(id)
 }
 
 /// 归一化配置里的提供商清单：只认 CHECKIN_PROVIDERS 里的 id（去重、保持顺序），
 /// 缺失 / 空数组 / 全是非法值都回落到「全选」—— 旧配置文件里没有这个字段，
 /// 读出来必须是合法的默认行为。
+///
+/// 存量兼容：Qoder 拆家（2026-10）前的老清单只有 9 项、没有 `qoder-intl`，
+/// 而显式清单不会被「缺啥补啥」—— 不补的话，拆家前勾了 Qoder 的用户拆家后
+/// 自动签到会静默漏掉国际版账号。这里按账号迁移的同一口径补齐：勾了
+/// `qoder` 的，紧跟其后补上 `qoder-intl`（要签中国版就要签国际版，拆家只是
+/// 同一套能力的地区分身）；两者都没勾的（明确不签 Qoder）不动。
 pub fn normalize_providers(value: Option<&Value>) -> Vec<String> {
     let Some(list) = value.and_then(Value::as_array) else {
         return default_providers();
@@ -140,11 +155,17 @@ pub fn normalize_providers(value: Option<&Value>) -> Vec<String> {
         })
         .map(|id| id.to_string())
         .collect();
-    if picked.is_empty() {
+    let mut picked = if picked.is_empty() {
         default_providers()
     } else {
         picked
+    };
+    if let Some(pos) = picked.iter().position(|id| id == "qoder") {
+        if !picked.contains(&"qoder-intl".to_string()) {
+            picked.insert(pos + 1, "qoder-intl".to_string());
+        }
     }
+    picked
 }
 
 /// config.json 里承载定时签到状态的键
@@ -234,17 +255,24 @@ pub fn normalize_time(value: Option<&Value>) -> Result<String, AutoCheckinConfig
     Ok(format!("{hour:02}:{minute:02}"))
 }
 
-/// 本地日期键 YYYY-MM-DD：用于「今天是否已触发」的判定。
-/// Node 用 `getFullYear/getMonth/getDate`（**本地时区**），不能用 UTC ——
-/// UTC+8 的凌晨 00:01 在 UTC 下还是前一天，会让补签判重算错一整天。
-pub fn local_date_key(now: DateTime<Local>) -> String {
-    now.format("%Y-%m-%d").to_string()
+/// 北京日期键 YYYY-MM-DD：用于「今天是否已触发」的判定。
+///
+/// 为什么不能用 UTC 算：UTC+8 的凌晨 00:01 在 UTC 下还是前一天，会让
+/// 「今天签过没有」的判重错一整天（移植来源 Node 版用本地时区，作者在
+/// 国内恰好等于 UTC+8 —— 这里显式钉住北京时间，见 `core::beijing`）。
+pub fn date_key(now: DateTime<FixedOffset>) -> String {
+    beijing::date_key(now)
 }
 
-/// 今天的触发时刻（本地时区）；已过则返回 Some，未到返回 None。
+/// 北京时间的今天（`YYYY-MM-DD`）——「今天是否已触发」判定的统一入口。
+pub fn today_key() -> String {
+    beijing::today_key()
+}
+
+/// 今天的触发时刻（北京时间）；已过则返回 Some，未到返回 None。
 /// 对应 Node 版 dueNow：非法的 time 文本在这里同样表现为 None（Node 是抛异常，
 /// 但调用方一律 catch 后 return，结果一致）。
-fn due_now(time_text: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
+fn due_now(time_text: &str, now: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
     let target = today_at(time_text, now)?;
     if now >= target {
         Some(target)
@@ -255,7 +283,7 @@ fn due_now(time_text: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
 
 /// 距离下一次触发的毫秒数（用于界面显示「下次执行」）。
 /// 对应 Node 版 msUntilNext：目标时刻已过则顺延到明天同一时刻。
-pub fn ms_until_next(time_text: &str, now: DateTime<Local>) -> i64 {
+pub fn ms_until_next(time_text: &str, now: DateTime<FixedOffset>) -> i64 {
     let Some(mut target) = today_at(time_text, now) else {
         return 0;
     };
@@ -265,23 +293,22 @@ pub fn ms_until_next(time_text: &str, now: DateTime<Local>) -> i64 {
     (target - now).num_milliseconds()
 }
 
-/// 今天的 HH:MM 时刻（本地时区）；time 文本非法时 None。
+/// 今天的 HH:MM 时刻（北京时间）；time 文本非法时 None。
 ///
 /// Node 用 `target.setHours(hour, minute, 0, 0)`（就地改到当天）；
 /// chrono 没有 set_* 的就地 API，用 `with_ymd_and_hms` 重建。
-/// 夏令时切换当天若该时刻不存在（LocalResult::None），按 None 处理 ——
-/// 跳过这一次而不是猜一个偏移，比 Node 的 setHours 更保守（中国无夏令时，
-/// 这条分支实际不会走到）。
-fn today_at(time_text: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
+/// 固定偏移没有夏令时问题（构造恒为 `Single`），因此不需要 Node 那种
+/// 「DST 当天该时刻不存在」的兜底 —— `single()` 取不到就当 None，
+/// 也就是这台机器上的时钟环境异常到连北京时间的固定偏移都构造不出来。
+fn today_at(time_text: &str, now: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
     let normalized = normalize_time(Some(&Value::String(time_text.to_string()))).ok()?;
     let (hour, minute) = normalized.split_once(':')?;
     let hour: u32 = hour.parse().ok()?;
     let minute: u32 = minute.parse().ok()?;
     let naive = now.date_naive().and_hms_opt(hour, minute, 0)?;
-    Local
+    beijing::offset()
         .from_local_datetime(&naive)
-        .earliest()
-        .map(|value| value.with_timezone(&Local))
+        .single()
 }
 
 // ─── 状态读写 ───────────────────────────────────────────────
@@ -411,7 +438,7 @@ impl AutoCheckin {
     /// 对外暴露的状态（对应 Node 版 getState，含界面要显示的「下次执行」）
     pub fn state(&self) -> Value {
         let state = read_state();
-        let now = Local::now();
+        let now = beijing::now();
         let next_run_at = if state.enabled {
             let next = logging::now_ms() + ms_until_next(&state.time, now);
             Value::from(next)
@@ -427,7 +454,7 @@ impl AutoCheckin {
                 json!({ "id": id, "label": provider_label(id) })
             }).collect::<Vec<_>>(),
             "lastFiredDate": state.last_fired_date,
-            "lastFiredToday": state.last_fired_date.as_deref() == Some(local_date_key(now).as_str()),
+            "lastFiredToday": state.last_fired_date.as_deref() == Some(date_key(now).as_str()),
             "nextRunAt": next_run_at,
             "lastResult": state.last_result,
             "running": self.is_running(),
@@ -453,7 +480,7 @@ impl AutoCheckin {
             RunningGuard { inner: self.inner.clone() }
         };
 
-        let today = local_date_key(Local::now());
+        let today = today_key();
         // 先落日期再执行：即便签到中途进程被杀，也不会在重启后反复补签
         write_state(json!({ "lastFiredDate": today }));
         logging::log("[Checkin]", &format!("⏰ 定时签到开始（{reason}）"));
@@ -489,6 +516,25 @@ impl AutoCheckin {
         };
         drop(guard);
         outcome
+    }
+
+    /// 本轮是否有「Qoder 国际版账号没领到且不算已签」的行 —— 有则今天保持
+    /// 未落账状态，等窗口开了重试（见 tick 的说明）。
+    fn qoder_intl_pending(result: &Value) -> bool {
+        result
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id.starts_with("qoder-global-"))
+                        && crate::server::core::billing::checkin::claim_pending(
+                            &item.get("claim").cloned().unwrap_or(Value::Null),
+                        )
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// 成功分支：汇总 + 记录 lastResult + 日志（对应 Node fire 里的 try 主体）
@@ -553,26 +599,60 @@ impl AutoCheckin {
                 },
             ),
         );
+        // qoderIntlPending 不进 lastResult（那是给界面看的快照），单独放在
+        // fire 的返回值上供 tick 决定今天要不要保持未落账
+        let mut summary = summary;
+        if let Some(object) = summary.as_object_mut() {
+            object.insert(
+                "qoderIntlPending".to_string(),
+                Value::Bool(Self::qoder_intl_pending(result)),
+            );
+        }
         summary
     }
 
     // ─── 调度 ───────────────────────────────────────────────
 
-    /// 轮询回调：到点且今天没签过就执行（对应 Node 版 tick）
+    /// 轮询回调：到点且今天没签过就执行（对应 Node 版 tick）。
+    ///
+    /// ── Qoder 国际版的窗口补领（2026-10，issue #140）────────────
+    /// 国际版「每日 100 Credits」的官方窗口**每天 10:00（UTC+8）开启**，而
+    /// 缺省触发时刻是 00:01 —— 那时窗口还没开，活动列表里没有积分活动，
+    /// 领取轮次对它只能得到「无活动」。若就此落 `lastFiredDate` 整天不再
+    /// 重试，国际版账号等于永远领不到。所以主轮次**照常在配置时刻跑**，
+    /// 但当轮次里存在「Qoder 国际版无活动未落账」的行时，今天暂不落
+    /// `lastFiredDate`：之后每个 tick 会重新进来，直到 10:00 窗口开启领到
+    /// （或活动行出现 CLAIMED）才落账 —— 与 10router「no-activity 刻意不
+    /// 记忆、下个 tick 再看」同一语义。`fire` 返回该信息，None（在跑/出错）
+    /// 与普通完成照旧落账。
     pub async fn tick(&self) {
         let state = read_state();
         if !state.enabled {
             return;
         }
-        let now = Local::now();
+        let now = beijing::now();
         // 未到点（含 time 非法）直接返回
         if due_now(&state.time, now).is_none() {
             return;
         }
-        if state.last_fired_date.as_deref() == Some(local_date_key(now).as_str()) {
+        if state.last_fired_date.as_deref() == Some(date_key(now).as_str()) {
             return;
         }
-        self.fire("到点触发").await;
+        match self.fire("到点触发").await {
+            Some(result) => {
+                // 领取轮次完成，但里面有「Qoder 国际版无活动」的行 → 不落账，
+                // 今天窗口开了之后由后续 tick 重试
+                if result.get("qoderIntlPending").and_then(Value::as_bool) == Some(true) {
+                    write_state(json!({ "lastFiredDate": Value::Null }));
+                    logging::log(
+                        "[Checkin]",
+                        "⏳ Qoder 国际版的活动窗口未开（官方每日 10:00 UTC+8），今天会自动重试到领到为止",
+                    );
+                }
+            }
+            // None = 已有轮次在跑或执行出错：照旧落账（fire 内部已写），行为不变
+            None => {}
+        }
     }
 
     /// 起调度循环（对应 Node 版 schedule 的 `if (timer) return`）：
@@ -615,7 +695,7 @@ impl AutoCheckin {
             return;
         }
         self.schedule();
-        if state.last_fired_date.as_deref() != Some(local_date_key(Local::now()).as_str()) {
+        if state.last_fired_date.as_deref() != Some(today_key().as_str()) {
             let service = self.clone();
             crate::spawn_task(async move {
                 service.fire("启动补签").await;

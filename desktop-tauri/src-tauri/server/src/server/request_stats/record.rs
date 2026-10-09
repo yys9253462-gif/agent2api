@@ -337,6 +337,10 @@ pub struct AttemptDetail {
     /// 这一轮的提示（目前只有代理回退直连）
     #[serde(default)]
     pub notice: Option<String>,
+    /// 这一轮实际发给上游的体字节数（None = 没发出去过）。采集侧的来由与
+    /// 「只记体积不记内容」的口径见 `core::upstream::usage::AttemptDetail::body_bytes`。
+    #[serde(rename = "bodyBytes", default)]
+    pub body_bytes: Option<i64>,
 }
 
 /// 一次尝试内部的退避重试（存储契约，与采集侧同形各自定义）。
@@ -571,6 +575,8 @@ impl NewRequestEntry {
                         .collect(),
                     // notice 空串收敛成 None，理由同 error
                     notice: item.notice.filter(|text| !text.is_empty()),
+                    // 体字节数原样透传（None = 这一轮没发出去；采集侧的理由见 usage 的字段说明）
+                    body_bytes: item.body_bytes,
                 })
                 .collect(),
             sensitive_hits: self

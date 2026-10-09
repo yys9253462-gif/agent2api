@@ -62,6 +62,7 @@ export const PROVIDER_ICONS: Record<string, string> = {
   autoclaw: 'assets/providers/autoclaw.png',
   'autoclaw-intl': 'assets/providers/autoclaw.png',
   qoder: 'assets/providers/qoder.png',
+  'qoder-intl': 'assets/providers/qoder.png',
   'cline-free': 'assets/providers/cline.png',
   'cline-pass': 'assets/providers/cline.png',
   accio: 'assets/providers/accio.png',
@@ -146,11 +147,12 @@ function providerCards(accountType: AccountType): CardItem[] {
   // Accio / ZCode 那三家（各自一块、没有地区分段）的形态不同，这是刻意的：
   // WorkBuddy 两地的登录页与凭证形态完全一致，合成一块对用户更省事。
   const visible = cards.filter(item => item.id !== 'workbuddy-intl')
-  // 展示顺序微调：两个 AutoClaw 版本要挨着（两列网格里同处一行）且**国内版在前**
-  // —— 摘要给的是注册表顺序，把 Qoder 挪到国内版前面即可
-  const from = visible.findIndex(item => item.id === 'qoder')
+  // 展示顺序微调：AutoClaw 与 Qoder 的两个版本都要挨着（两列网格里同处一行）
+  // 且**国内版在前** —— 摘要给的是注册表顺序，Qoder 国际版注册在 Qoder 后面
+  // 本就相邻（拆家后无需再挪）；AutoClaw 国际版排在 Cline 之后，仍要前移。
+  const from = visible.findIndex(item => item.id === 'autoclaw-intl')
   const to = visible.findIndex(item => item.id === 'autoclaw')
-  if (to >= 0 && from > to) visible.splice(to, 0, visible.splice(from, 1)[0])
+  if (to >= 0 && from > to) visible.splice(to + 1, 0, visible.splice(from, 1)[0])
   return visible
 }
 

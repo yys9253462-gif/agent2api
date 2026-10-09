@@ -339,6 +339,10 @@ impl ServerState {
         // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
         // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
         core::usage_records::install(db.clone());
+        // 每账号的「限制器」（余额 / Token 规则列表）：Token 周期消耗的窗口
+        // 聚合读同一个库（schema v9 的聚合索引），装句柄即可 —— 事实表的刷新
+        // 由 usage_query 的心跳循环驱动（见 limiter 模块头）。
+        core::limiter::install(db.clone());
         // 出网代理池（「网络代理」页维护的命名代理；账号按 id 引用它们）：
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。

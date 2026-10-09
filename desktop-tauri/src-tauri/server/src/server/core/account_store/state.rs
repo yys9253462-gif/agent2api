@@ -347,6 +347,24 @@ impl StoredAccount {
             .insert("onboardingGrants".to_string(), Value::Object(ledger));
     }
 
+    /// 新手任务的**一次性结算快照**（Loomy 8 条任务 / CodeArts 新人礼）：
+    /// `{ "at": <ms>, "tasks": [...], "earned": n, "total": n }`，`tasks` 与
+    /// 状态查询返回的行同形（此刻全部 `done`）。
+    ///
+    /// 与 [`Self::onboarding_grants`] 的分工：那份是**逐条**时刻（小浣熊的两条
+    /// 首登奖励各有独立的探测口径），这份是**整份清单** —— 给那两家「任务表领完
+    /// 就没有了」的家用：结算之后状态查询与一键领取都不必再打上游（零请求），
+    /// 面板进页面也直接按记忆渲染。一次性福利不会再变，快照因此没有过期问题；
+    /// 手动「查询任务」仍走强制刷新（`?refresh=1`），拿到新事实时覆盖它。
+    ///
+    /// 读在 [`crate::server::core::providers::onboarding_memory::snapshot`]：
+    /// 那里的入参是**账号记录的原始 JSON**（几家 `*_account_record()` 的返回形态），
+    /// 读侧因此只有一份实现，本访问器只负责写。
+    pub fn set_onboarding_settled(&mut self, snapshot: Value) {
+        self.fields
+            .insert("onboardingSettled".to_string(), snapshot);
+    }
+
     /// 账号级出网代理配置（缺失返回 Value::Null）
     pub fn proxy(&self) -> Value {
         self.fields.get("proxy").cloned().unwrap_or(Value::Null)
