@@ -29,7 +29,11 @@
 
    依赖：`ui/aliyun-captcha.js` 的 `window.wbAliyunCaptcha.mintTraceless`
    （脚本顺序：本文件必须排在它之后）与桥接层 `zcodeCaptchaStats` /
-   `pushZcodeCaptchaTokens`（见 desktop-tauri/src-tauri/src/bridge.rs）。 */
+   `pushZcodeCaptchaTokens`（deploy 的两种形态各有一份实现：桌面端
+   desktop-tauri/src-tauri/src/bridge.rs，headless 面板
+   server/src/web_shim.rs —— 两份都给才谈得上「同一份界面代码两种部署通用」，
+   早先在 headless 缺这两条，于是铸造器每轮都退让、池子永远是空的，
+   见 Issue #163）。 */
 
 (() => {
   /** 轮询间隔（毫秒）。2.5 秒是「库存见底到补上」的平滑窗口 */
@@ -60,7 +64,7 @@
     if (window.wbApp?.debug) window.wbApp.debug(`[ZCodeCaptcha] [WARN] ${message}`);
   }
 
-  /** 拿一次池子概况；桥接不可用（浏览器直开界面）时返回 null，循环安静地退让 */
+  /** 拿一次池子概况；桥接方法缺失（界面被别的宿主打开、脚本没就位）时返回 null，循环安静地退让 */
   async function fetchStats() {
     const bridge = api();
     if (!bridge?.zcodeCaptchaStats) return null;
@@ -214,7 +218,8 @@
 
   window.wbZcodeCaptchaPool = { start, stop };
 
-  // 自启：界面加载完就开始守着。桥接不可用（浏览器直开）时循环会安静退让，
+  // 自启：界面加载完就开始守着（桌面端与 headless 面板都走这里 —— 两种部署的
+  // 桥接方法都由各自的实现提供，见文件头）。桥接方法真缺失时循环安静退让，
   // 不会有报错刷屏（见 fetchStats 的返回 null 分支）
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start, { once: true });

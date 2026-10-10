@@ -335,7 +335,7 @@ function zcodeForm(spec: { provider: string; label: string; site: string; planNo
       ],
     },
     manualTitle: t('填写凭证'),
-    manualNoteHtml: t('本家有两个**互不替代**的凭证，按你要用的功能填，至少填一个：<b>编码套餐 API Key</b> 用于转发推理（打 <code>{site}</code>）；<b>jwt</b> 用于领取套餐与查询余额（打 <code>zcode.z.ai</code> 的 billing 网关，官方叫 Coding Plan JWT，是一串三段点分的字符串）。只填 jwt 的账号能领套餐、能看余额但不能转发，反之亦然。请填写 <b>{label}</b>账号的凭证 —— {plan}（最容易拿到的办法：直接用上方的「网页登录」—— 它会替你把这个 API Key 换好，两个凭证一起拿到。）', { site, label, plan: planNote }),
+    manualNoteHtml: t('本家有两个**互不替代**的凭证，按你要用的功能填，至少填一个：<b>编码套餐 API Key</b> 用于转发推理（打 <code>{site}</code>）与查询窗口限额（每 N 小时 / 每周的剩余比例）；<b>jwt</b> 用于领取套餐与查询余额（打 <code>zcode.z.ai</code> 的 billing 网关，官方叫 Coding Plan JWT，是一串三段点分的字符串）。余额两把都能查、但读到的东西不同：jwt 读到余额桶与套餐到期，API Key 读到窗口限额；而领取只认 jwt、转发只认 API Key。请填写 <b>{label}</b>账号的凭证 —— {plan}（最容易拿到的办法：直接用上方的「网页登录」—— 它会替你把这个 API Key 换好，两个凭证一起拿到。）', { site, label, plan: planNote }),
     fields: [
       {
         key: 'accessToken',

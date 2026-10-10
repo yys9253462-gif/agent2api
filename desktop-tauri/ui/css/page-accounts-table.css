@@ -1037,22 +1037,3 @@
    批量栏沿用 page-accounts.css 的骨架，这里只补一条：表格化之后
    「全选」有两个入口（批量栏 + 表头），表头的那个需要一点可点区域 */
 #acct-select-all { cursor: pointer; }
-
-/* ─── ZCode「领套餐」确认弹窗里的套餐清单 ───
-   清单由 ui/zcode-claim.js 生成。`.muted` 在别处只以 `.cell-expiry .muted`
-   的形式生效，弹窗里拿不到那条规则 —— 这里补一条作用域内的，否则
-   「权益 / 有效期 / 描述」那几行与套餐名同样粗细，读起来分不出主次。 */
-.zcode-claim-plans { margin: 8px 0 0; padding-left: 18px; }
-.zcode-claim-plans li + li { margin-top: 8px; }
-.zcode-claim-plans .muted { color: var(--text-3); }
-
-/* 多套餐时的单选形态（「领取时指定领哪个」）：去掉列表符号、把圆钮与说明并排。
-   与上面的只读列表同一档间距，只是每行多了一个可点的圆钮。
-   今天已领过的那几份：圆钮 disabled + 整行压暗 + 名字后标「（今日已领）」——
-   逐份标注是必需的，上游按套餐判「已领取过」，领了 A 不影响 B（见 zcode-claim.js）。 */
-.zcode-claim-plans.pickable { padding-left: 0; list-style: none; }
-.zcode-claim-option { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
-.zcode-claim-option input[type="radio"] { flex: none; margin: 2px 0 0; }
-.zcode-claim-option > span { min-width: 0; }
-.zcode-claim-option.taken { cursor: default; opacity: .55; }
-.zcode-claim-taken { color: var(--text-3); }

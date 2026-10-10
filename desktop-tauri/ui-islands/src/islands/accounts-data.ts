@@ -34,7 +34,7 @@ import {
   type TokenReading, type UsageEntry,
 } from './accounts-shared'
 import {
-  claimedPlanIdsToday, isDesktopAccount, isEnabled, isLimitedNow, isRateLimited,
+  isDesktopAccount, isEnabled, isLimitedNow, isRateLimited,
   supportsUsage,
 } from './accounts-domain'
 import * as domain from './accounts-domain'
@@ -797,38 +797,33 @@ export const PROXY_CUSTOM_CURRENT = '__proxy_custom__'
 export const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__'
 
 /**
- * 行上「领套餐」：整条流程（探测 → 确认 → 验证码 → 领取）在 ui/zcode-claim.js，
- * 这里负责发起与**收尾**。
+ * 行上「领套餐」/ 签到中心 ZCode 行：打开**套餐明细**弹窗（zcode-plans-modal.tsx）。
  *
- * ── 为什么要把「今天领过的套餐」传给脚本 ──────────────────────
- * 一个账号可能同时挂着几份可领套餐，上游的「已领取过」是**按套餐**判的
- * （见 `claimedPlanIdsToday`）。台账在本页（账号记录的 `claimPlans`），
- * 判定规则在域层，脚本只负责把它们画进弹窗、并只让选还没领的那几份 ——
- * 日界的算法因此仍然只有域层一处。
+ * ── 为什么是一颗「打开弹窗」的按钮而不是直接开领 ──────────────
+ * 一个账号可能同时挂着几份可领套餐，而上游的「已领取过」是**按套餐**判的
+ * （同一份再领回 1003，换一份照样能领）—— 所以「这次领哪一份」必须由用户看着
+ * 逐份状态来决定。旧版是先探测再弹一个原生确认框，里面既列不出逐份状态、也显示
+ * 不了刚领到还没生效的套餐；现在统一进弹窗：上面是可领取（逐份标「今日已领」、
+ * 逐份点「领取」），下面是账号名下已有的套餐（含**待生效**与已过期）。
  *
- * ── 收尾为什么在本文件而不是那支 legacy 脚本里 ────────────────
- * 领到的是 token 额度：余额列的读数立刻就变了，而那颗按钮的悬停提示也跟着变
- * （后端落的领取台账由重拉账号拿到）。两件事都是本页的 store / 动作
- * （legacy 脚本拿不到），所以脚本只把结果交回来，由这里刷新 ——
- * 与 CodeArts 那条不同（它的入口在签到中心，脚本领完自己调 `wbApp.refresh()`），
- * 是因为这条还得顺带刷本页的余额。
+ * 「今天领过哪几份」与余额读数都由弹窗自己从账号页状态里读（判据只有域层的
+ * `claimedPlanIdsToday` 一处），这里只传 id 与显示名。
  *
- * `already_claimed` 同样算「已领」：上游说这份套餐已经被领掉了（可能是另一台
- * 设备领的），台账该补上它，否则用户会一直点它、每次拿回同一句话。
+ * ── 收尾（刷新余额 / 重拉账号）为什么在弹窗里 ────────────────
+ * 领到的是 token 额度：余额列的读数立刻就变了，领取台账也变了。这两件事都是本页
+ * 的 store（弹窗能订阅到，见那边的 `subscribe`），所以由弹窗领完自己刷 ——
+ * 这里不替它盯流程。
  */
-export async function startZcodeClaim(id: string): Promise<void> {
-  const account = findAccount(id) || undefined
-  const result = (await shared().wbZcodeClaim?.start?.(
-    account,
-    claimedPlanIdsToday(account),
-  )) as { ok?: boolean; failure?: string } | undefined
-  const settled = result?.ok === true || result?.failure === 'already_claimed'
-  if (!settled) return
-  // 余额静默刷新（不 await、不播报：领取结果那条 toast 不能被顶掉，
-  // 理由见 refreshUsageAfterCheckin）
-  void refreshUsageAfterCheckin(id)
-  // 重拉账号状态：领取台账是后端落盘的，弹窗与悬停提示据此更新「哪几份已领」
-  void shared().wbApp?.refresh?.()
+export function openZcodePlans(id: string, name?: string): void {
+  const account = findAccount(id)
+  if (!account) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
+  const modal = shared().wbZcodePlans
+  if (!modal?.open) {
+    // 岛还没挂上（构建产物没更新 / 加载失败）：如实说一句，别静默什么都不做
+    toast(t('套餐明细弹窗未加载，请重启应用后重试'), 'err')
+    return
+  }
+  modal.open({ id, name: name || account.name })
 }
 
 /**

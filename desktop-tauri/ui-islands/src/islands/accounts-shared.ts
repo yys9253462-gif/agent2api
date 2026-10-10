@@ -417,11 +417,17 @@ export type SharedWindow = {
     }) => Promise<unknown>
     remove?: (id: string) => Promise<boolean>
   }
-  /** ZCode「领套餐」流程（ui/zcode-claim.js，本页把账号对象与「今天领过的套餐 id」
-   * 递过去）。第二个参数是**逐份**的领取状态：一个账号可能同时挂着几份可领套餐，
-   * 而上游的「已领取过」是按套餐判的 —— 弹窗据此把已领的那几份标出来、只让选没领的。
+  /**
+   * ZCode 领取的**网络侧**（ui/zcode-claim.js）：`preview` 探测可领取的一份份套餐
+   * （不要验证码，失败时 throw），`claim` 领指定的一份（要验证码，返回业务结果）。
+   * 界面在套餐明细弹窗（zcode-plans-modal.tsx）里，本文件只声明桥的形状。
    */
-  wbZcodeClaim?: { start?: (account: AccountRecord | undefined, claimedPlanIds?: string[]) => Promise<unknown> }
+  wbZcodeClaim?: {
+    preview?: (accountId: string) => Promise<unknown>
+    claim?: (accountId: string, planId: string) => Promise<unknown>
+  }
+  /** ZCode 套餐明细弹窗（zcode-plans-modal.tsx）：可领取 + 名下已有的套餐，逐份领取 */
+  wbZcodePlans?: { open?: (options: { id: string; name?: string }) => void }
   /** CodeArts「领福利」流程（ui/codearts-welfare.js：只读探测 → 确认 → 领取 → 回读） */
   wbCodeArtsWelfare?: { start?: (account: AccountRecord | undefined) => Promise<unknown> }
   /** 「添加账号」弹窗（归另一个代理，本页只调它的 open） */

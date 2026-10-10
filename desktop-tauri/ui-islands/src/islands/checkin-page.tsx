@@ -14,6 +14,7 @@ import {
   toggleOnboardingExpand, toggleProviderExpand,
   type AutoCheckinState, type CheckinProviderGroup, type CheckinStore,
 } from './checkin-state'
+import { openZcodePlans } from './accounts-data'
 import { t } from '../i18n'
 
 /**
@@ -379,7 +380,14 @@ function OnboardingRow({ row }: { row: { id: string; name: string; provider?: st
  * 两页不会一个说领了一个说没领。已领时按钮置灰、行上加绿徽章：再点也只是
  * 让后端回一句「已领取并确认」，留着可点会让人以为还能再领一次。
  * **试过但没到账不置灰**：手动点击在后端是绕过限流闸的，重试不会变成第二笔领取。
- * ZCode 那行的领取状态本来就是逐份的（claimPlans），交给领取弹窗自己标，行上不动。
+ *
+ * ── ZCode 那行的状态也是逐份的（`claimPlans`）───────────────
+ * 「已领取过」在上游是按**套餐**判的（领了 A 之后 B 照样能领），所以这一行不按
+ * 「今天领过没」把入口堵死，而是：行上标出**今天已领几份 / 今天未领**（台账判据
+ * 复用账号页域层的 `claimedPlanIdsToday`，北京时间的日界只在那一处），按钮始终
+ * 开着 —— 点开套餐明细弹窗（`wbZcodePlans`）逐份看：可领取的、名下的（含未生效
+ * 与已过期）都在那里，领取也在那里。旧版点这里直接进原生确认框，既看不出逐份
+ * 状态、也显示不了刚领到还没生效的套餐。
  */
 function WelfareRow({ row, kind }: {
   row: { id: string; name: string; welfare?: unknown; claimAt?: number | null; claimPlans?: Record<string, number> | null }
@@ -389,18 +397,23 @@ function WelfareRow({ row, kind }: {
     ? welfareStateOf({ welfare: row.welfare } as never)
     : null
   const taken = state !== null && state.today && state.accepted
+  // ZCode 的逐份领取台账（只算今天、按北京时间判；`row.claimPlans` 是后端落盘事实）
+  const claimedIds = kind === 'plan'
+    ? claimedPlanIdsToday({ claimPlans: row.claimPlans } as never)
+    : []
+  const claimed = claimedIds.length > 0
   /** 领取完成后刷新快照与主状态（账号页的余额读数也在那一轮里跟上） */
   const start = async () => {
     const account = { id: row.id, name: row.name }
     if (kind === 'welfare') {
       await shared().wbCodeArtsWelfare?.start?.(account as never)
-    } else {
-      // 「今天领过哪几份」逐份比对（claimPlans 的日界判定复用账号页的同款实现）
-      const claimed = claimedPlanIdsToday({ claimPlans: row.claimPlans } as never)
-      await shared().wbZcodeClaim?.start?.(account as never, claimed)
+      await loadCheckinCenter()
+      void shared().wbApp?.refresh?.()
+      return
     }
-    await loadCheckinCenter()
-    void shared().wbApp?.refresh?.()
+    // ZCode：打开套餐明细弹窗，领取由弹窗内的逐份按钮发起
+    // （账台与余额读数弹窗自己从账号页状态里读，见 zcode-plans-modal.tsx）
+    openZcodePlans(row.id, row.name)
   }
   return (
     <div className='ck-welfare-row'>
@@ -409,15 +422,24 @@ function WelfareRow({ row, kind }: {
         <div className='ck-prov-name'>
           {row.name || row.id}
           {taken ? <Badge variant='success' shape='tag' title={welfareDoneTitle(state!)}>{t('已领取')}</Badge> : null}
+          {kind === 'plan' ? (
+            claimed
+              ? <Badge variant='success' shape='tag' title={t('本地台账里今天（北京时间）领过的套餐：{plans}', { plans: claimedIds.join(t('、')) })}>
+                {t('今天已领 {n} 份', { n: claimedIds.length })}
+              </Badge>
+              : <Badge variant='outline' shape='tag' title={t('本地台账里今天还没领过；活动期内每天发一份新套餐')}>{t('今天未领')}</Badge>
+          ) : null}
         </div>
         <div className='ck-prov-desc'>
           {kind === 'welfare'
             ? taken
               ? t('今天（北京时间 {day}）已领取 · 官方确认到账 {n} 项 · 明天可再领', { day: state!.day, n: state!.confirmed })
               : t('运营活动交付（领取 → 确认 → 回读核实）· 领的是套餐赠送积分')
-            : row.claimAt
-              ? t('上次领取 {time} · 领取需通过滑块验证码', { time: formatTime(row.claimAt) })
-              : t('限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码')}
+            : claimed
+              ? t('点「套餐明细」看领到了哪几份、什么时候生效；活动期内每天可再领')
+              : row.claimAt
+                ? t('上次领取 {time} · 领取需通过滑块验证码', { time: formatTime(row.claimAt) })
+                : t('限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码')}
         </div>
       </div>
       <div className='ck-prov-right'>
@@ -427,7 +449,7 @@ function WelfareRow({ row, kind }: {
           <Button size='sm' variant='outline'
             title={state && !taken ? welfareTodoTitle(state) : undefined}
             onClick={() => void start()}>
-            {kind === 'welfare' ? t('去领取') : t('去领取（需验证码）')}
+            {kind === 'welfare' ? t('去领取') : claimed ? t('套餐明细') : t('去领取')}
           </Button>
         )}
       </div>

@@ -20,6 +20,7 @@
 | CodeArts | ✓ | ✓ 一次性輪換 | ✓ 遠端（三來源合併） | ✓ 兩份帳 | — | ✓ 每日福利（手動） |
 | Trae | ✓ | ✓ 一次一換 | ✓ 僅遠端 | ✓ 兩份帳 | — | — |
 | Loomy（訊飛） | ✓ | ✗ 無續期介面 | ✓ 僅遠端 | ✓ 兩份積分帳 | ✓ 每日贈送積分重新整理 | — |
+| KukuAI（百度文庫） | ✓ | ✗ 無續期介面 | ✓ 遠端 + 靜態備援 | ✓ 積分餘額 | ✓ 每日簽到（免費積分） | — |
 | MonkeyCode（長亭科技，中國版 / 國際版） | ✓ | ✗ 無續期介面 | ✓ 僅遠端 | — | — | — |
 | Command Code | ✓ | ✗ 靜態 API Key | ✓ 遠端 + 靜態備援 | — | — | — |
 | Antigravity（Google，Gemini） | ✓ | ✓ | ✓ 遠端 + 靜態備援 | — | — | — |
@@ -27,9 +28,9 @@
 
 三條對話協定入口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，另含 `/v1/messages/count_tokens`）與 `/v1/models` 對所有平台一視同仁，差異只在各家上游能不能做到表裡那些事；模型對應、全域優先順序佇列、429 降級、出口代理、出站指紋脫敏與請求報表同樣對全平台通用。
 
-> **本專案僅供學習與交流使用。** 它透過本地反向代理重用你自己帳號的登入狀態，這種「以非官方客戶端形態轉發」的方式可能不符合上游服務的使用條款，使用風險（含帳號被風控、封禁）由使用者自行承擔；禁止用於商業用途或繞過計費。詳見[使用聲明](#使用聲明)與 [LICENSE](./LICENSE)。
+> **本專案僅供學習與交流使用。** 它以非官方客戶端形態重用你自己帳號的登入狀態，可能不符合上游服務的使用條款，風險（含帳號被風控、封鎖）自負；禁止商用或繞過計費。詳見[使用聲明](#使用聲明)與 [LICENSE](./LICENSE)。
 >
-> 本專案是個人用途的本地代理工具，與騰訊（WorkBuddy）、美團（CatPaw）、商湯（小浣熊）、智譜（AutoClaw/autoglm）、阿里巴巴（Qoder / Accio）、華為雲（CodeArts）、字節跳動（Trae）、科大訊飛（Loomy）、長亭科技（MonkeyCode）、Command Code、Google（Antigravity）、Cline 及其官方產品均無關；所有介面形態來自對各家桌面端通訊的觀察，上游隨時可能調整。
+> 本專案與各上游廠商及其官方產品均無關（名單見[使用聲明](#使用聲明)）；介面形態來自對各家客戶端通訊的觀察，上游隨時可能調整。
 
 ---
 
@@ -50,12 +51,10 @@
 從 Releases 下載安裝包（NSIS，簡體中文，預設裝到 `C:\Program Files\Agent2API`，安裝時需要管理員授權），安裝後啟動即可，**無需安裝 Node 或任何其它執行環境**。
 
 1. 首次啟動即在應用程式行程內啟動本機閘道（連接埠 3065）並開啟主視窗；若偵測到舊版本的資料目錄或資料檔案，會彈窗提示遷移，依指引操作即可。
-2. 點「帳號」頁的「新增帳號」，選供應商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 中國版 / AutoClaw 國際版 / Qoder / Cline / Accio 國際版 / Accio 中國版 / ZCode 中國版 / ZCode 國際版 / CodeArts / Trae / Loomy / KukuAI / MonkeyCode 中國版 / MonkeyCode 國際版 / Command Code / Antigravity），再依該家支援的方式完成登入或填寫憑證：網頁登入、手機驗證碼、貼上憑證，或匯入本機桌面端登入狀態（匯入不保存 token，客戶端重新登入後閘道自動跟上；CodeArts 與 Trae 只有網頁登入與貼上憑證兩種，Loomy 只有手機驗證碼與貼上 session 兩種，MonkeyCode / Command Code / Antigravity 只有貼上憑證一種）。
+2. 點「帳號」頁的「新增帳號」，選供應商後依彈窗提示完成登入或填寫憑證即可（方式以彈窗為準：網頁登入 / 手機驗證碼 / 貼上憑證 / 匯入本機登入狀態）。
 3. 把 OpenAI 客戶端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 隨便填（例如 `sk-local`，未啟用鑑權時伺服器端不校驗）。
 
-關閉視窗預設只是最小化到系統匣，閘道繼續在背景轉發；要徹底結束請在系統匣圖示上按右鍵選「結束」。
-
-帳號排在同一條**全域佇列**裡，依優先順序從小到大逐個嘗試，跳過已停用、餘額不足（帳號設定裡設定了「跳過」且低於閾值）、不提供該模型或對該模型處於限額冷卻期的帳號；某家對某模型觸發 429 時降級到下一個候選，全部不可用才把最後一個真實錯誤透傳出來。
+關閉視窗預設最小化到系統匣，閘道繼續在背景轉發；徹底結束請在系統匣圖示按右鍵選「結束」。
 
 ### 驗證
 
@@ -83,11 +82,11 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-**瀏覽器裡的頁面**（自建 Web UI、單檔前端應用等）用 `fetch` 直連這個端點時，會因為跨來源預檢被拒而報「無法連接 API」：閘道面預設**不回應 CORS**，預檢請求（OPTIONS）會落到 API Key 校驗上得到 401（跨來源預檢依規範不攜帶 `Authorization` 標頭），請求根本送不出去。兩種解法：① 在設定頁「安全 → 閘道跨來源存取」裡開啟它，閘道隨即依面板的同一套規則回應（預檢放行、回應帶 `Access-Control-Allow-*`，來源 `*`，立即生效）—— 注意閘道是真正轉發上游、消耗額度的那一面，開著 `*` 又沒設定 API Key 時任何網頁都能借本機閘道打上游，建議同時設定「閘道 Key」；② 讓頁面與閘道同來源 —— 用一個本地靜態服務同時託管頁面並把 `/v1` 反向代理到 `127.0.0.1:3065`，這樣連跨來源都不存在，不需要開放任何東西。
+**瀏覽器裡的頁面**（自建 Web UI 等）用 `fetch` 直連會被跨來源預檢拒絕——閘道預設不回應 CORS，預檢落到 API Key 校驗上得 401。兩種解法：① 設定頁「安全 → 閘道跨來源存取」開啟（來源 `*`；此時任何網頁都能借本機閘道打上游，建議同時設定「閘道 Key」）；② 頁面與閘道同來源——本地靜態服務託管頁面並把 `/v1` 反向代理到 `127.0.0.1:3065`。
 
 ### 區域網路存取
 
-預設閘道只監聽 `127.0.0.1`，只有本機能用。在「設定 → 一般 → 區域網路存取」開啟後，閘道改聽所有網路介面卡，同一區域網路內的裝置把 API 位址指向本機 IP（介面上會給出完整位址，如 `http://192.168.1.5:3065/v1`）即可共用這套帳號。出於安全考量，開啟前必須註冊一個面板管理員：管理介面從此要求管理員工作階段或閘道 Key，一把啟用的 Key 都沒有時轉發介面也會拒絕服務（開啟流程會自動補一把「預設」Key）。還可以選擇把網頁管理面板一併開放給區域網路（其他裝置的瀏覽器開啟本機 IP 即可管理，需管理員登入）；預設不開放，桌面端的面板只由本程式自己提供。變更隨應用程式重新啟動生效。
+預設只監聽 `127.0.0.1`。開啟「設定 → 一般 → 區域網路存取」後改聽所有網路介面卡，區域網路裝置把 API 位址指向本機 IP 即可共用（介面會給出完整位址）。出於安全，開啟前必須註冊面板管理員：管理介面要求管理員工作階段或閘道 Key，無可用 Key 時轉發介面同樣拒絕服務（開啟流程會自動補一把「預設」Key）；也可選擇同時開放網頁面板（預設關閉）。變更重新啟動後生效。
 
 ---
 
@@ -101,7 +100,7 @@ docker run -d --name agent2api --restart unless-stopped \
 
 瀏覽器開啟 `http://<主機>:3065`，首次進入會引導**註冊管理員帳號**（後續登入用它）；登入後在「閘道 Key」頁建立一把 API Key 給客戶端用 —— `http://<主機>:3065/v1` 即 OpenAI 相容端點，未建立 Key 前拒絕轉發，建立第一把後自動恢復。所有狀態（SQLite 資料庫 / 設定 / 日誌）都落在 `./data` 一個卷裡。
 
-compose 使用者（`docker-compose.yml` 全文就這麼多；amd64 / arm64 都有映像）：
+compose 使用者（amd64 / arm64 都有映像）：
 
 ```yaml
 services:
@@ -127,7 +126,7 @@ services:
 
 從原始碼建置：複製本專案後 `docker compose up -d --build`（映像裡只有閘道與面板，不含 Rust 工具鏈）。
 
-**網頁端功能差異**（都源於「沒有本機桌面客戶端」）：網頁登入（WorkBuddy / Qoder / Cline）、手機驗證碼、貼上憑證完全可用；AutoClaw / CatPaw / Accio / CodeArts / Trae 網頁登入的回呼打本機連接埠，遠端面板請改用貼上憑證；小浣熊網頁登入與「匯入本機桌面端登入狀態」不可用（用填寫憑證；Loomy / CodeArts / Trae 本來也沒有桌面端登入狀態可匯入；MonkeyCode / Command Code / Antigravity 同樣只有貼上憑證一種方式）。
+**網頁端功能差異**（源於「沒有本機桌面客戶端」）：網頁登入（WorkBuddy / Qoder / Cline）、手機驗證碼、貼上憑證完全可用；需要本機回呼的網頁登入（AutoClaw / CatPaw / Accio / CodeArts / Trae）與「匯入本機登入狀態」不可用，請改用貼上憑證。
 
 ---
 
@@ -135,27 +134,27 @@ services:
 
 ### 帳號
 
-所有供應商的帳號排在同一條**全域佇列**裡（左起第二欄就是優先順序），可逐條啟停；限額列顯示依模型維度的冷卻狀態與恢復時間，有效期由「憑證維護」背景任務重新整理，餘額依**每帳號自己的間隔**自動查詢（帳號設定「查詢設定」裡設定，預設開啟、每 1 分鐘）；餘額不足預設依閾值 1 跳過，也可改停用或不處理。
+全部帳號排在同一條佇列裡（左起第二欄是優先順序），可逐條啟停；限額冷卻、有效期與餘額都在列內顯示，餘額不足預設依閾值跳過。
 
 ![帳號管理頁：全域佇列、依模型限額冷卻、有效期與餘額](./assets/screenshots/accounts.png)
 
-新增帳號時先選供應商，再依該家支援的方式登入。同一家可同時保存多個版本的帳號（例如 WorkBuddy 的中國版 / 國際版），轉發時依模型自動選路：
+新增帳號先選供應商再登入；同一家可保存多版帳號（例如 WorkBuddy 中國版 / 國際版）：
 
 ![新增帳號：選擇供應商與版本，然後走網頁登入](./assets/screenshots/add-account.png)
 
 ### 報表
 
-統計概覽給出總請求數、成功率、Token 總量與 Top 模型，右側依帳號和供應商分別排序；再往下是模型用量與供應商用量兩張環圈圖，以及固定 365 天的活躍熱力圖：
+概覽：請求數 / 成功率 / Token 總量 / Top 模型與帳號、供應商排名，附用量環圈圖與 365 天活躍熱力圖：
 
 ![報表概覽：統計卡片、Top 帳號 / 供應商、模型與供應商用量環圈圖](./assets/screenshots/report-overview.png)
 
-再往下是趨勢區：近 24 小時的**快取命中率**（左軸，折線）與 **Token 消耗**（右軸，面積）疊在同一張圖上，便於判斷命中率下滑是流量結構變化還是快取失效；底部是依天 Token 長條圖，範圍隨頂部時間窗切換：
+趨勢：24 小時**快取命中率**（折線）與 **Token 消耗**（面積）雙軸同圖，底部依天 Token 長條圖：
 
 ![報表趨勢：快取命中率與 Token 消耗雙軸趨勢、依天 Token 長條圖](./assets/screenshots/report-trends.png)
 
 ### 排程任務
 
-背景任務在「排程任務」頁統一管理：開關、執行間隔、上次執行結果與下次觸發時間都在這裡，也可以跳過間隔手動「立即執行」一次。任務清單本身保存在 `~/.agent2api/config.json` 的 `scheduledTasks` 欄位，變更立即生效，不需要重新啟動程式。
+背景任務統一在這一頁（開關 / 間隔 / 上次結果 / 立即執行）；清單保存在 `~/.agent2api/config.json` 的 `scheduledTasks`，變更即時生效。
 
 ![排程任務頁：自動簽到、憑證維護、模型目錄重新整理等背景任務的開關與間隔](./assets/screenshots/scheduled-tasks.png)
 
@@ -211,6 +210,12 @@ agent2api/
 │  │  │  │  │  │                models（靜態備援 + /api/llm/config/v2）/
 │  │  │  │  │  │                protocol（OpenAI ↔ ADK 的 Gemini 風格信封）/
 │  │  │  │  │  │                chat（工作階段式轉發）/ stream（ADK SSE 解包）/ balance
+│  │  │  │  │  ├─ zcode/        ZCode（智譜 Z.AI，中國版 + 國際版兩家）：region（兩地域名與身分）/
+│  │  │  │  │  │                adapter（無狀態、依地區參數化）/ credentials（權杖 + 套餐 JWT）/
+│  │  │  │  │  │                oauth（CLI 輪詢登入）/ coding_key（換推理用 API Key）/ models（靜態表）/
+│  │  │  │  │  │                balance（套餐餘額）/ plan + claim（活動套餐通道與限時領取）/
+│  │  │  │  │  │                captcha（人機驗證權杖池）/ reasoning（GLM-5.3 思考預算）/
+│  │  │  │  │  │                zcode_system.json（系統提示詞）
 │  │  │  │  │  ├─ codearts/     CodeArts（華為雲碼道）：signer（華為雲 SDK-HMAC-SHA256，
 │  │  │  │  │  │                與參考實作逐位元組對帳）/ credentials / dpop（ES256 DPoP proof）/
 │  │  │  │  │  │                oauth（PKCE 網頁登入 + loopback 回呼）/ refresh（單飛續期）/
@@ -230,7 +235,13 @@ agent2api/
 │  │  │  │  │  │                sign（複刻客戶端 HMAC-SHA1 簽名標頭）/ endpoints / client（整合閘道）/
 │  │  │  │  │  │                models（/api/v1/models 遠端目錄，上游無內建備援清單）/
 │  │  │  │  │  │                balance（永久積分 + 每日贈送兩份帳）/ checkin（每日首次登入重新整理贈送積分）
-│  │  │  │  │  ├─ monkeycode/  MonkeyCode（長亭科技，中國版 + 國際版兩家）：region（兩站位址與身分）/
+│  │  │  │  │  ├─ kuku/         KukuAI（百度文庫「庫庫 AI / GenFlowPro」，kuku.baidu.com）：
+│  │  │  │  │  │                adapter（is_stateful）/ session（bdstoken/uinfo/uk 三件套快取）/
+│  │  │  │  │  │                engine（STOKEN 換發）/ http / login（主站網頁登入 + 殼側收 Cookie）/
+│  │  │  │  │  │                credentials（BDUSS Cookie）/ models（靜態備援 + 遠端重新整理）/
+│  │  │  │  │  │                chat（建工作階段 → 分配算力 → SSE）/ balance（積分餘量）/
+│  │  │  │  │  │                checkin（每日免費積分）
+│  │  │  │  │  ├─ monkeycode/   MonkeyCode（長亭科技，中國版 + 國際版兩家）：region（兩站位址與身分）/
 │  │  │  │  │  │                adapter / endpoints（路徑 / cookie 名 / interface_type→CLI 對應）/
 │  │  │  │  │  │                client / credentials（session + imageId）/ login（貼上 session 與自動探索）/
 │  │  │  │  │  │                models（兩站各一格清單，僅遠端）/ task（建任務）/ stream（WS 任務串流）/
@@ -313,7 +324,7 @@ npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，
 
 ### 僅供學習與交流
 
-本專案是一個用於學習 HTTP 反向代理、SSE 串流透傳、多上游協定適配與桌面端打包（Tauri）等技術主題的實踐專案，**僅供個人學習與研究使用**。它不是官方產品，與騰訊公司及 WorkBuddy / CodeBuddy、美團及 CatPaw、商湯及小浣熊、智譜及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、華為雲及 CodeArts、字節跳動及 Trae、科大訊飛及 Loomy、長亭科技及 MonkeyCode、Command Code、Google 及 Antigravity 均無任何關聯，未獲得其授權、認可或贊助。
+本專案是一個用於學習 HTTP 反向代理、SSE 串流透傳、多上游協定適配與桌面端打包（Tauri）等技術主題的實踐專案，**僅供個人學習與研究使用**。它不是官方產品，與騰訊公司及 WorkBuddy / CodeBuddy、美團及 CatPaw、商湯及小浣熊、智譜及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、華為雲及 CodeArts、字節跳動及 Trae、科大訊飛及 Loomy、百度文庫及 KukuAI、長亭科技及 MonkeyCode、Command Code、Google 及 Antigravity 均無任何關聯，未獲得其授權、認可或贊助。
 
 ### 關於反向代理行為
 

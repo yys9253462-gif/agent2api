@@ -117,10 +117,12 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   accio: { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
   'accio-cn': { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
   // ZCode 两个地区：本家的运营动作是「限时套餐领取」（claim 位）。
-  // `usage: true` 对应 providers::zcode::balance —— 余额读的是 billing 网关的
-  //   `/zcode-plan/billing/balance`，认**套餐 JWT**（与转发用的 accessToken 不是
-  //   一套凭证）。账号只粘了 accessToken 时后端回可识别的「未配置」，余额列显示成
-  //   中性提示而不是一片红，所以这颗按钮照样渲染。
+  // `usage: true` 对应 providers::zcode::balance —— 它是一条**候选令牌链**：
+  //   有套餐 JWT 时读 billing 网关的 `/zcode-plan/billing/balance`（余额桶 + 到期），
+  //   否则（或 JWT 被拒时）用 accessToken 读开放平台监控接口的窗口限额
+  //   （每 N 小时 / 每周的剩余比例，见 providers::zcode::monitor）。
+  //   两把凭证都没有时后端回可识别的「未配置」，余额列显示成中性提示而不是一片红，
+  //   所以这颗按钮照样渲染。
   // `claim: true` 就是那颗「领套餐」：2026-09-28 起那期（ZCode Trust Build）是
   //   **每天一份新套餐**（plan_id 带日期段），领过之后按钮当天显示「今日已领」、
   //   次日自动恢复 —— 见 `claimedToday`。
@@ -659,6 +661,24 @@ export function zcodePlanOf(account: AccountRecord | null | undefined): string {
  */
 export function zcodePlanLabel(plan: string | undefined): string {
   return plan === ZCODE_PLAN_START ? t('活动套餐（Start Plan）') : t('编码套餐（Coding Plan）')
+}
+
+/**
+ * 套餐状态 → 展示文案。键由后端给（`providers::zcode::balance` 的 `PlanState::key`：
+ * pending / active / expired / unknown），**文案只在前端拼** —— 后端返回中文的话，
+ * 非中文界面里会露出一串看不懂的汉字。
+ *
+ * 三处共用同一份译法：套餐明细弹窗的行内徽章、余额列的「待生效」徽章及其悬停提示。
+ * 认不出的键原样显示（上游将来多一个状态时，界面上看到的是那个键，不是空白）。
+ */
+export function zcodePlanStateLabel(state: unknown): string {
+  switch (String(state ?? '').trim()) {
+    case 'pending': return t('待生效')
+    case 'active': return t('生效中')
+    case 'expired': return t('已过期')
+    case 'unknown': return t('状态未知')
+    default: return String(state ?? '')
+  }
 }
 
 /**

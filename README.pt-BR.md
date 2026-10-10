@@ -20,6 +20,7 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 | CodeArts | ✓ | ✓ rotação única | ✓ remota (três fontes mescladas) | ✓ dois balanços | — | ✓ bônus diário (manual) |
 | Trae | ✓ | ✓ troca a cada uso | ✓ somente remota | ✓ dois balanços | — | — |
 | Loomy (iFlytek) | ✓ | ✗ sem API de renovação | ✓ somente remota | ✓ dois balanços de pontos | ✓ atualização dos pontos diários | — |
+| KukuAI (Baidu Wenku) | ✓ | ✗ sem API de renovação | ✓ remota + fallback estático | ✓ saldo de pontos | ✓ check-in diário (pontos grátis) | — |
 | MonkeyCode (长亭科技, China / global) | ✓ | ✗ sem API de renovação | ✓ somente remota | — | — | — |
 | Command Code | ✓ | ✗ API key estática | ✓ remota + fallback estático | — | — | — |
 | Antigravity (Google, Gemini) | ✓ | ✓ | ✓ remota + fallback estático | — | — | — |
@@ -27,9 +28,9 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 
 Os três pontos de entrada de conversa (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, além de `/v1/messages/count_tokens`) e `/v1/models` funcionam igual para todas as plataformas; as diferenças acima dizem respeito apenas ao que cada upstream consegue fazer. Mapeamento de modelos, fila global de prioridade, fallback em 429, proxy de saída, mascaramento de impressão digital e relatórios de requisições valem para todas as plataformas.
 
-> **Este projeto é apenas para aprendizado e troca de conhecimento.** Ele reutiliza o estado de login das suas próprias contas por meio de um proxy reverso local; encaminhar requisições na forma de um cliente não oficial pode violar os termos de uso dos serviços upstream, e qualquer risco (inclusive sinalização por controle de risco ou banimento da conta) é de responsabilidade do usuário. Uso comercial e contorno de cobrança são proibidos. Veja o [Aviso de uso](#aviso-de-uso) e a [LICENSE](./LICENSE).
+> **Este projeto é apenas para aprendizado e troca de conhecimento.** Ele reutiliza o estado de login das suas contas na forma de um cliente não oficial, o que pode violar os termos dos serviços upstream; os riscos (inclusive banimento da conta) são seus. Uso comercial e contorno de cobrança são proibidos. Veja o [Aviso de uso](#aviso-de-uso) e a [LICENSE](./LICENSE).
 >
-> Este é um projeto pessoal de ferramenta de proxy local, sem qualquer vínculo com Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (小浣熊), Zhipu (AutoClaw/autoglm), Alibaba (Qoder / Accio), Huawei Cloud (CodeArts), ByteDance (Trae), iFlytek (Loomy), 长亭科技 (MonkeyCode), Command Code, Google (Antigravity), Cline e seus produtos oficiais; todo formato de interface vem da observação do tráfego dos clientes de desktop de cada fornecedor, e o upstream pode mudar a qualquer momento.
+> Este é um projeto pessoal de ferramenta de proxy local, sem vínculo com qualquer fornecedor upstream ou seus produtos oficiais (a lista está no [Aviso de uso](#aviso-de-uso)); os formatos de interface vêm da observação do tráfego dos clientes, e o upstream pode mudar a qualquer momento.
 
 ---
 
@@ -50,12 +51,10 @@ Os três pontos de entrada de conversa (`/v1/chat/completions`, `/v1/responses`,
 Baixe o instalador na página de Releases (NSIS, chinês simplificado, instala por padrão em `C:\Program Files\Agent2API` e exige aprovação de administrador durante a instalação) e basta iniciá-lo — **não é necessário instalar Node nem qualquer outro runtime**.
 
 1. Na primeira execução, o gateway local (porta 3065) sobe dentro do processo do aplicativo e a janela principal abre. Se um diretório ou arquivo de dados de uma versão antiga for encontrado, um diálogo orienta a migração — basta seguir as instruções.
-2. Clique em "Adicionar conta" na página de Contas, escolha um provedor (WorkBuddy / 小浣熊 / CatPaw / AutoClaw China / AutoClaw global / Qoder / Cline / Accio global / Accio China / ZCode China / ZCode global / CodeArts / Trae / Loomy / KukuAI / MonkeyCode China / MonkeyCode global / Command Code / Antigravity) e faça login ou preencha as credenciais da forma que aquele provedor suporta: login pela web, código por SMS, colar credenciais, ou importar o estado de login do cliente de desktop desta máquina (a importação não armazena token — o gateway acompanha quando o cliente faz login de novo; CodeArts e Trae só oferecem login pela web e credenciais coladas; Loomy só oferece login por SMS e session colada; MonkeyCode / Command Code / Antigravity só aceitam credenciais coladas).
+2. Clique em "Adicionar conta" na página de Contas, escolha um provedor e siga o diálogo: entre ou preencha as credenciais (login pela web / código por SMS / colar credenciais / importar o estado de login desta máquina).
 3. Aponte o `base_url` do seu cliente OpenAI para `http://127.0.0.1:3065/v1` e preencha o `api_key` com qualquer coisa (por exemplo `sk-local`; o servidor não valida enquanto a autenticação estiver desativada).
 
-Fechar a janela apenas minimiza para a bandeja por padrão, e o gateway continua encaminhando em segundo plano; para sair de verdade, clique com o botão direito no ícone da bandeja e escolha "Sair".
-
-As contas ficam em uma única **fila global** e são tentadas em ordem crescente de prioridade, pulando contas desativadas, sem saldo (configuradas como "pular" abaixo do limiar nas configurações da conta), que não oferecem aquele modelo ou que estão em cooldown de limite para aquele modelo; quando uma conta leva 429 em um modelo, a requisição cai para o próximo candidato, e somente quando todos estão indisponíveis o último erro real é repassado.
+Fechar a janela apenas minimiza para a bandeja, e o gateway continua encaminhando em segundo plano; para sair de verdade, clique com o botão direito no ícone da bandeja e escolha "Sair".
 
 ### Verificação
 
@@ -83,11 +82,11 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-**Páginas no navegador** (uma interface web própria, um app frontend de arquivo único etc.) que chamam esse endpoint com `fetch` falham com "não foi possível conectar à API": a superfície do gateway **não responde CORS** por padrão, então o preflight (OPTIONS) cai na verificação de API key e recebe 401 (um preflight cross-origin nunca carrega o cabeçalho `Authorization`) e a requisição real nem chega a sair. Duas saídas: ① ative "Segurança → Acesso cross-origin do gateway" nas Configurações — o gateway passa a responder exatamente como o painel (preflight liberado, respostas com `Access-Control-Allow-*`, origem `*`, efeito imediato); atenção: o gateway é justamente a superfície que encaminha de verdade para o upstream e consome cota, e com `*` sem API key configurada qualquer página pode acionar o seu gateway local — configure também uma "Gateway Key"; ② coloque a página na mesma origem do gateway — rode um pequeno servidor estático local que também faça proxy reverso de `/v1` para `127.0.0.1:3065`, o que elimina o cross-origin por completo e não exige liberar nada.
+**Páginas no navegador** (uma interface web própria, …) que chamam este endpoint com `fetch` esbarram no preflight cross-origin — o gateway **não** responde CORS por padrão, então o preflight cai na verificação de API key e recebe 401. Duas saídas: ① ative "Segurança → Acesso cross-origin do gateway" nas Configurações (origem `*`; com `*` qualquer página pode acionar o seu gateway, então configure também uma "Gateway Key"); ② coloque a página na mesma origem — sirva-a de um pequeno servidor estático local que faz proxy reverso de `/v1` para `127.0.0.1:3065`.
 
 ### Acesso pela rede local
 
-Por padrão o gateway escuta apenas `127.0.0.1`, ou seja, só a própria máquina. Ao ativar "Configurações → Geral → Acesso pela rede local", o gateway passa a escutar todos os adaptadores de rede, e outros dispositivos na mesma rede local podem apontar o endereço da API para o IP desta máquina (a interface mostra o endereço completo, por exemplo `http://192.168.1.5:3065/v1`) e compartilhar esse conjunto de contas. Por segurança, é obrigatório registrar um administrador do painel antes de ativar: a API de gerenciamento passa a exigir sessão de administrador ou uma Gateway Key, e enquanto não houver nenhuma chave ativa a API de encaminhamento também recusa o serviço (o fluxo de ativação cria automaticamente uma chave "padrão"). Também é possível abrir o painel web de gerenciamento para a rede local (outros dispositivos abrem o IP da máquina no navegador e administram, com login de administrador); por padrão isso fica fechado, e o painel da versão desktop é servido apenas pelo próprio aplicativo. As mudanças passam a valer após reiniciar o aplicativo.
+Por padrão o gateway escuta apenas `127.0.0.1`. Ao ativar "Configurações → Geral → Acesso pela rede local" ele passa a escutar todos os adaptadores e os dispositivos da rede só precisam apontar o endereço da API para o IP desta máquina (a interface mostra o endereço completo). Por segurança, é obrigatório registrar um administrador do painel antes de ativar: a API de gerenciamento passa a exigir sessão de administrador ou uma Gateway Key e, sem chave ativa, a API de encaminhamento também recusa (o fluxo cria uma chave "padrão" automaticamente). O painel web pode ser exposto à rede local opcionalmente (fechado por padrão). As mudanças valem após reiniciar.
 
 ---
 
@@ -101,7 +100,7 @@ docker run -d --name agent2api --restart unless-stopped \
 
 Abra `http://<host>:3065` no navegador: a primeira visita guia o **cadastro do administrador** (usado nos logins seguintes); depois de entrar, crie uma API key na página "Gateway Keys" para os clientes — `http://<host>:3065/v1` é o endpoint compatível com OpenAI; sem nenhuma chave ele recusa o encaminhamento e, após criar a primeira, volta a funcionar sozinho. Todo o estado (banco SQLite / configuração / logs) fica em um único volume `./data`.
 
-Para quem usa compose (o `docker-compose.yml` inteiro é isto; há imagens amd64 e arm64):
+Para quem usa compose (há imagens amd64 e arm64):
 
 ```yaml
 services:
@@ -127,7 +126,7 @@ Variáveis de ambiente (todas opcionais — nada precisa ser predefinido):
 
 Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
 
-**Diferenças de recursos no painel web** (todas decorrem de "não haver cliente de desktop local"): login pela web (WorkBuddy / Qoder / Cline), código por SMS e credenciais coladas funcionam plenamente; o callback do login pela web de AutoClaw / CatPaw / Accio / CodeArts / Trae chega à porta da própria máquina, então em um painel remoto use credenciais coladas; o login pela web do 小浣熊 e a "importação do estado de login do desktop local" não estão disponíveis (use credenciais coladas; Loomy, CodeArts e Trae também não têm estado de login de desktop para importar; MonkeyCode, Command Code e Antigravity igualmente só aceitam credenciais coladas).
+**Diferenças de recursos no painel web** (todas decorrem de "não haver cliente de desktop local"): login pela web (WorkBuddy / Qoder / Cline), código por SMS e credenciais coladas funcionam plenamente; logins pela web que exigem callback nesta máquina (AutoClaw / CatPaw / Accio / CodeArts / Trae) e a "importação do estado de login local" não estão disponíveis — use credenciais coladas.
 
 ---
 
@@ -135,27 +134,27 @@ Compilar a partir do código: clone o repositório e rode `docker compose up -d 
 
 ### Contas
 
-As contas de todos os provedores ficam em uma única **fila global** (a segunda coluna da esquerda é a prioridade) e podem ser ativadas ou desativadas individualmente. A linha de limite mostra o estado de cooldown por modelo e quando ele se recupera; a validade é mantida atualizada pela tarefa "Manutenção de credenciais" e o saldo é consultado automaticamente **no intervalo de cada conta** (na janela de configurações da conta, em "Configurações de consulta"; ativado por padrão, a cada 1 minuto). Saldo baixo é pulado por padrão abaixo do limiar 1, mas você pode mudar para desativar a conta ou não fazer nada.
+Todas as contas ficam em uma fila única (a segunda coluna é a prioridade) e podem ser ativadas individualmente; cooldown por modelo, validade e saldo aparecem na linha, e saldo baixo é pulado abaixo do limiar por padrão.
 
 ![Página de contas: fila global, cooldown de limite por modelo, validade e saldo](./assets/screenshots/accounts.png)
 
-Ao adicionar uma conta você escolhe o provedor primeiro e depois entra da forma que aquele fornecedor suporta. Um mesmo fornecedor pode manter várias versões de conta ao mesmo tempo (as edições China e global do WorkBuddy, por exemplo), e o encaminhamento escolhe a certa pelo nome do modelo:
+Escolha o provedor e entre; o mesmo fornecedor pode manter várias versões de conta (ex.: WorkBuddy China / global) e o encaminhamento escolhe pelo nome do modelo:
 
 ![Adicionar conta: escolha o provedor e a versão, depois faça login pela web](./assets/screenshots/add-account.png)
 
 ### Relatório
 
-A visão geral mostra total de requisições, taxa de sucesso, total de tokens e o modelo mais usado, com rankings por conta e por provedor ao lado; abaixo vêm dois gráficos de rosca (uso por modelo e por provedor) e um mapa de calor de atividade fixo de 365 dias:
+Visão geral: requisições / taxa de sucesso / tokens / modelo mais usado, com rankings por conta e provedor, roscas de uso e mapa de calor de 365 dias:
 
 ![Visão geral do relatório: cartões de estatística, top contas / provedores, roscas de uso por modelo e por provedor](./assets/screenshots/report-overview.png)
 
-Mais abaixo ficam as tendências: as últimas 24 horas de **taxa de acerto de cache** (eixo esquerdo, linha) e **consumo de tokens** (eixo direito, área) sobrepostos no mesmo gráfico, para distinguir se uma queda na taxa de acerto vem de mudança no perfil de tráfego ou de cache perdido; no rodapé há um gráfico de barras de tokens por dia, cujo intervalo acompanha a janela de tempo no topo:
+Tendências: **taxa de acerto de cache** (linha) e **consumo de tokens** (área) em dois eixos, com barras de tokens por dia abaixo:
 
 ![Tendências do relatório: taxa de acerto de cache e consumo de tokens em dois eixos, barras de tokens por dia](./assets/screenshots/report-trends.png)
 
 ### Tarefas agendadas
 
-As tarefas de segundo plano são gerenciadas em uma única página: ativar/desativar, intervalo, resultado da última execução e próximo disparo ficam todos aqui, e você também pode rodar uma imediatamente sem esperar o intervalo. A lista de tarefas em si fica no campo `scheduledTasks` de `~/.agent2api/config.json`, e as alterações valem na hora — sem precisar reiniciar o programa.
+As tarefas de segundo plano ficam todas nesta página (ativar / intervalo / último resultado / executar agora); a lista fica em `scheduledTasks` no `~/.agent2api/config.json` e as alterações valem na hora.
 
 ![Página de tarefas agendadas: ativação e intervalos de check-in, manutenção de credenciais, atualização do catálogo de modelos e mais](./assets/screenshots/scheduled-tasks.png)
 
@@ -211,6 +210,12 @@ agent2api/
 │  │  │  │  │  │                models (fallback estático + /api/llm/config/v2) /
 │  │  │  │  │  │                protocol (envelope estilo Gemini do OpenAI ↔ ADK) /
 │  │  │  │  │  │                chat (encaminhamento em estilo sessão) / stream (desempacote do SSE do ADK) / balance
+│  │  │  │  │  ├─ zcode/        ZCode (Zhipu Z.AI, China + global): region (dois domínios e identidades) /
+│  │  │  │  │  │                adapter (stateless, parametrizado por região) / credentials (token + JWT do plano) /
+│  │  │  │  │  │                oauth (login por polling da CLI) / coding_key (troca por API key de inferência) / models (tabela estática) /
+│  │  │  │  │  │                balance (saldo do plano) / plan + claim (canal do plano e resgate por tempo limitado) /
+│  │  │  │  │  │                captcha (pool de tokens de verificação humana) / reasoning (orçamento de pensamento GLM-5.3) /
+│  │  │  │  │  │                zcode_system.json (prompt de sistema)
 │  │  │  │  │  ├─ codearts/     CodeArts (Huawei Cloud): signer (SDK-HMAC-SHA256 da Huawei Cloud,
 │  │  │  │  │  │                conferido byte a byte com a implementação de referência) / credentials / dpop (proof DPoP ES256) /
 │  │  │  │  │  │                oauth (login pela web PKCE + callback loopback) / refresh (renovação single-flight) /
@@ -230,7 +235,13 @@ agent2api/
 │  │  │  │  │  │                sign (reproduz os cabeçalhos de assinatura HMAC-SHA1 do cliente) / endpoints / client (gateway de integração) /
 │  │  │  │  │  │                models (catálogo remoto /api/v1/models, sem lista de fallback embutida no upstream) /
 │  │  │  │  │  │                balance (pontos permanentes + pontos diários, dois balanços) / checkin (o primeiro login do dia atualiza os pontos dados)
-│  │  │  │  │  ├─ monkeycode/  MonkeyCode (长亭科技, China + global, dois provedores): region (domínios e identidade dos dois sites) /
+│  │  │  │  │  ├─ kuku/         KukuAI (Baidu Wenku "Kuku AI / GenFlowPro", kuku.baidu.com):
+│  │  │  │  │  │                adapter (is_stateful) / session (cache do trio bdstoken/uinfo/uk) /
+│  │  │  │  │  │                engine (troca de STOKEN) / http / login (login pela web no site + captura de cookie no shell) /
+│  │  │  │  │  │                credentials (cookies BDUSS) / models (fallback estático + atualização remota) /
+│  │  │  │  │  │                chat (criar sessão → alocar computação → SSE) / balance (pontos) /
+│  │  │  │  │  │                checkin (pontos grátis diários)
+│  │  │  │  │  ├─ monkeycode/   MonkeyCode (长亭科技, China + global, dois provedores): region (domínios e identidade dos dois sites) /
 │  │  │  │  │  │                adapter / endpoints (caminhos / nome do cookie / mapa interface_type→CLI) /
 │  │  │  │  │  │                client / credentials (session + imageId) / login (colar session e descoberta automática) /
 │  │  │  │  │  │                models (uma lista por site, somente remota) / task (criar tarefa) / stream (stream de tarefas via WS) /
@@ -313,7 +324,7 @@ O projeto raiz não tem dependências de runtime; o `package.json` apenas fornec
 
 ### Apenas para aprendizado e discussão
 
-Este projeto é um exercício prático de proxy reverso HTTP, passthrough de streaming SSE, adaptação de protocolos de múltiplos upstreams e empacotamento desktop (Tauri), e destina-se **apenas a aprendizado e pesquisa pessoal**. Não é um produto oficial e não tem qualquer vínculo, endosso ou patrocínio de Tencent e WorkBuddy / CodeBuddy, Meituan e CatPaw, SenseTime e 小浣熊, Zhipu e AutoClaw / autoglm, Alibaba e Qoder / Accio, Huawei Cloud e CodeArts, ByteDance e Trae, iFlytek e Loomy, 长亭科技 e MonkeyCode, Command Code, ou Google e Antigravity.
+Este projeto é um exercício prático de proxy reverso HTTP, passthrough de streaming SSE, adaptação de protocolos de múltiplos upstreams e empacotamento desktop (Tauri), e destina-se **apenas a aprendizado e pesquisa pessoal**. Não é um produto oficial e não tem qualquer vínculo, endosso ou patrocínio de Tencent e WorkBuddy / CodeBuddy, Meituan e CatPaw, SenseTime e 小浣熊, Zhipu e AutoClaw / autoglm, Alibaba e Qoder / Accio, Huawei Cloud e CodeArts, ByteDance e Trae, iFlytek e Loomy, Baidu Wenku e KukuAI, 长亭科技 e MonkeyCode, Command Code, ou Google e Antigravity.
 
 ### Sobre o comportamento de proxy reverso
 
