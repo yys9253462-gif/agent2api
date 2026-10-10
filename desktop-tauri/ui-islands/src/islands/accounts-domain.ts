@@ -3,7 +3,8 @@
  *
  * 替换 ui/accounts-groups.js + ui/accounts-model.js 里的纯逻辑部分（那两个文件里的
  * 「标签 / 面板 HTML」字符串生成器随表格一起变成 React 组件，见 accounts-page.tsx）。
- * 本文件不碰 DOM、不读写模块状态，只依赖 window.wbProviders 的 label（运行期读）。
+ * 本文件不碰 DOM、不读写模块状态，只依赖 window.wbProviders 的 label 与
+ * window.wbUnits 的读数格式化（都是运行期读）。
  *
  * ── 对外契约（必须原样保留的调用点）────────────────────────────
  *   · app.js:236  `wbAccountsModel.isLimited`（顶栏「已限流」计数，含余额不足档）
@@ -22,6 +23,7 @@
  */
 
 import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
+import { t } from '../i18n'
 
 /** 缺省 provider id（后端注册表的默认项；旧账号记录没有该字段时的兜底） */
 export const DEFAULT_PROVIDER_ID = 'workbuddy'
@@ -515,26 +517,31 @@ export function tokenCountdownText(remainingMs: number, daily: boolean): string 
   const minutes = Math.ceil(remainingMs / 60_000)
   if (daily) {
     const hours = Math.ceil(remainingMs / 3_600_000)
-    return hours >= 1 ? `今日剩 ${hours} 小时` : `今日剩 ${minutes} 分钟`
+    return hours >= 1 ? t('今日剩 {n} 小时', { n: hours }) : t('今日剩 {n} 分钟', { n: minutes })
   }
-  return minutes >= 1 ? `剩 ${minutes} 分钟` : '剩不到 1 分钟'
+  return minutes >= 1 ? t('剩 {n} 分钟', { n: minutes }) : t('剩不到 1 分钟')
 }
 
-/** Token 数的展示形态：`310000` → `31 万`、`2030000` → `203 万`、`150000000` → `1.5 亿`。 */
+/** units.js 的公开面（本文件只读 formatTokens）：量级词（万 / 亿 与 k / M）已按界面语言
+ *  在那边一处处理，这里不再自己拼字面量。局部窄类型 + 转型而不是 declare global
+ *  —— wbUnits 是多页共享的桥，各岛各 declare 一份会撞 TS2717（同 accounts-panels 的处理）。 */
+type UnitsBridge = { formatTokens?: (value: unknown) => string }
+
+/** Token 数的展示形态：量级词与分档全交给 units.js 的 formatTokens（简体「31万」、
+ *  英文「31k」，设置页那个开关拨一下两处一起变）；拿不到桥时退回裸数字，非数字给「—」。 */
 export function formatTokenCount(value: unknown): string {
   const number = Number(value)
   if (!Number.isFinite(number)) return '—'
-  if (number >= 100_000_000) return `${Number((number / 100_000_000).toFixed(1))} 亿`
-  if (number >= 10_000) return `${Number((number / 10_000).toFixed(1))} 万`
-  return String(Math.round(number))
+  const api = (window as unknown as { wbUnits?: UnitsBridge }).wbUnits
+  return api?.formatTokens ? api.formatTokens(number) : String(Math.round(number))
 }
 
 /** 秒数 → 人能读的间隔文案（`每 90 分钟` 这类），与后端变更提示同一口径：
  * 整小时 / 整分钟进位，其余按秒。 */
 export function formatIntervalSeconds(seconds: number): string {
-  if (seconds > 0 && seconds % 3600 === 0) return `${seconds / 3600} 小时`
-  if (seconds > 0 && seconds % 60 === 0) return `${seconds / 60} 分钟`
-  return `${seconds} 秒`
+  if (seconds > 0 && seconds % 3600 === 0) return t('{n} 小时', { n: seconds / 3600 })
+  if (seconds > 0 && seconds % 60 === 0) return t('{n} 分钟', { n: seconds / 60 })
+  return t('{n} 秒', { n: seconds })
 }
 
 /** 是否为「桌面端实时登录态」账号（凭证实时读客户端文件；可禁用、也可删除） */
@@ -564,9 +571,9 @@ export function isCustomProviderId(provider: string | null | undefined): boolean
 }
 
 export function typeLabel(type: string | undefined): string {
-  if (type === 'enterprise') return '企业'
-  if (type === 'ultimate') return '旗舰'
-  return '个人'
+  if (type === 'enterprise') return t('企业')
+  if (type === 'ultimate') return t('旗舰')
+  return t('个人')
 }
 
 /**
@@ -651,7 +658,7 @@ export function zcodePlanOf(account: AccountRecord | null | undefined): string {
  * 不一致，用户会以为设置里选的与提示里说的不是同一件事。
  */
 export function zcodePlanLabel(plan: string | undefined): string {
-  return plan === ZCODE_PLAN_START ? '活动套餐（Start Plan）' : '编码套餐（Coding Plan）'
+  return plan === ZCODE_PLAN_START ? t('活动套餐（Start Plan）') : t('编码套餐（Coding Plan）')
 }
 
 /**
@@ -686,9 +693,10 @@ export function claimedToday(account: AccountRecord | null | undefined): boolean
 /** 「今天领过 N 份」的悬停说明：列出领过的套餐，并说清还能继续领别的 */
 export function claimDoneTitle(account: AccountRecord | null | undefined): string {
   const planIds = claimedPlanIdsToday(account)
-  const names = planIds.length ? `（${planIds.join('、')}）` : ''
-  return `今天（北京时间 ${beijingDay()}）已领取 ${planIds.length} 份${names}；`
-    + '还有其他可领套餐时，点这里可以继续领；活动按自然日发新套餐，明天可再领'
+  const names = planIds.length ? t('（{plans}）', { plans: planIds.join(t('、')) }) : ''
+  return t('今天（北京时间 {day}）已领取 {n} 份{names}；还有其他可领套餐时，点这里可以继续领；活动按自然日发新套餐，明天可再领', {
+    day: beijingDay(), n: planIds.length, names,
+  })
 }
 
 /**
@@ -696,6 +704,17 @@ export function claimDoneTitle(account: AccountRecord | null | undefined): strin
  */
 export function supportsUsageDetail(account: AccountRecord | null | undefined): boolean {
   return Boolean(providerFeatures(providerOf(account)).usageDetail)
+}
+
+/**
+ * 上游套餐名是否为免费版（`^free$`，不区分大小写）。
+ *
+ * 判定必须比**上游原始名**（后端 `plan_name` 取 `package_name_en`，现网给过 `Free`），
+ * 不能比 `planBadgeLabel` 的输出 —— 那是随界面语言变的展示文案（余额格的
+ * `plan-chip.free` 样式类就按这个判）。单独导出，与 `planBadgeLabel` 共用同一口径。
+ */
+export function isFreePlan(planName: unknown): boolean {
+  return /^free$/i.test(String(planName ?? '').trim())
 }
 
 /**
@@ -707,8 +726,8 @@ export function supportsUsageDetail(account: AccountRecord | null | undefined): 
  */
 export function planBadgeLabel(planName: unknown): string {
   const name = String(planName ?? '').trim()
-  if (/^trial$/i.test(name)) return '试用版'
-  if (/^free$/i.test(name)) return '免费版'
+  if (/^trial$/i.test(name)) return t('试用版')
+  if (isFreePlan(name)) return t('免费版')
   return name
 }
 
@@ -768,16 +787,17 @@ export function welfareDoneTitle(state: WelfareState): string {
   // 「不增加福利模型的 token 池」是**故意留在这里**的：这一家有两份账，领到的积分进的
   // 是套餐赠送积分，而用户点完最可能问的下一句就是「那我的福利模型怎么还是没额度」——
   // 答案放在这行说明里，不必再去余额明细里猜（后端 usage 文档的 note 同口径）。
-  return `今天（北京时间 ${state.day}）已由官方确认到账 ${state.confirmed} 项；`
-    + '领到的是套餐赠送积分，不增加福利模型的 token 池；按自然日重置，明天可再领'
+  return t('今天（北京时间 {day}）已由官方确认到账 {n} 项；领到的是套餐赠送积分，不增加福利模型的 token 池；按自然日重置，明天可再领', {
+    day: state.day, n: state.confirmed,
+  })
 }
 
 /** 「去领取」的悬停说明：把台账里已有的读数带上，回答「今天第几次了」。 */
 export function welfareTodoTitle(state: WelfareState): string {
   const tried = state.today && state.attempts > 0
-    ? `今天（北京时间 ${state.day}）已试过 ${state.attempts} 次但官方尚未确认到账，`
+    ? t('今天（北京时间 {day}）已试过 {n} 次但官方尚未确认到账，', { day: state.day, n: state.attempts })
     : ''
-  return `${tried}探测并领取官方每日登录赠送的套餐积分（到账进套餐积分，不增加福利模型 token 池）`
+  return t('{tried}探测并领取官方每日登录赠送的套餐积分（到账进套餐积分，不增加福利模型 token 池）', { tried })
 }
 
 /* ─── 筛选维度（provider / enabled / limit 三维各自独立）───── */
@@ -955,9 +975,9 @@ export function formatResetText(resetAt: unknown): string {
   // 按自然日求差而不是按 24 小时：今晚 23:50 到明天 00:10 只差 20 分钟，但用户嘴里
   // 它就是「明天」，按毫秒差算会显示成「今天」，与直觉相反
   const days = Math.round((startOfDay(date) - startOfDay(new Date())) / 86400e3)
-  if (days === 0) return `今天 ${clock}`
-  if (days === 1) return `明天 ${clock}`
-  return `${date.getMonth() + 1}月${date.getDate()}日 ${clock}`
+  if (days === 0) return t('今天 {clock}', { clock })
+  if (days === 1) return t('明天 {clock}', { clock })
+  return t('{month}月{day}日 {clock}', { month: date.getMonth() + 1, day: date.getDate(), clock })
 }
 
 /**
@@ -974,9 +994,12 @@ export function editionSuffix(account: AccountRecord | null | undefined): string
   const provider = providerOf(account)
   if (!providerFeatures(provider).edition) return ''
   const edition = accountEdition(account)
-  const suffix = account?.editionLabel || (edition === 'intl' ? '国际版' : '国内版')
+  const custom = account?.editionLabel
+  // 判重比的是注册名里的中文地区词（后端数据，不随界面语言变）；只有最终展示的后缀走 t()
+  const suffix = custom || (edition === 'intl' ? '国际版' : '国内版')
   const label = shared().wbProviders?.labelOf?.(provider) || ''
-  return label.includes(suffix) ? '' : suffix
+  if (label.includes(suffix)) return ''
+  return custom || (edition === 'intl' ? t('国际版') : t('国内版'))
 }
 
 /** 健康标签（结构化；原来由 accountTags 直接拼 HTML，现在交给 React 渲染成 Badge） */
@@ -996,7 +1019,11 @@ export function accountTags(account: AccountRecord): AccountTag[] {
     // 让人以为「没标记就是好的」。判据是后端的 chatSupported，正常配置下不会出现 ——
     // 留着是为了「将来某家处于只有账号管理的过渡期」时界面能自己说清楚
     supportsChat(account)
-      ? null : { text: '仅账号管理', kind: 'plain' as const, title: '该提供商的推理转发尚未接入，账号不参与转发' },
+      ? null : {
+        text: t('仅账号管理'),
+        kind: 'plain' as const,
+        title: t('该提供商的推理转发尚未接入，账号不参与转发'),
+      },
     // 自定义账号没有凭证：既没填 API Key、也没勾「无需鉴权」时，它在选路里会被
     // **静默跳过**（后端 hasCredentials = false，目录也不广告它家的模型）——原样
     // 展示成一条普通账号会让用户完全看不出「为什么加了账号却发不出去请求」。
@@ -1004,23 +1031,26 @@ export function accountTags(account: AccountRecord): AccountTag[] {
     // false —— 其它家的凭证各有各的链路），再限定 id 前缀避免误报。
     isCustomProviderId(providerOf(account)) && account.hasCredentials === false
       ? {
-        text: '未配置凭证',
+        text: t('未配置凭证'),
         kind: 'bad' as const,
-        title: '这条自定义账号既没有 API Key，也没有勾选「无需鉴权」：转发时会被跳过，'
-          + '该提供商下的模型也不会出现在模型列表里。去账号「设置」里补上 Key，或勾选「该上游无需鉴权」',
+        title: t('这条自定义账号既没有 API Key，也没有勾选「无需鉴权」：转发时会被跳过，该提供商下的模型也不会出现在模型列表里。去账号「设置」里补上 Key，或勾选「该上游无需鉴权」'),
       }
       : null,
     // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
     account.proxy?.error
-      ? { text: '代理异常', kind: 'bad' as const, title: `${account.proxy.error}（转发时会回退直连）` }
+      ? {
+        text: t('代理异常'),
+        kind: 'bad' as const,
+        title: t('{error}（转发时会回退直连）', { error: account.proxy.error }),
+      }
       : null,
     // 走活动套餐通道时标出来：它不是默认值，而「这条请求到底花的是哪份额度」
     // 恰恰是用户在这个页面上要回答的问题（行上的余额列也可能同时挂着两份）
     zcodePlanOf(account) === ZCODE_PLAN_START
       ? {
-        text: '活动套餐',
+        text: t('活动套餐'),
         kind: 'plain' as const,
-        title: '转发走活动套餐通道（zcode.z.ai 的 Anthropic 端点，用账号里领到的额度）；在账号设置里可切回编码套餐',
+        title: t('转发走活动套餐通道（zcode.z.ai 的 Anthropic 端点，用账号里领到的额度）；在账号设置里可切回编码套餐'),
       }
       : null,
   ].filter((tag): tag is AccountTag => tag !== null)

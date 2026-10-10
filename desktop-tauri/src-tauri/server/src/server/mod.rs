@@ -300,6 +300,10 @@ impl ServerState {
         // CodeArts 同理：授权地址由适配器拼（同步无参），而 portal 只认 `port`，
         // 所以端口要在发起登录之前就写在进程级常量里（见该模块 `set_loopback_port`）。
         crate::server::core::providers::codearts::oauth::set_loopback_port(port);
+        // Antigravity 的网页登录同理：Google 授权页完成后要回到
+        // `http://localhost:{port}/oauth-callback`（redirect_uri 由适配器在发起
+        // 登录时本地拼），端口必须在第一次发起之前就位（见该模块 `set_loopback_port`）。
+        crate::server::core::providers::antigravity::oauth::set_loopback_port(port);
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开
         // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），

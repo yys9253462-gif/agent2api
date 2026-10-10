@@ -27,6 +27,7 @@ import {
   SelectValue,
   Switch,
 } from '@ui'
+import { t } from '../i18n'
 import { type AccountRecord } from './accounts-shared'
 import { usageQueryOf, USAGE_QUERY_MAX_SECONDS, USAGE_QUERY_MIN_SECONDS } from './accounts-domain'
 
@@ -75,10 +76,10 @@ export function readUsageChanges(account: AccountRecord, draft: UsageDraft): Usa
   const seconds = Math.round(Number(draft.intervalInput) * UNIT_MS[draft.unit])
   if (draft.enabled) {
     if (!Number.isFinite(Number(draft.intervalInput)) || Number(draft.intervalInput) <= 0) {
-      return { error: '请填写查询间隔' }
+      return { error: t('请填写查询间隔') }
     }
     if (seconds < USAGE_QUERY_MIN_SECONDS || seconds > USAGE_QUERY_MAX_SECONDS) {
-      return { error: `查询间隔必须是 ${USAGE_QUERY_MIN_SECONDS} 秒 ~ 24 小时` }
+      return { error: t('查询间隔必须是 {min} 秒 ~ 24 小时', { min: USAGE_QUERY_MIN_SECONDS }) }
     }
   }
   const patch: { usageQuery?: { enabled: boolean; interval: number } } = {}
@@ -106,27 +107,27 @@ export function UsageSettingsSection({
       <div className='field-row mt-2.5'>
         <Label className='inline-flex cursor-pointer items-center gap-2.5 font-normal'>
           <Switch checked={draft.enabled} onCheckedChange={next => patch({ enabled: next === true })}
-            aria-label='自动查询余额' />
-          <span className='text-xs text-subtle'>自动查询余额（按下面的间隔自动刷新余额列的读数）</span>
+            aria-label={t('自动查询余额')} />
+          <span className='text-xs text-subtle'>{t('自动查询余额（按下面的间隔自动刷新余额列的读数）')}</span>
         </Label>
       </div>
       {draft.enabled ? (
         <div className='field-row mt-2.5'>
-          <label htmlFor='account-usage-interval'>查询间隔</label>
+          <label htmlFor='account-usage-interval'>{t('查询间隔')}</label>
           <Input id='account-usage-interval' type='number' min={1} step={1}
             className='max-w-[110px]' value={draft.intervalInput}
             onChange={event => patch({ intervalInput: event.currentTarget.value })} />
           <Select value={draft.unit} onValueChange={value => patch({ unit: value as IntervalUnit })}>
-            <SelectTrigger className='w-[92px]' aria-label='间隔单位'>
-              <SelectValue>{draft.unit === 'hours' ? '小时' : draft.unit === 'minutes' ? '分钟' : '秒'}</SelectValue>
+            <SelectTrigger className='w-[92px]' aria-label={t('间隔单位')}>
+              <SelectValue>{draft.unit === 'hours' ? t('小时') : draft.unit === 'minutes' ? t('分钟') : t('秒')}</SelectValue>
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value='seconds'>秒</SelectItem>
-              <SelectItem value='minutes'>分钟</SelectItem>
-              <SelectItem value='hours'>小时</SelectItem>
+              <SelectItem value='seconds'>{t('秒')}</SelectItem>
+              <SelectItem value='minutes'>{t('分钟')}</SelectItem>
+              <SelectItem value='hours'>{t('小时')}</SelectItem>
             </SelectContent>
           </Select>
-          <span className='detail'>30 秒 ~ 24 小时；手动查询会顺延下一轮</span>
+          <span className='detail'>{t('30 秒 ~ 24 小时；手动查询会顺延下一轮')}</span>
         </div>
       ) : null}
     </>

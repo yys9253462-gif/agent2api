@@ -39,6 +39,7 @@ import {
 } from './accounts-domain'
 import * as domain from './accounts-domain'
 import { clampPriority, priorityOf } from './accounts-columns'
+import { t } from '../i18n'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, openPanelsFor, panelOpen, patch,
 } from './accounts-store'
@@ -203,7 +204,7 @@ export async function clashOptions(options: { force?: boolean } = {}): Promise<C
       try {
         const data = await shared().workbuddyDesktop?.getProxies?.()
         if (!data || typeof data !== 'object' || !data.clash) {
-          throw new Error(`代理列表响应异常（${typeof data}）`)
+          throw new Error(t('代理列表响应异常（{type}）', { type: typeof data }))
         }
         return data.clash
       } finally {
@@ -259,7 +260,7 @@ export async function proxyPoolOptions(options: { force?: boolean } = {}): Promi
       try {
         const data = await shared().workbuddyDesktop?.getProxyPool?.()
         if (!data || typeof data !== 'object' || !Array.isArray(data.items)) {
-          throw new Error(`代理池响应异常（${typeof data}）`)
+          throw new Error(t('代理池响应异常（{type}）', { type: typeof data }))
         }
         return data.items
       } finally {
@@ -315,7 +316,7 @@ export function ensureProxyPoolOptions(): void {
 /* ─── 弹窗 ─────────────────────────────────── */
 
 export function openSettingsDialog(id: string): void {
-  if (!findAccount(id)) { toast('账号不存在，请刷新后重试', 'err'); return }
+  if (!findAccount(id)) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
   patch({ dialog: { kind: 'settings', id } })
 }
 
@@ -325,7 +326,7 @@ export function closeDialog(): void {
 
 export function openBatchDialog(ids: string[], action = 'enable'): void {
   const selected = (Array.isArray(ids) ? ids : []).filter(id => findAccount(id))
-  if (!selected.length) { toast('请先勾选要操作的账号', 'err'); return }
+  if (!selected.length) { toast(t('请先勾选要操作的账号'), 'err'); return }
   patch({ dialog: { kind: 'batch', ids: selected, action } })
 }
 
@@ -433,7 +434,7 @@ export function usageFailureOf(entry: UsageEntry): { message: string; notConfigu
  *  与真正的失败（红色）—— 只存 error 字符串会丢掉这个判据。 */
 function cacheEntryOf(row: Record<string, unknown>): UsageEntry {
   if (row.usage) return row.usage as Record<string, unknown>
-  return { error: row.error ? String(row.error) : '余额响应为空', code: row.code }
+  return { error: row.error ? String(row.error) : t('余额响应为空'), code: row.code }
 }
 
 /**
@@ -528,7 +529,7 @@ export async function queryUsageFor(id?: string | null): Promise<{ results?: Arr
   }
   if (id) {
     // 后端返回了 0 行才是真的「没数据」（账号刚被删、或 provider 不认这个 id）
-    if (!returned.has(id)) putUsage(id, '未返回余额数据', at)
+    if (!returned.has(id)) putUsage(id, t('未返回余额数据'), at)
     bump()
     return data
   }
@@ -537,7 +538,7 @@ export async function queryUsageFor(id?: string | null): Promise<{ results?: Arr
   // 本轮查询」说成「上游没给数据」—— 与单查那个 bug 同源。判据走 `batchUsageTargets`，
   // 与后端 `resolve_batch_targets` 逐字一致。
   for (const account of batchUsageTargets()) {
-    if (!returned.has(account.id)) putUsage(account.id, '未返回余额数据', at)
+    if (!returned.has(account.id)) putUsage(account.id, t('未返回余额数据'), at)
   }
   bump()
   return data
@@ -553,7 +554,7 @@ export async function queryUsageFor(id?: string | null): Promise<{ results?: Arr
 export async function queryAllUsage(): Promise<void> {
   if (getStore().usageBusy) return
   const targets = batchUsageTargets()
-  if (!targets.length) { toast('暂无可查询余额的账号', 'err'); return }
+  if (!targets.length) { toast(t('暂无可查询余额的账号'), 'err'); return }
   patch({ usageBusy: true })
   // 先写「查询中」再重绘：余额列立刻显示查询中，结果回来了直接换成读数
   targets.forEach(account => putUsage(account.id, null, Date.now()))
@@ -563,16 +564,16 @@ export async function queryAllUsage(): Promise<void> {
     const ok = rows.filter(row => row.usage).length
     // 「未配置查询」不算失败：那些账号成功返回了、只是缺一个可选的凭证
     const skipped = rows.filter(row => row.code === NOT_CONFIGURED_CODE).length
-    const suffix = skipped ? `（${skipped} 个未配置查询凭证）` : ''
+    const suffix = skipped ? t('（{n} 个未配置查询凭证）', { n: skipped }) : ''
     const failed = rows.length - ok - skipped
     toast(ok + skipped === rows.length
-      ? `✅ 已更新 ${ok} 个账号的余额${suffix}`
-      : `已更新 ${ok}/${rows.length} 个账号，${failed} 个失败`, failed ? 'err' : 'ok')
+      ? t('✅ 已更新 {n} 个账号的余额{suffix}', { n: ok, suffix })
+      : t('已更新 {ok}/{total} 个账号，{failed} 个失败', { ok, total: rows.length, failed }), failed ? 'err' : 'ok')
   } catch (error) {
     const message = errorMessage(error)
-    targets.forEach(account => putUsage(account.id, `查询失败：${message}`, Date.now()))
+    targets.forEach(account => putUsage(account.id, t('查询失败：{message}', { message }), Date.now()))
     bump()
-    toast(`余额查询失败：${message}`, 'err')
+    toast(t('余额查询失败：{message}', { message }), 'err')
   } finally {
     patch({ usageBusy: false })
   }
@@ -608,12 +609,12 @@ export async function queryUsageOnce(id: string): Promise<void> {
     // 「未配置」与「失败」—— 提示语要跟着这个分叉走
     const failure = usageFailureOf(usageMap.get(id))
     if (failure?.notConfigured) toast(failure.message, 'ok')
-    else if (failure) toast(`余额查询失败：${failure.message}`, 'err')
-    else toast('✅ 已更新余额')
+    else if (failure) toast(t('余额查询失败：{message}', { message: failure.message }), 'err')
+    else toast(t('✅ 已更新余额'))
   } catch (error) {
-    putUsage(id, `查询失败：${errorMessage(error)}`, Date.now())
+    putUsage(id, t('查询失败：{message}', { message: errorMessage(error) }), Date.now())
     bump()
-    toast(`余额查询失败：${errorMessage(error)}`, 'err')
+    toast(t('余额查询失败：{message}', { message: errorMessage(error) }), 'err')
   }
 }
 
@@ -648,7 +649,7 @@ export async function refreshUsageAfterCheckin(id?: string): Promise<void> {
     try {
       await runUsageQuery(id)
     } catch (error) {
-      putUsage(id, `查询失败：${errorMessage(error)}`, Date.now())
+      putUsage(id, t('查询失败：{message}', { message: errorMessage(error) }), Date.now())
       bump()
     }
     return
@@ -663,7 +664,7 @@ export async function refreshUsageAfterCheckin(id?: string): Promise<void> {
     await queryUsageFor(null)
   } catch (error) {
     const message = errorMessage(error)
-    targets.forEach(account => putUsage(account.id, `查询失败：${message}`, Date.now()))
+    targets.forEach(account => putUsage(account.id, t('查询失败：{message}', { message }), Date.now()))
     bump()
   } finally {
     patch({ usageBusy: false })
@@ -690,12 +691,12 @@ export async function commitPriority(id: string, raw: string): Promise<number | 
   if (next === current) return current
   try {
     await shared().workbuddyDesktop?.updateAccount?.(id, { priority: next })
-    toast(`✅ 优先级已改为 ${next}`)
+    toast(t('✅ 优先级已改为 {n}', { n: next }))
     // 改完顺序会变，必须重拉：只改本地状态的话行不会重排，看起来「没生效」
     await shared().wbApp?.refresh?.()
     return next
   } catch (error) {
-    toast(`优先级未保存：${errorMessage(error)}`, 'err')
+    toast(t('优先级未保存：{message}', { message: errorMessage(error) }), 'err')
     // 冲突可能来自别处已经改过的数据（比如另一端刚占了号），补一次刷新让列表回到事实
     void shared().wbApp?.refresh?.()
     return current
@@ -713,9 +714,9 @@ export async function setAccountEnabled(id: string, enabled: boolean): Promise<v
   try {
     await shared().workbuddyDesktop?.updateAccount?.(id, { enabled })
     await shared().wbApp?.refresh?.()
-    toast(enabled ? '✅ 已启用' : '✅ 已禁用')
+    toast(enabled ? t('✅ 已启用') : t('✅ 已禁用'))
   } catch (error) {
-    toast(`操作失败：${errorMessage(error)}`, 'err')
+    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
     // 失败时把开关拨回去：界面上不能留一个「已改」的假象
     void shared().wbApp?.refresh?.()
   }
@@ -734,7 +735,7 @@ export async function moveAccount(id: string, direction: 'up' | 'down'): Promise
     await shared().workbuddyDesktop?.moveAccount?.(id, direction)
     await shared().wbApp?.refresh?.()
   } catch (error) {
-    toast(`调整顺序失败：${errorMessage(error)}`, 'err')
+    toast(t('调整顺序失败：{message}', { message: errorMessage(error) }), 'err')
   }
 }
 
@@ -742,10 +743,10 @@ export async function moveAccount(id: string, direction: 'up' | 'down'): Promise
 export async function clearLimits(id: string, model?: string): Promise<void> {
   try {
     await shared().workbuddyDesktop?.clearRateLimits?.(id, model || null)
-    toast(model ? `✅ 已清除 ${model} 的限流标记` : '✅ 已清除该账号全部限流标记')
+    toast(model ? t('✅ 已清除 {model} 的限流标记', { model }) : t('✅ 已清除该账号全部限流标记'))
     await shared().wbApp?.refresh?.()
   } catch (error) {
-    toast(`清除失败：${errorMessage(error)}`, 'err')
+    toast(t('清除失败：{message}', { message: errorMessage(error) }), 'err')
   }
 }
 
@@ -780,10 +781,11 @@ export async function applyProxyPick(id: string, value: string, fallback: string
       : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
     const result = await shared().workbuddyDesktop?.updateAccount?.(id, { proxy })
     const changes = result?.changes
-    const change = Array.isArray(changes) && changes.length ? changes[0] : '代理已更新'
+    // changes[0] 是后端回报的变更说明（后端文案保持一份事实），没有时给前端兜底一句
+    const change = Array.isArray(changes) && changes.length ? changes[0] : t('代理已更新')
     toast(`✅ ${change}`)
   } catch (error) {
-    toast(`保存失败：${errorMessage(error)}`, 'err')
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
   } finally {
     // 成败都重拉：成功让这格显示落库后的值，失败把下拉拨回原值
     await shared().wbApp?.refresh?.()

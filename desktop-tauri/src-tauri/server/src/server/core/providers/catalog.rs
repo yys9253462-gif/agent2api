@@ -144,6 +144,30 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::kuku::models::remote_refreshed(),
             super::kuku::models::last_refreshed_at(),
         ),
+        // MonkeyCode 的两个站点各有一份独立清单（缓存按地区分格，见
+        // `monkeycode::models` 的模块头）：这里如实各查**自己那一格**。
+        ProviderKind::MonkeyCode | ProviderKind::MonkeyCodeIntl => {
+            let region = super::monkeycode::Region::from_kind(kind)
+                .unwrap_or(super::monkeycode::Region::Cn);
+            (
+                super::monkeycode::models::remote_refreshed(region),
+                super::monkeycode::models::last_refreshed_at(region),
+            )
+        }
+        // Command Code：清单来自 `GET /provider/v1/models`（单一域名、无地区），
+        // 拉不到时回落内置 26 项 —— 「有远程内容」才算远程来源（`remote_refreshed`
+        // 只看落地的那些，不看兜底表）。
+        ProviderKind::CommandCode => (
+            super::commandcode::models::remote_refreshed(),
+            super::commandcode::models::last_refreshed_at(),
+        ),
+        // Antigravity：清单来自 `POST {base}:fetchAvailableModels`（三个环境
+        // 轮流打，但只有**一格**缓存 —— 环境不是地区）。拉不到时回落内置的
+        // Gemini 兜底清单，所以同样「有远程内容」才算远程来源。
+        ProviderKind::Antigravity => (
+            super::antigravity::models::remote_refreshed(),
+            super::antigravity::models::last_refreshed_at(),
+        ),
     }
 }
 

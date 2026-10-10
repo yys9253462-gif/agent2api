@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { Badge, Button, Input, Switch } from '@ui'
+import { t } from '../i18n'
 // 「把检查结果交给更新弹窗」与 app.js 的轮询同一条出口，实现在更新家族的共享模块里
 
 /**
@@ -173,9 +174,9 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** 间隔单位的中文名：单位由后端给定（'seconds' | 'minutes'），前端不自己猜 */
+/** 间隔单位的展示名：单位由后端给定（'seconds' | 'minutes'），前端不自己猜 */
 function unitLabel(unit: string): string {
-  return unit === 'seconds' ? '秒' : '分钟'
+  return unit === 'seconds' ? t('秒') : t('分钟')
 }
 
 /** 把毫秒时间戳化成「时:分:秒」，供上次 / 下次执行展示 */
@@ -190,14 +191,14 @@ function describeNext(value: unknown): string {
   const ms = Number(value) || 0
   if (!ms) return ''
   const diff = ms - Date.now()
-  if (diff <= 0) return '即将执行'
+  if (diff <= 0) return t('即将执行')
   const seconds = Math.round(diff / 1000)
-  if (seconds < 60) return `${seconds} 秒后`
+  if (seconds < 60) return t('{n} 秒后', { n: seconds })
   const minutes = Math.round(seconds / 60)
-  if (minutes < 60) return `${minutes} 分钟后`
+  if (minutes < 60) return t('{n} 分钟后', { n: minutes })
   const hours = Math.round(minutes / 60)
-  if (hours < 24) return `${hours} 小时后`
-  return `${Math.round(hours / 24)} 天后`
+  if (hours < 24) return t('{n} 小时后', { n: hours })
+  return t('{n} 天后', { n: Math.round(hours / 24) })
 }
 
 /**
@@ -213,15 +214,22 @@ function taskStateText(task: IntervalTask): string {
   const backend = task.runner === 'backend'
   const lines: string[] = []
   if (task.lastRunAt) {
-    lines.push(`上次执行 ${clockOf(task.lastRunAt)}${task.lastResult ? `（${task.lastResult}）` : ''}`)
+    const at = clockOf(task.lastRunAt)
+    // 上次执行的结果原文是后端数据，包进 {result} 形参、不翻译
+    lines.push(task.lastResult
+      ? t('上次执行 {time}（{result}）', { time: at, result: task.lastResult })
+      : t('上次执行 {time}', { time: at }))
   } else {
-    lines.push(backend ? '还没有执行记录' : '由页面按间隔自动刷新')
+    lines.push(backend ? t('还没有执行记录') : t('由页面按间隔自动刷新'))
   }
   if (backend && task.enabled && task.nextRunAt) {
-    lines.push(`下次执行 ${clockOf(task.nextRunAt)}（${describeNext(task.nextRunAt)}）`)
+    lines.push(t('下次执行 {time}（{relative}）', {
+      time: clockOf(task.nextRunAt),
+      relative: describeNext(task.nextRunAt),
+    }))
   }
   if (backend && task.retryAt && task.retryAt > Date.now()) {
-    lines.push(`冷却中，${describeNext(task.retryAt)}重试`)
+    lines.push(t('冷却中，{relative}重试', { relative: describeNext(task.retryAt) }))
   }
   return lines.join(SEP)
 }
@@ -236,11 +244,21 @@ function parseInterval(
 ): { ok: true; value: number } | { ok: false; message: string } {
   const text = String(raw ?? '').trim()
   const unit = unitLabel(task.unit)
-  if (!text) return { ok: false, message: `间隔不能为空（可填 ${task.min}–${task.max} ${unit}）` }
-  if (!/^\d+$/.test(text)) return { ok: false, message: '间隔必须是整数' }
+  if (!text) {
+    return { ok: false, message: t('间隔不能为空（可填 {min}–{max} {unit}）', { min: task.min, max: task.max, unit }) }
+  }
+  if (!/^\d+$/.test(text)) return { ok: false, message: t('间隔必须是整数') }
   const value = Number(text)
   if (value < task.min || value > task.max) {
-    return { ok: false, message: `间隔必须在 ${task.min}–${task.max} ${unit} 之间（当前填的是 ${text}）` }
+    return {
+      ok: false,
+      message: t('间隔必须在 {min}–{max} {unit} 之间（当前填的是 {value}）', {
+        min: task.min,
+        max: task.max,
+        unit,
+        value: text,
+      }),
+    }
   }
   return { ok: true, value }
 }
@@ -327,7 +345,7 @@ function TasksPanel() {
   const loadPanel = React.useCallback(async () => {
     const api = shared().workbuddyDesktop
     try {
-      if (!api) throw new Error('后端桥不可用')
+      if (!api) throw new Error(t('后端桥不可用'))
       const list = await api.getScheduledTasks()
       setTasks(filterVisibleTasks(list))
       setLoaded(true)
@@ -393,6 +411,8 @@ function TasksPanel() {
    * 以接口返回值为准（后端会把非法值夹到范围内并在必要时回落默认值），所以不能
    * 「按前端算的值渲染」—— 那会在后端实际拒绝时显示成已生效。
    * 失败时回滚到后端的真实状态：界面显示的可能是用户刚拨过去的假值。
+   *
+   * `label` 是 toast 里用的展示名，调用方拼好且已走 t()（任务名是后端下发的展示文案）。
    */
   async function saveTask(id: string, patch: Record<string, unknown>, label: string) {
     if (panelBusy) return
@@ -403,9 +423,9 @@ function TasksPanel() {
       const saved = await api.saveScheduledTask(id, patch)
       setTasks(prev => prev.map(task => (task.id === id ? saved : task)))
       pushAutoRefresh(saved)
-      toast(`✅ 已更新「${label}」`)
+      toast(t('✅ 已更新「{label}」', { label }))
     } catch (error) {
-      toast(`保存失败：${errorMessage(error)}`, 'err')
+      toast(t('保存失败：{reason}', { reason: errorMessage(error) }), 'err')
       await loadPanel()
     } finally {
       panelBusy = false
@@ -429,7 +449,7 @@ function TasksPanel() {
       clearIntervalDraft(task.id)
       return
     }
-    await saveTask(task.id, { interval: parsed.value }, `${task.label}间隔`)
+    await saveTask(task.id, { interval: parsed.value }, t('{name}间隔', { name: t(task.label) }))
     // 成功时以后端返回值为准；失败时 saveTask 内部已 loadPanel() 回滚 —— 两种情况都让草稿归位
     clearIntervalDraft(task.id)
   }
@@ -447,11 +467,14 @@ function TasksPanel() {
         const refreshed = result.task
         setTasks(prev => prev.map(item => (item.id === task.id ? refreshed : item)))
       }
-      toast(`✅ ${task.label}：${result?.summary || '已执行'}`)
+      toast(t('✅ {task}：{summary}', {
+        task: t(task.label),
+        summary: result?.summary || t('已执行'),
+      }))
       // 凭证刷新会改账号页的有效期 / 凭证状态，顺手刷新主界面
       if (task.id === 'credentialMaintenance') await shared().wbApp?.refresh?.()
     } catch (error) {
-      toast(`执行失败：${errorMessage(error)}`, 'err')
+      toast(t('执行失败：{reason}', { reason: errorMessage(error) }), 'err')
       await loadPanel()
     } finally {
       panelBusy = false
@@ -486,17 +509,18 @@ function TasksPanel() {
             <label className='switch'>
               <Switch
                 checked={task.enabled === true}
-                onCheckedChange={next => void saveTask(task.id, { enabled: next }, `${task.label}开关`)}
+                onCheckedChange={next => void saveTask(task.id, { enabled: next }, t('{name}开关', { name: t(task.label) }))}
               />
-              <span className='task-name'>{task.label}</span>
+              {/* 任务名 / 描述由后端随任务下发（固定中文常量），走 t() 让词典能翻 */}
+              <span className='task-name'>{t(task.label)}</span>
             </label>
-            <span className='tip-q' data-tip={task.description}></span>
+            <span className='tip-q' data-tip={t(task.description)}></span>
             <Badge className='task-badge' variant={task.enabled ? 'success' : 'outline'}>
-              {task.enabled ? '已开启' : '已关闭'}
+              {task.enabled ? t('已开启') : t('已关闭')}
             </Badge>
             {task.running ? (
               <Badge className='task-badge' variant='warning'>
-                执行中…
+                {t('执行中…')}
               </Badge>
             ) : null}
           </div>
@@ -504,7 +528,7 @@ function TasksPanel() {
         </div>
         <div className='task-actions'>
           <span className='task-interval'>
-            <span className='task-interval-label'>每</span>
+            <span className='task-interval-label'>{t('每')}</span>
             {/* 单位是后端的固定属性（'seconds' | 'minutes'），不是一个可选字段：
                 PATCH 只受理 {enabled?, interval?}，做成下拉会「看着能改、其实不生效」。
 
@@ -521,7 +545,12 @@ function TasksPanel() {
               step={1}
               className='w-[74px] max-w-[74px] text-center tabular-nums'
               value={intervalDrafts[task.id] ?? String(task.interval)}
-              title={`可填 ${task.min}–${task.max} ${unit}（默认 ${task.defaultInterval} ${unit}）`}
+              title={t('可填 {min}–{max} {unit}（默认 {def} {unit}）', {
+                min: task.min,
+                max: task.max,
+                unit,
+                def: task.defaultInterval,
+              })}
               // onChange 只记草稿、不发请求：提交交给 blur / 回车（见 submitInterval）
               onChange={event => {
                 const value = event.currentTarget.value
@@ -542,7 +571,7 @@ function TasksPanel() {
               disabled={running || task.running === true}
               onClick={() => void runTask(task)}
             >
-              {running ? '执行中…' : '立即执行'}
+              {running ? t('执行中…') : t('立即执行')}
             </Button>
           ) : null}
         </div>
@@ -555,9 +584,9 @@ function TasksPanel() {
   const enabledCount = tasks.filter(task => task.enabled).length
   const badgeText = empty
     ? loaded
-      ? '不可用'
+      ? t('不可用')
       : '—'
-    : `${enabledCount} / ${tasks.length} 个已开启`
+    : t('{enabled} / {total} 个已开启', { enabled: enabledCount, total: tasks.length })
   /** 徽标配色：无数据未定 → 无修饰；尝试过但读不到 → bad；正常 → 有开启就 ok */
   const badgeVariant: 'destructive' | 'outline' | 'success' = empty
     ? loaded
@@ -577,17 +606,17 @@ function TasksPanel() {
   return (
     <section className='panel'>
       <div className='panel-head'>
-        <h2>任务清单</h2>
+        <h2>{t('任务清单')}</h2>
         {/* id 保留：app.js 的 renderTopbarStatus 会按 id 镜像这枚徽标的文案与配色
             （配色经 data-tone 传，见 badgeTone） */}
         <Badge id='tasks-badge' variant={badgeVariant} data-tone={badgeTone}>
           {badgeText}
         </Badge>
-        <span className='panel-sub'>状态每 20 秒自动同步</span>
+        <span className='panel-sub'>{t('状态每 20 秒自动同步')}</span>
         <div className='head-actions'>
           {/* 旧实现是 load().then(() => toast('定时任务已刷新'))：不看结果，一律报已刷新 */}
-          <Button variant='outline' onClick={() => void loadPanel().then(() => toast('定时任务已刷新'))}>
-            刷新
+          <Button variant='outline' onClick={() => void loadPanel().then(() => toast(t('定时任务已刷新')))}>
+            {t('刷新')}
           </Button>
         </div>
       </div>
@@ -596,8 +625,8 @@ function TasksPanel() {
           {empty ? (
             <div className='log-empty'>
               {loaded
-                ? '没有可显示的定时任务。后端未返回任务清单，请确认网关正在运行。'
-                : '正在加载定时任务…'}
+                ? t('没有可显示的定时任务。后端未返回任务清单，请确认网关正在运行。')
+                : t('正在加载定时任务…')}
             </div>
           ) : (
             <>
@@ -608,10 +637,11 @@ function TasksPanel() {
         </div>
       </div>
       <div className='panel-foot'>
+        {/* 路径 / 字段名是配置契约、不进词典；两边的中文碎片各走 t()（片段式与 docs-page 脚注同一手法） */}
         <span>
-          任务配置保存在 <code>~/.agent2api/config.json</code> 的 <code>scheduledTasks</code> 字段
+          {t('任务配置保存在 ')}<code>~/.agent2api/config.json</code>{t(' 的 ')}<code>scheduledTasks</code>{t(' 字段')}
         </span>
-        <span>改动立即生效，不需要重启程序</span>
+        <span>{t('改动立即生效，不需要重启程序')}</span>
       </div>
     </section>
   )

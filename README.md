@@ -1,6 +1,6 @@
 # Agent2API · 多提供商本地网关
 
-**简体中文** | [English](./README.en.md)
+**简体中文** | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
 把多家 AI 桌面客户端的登录态包装成本地 **OpenAI 兼容 API 网关**，统一暴露一个 `base_url`，附带多提供商账号管理、模型管理（启停 / 删除 / 映射）、出站指纹脱敏、出网代理与请求报表，并提供一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点调用这几家的模型额度——不需要 API Key，不需要改客户端源码。
 
@@ -20,13 +20,16 @@
 | CodeArts | ✓ | ✓ 一次性轮换 | ✓ 远程（三源合并） | ✓ 两份账 | — | ✓ 每日福利（手动） |
 | Trae | ✓ | ✓ 一次一换 | ✓ 仅远程 | ✓ 两份账 | — | — |
 | Loomy（讯飞） | ✓ | ✗ 无续期接口 | ✓ 仅远程 | ✓ 两份积分账 | ✓ 每日赠送积分刷新 | — |
+| MonkeyCode（长亭科技，国内版 / 国际版） | ✓ | ✗ 无续期接口 | ✓ 仅远程 | — | — | — |
+| Command Code | ✓ | ✗ 静态 API Key | ✓ 远程 + 静态兜底 | — | — | — |
+| Antigravity（Google，Gemini） | ✓ | ✓ | ✓ 远程 + 静态兜底 | — | — | — |
 | 自定义提供商 | ✓ Chat 透传 / Responses / Anthropic | — | ✓ 手动登记 + 服务端拉取 | — | — | — |
 
 三条对话协议入口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，另含 `/v1/messages/count_tokens`）与 `/v1/models` 对所有平台一视同仁，差异只在各家上游能不能做到表里那些事；模型映射、全局优先级队列、429 降级、出网代理、出站指纹脱敏与请求报表同样对全平台通用。
 
 > **本项目仅供学习与交流使用。** 它通过本地反向代理复用你自己账号的登录态，这种「以非官方客户端形态转发」的方式可能不符合上游服务的用户协议，使用风险（含账号被风控、封禁）由使用者自行承担；禁止用于商业用途或绕过计费。详见[使用声明](#使用声明)与 [LICENSE](./LICENSE)。
 >
-> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder / Accio）、华为云（CodeArts）、字节跳动（Trae）、科大讯飞（Loomy）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
+> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder / Accio）、华为云（CodeArts）、字节跳动（Trae）、科大讯飞（Loomy）、长亭科技（MonkeyCode）、Command Code、Google（Antigravity）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
 
 ---
 
@@ -47,7 +50,7 @@
 从 Releases 下载安装包（NSIS，简体中文，默认装到 `C:\Program Files\Agent2API`，安装时需要管理员授权），安装后启动即可，**无需安装 Node 或任何其它运行时**。
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口；若检测到旧版本的数据目录或数据文件，会弹窗提示迁移，按指引操作即可。
-2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline / Accio 国际版 / Accio 国内版 / ZCode 国内版 / ZCode 国际版 / CodeArts / Trae / Loomy），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上；CodeArts 与 Trae 只有网页登录与粘贴凭证两种，Loomy 只有手机验证码与粘贴 session 两种）。
+2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline / Accio 国际版 / Accio 国内版 / ZCode 国内版 / ZCode 国际版 / CodeArts / Trae / Loomy / KukuAI / MonkeyCode 国内版 / MonkeyCode 国际版 / Command Code / Antigravity），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上；CodeArts 与 Trae 只有网页登录与粘贴凭证两种，Loomy 只有手机验证码与粘贴 session 两种，MonkeyCode / Command Code / Antigravity 只有粘贴凭证一种）。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
@@ -124,9 +127,7 @@ services:
 
 从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
 
-**网页端功能差异**（都源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；AutoClaw / CatPaw / Accio / CodeArts / Trae 网页登录的回调打本机端口，远程面板请改用粘贴凭证；小浣熊网页登录与「导入本机桌面端登录态」不可用（用填写凭证；Loomy / CodeArts / Trae 本来也没有桌面端登录态可导入）。
-
----
+**网页端功能差异**（都源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；AutoClaw / CatPaw / Accio / CodeArts / Trae 网页登录的回调打本机端口，远程面板请改用粘贴凭证；小浣熊网页登录与「导入本机桌面端登录态」不可用（用填写凭证；Loomy / CodeArts / Trae 本来也没有桌面端登录态可导入；MonkeyCode / Command Code / Antigravity 同样只有粘贴凭证一种方式）。
 
 ---
 
@@ -225,12 +226,28 @@ agent2api/
 │  │  │  │  │                   stream（SSE→chunk 翻译）/ forward（有状态转发）/
 │  │  │  │  │                   errors（错误分类与死配置名单）/ models（get_detail_param 目录）/
 │  │  │  │  │                   usage（权益包 + 套餐 quota 两份账）/ profile（身份解析）
-│  │  │  │  │  └─ loomy/        Loomy（讯飞）：login（手机验证码）/ credentials（session 14 天、无续期接口）/
-│  │  │  │  │                   sign（复刻客户端 HMAC-SHA1 签名头）/ endpoints / client（集成网关）/
-│  │  │  │  │                   models（/api/v1/models 远程目录，上游无内置兜底清单）/
-│  │  │  │  │                   balance（永久积分 + 每日赠送两份账）/ checkin（每日首次登录刷新赠送积分）
+│  │  │  │  │  ├─ loomy/        Loomy（讯飞）：login（手机验证码）/ credentials（session 14 天、无续期接口）/
+│  │  │  │  │  │                sign（复刻客户端 HMAC-SHA1 签名头）/ endpoints / client（集成网关）/
+│  │  │  │  │  │                models（/api/v1/models 远程目录，上游无内置兜底清单）/
+│  │  │  │  │  │                balance（永久积分 + 每日赠送两份账）/ checkin（每日首次登录刷新赠送积分）
+│  │  │  │  │  ├─ monkeycode/  MonkeyCode（长亭科技，国内版 + 国际版两家）：region（两站域名与身份）/
+│  │  │  │  │  │                adapter / endpoints（路径 / cookie 名 / interface_type→CLI 映射）/
+│  │  │  │  │  │                client / credentials（session + imageId）/ login（粘贴 session 与自动发现）/
+│  │  │  │  │  │                models（两站各一格清单，仅远程）/ task（建任务）/ stream（WS 任务流）/
+│  │  │  │  │  │                translate（ACP 事件 → chat 帧，含工具自动批准与提问自动应答）
+│  │  │  │  │  ├─ commandcode/  Command Code：adapter / endpoints / credentials / login /
+│  │  │  │  │  │                fingerprint（确定性设备指纹与 8h 上报）/ models /
+│  │  │  │  │  │                plan（8 键信封与 params 重写、session id 派生）
+│  │  │  │  │  └─ antigravity/  Antigravity（Google，Gemini）：oauth（refresh token 续期 + 单飞）/
+│  │  │  │  │                   project（loadCodeAssist → onboardUser 发现）/ credentials /
+│  │  │  │  │                   endpoints（三环境基址与头集合）/ login /
+│  │  │  │  │                   models（fetchAvailableModels + 内置兜底 + 上游真名映射）/ adapter
+│  │  │  │  ├─ protocol/        协议转换层（各家 wire ↔ 标准 chat SSE 的请求/响应翻译：
+│  │  │  │  │                    Anthropic Messages / Responses / NDJSON（Command Code）/
+│  │  │  │  │                    Gemini 信封（Antigravity），以及工具 plan 与历史修复）
 │  │  │  │  ├─ upstream/        转发编排：全局账号队列循环（provider_loop）+ 发送体处理
-│  │  │  │  │                    （payload）+ SSE 透传/聚合 + usage 旁路提取
+│  │  │  │  │                    （payload）+ SSE 透传/聚合 + usage 旁路提取 + 非 chat 协议的
+│  │  │  │  │                    翻译流接入（translate：Anthropic / NDJSON / Gemini 三条并列）
 │  │  │  │  ├─ account_store/   账号存储（全局优先级、限额冷却、各家添加与导入）
 │  │  │  │  ├─ models/          模型目录底层（workbuddy 内置清单 + /v3/config 刷新）
 │  │  │  │  ├─ model_rules.rs   模型管理规则（禁用 / 隐藏 / 映射 alias）
@@ -296,7 +313,7 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 
 ### 仅供学习与交流
 
-本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与桌面端打包（Tauri）等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy / CodeBuddy、美团及 CatPaw、商汤及小浣熊、智谱及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、华为云及 CodeArts、字节跳动及 Trae、科大讯飞及 Loomy 均无任何关联，未获得其授权、认可或赞助。
+本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与桌面端打包（Tauri）等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy / CodeBuddy、美团及 CatPaw、商汤及小浣熊、智谱及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、华为云及 CodeArts、字节跳动及 Trae、科大讯飞及 Loomy、长亭科技及 MonkeyCode、Command Code、Google 及 Antigravity 均无任何关联，未获得其授权、认可或赞助。
 
 ### 关于反向代理行为
 

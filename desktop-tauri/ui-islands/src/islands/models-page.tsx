@@ -133,6 +133,7 @@ import {
   writeBinding, writeRemoveMapping, writeRemoveModel,
   type Align, type Binding, type ColumnView, type CustomModelContext, type MappingContext,
 } from './models-panel-state'
+import { t } from '../i18n'
 
 
 /* ─── 页面本体 ───────────────────────────────── */
@@ -338,7 +339,7 @@ function ModelsPage() {
    * 有映射按 `model.aliases`（与「有映射」筛选同一份判据）。
    */
   const titleLabel = provider === 'all'
-    ? '全部'
+    ? t('全部')
     : (custom
       ? String(customSource.record(provider)?.name || provider)
       : (builtinRailItems(state.data).get(provider)?.label || providerLabelOf(provider)))
@@ -369,8 +370,8 @@ function ModelsPage() {
   /** 表头那格没有文案（照账号页勾选列：列设置里才需要名字），只有全选复选框 */
   const allPickNode = (
     <Checkbox checked={allVisiblePicked} indeterminate={!allVisiblePicked && someVisiblePicked}
-      disabled={!visibleKeys.length} aria-label='全选当前筛选结果'
-      title='全选当前筛选出的模型（跨分页）；再点取消'
+      disabled={!visibleKeys.length} aria-label={t('全选当前筛选结果')}
+      title={t('全选当前筛选出的模型（跨分页）；再点取消')}
       onCheckedChange={next => {
         const nextSet = new Set(selection)
         for (const key of visibleKeys) {
@@ -388,11 +389,11 @@ function ModelsPage() {
     const counts = builtinRailItems(state.data)
     const customs = customSource.list()
     const total = [...counts.values()].reduce((sum, item) => sum + item.n, 0)
-    const allLabel = `全部（${counts.size} 家）`
+    const allLabel = t('全部（{n} 家）', { n: counts.size })
     return (
-      <aside className='prov-rail' id='prov-rail' aria-label='按提供商选择'>
+      <aside className='prov-rail' id='prov-rail' aria-label={t('按提供商选择')}>
         <div className='rail-scroll'>
-          <div className='rail-label'>内置提供商</div>
+          <div className='rail-label'>{t('内置提供商')}</div>
           {/* 条目是导航项而不是按钮，走 NavItem（选中态 / 悬浮态 / 字重 / 计数都在组件里，
               与原来的 .pv 是同一套令牌取值）。头像（icon=）按家给一枚色相 monogram，
               见 providerAvatar 的说明。shadow-none 是为了清掉 ui/css/components.css
@@ -406,7 +407,7 @@ function ModelsPage() {
               count={entry.n} icon={providerAvatar(key, entry.label)} className='shadow-none'
               onClick={() => selectProvider(key)}>{entry.label}</NavItem>
           ))}
-          <div className='rail-label'>自定义提供商</div>
+          <div className='rail-label'>{t('自定义提供商')}</div>
           {customs.length ? customs.map(item => {
             const id = String(item.id || '')
             const label = String(item.name || id)
@@ -419,17 +420,17 @@ function ModelsPage() {
                   icon={providerAvatar(id, label)}
                   className={cn('shadow-none', RAIL_HIDE_COUNT_ON_HOVER)}
                   onClick={() => selectProvider(id)}>{label}</NavItem>
-                <button type='button' className='pv-del' aria-label='删除自定义提供商'
-                  title='删除这个自定义提供商（连同名下账号）'
+                <button type='button' className='pv-del' aria-label={t('删除自定义提供商')}
+                  title={t('删除这个自定义提供商（连同名下账号）')}
                   onClick={() => void removeCustomProvider(id)}>×</button>
               </div>
             )
-          }) : <div className='rail-empty'>还没有自定义提供商</div>}
+          }) : <div className='rail-empty'>{t('还没有自定义提供商')}</div>}
         </div>
         <div className='rail-foot'>
           <NavItem variant='add' id='rail-add-custom'
-            title='新建一个自定义提供商（同时创建它的第一个账号）'
-            onClick={() => openAddCustomProvider()}>＋ 新建自定义提供商</NavItem>
+            title={t('新建一个自定义提供商（同时创建它的第一个账号）')}
+            onClick={() => openAddCustomProvider()}>{t('＋ 新建自定义提供商')}</NavItem>
         </div>
       </aside>
     )
@@ -444,9 +445,9 @@ function ModelsPage() {
       // shadow-none 是清掉通用 button 规则的投影（旧 CSS 同样显式清过）
       <Button variant={level ? 'secondary' : 'dashed'} size='2xs' disabled={busy}
         className='font-mono font-bold shadow-none'
-        title={level ? `思考等级 ${level}（点击修改）` : '设置思考等级（当前未绑定）'}
+        title={level ? t('思考等级 {level}（点击修改）', { level }) : t('设置思考等级（当前未绑定）')}
         onClick={() => openMapping({ alias, target, provider: providerId })}>
-        {level || '＋等级'}
+        {level || t('＋等级')}
       </Button>
     )
   }
@@ -463,16 +464,16 @@ function ModelsPage() {
      */
     async function confirmUnmap(alias: string): Promise<void> {
       const ok = await shared().wbConfirm?.ask?.({
-        title: '删除映射',
-        html: `确定删除映射「<strong>${esc(alias)} → ${esc(model.id)}</strong>」？`,
-        okText: '删除',
+        title: t('删除映射'),
+        html: t('确定删除映射「<strong>{alias} → {target}</strong>」？', { alias: esc(alias), target: esc(model.id) }),
+        okText: t('删除'),
         okClass: 'danger',
       })
       if (!ok) return
       void runRowAction(
         bindingKeyOf(alias, model.id, providerId),
         () => writeRemoveMapping(providerId, alias, model.id),
-        '映射已删除',
+        t('映射已删除'),
       )
     }
 
@@ -487,26 +488,26 @@ function ModelsPage() {
               与旧 CSS 里 `.alias .switch .track` 同尺寸：标准档（36×21）塞进 22px 的药丸里
               会把 chip 连同整张表的行高一起撑高 */}
           <Switch size='sm' checked={on} disabled={busy}
-            title={on ? '映射已启用，点击关闭' : '映射已关闭，点击启用'}
-            aria-label={`${on ? '关闭' : '启用'}映射 ${alias}`}
+            title={on ? t('映射已启用，点击关闭') : t('映射已关闭，点击启用')}
+            aria-label={t('{action}映射 {alias}', { action: on ? t('关闭') : t('启用'), alias })}
             onCheckedChange={next => {
               void runRowAction(
                 bindingKeyOf(alias, model.id, providerId),
                 () => writeBinding(providerId, alias, model.id, { enabled: next }),
-                next ? '映射已启用' : '映射已关闭',
+                next ? t('映射已启用') : t('映射已关闭'),
               )
             }} />
           {/* 名字本身就是复制入口（data-copy 走 clipboard.js 的全局委托，点一下
               toast「已复制」）；title 同时承担两件事 —— 提示可点、长名字被
               ellipsis 截断时悬停能看全 */}
-          <span className='t' data-copy={alias} title={`点击复制：${alias}`}>{alias}</span>
-          {binding.isDefault ? <span className='binding-default'>默认</span> : null}
+          <span className='t' data-copy={alias} title={t('点击复制：{name}', { name: alias })}>{alias}</span>
+          {binding.isDefault ? <span className='binding-default'>{t('默认')}</span> : null}
           {levelBadge(alias, model.id, providerId, busy)}
           {binding.isDefault ? null : (
             // 16px 的删除小件（icon-2xs 档）：字号 / 行高照旧 CSS 的 `.alias .x` 给，
             // 免得 × 跟着 chip 的 11px 一起缩水
             <Button variant='ghost' size='icon-2xs' className='text-[12px] leading-none'
-              disabled={busy} title={`删除映射 ${alias}`}
+              disabled={busy} title={t('删除映射 {alias}', { alias })}
               onClick={() => void confirmUnmap(alias)}>×</Button>
           )}
         </span>
@@ -521,7 +522,7 @@ function ModelsPage() {
           {/* dashed = 「这里还能再添一个」的入口语义（对应旧的 .alias-add），与旁边那些
               实心按钮一眼分开 */}
           <Button variant='dashed' size='xs'
-            onClick={() => openMapping({ target: model.id, provider: providerId })}>＋ 映射</Button>
+            onClick={() => openMapping({ target: model.id, provider: providerId })}>{t('＋ 映射')}</Button>
         </div>
         {rest.map(chip)}
       </div>
@@ -535,15 +536,15 @@ function ModelsPage() {
    */
   function sourceCell(model: ManageModel) {
     if (model.source === 'manual') {
-      return <span className='src manual' title='手动登记的上游模型；移除它会直接删掉这条登记'><i aria-hidden='true' />手动</span>
+      return <span className='src manual' title={t('手动登记的上游模型；移除它会直接删掉这条登记')}><i aria-hidden='true' />{t('手动')}</span>
     }
     if (model.source !== 'remote' && model.source !== 'builtin') return <span className='rate'>—</span>
     const remote = model.source === 'remote'
     const at = formatTime(Number(model.refreshedAt) || 0)
     const hint = remote
-      ? `来自上游目录接口${at ? `，清单拉取于 ${at}` : ''}；刷新失败时保留上一份成功结果`
-      : '上游目录尚未拉到，用的是内置静态清单；点「刷新模型清单」可重试'
-    return <span className={cn('src', remote ? 'remote' : 'builtin')} title={hint}><i aria-hidden='true' />{remote ? '远程' : '内置'}</span>
+      ? (at ? t('来自上游目录接口，清单拉取于 {at}；刷新失败时保留上一份成功结果', { at }) : t('来自上游目录接口；刷新失败时保留上一份成功结果'))
+      : t('上游目录尚未拉到，用的是内置静态清单；点「刷新模型清单」可重试')
+    return <span className={cn('src', remote ? 'remote' : 'builtin')} title={hint}><i aria-hidden='true' />{remote ? t('远程') : t('内置')}</span>
   }
 
   /**
@@ -558,18 +559,18 @@ function ModelsPage() {
     const overrides = normalizeOverrides(model.capOverrides)
     const input = typeof caps.maxInputTokens === 'number' ? caps.maxInputTokens : null
     const output = typeof caps.maxOutputTokens === 'number' ? caps.maxOutputTokens : null
-    const hint = `上下文窗口 ${exactTokens(input)} / 最大输出 Token ${exactTokens(output)} —— 点击修改模型能力`
+    const hint = t('上下文窗口 {input} / 最大输出 Token {output} —— 点击修改模型能力', { input: exactTokens(input), output: exactTokens(output) })
     return (
       <button type='button' className='caps-open' title={hint}
         onClick={() => openCapability(model.provider || '', model.id)}>
         <span className={cn('cap-num', input === null && 'unset')}>
           {formatTokens(input)}
-          {overrides.includes('maxInputTokens') ? <i className='cap-mark' title='已覆盖上游值' /> : null}
+          {overrides.includes('maxInputTokens') ? <i className='cap-mark' title={t('已覆盖上游值')} /> : null}
         </span>
         <span className='cap-sep'>/</span>
         <span className={cn('cap-num', output === null && 'unset')}>
           {formatTokens(output)}
-          {overrides.includes('maxOutputTokens') ? <i className='cap-mark' title='已覆盖上游值' /> : null}
+          {overrides.includes('maxOutputTokens') ? <i className='cap-mark' title={t('已覆盖上游值')} /> : null}
         </span>
       </button>
     )
@@ -586,7 +587,7 @@ function ModelsPage() {
     const overrides = normalizeOverrides(model.capOverrides)
     return (
       <button type='button' className='caps-open caps-badges'
-        title='对下游声明的能力（工具调用 / 图片识别 / 视频识别 / 支持思考）—— 点击修改'
+        title={t('对下游声明的能力（工具调用 / 图片识别 / 视频识别 / 支持思考）—— 点击修改')}
         onClick={() => openCapability(model.provider || '', model.id)}>
         {BOOLEAN_KEYS.map(key => {
           const value = caps[key] ?? null
@@ -619,16 +620,16 @@ function ModelsPage() {
      */
     async function confirmRemoveModel(): Promise<void> {
       const ok = await shared().wbConfirm?.ask?.({
-        title: '移除自定义模型',
-        html: `确定移除自定义模型「<strong>${esc(model.id)}</strong>」？这条登记会被<b>直接移除</b>，之后 <code>/v1/models</code> 不再广告它、请求它也会被拒。`,
-        okText: '移除',
+        title: t('移除自定义模型'),
+        html: t('确定移除自定义模型「<strong>{id}</strong>」？这条登记会被<b>直接移除</b>，之后 <code>/v1/models</code> 不再广告它、请求它也会被拒。', { id: esc(model.id) }),
+        okText: t('移除'),
         okClass: 'danger',
       })
       if (!ok) return
       void runRowAction(
         rowKeyOf(model),
         () => writeRemoveModel(model.provider || '', model.id),
-        custom ? '模型已移除' : '自定义模型已移除',
+        custom ? t('模型已移除') : t('自定义模型已移除'),
       )
     }
 
@@ -636,8 +637,8 @@ function ModelsPage() {
       case 'check':
         return (
           <td className={cellClass('cell-check', column.align)}>
-            <Checkbox checked={selection.has(rowKeyOf(model))} title='勾选后可批量操作'
-              aria-label='勾选后可批量操作'
+            <Checkbox checked={selection.has(rowKeyOf(model))} title={t('勾选后可批量操作')}
+              aria-label={t('勾选后可批量操作')}
               onCheckedChange={next => togglePick(rowKeyOf(model), next === true)} />
           </td>
         )
@@ -649,7 +650,7 @@ function ModelsPage() {
                 ellipsis 截断时悬停能看全。曾经这里另挂一颗 ⧉ 小按钮，已去掉：
                 点名字更省事，也少一个悬停才显形的控件 */}
             <div className='mid'>
-              <span className='t' data-copy={model.id} title={`点击复制：${model.id}`}>{model.id}</span>
+              <span className='t' data-copy={model.id} title={t('点击复制：{name}', { name: model.id })}>{model.id}</span>
             </div>
             {model.name && model.name !== model.id ? <div className='mname'>{model.name}</div> : null}
           </td>
@@ -678,13 +679,13 @@ function ModelsPage() {
           <td className={cellClass('cell-act r', column.align)}>
             <div className='row-actions'>
               <Button variant='ghost' size='sm' disabled={Boolean(blocked)}
-                title={blocked || '以这个上游模型发一次最小请求，走真实转发链路'}
+                title={blocked || t('以这个上游模型发一次最小请求，走真实转发链路')}
                 onClick={() => setTestTarget({ provider: model.provider || '', id: model.id })}>
-                测试
+                {t('测试')}
               </Button>
               {model.source === 'manual' || custom ? (
                 <Button variant='ghost' size='sm' className='text-destructive' disabled={busyRow}
-                  onClick={() => void confirmRemoveModel()}>移除</Button>
+                  onClick={() => void confirmRemoveModel()}>{t('移除')}</Button>
               ) : null}
             </div>
           </td>
@@ -718,15 +719,15 @@ function ModelsPage() {
       // 说清下一步该做什么才有用；目录还没就位时既不能说「已删除」也不能说「还没有模型」
       const empty = custom
         ? (!directoryReady()
-          ? '加载中…'
+          ? t('加载中…')
           : customMissing
-            ? '该提供商已不存在（可能已被删除），请刷新列表'
-            : '这家还没有模型：点「添加模型」登记，或「获取上游模型」从上游拉取')
-        : (state.data ? '暂无模型（请先添加账号）' : '加载中…')
+            ? t('该提供商已不存在（可能已被删除），请刷新列表')
+            : t('这家还没有模型：点「添加模型」登记，或「获取上游模型」从上游拉取'))
+        : (state.data ? t('暂无模型（请先添加账号）') : t('加载中…'))
       return <tr><td colSpan={columnCount} className='empty'>{empty}</td></tr>
     }
     if (!shown.length) {
-      return <tr><td colSpan={columnCount} className='empty'>{keyword ? `没有匹配「${keyword}」的模型` : '没有匹配当前筛选的模型'}</td></tr>
+      return <tr><td colSpan={columnCount} className='empty'>{keyword ? t('没有匹配「{keyword}」的模型', { keyword }) : t('没有匹配当前筛选的模型')}</td></tr>
     }
     // 分组带只在「全部」视图里出现：选中单家时标题已经写了是哪一家，再叠一条是重复的
     const showGroups = provider === 'all'
@@ -736,7 +737,7 @@ function ModelsPage() {
     const groups = new Map<string, { label: string; items: ManageModel[] }>()
     for (const model of shown) {
       const key = model.provider || ''
-      if (!groups.has(key)) groups.set(key, { label: model.providerLabel || key || '未知', items: [] })
+      if (!groups.has(key)) groups.set(key, { label: model.providerLabel || key || t('未知'), items: [] })
       groups.get(key)?.items.push(model)
     }
     const rows: React.ReactNode[] = []
@@ -759,7 +760,7 @@ function ModelsPage() {
         rows.push(
           <tr className='tr-group' key={`group:${key}`}>
             <td colSpan={columnCount}>
-              <span className='prov-tag'>{group.label}</span>{from > 0 ? '（续）' : ''}{group.items.length} 个模型
+              <span className='prov-tag'>{group.label}</span>{from > 0 ? t('（续）') : ''}{t('{n} 个模型', { n: group.items.length })}
             </td>
           </tr>,
         )
@@ -770,7 +771,7 @@ function ModelsPage() {
         rows.push(
           <tr className='tr-more' key={`more:${key}`}>
             <td colSpan={columnCount}>
-              <Button variant='ghost' size='sm' onClick={() => expandGroup(key)}>展开其余 {rest} 个模型 ▾</Button>
+              <Button variant='ghost' size='sm' onClick={() => expandGroup(key)}>{t('展开其余 {n} 个模型 ▾', { n: rest })}</Button>
             </td>
           </tr>,
         )
@@ -778,7 +779,7 @@ function ModelsPage() {
         rows.push(
           <tr className='tr-more' key={`collapse:${key}`}>
             <td colSpan={columnCount}>
-              <Button variant='ghost' size='sm' onClick={() => collapseGroup(key)}>收起 ▴</Button>
+              <Button variant='ghost' size='sm' onClick={() => collapseGroup(key)}>{t('收起 ▴')}</Button>
             </td>
           </tr>,
         )
@@ -806,7 +807,7 @@ function ModelsPage() {
                     : providerAvatar(provider, titleLabel)}
                   <h2>{titleLabel}</h2>
                   <span className='mm-meta'>
-                    <b>{all.length}</b> 个模型 · 已启用 <b>{enabledCount}</b> · 有映射 <b>{mappedCount}</b>
+                    <b>{all.length}</b>{t(' 个模型 · 已启用 ')}<b>{enabledCount}</b>{t(' · 有映射 ')}<b>{mappedCount}</b>
                   </span>
                 </div>
                 <div className='head-actions'>
@@ -815,23 +816,23 @@ function ModelsPage() {
                       index.html 里不写死 */}
                   <Button id='btn-refresh-models'
                     title={custom
-                      ? '从这一家的上游拉一份模型清单，勾选要哪些再导入（已添加的不会重复导入）'
-                      : '刷新模型管理页里各提供商的远程模型目录，逐家结果列在弹窗里'}
-                    onClick={() => refreshModels()}>获取模型</Button>
+                      ? t('从这一家的上游拉一份模型清单，勾选要哪些再导入（已添加的不会重复导入）')
+                      : t('刷新模型管理页里各提供商的远程模型目录，逐家结果列在弹窗里')}
+                    onClick={() => refreshModels()}>{t('获取模型')}</Button>
                   <Button id='btn-add-custom-model' variant='outline' size='sm'
-                    onClick={() => openCustomModel()}>＋ 添加模型</Button>
+                    onClick={() => openCustomModel()}>{t('＋ 添加模型')}</Button>
                 </div>
               </div>
               <div className='mm-filters'>
                 {/* 状态筛选：语义、键盘、滑块都在组件库里，取值仍以快照为准（完全受控） */}
                 <SegmentedControl options={MODEL_STATE_OPTIONS} value={state.stateFilter}
-                  onValueChange={setStateFilter} aria-label='按状态筛选' className='shrink-0' />
+                  onValueChange={setStateFilter} aria-label={t('按状态筛选')} className='shrink-0' />
                 {/* 搜索框：InputGroup + addon 图标（与 input-control.tsx 的用法一致）。
                     刻意**不带** data-island-input：那是输入框岛（就地升级）的钩子，
                     两个岛同时挂一个输入框会打架。宽度沿用旧 CSS 的 #models-search 240px */}
                 <InputGroup className='w-[240px] flex-none' id='models-search'>
-                  <InputGroupInput type='search' placeholder='搜索模型 ID / 名称 / 映射名…'
-                    aria-label='搜索模型' autoComplete='off' value={state.search}
+                  <InputGroupInput type='search' placeholder={t('搜索模型 ID / 名称 / 映射名…')}
+                    aria-label={t('搜索模型')} autoComplete='off' value={state.search}
                     onChange={event => setSearch(event.currentTarget.value)} />
                   <InputGroupAddon aria-hidden='true'>⌕</InputGroupAddon>
                 </InputGroup>
@@ -839,10 +840,10 @@ function ModelsPage() {
                     不勾就不占位置）。弹窗里可删除 / 启用 / 禁用 / 设置思考等级 */}
                 {selectedModels.length > 0 ? (
                   <span className='batch-chip'>
-                    已选 <b>{selectedModels.length}</b> 个
+                    {t('已选 ')}<b>{selectedModels.length}</b>{t(' 个')}
                     <Button id='btn-batch-models' variant='outline' size='xs'
-                      title={`对选中的 ${selectedModels.length} 个模型执行批量操作`}
-                      onClick={() => setBatchOpen(true)}>批量操作</Button>
+                      title={t('对选中的 {n} 个模型执行批量操作', { n: selectedModels.length })}
+                      onClick={() => setBatchOpen(true)}>{t('批量操作')}</Button>
                   </span>
                 ) : null}
               </div>
@@ -869,17 +870,17 @@ function ModelsPage() {
                 </colgroup>
                 <thead><tr>
                   <th data-col='check'>{allPickNode}</th>
-                  <th data-col='model'>上游模型</th>
-                  <th data-col='rate'>倍率</th>
-                  <th data-col='source'>来源</th>
-                  <th data-col='budget'>上下文 / 输出</th>
-                  <th data-col='caps'>能力</th>
+                  <th data-col='model'>{t('上游模型')}</th>
+                  <th data-col='rate'>{t('倍率')}</th>
+                  <th data-col='source'>{t('来源')}</th>
+                  <th data-col='budget'>{t('上下文 / 输出')}</th>
+                  <th data-col='caps'>{t('能力')}</th>
                   {/* 表头只留短标题，完整口径进问号提示（原括号长标题让表头喧宾夺主）。
                       这是静态内容：重渲染时逐字不变，不会破坏「静态表头」的约定 */}
                   <th data-col='alias'>
-                    模型映射
+                    {t('模型映射')}
                     <span className='th-help' aria-hidden='true'
-                      title='每条映射 = 对外名 → 上游模型；原始 ID 与别名有独立开关，默认绑定永远存在（没有映射时是合成的那条）。'>
+                      title={t('每条映射 = 对外名 → 上游模型；原始 ID 与别名有独立开关，默认绑定永远存在（没有映射时是合成的那条）。')}>
                       <svg viewBox='0 0 24 24'>
                         <g fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round'>
                           <circle cx='12' cy='12' r='9' /><path d='M12 16v-4' /><path d='M12 8h.01' />
@@ -887,7 +888,7 @@ function ModelsPage() {
                       </svg>
                     </span>
                   </th>
-                  <th className='r' data-col='act'>操作</th>
+                  <th className='r' data-col='act'>{t('操作')}</th>
                 </tr></thead>
                 <tbody id='models'>{body()}</tbody>
               </table>
@@ -898,7 +899,7 @@ function ModelsPage() {
             <TableFooter
               className='models-panel-foot'
               leading={custom
-                ? <>自定义提供商的清单<b>只属于这一家</b>：这里的模型不会出现在其他家，别名也只在这一家内生效。改名称 / 协议 / Base URL 在账号页该家账号的「设置」→ 提供商一栏；整家不要了，鼠标移到左栏这家上点 × 删除（连同名下账号）。</>
+                ? <>{t('自定义提供商的清单')}<b>{t('只属于这一家')}</b>{t('：这里的模型不会出现在其他家，别名也只在这一家内生效。改名称 / 协议 / Base URL 在账号页该家账号的「设置」→ 提供商一栏；整家不要了，鼠标移到左栏这家上点 × 删除（连同名下账号）。')}</>
                 : undefined}
               total={shown.length}
               range={paging.paged ? { start: paging.rangeStart, end: paging.rangeEnd } : null}
@@ -933,7 +934,7 @@ function ModelsPage() {
 /* ─── 映射弹窗 ───────────────────────────────── */
 
 /** 弹窗里问号那枚说明（原文照抄 index.html 的 data-tip，别删条目 —— 每一条都是踩过的边界） */
-const REASONING_TIP = '绑定在「对外名 → 上游模型」这一条映射上的思考等级（列表照抄 OmniProxy 的手动绑定），选「不覆盖」表示不给这条映射指定等级。它会跟着这条映射注入转发，由承载的那家翻译成自己的档位字段（CatPaw 归并成 low/high/max，Qoder 按模型声明的档位归一）。以下几种情况故意不注入：① off / none（关闭思考）—— 本项目没有安全的表达方式；② 表外的自定义等级（各家能力范围不同，无法判断上游收不收）；③ 客户端请求体里已经自己指定了档位（那是更明确的意图，绑定不覆盖）；④ 这家上游不认识档位字段（如 WorkBuddy / 小浣熊 / AutoClaw / Cline）。注入与跳过都会写进详细日志。'
+const REASONING_TIP = t('绑定在「对外名 → 上游模型」这一条映射上的思考等级（列表照抄 OmniProxy 的手动绑定），选「不覆盖」表示不给这条映射指定等级。它会跟着这条映射注入转发，由承载的那家翻译成自己的档位字段（CatPaw 归并成 low/high/max，Qoder 按模型声明的档位归一）。以下几种情况故意不注入：① off / none（关闭思考）—— 本项目没有安全的表达方式；② 表外的自定义等级（各家能力范围不同，无法判断上游收不收）；③ 客户端请求体里已经自己指定了档位（那是更明确的意图，绑定不覆盖）；④ 这家上游不认识档位字段（如 WorkBuddy / 小浣熊 / AutoClaw / Cline）。注入与跳过都会写进详细日志。')
 
 /** 上游下拉的初值：候选里有就用候选里的原始拼写（value 必须与 option 逐字相同才会选中） */
 function pickUpstream(providerId: string, keep: string, locked: boolean): string {
@@ -993,12 +994,12 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
     const options = upstreamOptions(provider)
     const wanted = (upstream || '').trim()
     if (wanted && !options.some(item => item.id.toLowerCase() === wanted.toLowerCase())) {
-      options.unshift({ id: wanted, label: `${wanted}（不在该家当前清单里）`, off: true })
+      options.unshift({ id: wanted, label: t('{name}（不在该家当前清单里）', { name: wanted }), off: true })
     }
     return options
   })()
 
-  const providerLabel = providerChoices.find(item => item.id === provider)?.label || provider || '(全局)'
+  const providerLabel = providerChoices.find(item => item.id === provider)?.label || provider || t('(全局)')
   const level = reasoning.select === CUSTOM_LEVEL ? reasoning.custom.trim() : reasoning.select
   const showCustomLevel = reasoning.select === CUSTOM_LEVEL
 
@@ -1012,17 +1013,17 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
     if (saving) return
     const wanted = editing ? (context.alias || '') : alias.trim()
     const target = upstream
-    if (!wanted) { setStatus('请填写对外映射名'); return }
+    if (!wanted) { setStatus(t('请填写对外映射名')); return }
     // 下拉为空 = 这一家清单里一个模型都没有（还没加账号 / 清单没拉到）
-    if (!target) { setStatus('该提供商当前没有可选的上游模型'); return }
-    if (!provider) { setStatus('请选择提供商'); return }
+    if (!target) { setStatus(t('该提供商当前没有可选的上游模型')); return }
+    if (!provider) { setStatus(t('请选择提供商')); return }
     if (!editing && same(wanted, target)
       && models().some(model => same(model.id, target) && same(model.provider, provider))) {
-      setStatus('原始 ID 已作为默认绑定，请直接使用该绑定的开关或等级按钮')
+      setStatus(t('原始 ID 已作为默认绑定，请直接使用该绑定的开关或等级按钮'))
       return
     }
     setSaving(true)
-    setStatus('保存中…')
+    setStatus(t('保存中…'))
     try {
       // `reasoning` **总是显式给出**（空串 = 清空绑定）：三元组相同走的也是这条接口，而用户
       // 在这个弹窗里看到的就是他要的结果 —— 传 undefined（= 不改）会让「从 high 改成不覆盖」
@@ -1030,13 +1031,13 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
       accept(await writeBinding(provider, wanted, target, { reasoning: level }))
       setSaving(false)
       onClose()
-      const suffix = level ? ` · 思考等级 ${level}` : ''
+      const suffix = level ? t(' · 思考等级 {level}', { level }) : ''
       // 展示名走注册表 / 自定义目录：直接印 provider id 时，自定义家会显示成一串
       // custom-3f2a91b04c7e，用户认不出是哪一家
       const label = shared().wbProviders?.labelOf?.(provider) || provider
-      toast(editing ? `✅ 已更新 ${wanted} 的思考等级` : `✅ 已添加映射 ${wanted} → ${target}（${label}）${suffix}`)
+      toast(editing ? t('✅ 已更新 {name} 的思考等级', { name: wanted }) : t('✅ 已添加映射 {name} → {target}（{label}）{suffix}', { name: wanted, target, label, suffix }))
     } catch (error) {
-      setStatus(`保存失败：${errorMessage(error)}`)
+      setStatus(t('保存失败：{message}', { message: errorMessage(error) }))
       setSaving(false)
     }
   }
@@ -1057,11 +1058,11 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
     }}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{editing ? '设置思考等级' : '添加模型映射'}</DialogTitle>
+          <DialogTitle>{editing ? t('设置思考等级') : t('添加模型映射')}</DialogTitle>
         </DialogHeader>
         <DialogBody>
           <div className='flex flex-col gap-1.5'>
-            <Label htmlFor='mapping-provider'>提供商</Label>
+            <Label htmlFor='mapping-provider'>{t('提供商')}</Label>
             {/* 锁定 = 行内入口：提供商与上游模型就是这一行，不允许改 */}
             <Select value={provider} disabled onValueChange={next => changeProvider(String(next))}>
               <SelectTrigger id='mapping-provider' className='w-full'>
@@ -1076,14 +1077,14 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
           </div>
           <div className='grid grid-cols-[1fr_24px_1fr] items-end gap-2.5'>
             <div className='flex min-w-0 flex-col gap-1.5'>
-              <Label htmlFor='mapping-alias'>对外映射名（下游请求时用）</Label>
-              <Input id='mapping-alias' maxLength={128} placeholder='例如 gpt-4o' autoComplete='off'
+              <Label htmlFor='mapping-alias'>{t('对外映射名（下游请求时用）')}</Label>
+              <Input id='mapping-alias' maxLength={128} placeholder={t('例如 gpt-4o')} autoComplete='off'
                 autoFocus={!editing} value={alias} disabled={editing}
                 onChange={event => setAlias(event.currentTarget.value)} onKeyDown={onEnter} />
             </div>
             <div className='pb-2 text-center text-muted-foreground'>→</div>
             <div className='flex min-w-0 flex-col gap-1.5'>
-              <Label htmlFor='mapping-upstream'>转发到上游模型</Label>
+              <Label htmlFor='mapping-upstream'>{t('转发到上游模型')}</Label>
               <Select value={upstream} disabled onValueChange={next => setUpstream(String(next))}>
                 <SelectTrigger id='mapping-upstream' className='w-full'>
                   <SelectValue>{upstreamChoices.find(item => item.id === upstream)?.label || upstream}</SelectValue>
@@ -1091,7 +1092,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
                 <SelectContent>
                   {upstreamChoices.map(item => (
                     <SelectItem key={item.id} value={item.id}>
-                      {item.label}{item.off ? '（已禁用）' : ''}
+                      {item.label}{item.off ? t('（已禁用）') : ''}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -1100,16 +1101,16 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
           </div>
           {/* 预览：当前选择会变成哪一条映射（等级一起显示，保存前就能核对） */}
           <div className='rounded-md border border-border bg-surface-inset px-3 py-2.5 font-mono text-[12px] text-subtle'>
-            下游请求 <b className='text-primary-fg'>{alias.trim() || '<对外名>'}</b> → 转发{' '}
-            <b className='text-primary-fg'>{upstream || '<上游模型>'}</b>（{providerLabel}）
-            {level ? <> · 思考等级 <b className='text-primary-fg'>{level}</b></> : null}
+            {t('下游请求 ')}<b className='text-primary-fg'>{alias.trim() || t('<对外名>')}</b>{t(' → 转发')}{' '}
+            <b className='text-primary-fg'>{upstream || t('<上游模型>')}</b>{t('（{label}）', { label: providerLabel })}
+            {level ? <>{t(' · 思考等级 ')}<b className='text-primary-fg'>{level}</b></> : null}
           </div>
           <div className='flex flex-col gap-1.5'>
             <div className='flex items-center gap-[7px]'>
-              <Label htmlFor='mapping-reasoning'>思考等级</Label>
+              <Label htmlFor='mapping-reasoning'>{t('思考等级')}</Label>
               {/* 问号走组件库 Tooltip（旧的 data-tip + tooltip.js 是同一目标的更简陋版本） */}
               <Tooltip>
-                <TooltipTrigger render={<span className='tip-q' tabIndex={0} aria-label='思考等级的注入规则' />}>?</TooltipTrigger>
+                <TooltipTrigger render={<span className='tip-q' tabIndex={0} aria-label={t('思考等级的注入规则')} />}>?</TooltipTrigger>
                 <TooltipContent>{REASONING_TIP}</TooltipContent>
               </Tooltip>
             </div>
@@ -1120,40 +1121,38 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
               {/* 改等级形态没别的可填，把焦点直接放在等级下拉上（旧实现是 setTimeout 里 focus） */}
               <SelectTrigger id='mapping-reasoning' className='w-full' autoFocus={editing}>
                 <SelectValue>{reasoning.select === CUSTOM_LEVEL
-                  ? '自定义等级…'
-                  : (reasoning.select || '不覆盖')}</SelectValue>
+                  ? t('自定义等级…')
+                  : (reasoning.select || t('不覆盖'))}</SelectValue>
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value=''>不覆盖</SelectItem>
+                <SelectItem value=''>{t('不覆盖')}</SelectItem>
                 {candidates.map(candidate => (
                   <SelectItem key={candidate} value={candidate}>{candidate}</SelectItem>
                 ))}
-                <SelectItem value={CUSTOM_LEVEL}>自定义等级…</SelectItem>
+                <SelectItem value={CUSTOM_LEVEL}>{t('自定义等级…')}</SelectItem>
               </SelectContent>
             </Select>
             {/* 自定义输入框只在「自定义等级」被选中时露出（条件渲染而不是 hidden：组件库的
                 工具类是分层 !important 的，[hidden] 那条未分层规则压不过它） */}
             {showCustomLevel ? (
               <Input id='mapping-reasoning-custom' maxLength={32} autoFocus
-                placeholder='自定义等级（例如 custom-high）' autoComplete='off'
+                placeholder={t('自定义等级（例如 custom-high）')} autoComplete='off'
                 disabled={saving} value={reasoning.custom}
                 onChange={event => setReasoning(prev => ({ ...prev, custom: event.currentTarget.value }))}
                 onKeyDown={onEnter} />
             ) : null}
           </div>
           <p className='text-xs leading-[1.65] text-subtle'>
-            对外名可自由命名，允许与上游模型 ID 同名（同名时该上游的原生路由优先，映射作兜底）；
-            支持字母、数字与 <code>- _ . / :</code>。同一对外名可在多个提供商各添加一条：
-            下游用同一个名字请求，网关按账号优先级主备切换，失败自动落到下一个提供商。
+            {t('对外名可自由命名，允许与上游模型 ID 同名（同名时该上游的原生路由优先，映射作兜底）； 支持字母、数字与 ')}<code>- _ . / :</code>{t('。同一对外名可在多个提供商各添加一条： 下游用同一个名字请求，网关按账号优先级主备切换，失败自动落到下一个提供商。')}
           </p>
           {/* 状态行：高度固定，出现错误时弹窗不跳高 */}
           <div className='min-h-[18px] text-xs text-subtle'>{status}</div>
         </DialogBody>
         <DialogFooter>
           <div className='mr-auto' />
-          <Button variant='outline' onClick={onClose}>取消</Button>
+          <Button variant='outline' onClick={onClose}>{t('取消')}</Button>
           <Button variant='default' disabled={saving} onClick={() => void save()}>
-            {editing ? '保存等级' : '保存映射'}
+            {editing ? t('保存等级') : t('保存映射')}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1184,15 +1183,15 @@ function CustomModelDialog({ initial, onClose }: { initial: CustomModelContext; 
   })()
   // 候选里没有当前值时退回首项（原生 select 赋一个不存在的值也是这个结果）
   const providerValue = choices.some(item => item.id === provider) ? provider : (choices[0]?.id || '')
-  const providerLabel = choices.find(item => item.id === providerValue)?.label || providerValue || '(未选)'
+  const providerLabel = choices.find(item => item.id === providerValue)?.label || providerValue || t('(未选)')
 
   async function save(): Promise<void> {
     if (saving) return
     const value = id.trim()
-    if (!providerValue) { setStatus('请选择提供商'); return }
-    if (!value) { setStatus('请填写上游模型 ID'); return }
+    if (!providerValue) { setStatus(t('请选择提供商')); return }
+    if (!value) { setStatus(t('请填写上游模型 ID')); return }
     setSaving(true)
-    setStatus('保存中…')
+    setStatus(t('保存中…'))
     try {
       const next = await writeAddModel(providerValue, value)
       accept(next)
@@ -1201,18 +1200,18 @@ function CustomModelDialog({ initial, onClose }: { initial: CustomModelContext; 
       const label = choices.find(item => item.id === providerValue)?.label || providerValue
       if (customSource.isCustom(currentProvider())) {
         // 自定义家的清单就是用户自己的登记表，登记了必然出现在表里，所以只有一句成功提示
-        toast(`✅ 已登记模型 ${value}（${label}）`)
+        toast(t('✅ 已登记模型 {name}（{label}）', { name: value, label }))
       } else {
         // 内置家：登记成功但表格里看不到这一行时，必须说清为什么 —— 表格只列「当前有可用
         // 登录态」的家，给一个还没加账号的家登记模型不会立刻出现。不说的话用户会以为没保存成功
         const view = next as ManageView | null
         const visible = Array.isArray(view?.models)
           && view.models.some(item => item.id === value && (item.provider || '') === providerValue)
-        if (visible) toast(`✅ 已登记自定义模型 ${value}（${label}）`)
-        else toast(`✅ 已登记 ${value}（${label}），但该提供商还没有可用账号，这一行要加上账号后才会显示`, 'err')
+        if (visible) toast(t('✅ 已登记自定义模型 {name}（{label}）', { name: value, label }))
+        else toast(t('✅ 已登记 {name}（{label}），但该提供商还没有可用账号，这一行要加上账号后才会显示', { name: value, label }), 'err')
       }
     } catch (error) {
-      setStatus(`保存失败：${errorMessage(error)}`)
+      setStatus(t('保存失败：{message}', { message: errorMessage(error) }))
       setSaving(false)
     }
   }
@@ -1232,11 +1231,11 @@ function CustomModelDialog({ initial, onClose }: { initial: CustomModelContext; 
     }}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>添加自定义模型</DialogTitle>
+          <DialogTitle>{t('添加自定义模型')}</DialogTitle>
         </DialogHeader>
         <DialogBody>
           <div className='flex flex-col gap-1.5'>
-            <Label htmlFor='custom-model-provider'>提供商</Label>
+            <Label htmlFor='custom-model-provider'>{t('提供商')}</Label>
             <Select value={providerValue} disabled={initial.locked}
               onValueChange={next => setProvider(String(next))}>
               <SelectTrigger id='custom-model-provider' className='w-full'>
@@ -1250,30 +1249,27 @@ function CustomModelDialog({ initial, onClose }: { initial: CustomModelContext; 
             </Select>
           </div>
           <div className='flex flex-col gap-1.5'>
-            <Label htmlFor='custom-model-id'>上游模型 ID</Label>
-            <Input id='custom-model-id' maxLength={128} placeholder='例如 gpt-5.5-preview'
+            <Label htmlFor='custom-model-id'>{t('上游模型 ID')}</Label>
+            <Input id='custom-model-id' maxLength={128} placeholder={t('例如 gpt-5.5-preview')}
               autoComplete='off' spellCheck={false} autoFocus value={id}
               onChange={event => setId(event.currentTarget.value)} onKeyDown={onEnter} />
           </div>
           <div className='rounded-md border border-border bg-surface-inset px-3 py-2.5 font-mono text-[12px] text-subtle'>
-            在 <b className='text-primary-fg'>{providerLabel}</b> 上登记上游模型{' '}
-            <b className='text-primary-fg'>{id.trim() || '<上游模型 ID>'}</b>（登记后即可用这个名字请求）
+            {t('在 ')}<b className='text-primary-fg'>{providerLabel}</b>{t(' 上登记上游模型')}{' '}
+            <b className='text-primary-fg'>{id.trim() || t('<上游模型 ID>')}</b>{t('（登记后即可用这个名字请求）')}
           </div>
           <p className='text-xs leading-[1.65] text-subtle'>
-            填上游真正认识的那个模型 ID（不是给下游用的名字）。登记后它会进入该家的模型清单：
-            表格里出现这一行、<code>/v1/models</code> 会广告它、请求它也会被转发到这家。
-            支持字母、数字与 <code>- _ . / :</code>。
+            {t('填上游真正认识的那个模型 ID（不是给下游用的名字）。登记后它会进入该家的模型清单： 表格里出现这一行、')}<code>/v1/models</code>{t(' 会广告它、请求它也会被转发到这家。 支持字母、数字与 ')}<code>- _ . / :</code>{t('。')}
           </p>
           <p className='text-xs leading-[1.65] text-subtle'>
-            「来源」列会标成<b>手动</b>，与远程目录 / 内置清单区分开。删除自定义模型是
-            <b>直接移除</b>这条登记（不像内置模型那样只是隐藏），因为它的存在完全由这次登记决定。
+            {t('「来源」列会标成')}<b>{t('手动')}</b>{t('，与远程目录 / 内置清单区分开。删除自定义模型是')}<b>{t('直接移除')}</b>{t('这条登记（不像内置模型那样只是隐藏），因为它的存在完全由这次登记决定。')}
           </p>
           <div className='min-h-[18px] text-xs text-subtle'>{status}</div>
         </DialogBody>
         <DialogFooter>
           <div className='mr-auto' />
-          <Button variant='outline' onClick={onClose}>取消</Button>
-          <Button variant='default' disabled={saving} onClick={() => void save()}>保存</Button>
+          <Button variant='outline' onClick={onClose}>{t('取消')}</Button>
+          <Button variant='default' disabled={saving} onClick={() => void save()}>{t('保存')}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

@@ -156,6 +156,18 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/oauth/callback",
             get(api::session::login_codearts_callback).post(api::session::login_codearts_callback_post),
+        )
+        // Antigravity 网页登录的回调：**浏览器 302 到这里**（Google 授权页完成
+        // 后顶层导航回我们发起时登记的 redirect_uri）。路径 `/oauth-callback`
+        // 是 Google 侧登记/参考实现逐字使用的那个（`Antigravity-Manager`
+        // `oauth_server.rs`），不是我们自己挑的 —— 与 CodeArts 的
+        // `/oauth/callback`（多一个斜杠）是两个路径，同端口共存不冲突。
+        // 免鉴权的理由与 CatPaw / Accio / CodeArts 几条 loopback 回调同一句：
+        // 调用方是用户的浏览器，它没有我们的 API Key；安全性由本次登录任务
+        // 生成的一次性 state 承担（逐字比对见处理函数与 core::login）。
+        .route(
+            "/oauth-callback",
+            get(api::session::login_antigravity_callback),
         );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey

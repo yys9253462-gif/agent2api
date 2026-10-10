@@ -730,7 +730,7 @@ fn extract_elf(bundle: &str, machine: u16) -> Option<Vec<u8>> {
     const MARK: &str = "\"f0VMRgIB";
     let mut from = 0usize;
     while let Some(relative) = bundle[from..].find(MARK) {
-        let start = from + relative + MARK.len() - 1; // 含开头的引号
+        let start = from + relative; // 指向开头的引号
         let Some(end) = bundle[start + 1..].find('"').map(|value| start + 1 + value) else {
             break;
         };

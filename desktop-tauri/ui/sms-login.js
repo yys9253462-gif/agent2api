@@ -62,14 +62,14 @@
         verify: '/api/session/login/sms/verify',
         ticketKey: 'deviceId',
         phoneRe: /^1[2-9]\d{9}$/,
-        sentHint: '验证码已发送。收到后填入下方并点「登录并添加」',
+        sentHint: wbI18n.t('验证码已发送。收到后填入下方并点「登录并添加」'),
       },
       loomy: {
         send: '/api/session/login/loomy/sms/send',
         verify: '/api/session/login/loomy/sms/verify',
         ticketKey: 'msgid',
         phoneRe: /^1[3-9]\d{9}$/,
-        sentHint: '验证码已发送。收到后填入下方并点「登录并添加」',
+        sentHint: wbI18n.t('验证码已发送。收到后填入下方并点「登录并添加」'),
       },
       // KukuAI：百度通行证的发码要在官方页面里点（风控签名只有页面能生成），
       // 因此发码/登录都由**壳开的登录窗口**代做 —— send/verify 两个路径只是
@@ -82,7 +82,7 @@
         verify: '/api/session/login/kuku/sms/verify',
         ticketKey: 'state',
         phoneRe: /^1[2-9]\d{9}$/,
-        sentHint: '验证码已发送，请查看手机短信。填入下方并点「登录并添加」即完成登录',
+        sentHint: wbI18n.t('验证码已发送，请查看手机短信。填入下方并点「登录并添加」即完成登录'),
       },
     };
     const profile = SMS_PROFILES[prefix] || SMS_PROFILES.autoclaw;
@@ -115,17 +115,17 @@
       window.workbuddyDesktop.onKukuSmsStatus(payload => {
         const status = payload && payload.status;
         const textByStatus = {
-          opening: '正在打开百度登录页…',
-          filling: '已填写手机号，正在发送验证码…',
-          sending: '已点发送，等待短信…',
-          sent: '验证码已发送，请查看手机短信',
-          captcha: '需要图形验证码：登录窗口已弹出，请填写后继续',
-          timeout: '发送未确认：登录窗口已弹出，请在弹出的窗口中手动完成登录',
+          opening: wbI18n.t('正在打开百度登录页…'),
+          filling: wbI18n.t('已填写手机号，正在发送验证码…'),
+          sending: wbI18n.t('已点发送，等待短信…'),
+          sent: wbI18n.t('验证码已发送，请查看手机短信'),
+          captcha: wbI18n.t('需要图形验证码：登录窗口已弹出，请填写后继续'),
+          timeout: wbI18n.t('发送未确认：登录窗口已弹出，请在弹出的窗口中手动完成登录'),
         };
         const text = textByStatus[status];
         if (!text) return;
         setHint(text);
-        if (status === 'sent') window.wbApp.toast('验证码已发送，请查看手机短信');
+        if (status === 'sent') window.wbApp.toast(wbI18n.t('验证码已发送，请查看手机短信'));
         if (status === 'captcha' || status === 'timeout') window.wbApp.toast(text, 'err');
       });
     }
@@ -146,7 +146,7 @@
     const describeError = error => {
       if (error instanceof Error && error.message) return error.message;
       const text = String(error ?? '').trim();
-      return text || '未知错误';
+      return text || wbI18n.t('未知错误');
     };
 
     /**
@@ -168,7 +168,7 @@
       }
       const internals = window.__TAURI_INTERNALS__;
       if (!internals || typeof internals.invoke !== 'function') {
-        return Promise.reject(new Error('桌面运行时不可用（Tauri 未初始化）'));
+        return Promise.reject(new Error(wbI18n.t('桌面运行时不可用（Tauri 未初始化）')));
       }
       return internals.invoke('api_request', {
         request: { method: 'POST', path, body: payload },
@@ -223,7 +223,7 @@
       const button = $(`${prefix}-sms-send`);
       if (!button) return;
       button.disabled = false;
-      button.textContent = '获取验证码';
+      button.textContent = wbI18n.t('获取验证码');
     }
 
     /**
@@ -247,7 +247,7 @@
           return;
         }
         button.disabled = true;
-        button.textContent = `${cooldownLeft}s 后重发`;
+        button.textContent = wbI18n.t('{seconds}s 后重发', { seconds: cooldownLeft });
         cooldownLeft -= 1;
       };
       paint();
@@ -257,10 +257,10 @@
     async function send() {
       if (busy || cooldownLeft > 0) return;
       const phone = phoneOf();
-      if (!PHONE_RE.test(phone)) { window.wbApp.toast('请填写 11 位大陆手机号', 'err'); return; }
+      if (!PHONE_RE.test(phone)) { window.wbApp.toast(wbI18n.t('请填写 11 位大陆手机号'), 'err'); return; }
       const button = $(`${prefix}-sms-send`);
       busy = true;
-      if (button) { button.disabled = true; button.textContent = '发送中…'; }
+      if (button) { button.disabled = true; button.textContent = wbI18n.t('发送中…'); }
       setHint('');
       try {
         // provider 照带：后端按它分派（AutoClaw 两地区 / Loomy 各一条链路），
@@ -272,14 +272,14 @@
         // 放进模块级状态 —— 它只在这两次点击之间有意义，放进模块级会在用户
         // 切换提供商后串味。
         ticket = data?.[profile.ticketKey] || '';
-        window.wbApp.toast('验证码已发送，请查看短信');
+        window.wbApp.toast(wbI18n.t('验证码已发送，请查看短信'));
         setHint(profile.sentHint);
         // 成功也进冷却：官方口径（见 RESEND_COOLDOWN_SECONDS 的说明）
         startCooldown();
       } catch (error) {
         const reason = describeError(error);
-        setHint(`发送失败：${reason}`, true);
-        window.wbApp.toast(`发送失败：${reason}`, 'err');
+        setHint(wbI18n.t('发送失败：{message}', { message: reason }), true);
+        window.wbApp.toast(wbI18n.t('发送失败：{message}', { message: reason }), 'err');
         // ── 为什么失败也要倒计时 ───────────────────────────────────
         // 「过于频繁」（上游码 630101）正是最该冷却的一种失败：不打冷却的话
         // 用户会继续点，每次都稳定失败且可能延长服务端的限制窗口。
@@ -296,11 +296,11 @@
       if (busy) return;
       const phone = phoneOf();
       const code = codeOf();
-      if (!PHONE_RE.test(phone)) { window.wbApp.toast('请填写 11 位大陆手机号', 'err'); return; }
-      if (!CODE_RE.test(code)) { window.wbApp.toast('请填写 6 位数字验证码', 'err'); return; }
+      if (!PHONE_RE.test(phone)) { window.wbApp.toast(wbI18n.t('请填写 11 位大陆手机号'), 'err'); return; }
+      if (!CODE_RE.test(code)) { window.wbApp.toast(wbI18n.t('请填写 6 位数字验证码'), 'err'); return; }
       const button = $(`${prefix}-sms-submit`);
       busy = true;
-      if (button) { button.disabled = true; button.textContent = '登录中…'; }
+      if (button) { button.disabled = true; button.textContent = wbI18n.t('登录中…'); }
       setHint('');
       try {
         const payload = { phone, code, provider: prefix };
@@ -317,11 +317,11 @@
         await config.onSuccess?.(data);
       } catch (error) {
         const reason = describeError(error);
-        setHint(`登录失败：${reason}`, true);
-        window.wbApp.toast(`登录失败：${reason}`, 'err');
+        setHint(wbI18n.t('登录失败：{message}', { message: reason }), true);
+        window.wbApp.toast(wbI18n.t('登录失败：{message}', { message: reason }), 'err');
       } finally {
         busy = false;
-        if (button) { button.disabled = false; button.textContent = '登录并添加'; }
+        if (button) { button.disabled = false; button.textContent = wbI18n.t('登录并添加'); }
       }
     }
 

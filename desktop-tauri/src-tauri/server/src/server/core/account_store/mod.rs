@@ -84,17 +84,26 @@
 //!                存储与校验的架构说明见 `core::custom_providers`
 //!   accio_accounts.rs    Accio 账号（两个地区各一家 provider）：添加（粘贴凭证 /
 //!                网页登录共用入口）、续期回写、公开形态（含 edition）
+//!   monkeycode_accounts.rs MonkeyCode 账号（两个站点各一家 provider）：粘贴
+//!                session 添加（session + imageId + userId）、公开形态（含 edition）
+//!   commandcode_accounts.rs Command Code 账号（单一 provider）：粘贴 `user_`
+//!                开头的 API Key 添加、公开形态（只给尾号）
+//!   antigravity_accounts.rs Antigravity 账号（单一 provider）：粘贴 Google
+//!                refresh token 添加、刷新回写（比较-再写）、公开形态（只给尾号）
 
 pub mod accio_accounts;
+pub mod antigravity_accounts;
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
 pub mod catpaw_import;
 pub mod cline_accounts;
 pub mod codearts_accounts;
+pub mod commandcode_accounts;
 pub mod custom_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
+pub mod monkeycode_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -167,6 +176,42 @@ pub(crate) const TRAE_PROVIDER_ID: &str =
 /// [`TRAE_PROVIDER_ID`] 的口径）。账号形态见 `loomy_accounts.rs`。
 pub(crate) const LOOMY_PROVIDER_ID: &str =
     crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Loomy);
+
+/// MonkeyCode **国内版** provider id（账号存储内部多处要用；**从注册表推导**）。
+/// 账号形态见 `monkeycode_accounts.rs`；判「是不是 MonkeyCode 系」用
+/// [`is_monkeycode_family`]。
+pub(crate) const MONKEYCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::MonkeyCode,
+);
+
+/// MonkeyCode **国际版** provider id（同 [`MONKEYCODE_PROVIDER_ID`] 的口径）。
+///
+/// 两个站点是两家 provider（理由见 `providers::monkeycode::region` 的模块头）：
+/// 各有独立的账号集合，账号层的「按家过滤」必须区分它们。
+pub(crate) const MONKEYCODE_INTL_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::MonkeyCodeIntl,
+);
+
+/// 这个 provider 是不是 **MonkeyCode 系**（两个站点之一）。
+///
+/// 与 [`is_accio_family`] / [`is_zcode_family`] 同一形态、同一理由：账号层有
+/// 几处判断只关心「是不是 MonkeyCode」，不关心哪个站点。
+pub(crate) fn is_monkeycode_family(provider_id: &str) -> bool {
+    provider_id == MONKEYCODE_PROVIDER_ID || provider_id == MONKEYCODE_INTL_PROVIDER_ID
+}
+
+/// Command Code provider id（账号存储内部多处要用；**从注册表推导**）。
+/// 账号形态见 `commandcode_accounts.rs`（单一 provider、没有地区之分）。
+pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::CommandCode,
+);
+
+/// Antigravity provider id（账号存储内部多处要用；**从注册表推导**）。
+/// 账号形态见 `antigravity_accounts.rs`（单一 provider、没有地区之分 ——
+/// `sandbox`/`daily`/`prod` 是环境不是地区，规格 §6）。
+pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Antigravity,
+);
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `cline_accounts.rs`。

@@ -275,11 +275,25 @@ impl AccountStore {
             // Loomy（讯飞）：单一入口（手机验证码登录），公开形态带 userId /
             // phone / session 尾四位的展示字段（见 `loomy_accounts.rs`）
             self.to_loomy_public_account(record)
+        } else if super::is_monkeycode_family(&record.provider()) {
+            // MonkeyCode 的两个站点（`monkeycode` / `monkeycode-intl`）共用这一份
+            // 公开形态：字段两地完全一致，差别只在站点域名（那是转发与凭证层的
+            // 事，公开形态只用 `edition` 把地区标出来供界面显示）
+            self.to_monkeycode_public_account(record)
         } else if record.provider() == super::kuku_accounts::KUKU_PROVIDER_ID {
             // KukuAI（百度文库库库 AI）：单一入口（粘贴 Cookie / 导入本机登录态），
             // 公开形态带 uid(=uk) / loginName(=昵称) / tokenTail（见
             // `kuku_accounts.rs`）
             self.to_kuku_public_account(record)
+        } else if record.provider() == super::COMMANDCODE_PROVIDER_ID {
+            // Command Code：单一入口（粘贴 `user_` API Key），公开形态去掉 key
+            // 本体、只留尾号与「有没有 key」（见 `commandcode_accounts.rs`）
+            self.to_commandcode_public_account(record)
+        } else if record.provider() == super::ANTIGRAVITY_PROVIDER_ID {
+            // Antigravity（Google）：单一入口（粘贴 Google refresh token），
+            // 公开形态去掉 token 本体、只留 refresh token 尾号与
+            // 「有没有 refreshToken / accessToken」（见 `antigravity_accounts.rs`）
+            self.to_antigravity_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -301,7 +315,7 @@ impl AccountStore {
                 );
                 // 没有转发能力的家：界面据此说明「启用了也不会被转发」，
                 // 而不是把一个失效的启用开关当成正常账号展示。
-                // 五家现在都能转发，所以正常配置下这里恒为 true ——
+                // 各家现在都能转发，所以正常配置下这里恒为 true ——
                 // 保留这个字段是因为「能用账号管理、但转发还没接上」这种过渡期
                 // 状态将来还会出现，而界面需要有办法如实说出来。
                 fields.insert(
@@ -309,7 +323,7 @@ impl AccountStore {
                     Value::Bool(forwards_requests(record)),
                 );
                 // 最近一次签到成功的时刻（0 = 从未签过）。跨家统一注入的理由与上面
-                // 两条相同：它是「这条账号的签到状态」这一个事实，五家的存放位置
+                // 两条相同：它是「这条账号的签到状态」这一个事实，各家的存放位置
                 // 一致（`checkinAt`），界面不必按 provider 查表。
                 //
                 // 给出的是**时间戳**而不是「今天签过没」的布尔：自然日的边界要按

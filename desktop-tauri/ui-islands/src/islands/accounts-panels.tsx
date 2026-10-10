@@ -45,7 +45,8 @@ import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecor
 import {
   accountTags, activeLimits, balanceBlockedOf, claimDoneTitle, claimedToday,
   displayNameOf, editionSuffix, expiryMillis, formatIntervalSeconds, formatResetText,
-  formatTokenCount, identifierOf, isDesktopAccount, isEnabled, planBadgeLabel, providerFeatures,
+  formatTokenCount, identifierOf, isDesktopAccount, isEnabled, isFreePlan, planBadgeLabel,
+  providerFeatures,
   providerOf, RESET_UNKNOWN, supportsClaim, supportsUsage, supportsUsageDetail,
   tokenBlockedOf, tokenCountdownText, tokenDisableTriggeredOf, tokenReadingForRule,
   tokenRulesOf, tokenWindowInfo,
@@ -57,6 +58,9 @@ import {
   proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen, tokenUsageOf,
   startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
+import { PROVIDER_ICONS } from './add-provider-pick'
+import { t } from '../i18n'
+
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
 function iconHtml(name: string, size: number): string {
   return shared().wbIcons?.icon?.(name, size) || ''
@@ -113,14 +117,14 @@ export function PriorityStepper({ account, seat }: {
 
   return (
     <div className='prio'>
-      <span className='seat' title={`全局队列第 ${seat.position} 位，共 ${seat.total} 位`}>#{seat.position}</span>
+      <span className='seat' title={t('全局队列第 {position} 位，共 {total} 位', { position: seat.position, total: seat.total })}>#{seat.position}</span>
       <span className='prio-stepper'>
         <button type='button' className='prio-arrow' disabled={atEnd || moving}
-          title='与队列里的下一个账号交换优先级（可能是另一家的账号）'
+          title={t('与队列里的下一个账号交换优先级（可能是另一家的账号）')}
           onClick={() => void move('down')}
           dangerouslySetInnerHTML={{ __html: iconHtml('arrowDown', 14) }} />
         <input className='prio-input' type='number' min={PRIORITY_MIN} max={PRIORITY_MAX} step={1}
-          aria-label='优先级' title='全局唯一：所有提供商的账号都不能重号，数值越小越先用'
+          aria-label={t('优先级')} title={t('全局唯一：所有提供商的账号都不能重号，数值越小越先用')}
           value={draft}
           onChange={event => setDraft(event.currentTarget.value)}
           onFocus={() => setEditing(true)}
@@ -138,7 +142,7 @@ export function PriorityStepper({ account, seat }: {
             }
           }} />
         <button type='button' className='prio-arrow' disabled={atFront || moving}
-          title='与队列里的上一个账号交换优先级（可能是另一家的账号）'
+          title={t('与队列里的上一个账号交换优先级（可能是另一家的账号）')}
           onClick={() => void move('up')}
           dangerouslySetInnerHTML={{ __html: iconHtml('arrowUp', 14) }} />
       </span>
@@ -162,16 +166,16 @@ export function StatusCell({ account }: { account: AccountRecord }) {
   // 自动禁用钩子同判据，见 tokenDisableTriggeredOf）。
   if (!enabled && tokenDisableTriggeredOf(account, tokenUsageOf(account))) {
     tags.push({
-      text: 'Token 限额 · 已禁用',
+      text: t('Token 限额 · 已禁用'),
       kind: 'bad' as const,
-      title: '本周期 Token 消耗达到限制器的上限，账号已被自动禁用（窗口重置也不恢复，需手动启用）',
+      title: t('本周期 Token 消耗达到限制器的上限，账号已被自动禁用（窗口重置也不恢复，需手动启用）'),
     })
   }
   const who = displayNameOf(account) || account.id
   return (
     <>
-      <Switch checked={enabled} aria-label={`${enabled ? '禁用' : '启用'}${who}`}
-        title={enabled ? '已启用，点击禁用（不参与转发）' : '已禁用，点击启用'}
+      <Switch checked={enabled} aria-label={t('{action}{who}', { action: enabled ? t('禁用') : t('启用'), who })}
+        title={enabled ? t('已启用，点击禁用（不参与转发）') : t('已禁用，点击启用')}
         onCheckedChange={next => void setAccountEnabled(account.id, next)} />
       {tags.length ? (
         <div className='status-tags'>
@@ -202,22 +206,22 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
     if (balanceBlockedOf(account, usageEntryOf(account))) {
       return (
         <Badge variant='warning' shape='tag'
-          title='余额低于限制器的阈值，转发时会跳过该账号（余额回升自动恢复）'>
-          余额不足
+          title={t('余额低于限制器的阈值，转发时会跳过该账号（余额回升自动恢复）')}>
+          {t('余额不足')}
         </Badge>
       )
     }
     if (tokenBlockedOf(account, tokenUsageOf(account))) {
       return (
         <Badge variant='warning' shape='tag'
-          title='本周期 Token 消耗达到限制器的上限，转发时会跳过该账号（窗口重置自动恢复）'>
-          Token 限额
+          title={t('本周期 Token 消耗达到限制器的上限，转发时会跳过该账号（窗口重置自动恢复）')}>
+          {t('Token 限额')}
         </Badge>
       )
     }
     return (
-      <Badge variant='success' shape='tag' title='当前没有任何模型处于限流中'>
-        <BadgeDot />正常
+      <Badge variant='success' shape='tag' title={t('当前没有任何模型处于限流中')}>
+        <BadgeDot />{t('正常')}
       </Badge>
     )
   }
@@ -226,12 +230,12 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
     <>
       <Badge variant='warning' shape='tag' render={<button type='button' />}
         className={open ? 'ring-2 ring-warning-soft' : undefined}
-        title={`点击${open ? '收起' : '查看'}各模型的限流明细`}
+        title={t('点击{action}各模型的限流明细', { action: open ? t('收起') : t('查看') })}
         onClick={() => setPanelOpen(account.id, 'limits', !open)}>
-        {entries.length} 个模型 ▾
+        {t('{n} 个模型 ▾', { n: entries.length })}
       </Badge>
-      <span className='lim-sub' title='最早恢复'>
-        最早 {soonest === RESET_UNKNOWN ? '待定' : soonest} 恢复
+      <span className='lim-sub' title={t('最早恢复')}>
+        {t('最早 {soonest} 恢复', { soonest: soonest === RESET_UNKNOWN ? t('待定') : soonest })}
       </span>
     </>
   )
@@ -253,16 +257,16 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
 export function ExpiryCell({ account }: { account: AccountRecord }) {
   const features = providerFeatures(providerOf(account))
   const expiresAt = expiryMillis(features.edition ? account.expiresAt : account[features.expiry])
-  if (!expiresAt) return <span className='muted' title='记录里没有过期时间'>—</span>
+  if (!expiresAt) return <span className='muted' title={t('记录里没有过期时间')}>—</span>
   const left = expiresAt - Date.now()
-  if (left <= 0) return <Badge variant='destructive' shape='tag' title='凭证已过期，转发时会先刷新'>已过期</Badge>
-  const text = left < 3600e3 ? `${Math.max(1, Math.round(left / 60e3))} 分钟后`
-    : left < 48 * 3600e3 ? `${(left / 3600e3).toFixed(1)} 小时后`
-      : `${Math.floor(left / 24 / 3600e3)} 天后`
+  if (left <= 0) return <Badge variant='destructive' shape='tag' title={t('凭证已过期，转发时会先刷新')}>{t('已过期')}</Badge>
+  const text = left < 3600e3 ? t('{n} 分钟后', { n: Math.max(1, Math.round(left / 60e3)) })
+    : left < 48 * 3600e3 ? t('{n} 小时后', { n: (left / 3600e3).toFixed(1) })
+      : t('{n} 天后', { n: Math.floor(left / 24 / 3600e3) })
   // 完整时间点只在解析得出时补进 title：formatTime 对非法时间戳返回空串，
   // 直接拼会留下一个空的「（）」
   const full = formatTime(expiresAt)
-  return <span title={full ? `${text}过期（${full}）` : `${text}过期`}>{text}</span>
+  return <span title={full ? t('{text}过期（{full}）', { text, full }) : t('{text}过期', { text })}>{text}</span>
 }
 
 /**
@@ -276,7 +280,7 @@ export function ConnectionsCell({ account }: { account: AccountRecord }) {
   const value = connectionsOf(account.id)
   if (value <= 0) return null
   return (
-    <span className='conn-count' title={`${value} 个请求正在使用该账号（含还在下发内容的流式请求）`}>
+    <span className='conn-count' title={t('{n} 个请求正在使用该账号（含还在下发内容的流式请求）', { n: value })}>
       {value}
     </span>
   )
@@ -298,16 +302,16 @@ function subscriptionText(subscription: unknown): string {
   if (!subscription || typeof subscription !== 'object') return ''
   const info = subscription as Record<string, unknown>
   const parts: string[] = []
-  if (info.planName) parts.push(`套餐 ${String(info.planName)}`)
-  if (info.status) parts.push(`状态 ${String(info.status)}`)
+  if (info.planName) parts.push(t('套餐 {name}', { name: String(info.planName) }))
+  if (info.status) parts.push(t('状态 {status}', { status: String(info.status) }))
   const expireAt = info.expireAt
   if (expireAt !== null && expireAt !== undefined && expireAt !== '') {
     const asNumber = Number(expireAt)
     const text = Number.isFinite(asNumber) && asNumber > 1e11 ? formatTime(asNumber) : String(expireAt)
-    if (text) parts.push(`到期 ${text}`)
+    if (text) parts.push(t('到期 {time}', { time: text }))
   }
-  if (Number.isFinite(Number(info.remainQuota))) parts.push(`余量 ${numberText(info.remainQuota)}`)
-  if (Number.isFinite(Number(info.totalQuota))) parts.push(`总量 ${numberText(info.totalQuota)}`)
+  if (Number.isFinite(Number(info.remainQuota))) parts.push(t('余量 {value}', { value: numberText(info.remainQuota) }))
+  if (Number.isFinite(Number(info.totalQuota))) parts.push(t('总量 {value}', { value: numberText(info.totalQuota) }))
   return parts.join(' ')
 }
 
@@ -321,30 +325,32 @@ function subscriptionText(subscription: unknown): string {
  * 余额列是这张表里最窄的几列之一。
  */
 function usageSummary(entry: UsageEntry): { text: string; kind: string; title: string } {
-  if (entry === undefined) return { text: '未查询', kind: 'muted', title: '尚未查询该账号的余额' }
-  if (entry === null) return { text: '查询中…', kind: 'muted', title: '正在查询' }
+  if (entry === undefined) return { text: t('未查询'), kind: 'muted', title: t('尚未查询该账号的余额') }
+  if (entry === null) return { text: t('查询中…'), kind: 'muted', title: t('正在查询') }
   const failure = usageFailureOf(entry)
   if (failure) {
     return failure.notConfigured
-      ? { text: '未配置', kind: 'muted', title: `${failure.message}（去该账号的「设置」里填上查询凭证即可）` }
-      : { text: '查询失败', kind: 'bad', title: failure.message }
+      ? { text: t('未配置'), kind: 'muted', title: t('{message}（去该账号的「设置」里填上查询凭证即可）', { message: failure.message }) }
+      : { text: t('查询失败'), kind: 'bad', title: failure.message }
   }
-  if (typeof entry !== 'object' || entry === null) return { text: '无数据', kind: 'muted', title: String(entry) }
+  if (typeof entry !== 'object' || entry === null) return { text: t('无数据'), kind: 'muted', title: String(entry) }
   const data = entry as Record<string, unknown>
   if (Object.prototype.hasOwnProperty.call(data, 'totalLeft')) {
     const total = data.unlimited ? '∞' : numberText(data.totalLeft)
     return {
-      text: `可用 ${total}`,
+      text: t('可用 {total}', { total }),
       kind: 'ok',
-      title: `总剩余 ${total} · 套餐 ${numberText(data.planLeft)} · 奖励 ${numberText(data.bonusLeft)}`,
+      title: t('总剩余 {total} · 套餐 {plan} · 奖励 {bonus}', {
+        total, plan: numberText(data.planLeft), bonus: numberText(data.bonusLeft),
+      }),
     }
   }
   if (Object.prototype.hasOwnProperty.call(data, 'available') || Array.isArray(data.wallets)) {
-    const unit = String(data.unit || '积分')
+    const unit = String(data.unit || t('积分'))
     const wallets = Array.isArray(data.wallets) ? data.wallets as Array<Record<string, unknown>> : []
     // 上游给的展示串优先（带千分位 / 单位的格式化），没有才按数值拼
     const detail = wallets
-      .map(wallet => `${wallet?.displayName || wallet?.type || '明细'} `
+      .map(wallet => `${wallet?.displayName || wallet?.type || t('明细')} `
         + `${wallet?.balanceView ? String(wallet.balanceView) : numberText(wallet?.balance)}`)
       .join(' · ')
     const subscription = subscriptionText(data.subscription)
@@ -353,7 +359,7 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
     // 字段的家（其余全部）走的仍是「数值 + 单位」那条老路，行为一字未变。
     const available = data.availableView
       ? String(data.availableView)
-      : `可用 ${numberText(data.available)} ${unit}`
+      : t('可用 {value} {unit}', { value: numberText(data.available), unit })
     // ── 部分失败：一份账读到了、另一份没读到 ────────────────────
     // CodeArts 的余额是**两台网关**（订阅统计 + 福利网关，见后端
     // `providers::codearts::balance` 的模块头），后端把失败的一侧写进
@@ -362,8 +368,8 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
     // 而实际是那半边根本没读到。判据仍然只在 `usageFailureOf` 那一处
     // （整次失败的入口），这里只补「半次失败」。
     const missing = [
-      data.statisticsError ? `订阅统计未读到：${String(data.statisticsError)}` : '',
-      data.benefitError ? `福利网关未读到：${String(data.benefitError)}` : '',
+      data.statisticsError ? t('订阅统计未读到：{error}', { error: String(data.statisticsError) }) : '',
+      data.benefitError ? t('福利网关未读到：{error}', { error: String(data.benefitError) }) : '',
     ].filter(Boolean)
     // ── 「没有福利」不是「没读到」────────────────────────────────
     // 上游对没有福利池的账号（福利按限时活动下发，Free 账号常常没有）回
@@ -371,7 +377,7 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
     // 这里只在中性说明里提一句 —— 不动 kind、不加 ⚠：它回答的是「为什么
     // 这行没有福利读数」，不是一个需要用户去查的问题。
     const absent = data.benefitAbsent
-      ? ['该账号没有福利模型额度（福利按活动下发，不是每个账号都有）']
+      ? [t('该账号没有福利模型额度（福利按活动下发，不是每个账号都有）')]
       : []
     return {
       text: available + (missing.length ? ' ⚠' : ''),
@@ -379,7 +385,7 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
       title: [available, detail, subscription, ...absent, ...missing].filter(Boolean).join(' · '),
     }
   }
-  return { text: '无数据', kind: 'muted', title: '未返回可识别的余额数据' }
+  return { text: t('无数据'), kind: 'muted', title: t('未返回可识别的余额数据') }
 }
 
 /**
@@ -477,30 +483,35 @@ type UsageDetail = {
   unit: string
   /** 套餐徽标文案（试用版 / 免费版 / 原名）与积分重置日期 */
   plan: string
+  /** 上游原始套餐名是否 free（`plan-chip.free` 样式类按它判 —— 不能比 plan 展示文案，
+   *  后者随界面语言变，见 accounts-domain 的 isFreePlan） */
+  free: boolean
   resetDate: string
   /** 半次失败（两台网关有一台没回话）与「没有福利池」的中性说明 */
   missing: string[]
   benefitAbsent: boolean
 }
 
+/** units.js 的公开面（本文件只读 formatTokens）：量级词（万 / 亿 与 k / M）已按界面
+ *  语言在那边一处处理，这里不再自己拼字面量。局部窄类型 + 转型而不是 declare global
+ *  —— wbUnits 是多页共享的桥，各岛各 declare 一份会撞 TS2717（同 report-charts 的处理）。 */
+type UnitsBridge = { formatTokens?: (value: unknown) => string }
+
 /**
- * 数值 → 紧凑读数：`3541691 → 354 万`、`10000000 → 1000 万`、`172 → 172`。
- *
- * token 数常是七位八位的整数，余额列没有那么多像素（列宽 132px），
- * 也没有人逐位读它 —— 万/亿缩写保留一位小数（整万去尾），数值的
- * **数量级**才是这格要传达的东西；原值始终在悬停全文里。
+ * 数值 → 紧凑读数（token 数常是七位八位的整数，余额列只有 132px，读的是量级）：
+ * 量级词与分档全交给 units.js 的 formatTokens（简体「354万」、英文「354k」，
+ * 设置页那个开关拨一下两处一起变）；拿不到桥时退回裸数字。
  */
 function compactNumber(value: number): string {
-  const abs = Math.abs(value)
-  if (abs >= 1e8) return `${(value / 1e8).toFixed(1).replace(/\.0$/, '')} 亿`
-  if (abs >= 1e4) return `${(value / 1e4).toFixed(abs >= 1e6 ? 0 : 1).replace(/\.0$/, '')} 万`
-  return String(value)
+  const api = (window as unknown as { wbUnits?: UnitsBridge }).wbUnits
+  return api?.formatTokens ? api.formatTokens(value) : String(value)
 }
 
-/** 后端 displayName → 平铺短标签（映射不到的原样显示，不硬造） */
+/** 后端 displayName → 平铺短标签（映射不到的原样显示，不硬造）。匹配仍按上游给的中文
+ *  名称判定（那是数据），输出的短标签才是界面文案，走 t() */
 function flatMeterName(name: string): string {
-  if (name.includes('福利')) return '福利日额度'
-  if (name.includes('对话')) return '对话 token'
+  if (name.includes('福利')) return t('福利日额度')
+  if (name.includes('对话')) return t('对话 token')
   return name
 }
 
@@ -529,11 +540,11 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
   const data = entry as Record<string, unknown>
   const wallets = Array.isArray(data.wallets) ? data.wallets as Array<Record<string, unknown>> : []
   if (!wallets.length) return null
-  const unit = String(data.unit || '积分')
+  const unit = String(data.unit || t('积分'))
   const credit: UsageDetailRow[] = []
   const token: UsageFlatRow[] = []
   for (const wallet of wallets) {
-    const name = String(wallet.displayName || wallet.type || '明细')
+    const name = String(wallet.displayName || wallet.type || t('明细'))
     const remaining = numberOrNull(wallet.creditRemaining)
     const total = numberOrNull(wallet.creditTotal)
     const view = String(wallet.balanceView || '') || numberText(wallet.balance)
@@ -544,11 +555,13 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
       const percent = hasTotal ? Math.max(0, Math.min(100, remaining / total * 100)) : null
       credit.push({
         name,
-        view: hasTotal ? `剩 ${numberText(remaining)} / ${numberText(total)}` : `剩 ${numberText(remaining)}`,
+        view: hasTotal
+          ? t('剩 {remaining} / {total}', { remaining: numberText(remaining), total: numberText(total) })
+          : t('剩 {remaining}', { remaining: numberText(remaining) }),
         tone: remaining <= 0 ? 'muted' : percent !== null && percent < 20 ? 'warn' : 'ok',
         percent,
         over: false,
-        title: hasTotal ? undefined : '上游未给总量，画不出剩余比例',
+        title: hasTotal ? undefined : t('上游未给总量，画不出剩余比例'),
       })
       continue
     }
@@ -566,12 +579,14 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
         ? Math.max(0, Math.min(100, (1 - used / allowance) * 100))
         : null
       const flat = unlimited
-        ? `无上限 · 已用 ${compactNumber(used)}`
+        ? t('无上限 · 已用 {used}', { used: compactNumber(used) })
         : hasTotal
-          ? `剩 ${compactNumber(Math.max(0, allowance - used))} / ${compactNumber(allowance)}`
+          ? t('剩 {remaining} / {total}', {
+            remaining: compactNumber(Math.max(0, allowance - used)), total: compactNumber(allowance),
+          })
           : used > 0
-            ? `已用 ${compactNumber(used)}`
-            : '未使用'
+            ? t('已用 {used}', { used: compactNumber(used) })
+            : t('未使用')
       token.push({
         name: flatMeterName(name),
         view: flat,
@@ -579,7 +594,7 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
           : percent !== null && percent < 20 ? 'warn' : 'ok',
         percent,
         over,
-        title: [view, unlimited ? '无上限按日计（上游到达上限后仍继续计数，超额如实显示）' : null]
+        title: [view, unlimited ? t('无上限按日计（上游到达上限后仍继续计数，超额如实显示）') : null]
           .filter(Boolean).join(' · '),
       })
       continue
@@ -590,8 +605,8 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
   const subscription = (data.subscription && typeof data.subscription === 'object'
     ? data.subscription : {}) as Record<string, unknown>
   const missing = [
-    data.statisticsError ? `订阅统计未读到：${String(data.statisticsError)}` : '',
-    data.benefitError ? `福利网关未读到：${String(data.benefitError)}` : '',
+    data.statisticsError ? t('订阅统计未读到：{error}', { error: String(data.statisticsError) }) : '',
+    data.benefitError ? t('福利网关未读到：{error}', { error: String(data.benefitError) }) : '',
   ].filter(Boolean)
   return {
     credit,
@@ -599,6 +614,7 @@ function usageDetailOf(entry: UsageEntry): UsageDetail | null {
     total: numberOrNull(data.available),
     unit,
     plan: planBadgeLabel(subscription.planName),
+    free: isFreePlan(subscription.planName),
     resetDate: String(subscription.resetDate || ''),
     missing,
     benefitAbsent: data.benefitAbsent === true,
@@ -648,10 +664,14 @@ function prominentTokenLimit(account: AccountRecord): React.ReactNode {
   const hit = reading.used >= rule.threshold
   const info = tokenWindowInfo(rule)
   const countdown = !hit ? ` · ${tokenCountdownText(info.remainingMs, info.daily)}` : ''
-  const scope = info.daily ? '今日已用' : '周期 Token'
-  const title = `限制器：${rule.reset === 'daily' ? '今天（本地 0 点重置）' : `${formatIntervalSeconds(rule.period ?? 0)}窗口`}已用 `
-    + `${Math.round(reading.used).toLocaleString('en-US')} / ${Math.round(rule.threshold).toLocaleString('en-US')} Token`
-    + (hit ? '，已达到上限' : `，${tokenCountdownText(info.remainingMs, info.daily)}重置`)
+  const scope = info.daily ? t('今日已用') : t('周期 Token')
+  const windowText = rule.reset === 'daily' ? t('今天（本地 0 点重置）') : t('{period}窗口', { period: formatIntervalSeconds(rule.period ?? 0) })
+  const title = t('限制器：{window}已用 {used} / {threshold} Token', {
+    window: windowText,
+    used: Math.round(reading.used).toLocaleString('en-US'),
+    threshold: Math.round(rule.threshold).toLocaleString('en-US'),
+  })
+    + (hit ? t('，已达到上限') : t('，{countdown}重置', { countdown: tokenCountdownText(info.remainingMs, info.daily) }))
   return (
     <span className='usage-token-sub' title={title}>
       {scope} <span className={hit ? 'hit' : undefined}>{formatTokenCount(reading.used)}</span>
@@ -662,7 +682,7 @@ function prominentTokenLimit(account: AccountRecord): React.ReactNode {
 
 export function UsageCell({ account }: { account: AccountRecord }) {
   if (!supportsUsage(account)) {
-    return <span className='muted' title='该提供商没有余额查询'>—</span>
+    return <span className='muted' title={t('该提供商没有余额查询')}>—</span>
   }
   // 读入口走 usageEntryOf（不是裸的 usageEntries().get）：它会作废「比账号记录还旧」
   // 的失败结论，理由与后端快照出口一致
@@ -673,13 +693,13 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   // 状态列的「已禁用」开关就是答案；跳过档账号仍是启用的，不标就看不出。
   const blockedBadge = balanceBlockedOf(account, entry) ? (
     <Badge variant='warning' shape='tag'
-      title='余额低于限制器的阈值，转发时会跳过该账号（余额回升自动恢复）'>
-      余额不足 · 已跳过
+      title={t('余额低于限制器的阈值，转发时会跳过该账号（余额回升自动恢复）')}>
+      {t('余额不足 · 已跳过')}
     </Badge>
   ) : tokenBlockedOf(account, tokenUsageOf(account)) ? (
     <Badge variant='warning' shape='tag'
-      title='本周期 Token 消耗达到限制器的上限，转发时会跳过该账号（窗口重置自动恢复）'>
-      Token 限额 · 已跳过
+      title={t('本周期 Token 消耗达到限制器的上限，转发时会跳过该账号（窗口重置自动恢复）')}>
+      {t('Token 限额 · 已跳过')}
     </Badge>
   ) : null
   const tokenSub = prominentTokenLimit(account)
@@ -749,16 +769,16 @@ function UsageDetailCell({ summary, detail, blockedBadge, tokenSub }: {
     <span className={open ? 'usage-cell open' : 'usage-cell'}>
       <span className='usage-plan'>
         {detail.plan
-          ? <span className={`plan-chip${detail.plan === '免费版' ? ' free' : ''}`}>{detail.plan}</span>
+          ? <span className={`plan-chip${detail.free ? ' free' : ''}`}>{detail.plan}</span>
           : null}
         {detail.resetDate
-          ? <span className='plan-sub' title='套餐积分的重置日期'>重置 {detail.resetDate}</span>
+          ? <span className='plan-sub' title={t('套餐积分的重置日期')}>{t('重置 {date}', { date: detail.resetDate })}</span>
           : null}
       </span>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger
           render={<button type='button' className={`usage-toggle ${summary.kind}`}
-            title={summary.title} aria-label='积分明细' />}
+            title={summary.title} aria-label={t('积分明细')} />}
         >
           <span className='val'>{summary.text}</span>
           <span className='caret' aria-hidden>▾</span>
@@ -769,13 +789,13 @@ function UsageDetailCell({ summary, detail, blockedBadge, tokenSub }: {
             : null}
           {detail.credit.length ? (
             <>
-              <div className='usage-pop-group'>积分</div>
+              <div className='usage-pop-group'>{t('积分')}</div>
               {detail.credit.map(row => <UsageDetailRowView key={row.name} row={row} />)}
             </>
           ) : null}
           {detail.total !== null ? (
             <div className='usage-pop-total'>
-              <span className='k'>可用合计</span>
+              <span className='k'>{t('可用合计')}</span>
               <span className='v'>{numberText(detail.total)} <small>{detail.unit}</small></span>
             </div>
           ) : null}
@@ -783,8 +803,9 @@ function UsageDetailCell({ summary, detail, blockedBadge, tokenSub }: {
               福利 token 池 —— available 为 null，摘要那行显示「可用 —」）不加这句
               弹层就是一个空框，「弹不出来」的观感比缺数据更让人怀疑是故障 */}
           {!detail.credit.length && detail.total === null ? (
-            <div className='usage-pop-empty' title='该账号的额度只有福利 token 池（见余额格那两行），订阅统计没有积分类计量表'>
-              该账号没有积分类读数（额度只有福利 token 池）
+            <div className='usage-pop-empty'
+              title={t('该账号的额度只有福利 token 池（见余额格那两行），订阅统计没有积分类计量表')}>
+              {t('该账号没有积分类读数（额度只有福利 token 池）')}
             </div>
           ) : null}
         </PopoverContent>
@@ -799,16 +820,16 @@ function UsageDetailCell({ summary, detail, blockedBadge, tokenSub }: {
           </span>
           {row.percent !== null ? (
             <span className={`usage-flat-track${row.over ? ' over' : ''}`}>
-              <i style={{ width: `${row.percent}%` }} aria-label={`剩余 ${Math.round(row.percent)}%`} />
+              <i style={{ width: `${row.percent}%` }} aria-label={t('剩余 {percent}%', { percent: Math.round(row.percent) })} />
             </span>
           ) : null}
         </span>
       ))}
       {detail.benefitAbsent ? (
         <span className='usage-flat-line'
-          title='福利按限时活动下发，不是每个账号都有 —— 正常状态，不是查询失败'>
-          <span className='usage-flat-name'>福利日额度</span>
-          <span className='usage-flat-view muted'>无福利额度</span>
+          title={t('福利按限时活动下发，不是每个账号都有 —— 正常状态，不是查询失败')}>
+          <span className='usage-flat-name'>{t('福利日额度')}</span>
+          <span className='usage-flat-view muted'>{t('无福利额度')}</span>
         </span>
       ) : null}
       {blockedBadge}
@@ -827,7 +848,7 @@ function UsageDetailRowView({ row }: { row: UsageDetailRow }) {
       </div>
       {row.percent !== null ? (
         <span className={`usage-pop-track${row.over ? ' over' : ''}`}>
-          <i style={{ width: `${row.percent}%` }} aria-label={`剩余 ${Math.round(row.percent)}%`} />
+          <i style={{ width: `${row.percent}%` }} aria-label={t('剩余 {percent}%', { percent: Math.round(row.percent) })} />
         </span>
       ) : null}
     </div>
@@ -855,7 +876,7 @@ function UsageDetailRowView({ row }: { row: UsageDetailRow }) {
 export function AccountCell({ account, namesHidden }: { account: AccountRecord; namesHidden: boolean }) {
   const ident = identifierOf(account)
   const features = providerFeatures(providerOf(account))
-  const name = displayNameOf(account) || '未命名账号'
+  const name = displayNameOf(account) || t('未命名账号')
   const email = String(account.email || '').trim()
   const nickname = String(account.nickname || '').trim()
   // 记录里原样的备注名（未经 displayNameOf 的兜底链）：未设备注时它建号时就有种子值，
@@ -863,15 +884,15 @@ export function AccountCell({ account, namesHidden }: { account: AccountRecord; 
   const rawName = String(account.name || '').trim()
   const mask = (value: string): string => (namesHidden ? maskName(value) : value)
   const titleLines = [
-    email && email !== name ? `邮箱 ${mask(email)}` : '',
+    email && email !== name ? t('邮箱 {email}', { email: mask(email) }) : '',
     ident ? `${features.identifier} ${ident}` : '',
     !account.nameCustom && rawName && rawName !== email && rawName !== nickname
-      ? `备注名 ${mask(rawName)}`
+      ? t('备注名 {name}', { name: mask(rawName) })
       : '',
-    nickname && nickname !== name && nickname !== email ? `昵称 ${mask(nickname)}` : '',
-    isDesktopAccount(account) ? '桌面端实时登录态（凭证每次从客户端登录态文件读取）' : '',
-    account.updatedAt ? `更新于 ${formatTime(account.updatedAt)}` : '',
-    account.source ? `来源 ${account.source === 'imported' ? '旧数据导入' : '手动添加'}` : '',
+    nickname && nickname !== name && nickname !== email ? t('昵称 {name}', { name: mask(nickname) }) : '',
+    isDesktopAccount(account) ? t('桌面端实时登录态（凭证每次从客户端登录态文件读取）') : '',
+    account.updatedAt ? t('更新于 {time}', { time: formatTime(account.updatedAt) }) : '',
+    account.source ? t('来源 {source}', { source: account.source === 'imported' ? t('旧数据导入') : t('手动添加') }) : '',
   ].filter(Boolean)
 
   const showEmail = email && email !== name
@@ -901,11 +922,12 @@ export function AccountCell({ account, namesHidden }: { account: AccountRecord; 
       {nameNode}
       {showEmail ? (
         <div className='acct-sub'>
-          <span className='acct-email' title='账号邮箱'>{mask(email)}</span>
+          <span className='acct-email' title={t('账号邮箱')}>{mask(email)}</span>
         </div>
       ) : null}
       {proxyError ? (
-        <div className='acct-note bad' title={`代理不可用：${proxyError}`}>代理不可用：{proxyError}</div>
+        <div className='acct-note bad'
+          title={t('代理不可用：{error}', { error: proxyError })}>{t('代理不可用：{error}', { error: proxyError })}</div>
       ) : null}
     </>
   )
@@ -914,6 +936,8 @@ export function AccountCell({ account, namesHidden }: { account: AccountRecord; 
 /**
  * 提供商：一枚徽章，带版本后缀（「WorkBuddy 国际版」）—— 与 AutoClaw 那种「名字自带
  * 版本」的家同一种形态，不再提供商、版本两枚并排。
+ * 收录过图标的家（PROVIDER_ICONS，与模型管理页 / 签到中心同一份）在名字前挂
+ * 13px 小图标，没有的仍是纯文字 —— 与卡片图标的兜底口径一致。
  * 配色按 provider id 生成（`p-<id>` 类），未登记的家落到 CSS 里的中性兜底 ——
  * 加一家时不必改样式表，也不会显示成空白（所以这里不换组件库的 Badge：它没有按
  * provider 上色的档位，见最终报告的组件库缺口）。
@@ -923,9 +947,13 @@ export function ProviderCell({ account }: { account: AccountRecord }) {
   const label = shared().wbProviders?.labelOf?.(provider) || provider
   const edition = providerFeatures(provider).edition ? editionSuffix(account) : ''
   const text = edition ? `${label} ${edition}` : label
+  const icon = PROVIDER_ICONS[provider]
   return (
     <div className='pv'>
-      <span className={`pbadge p-${provider}`} title={`提供商：${text}`}>{text}</span>
+      <span className={`pbadge p-${provider}`} title={t('提供商：{name}', { name: text })}>
+        {icon ? <img className='pbadge-ico' src={icon} alt='' loading='lazy' /> : null}
+        <span className='pbadge-txt'>{text}</span>
+      </span>
     </div>
   )
 }
@@ -947,7 +975,7 @@ export function ProviderCell({ account }: { account: AccountRecord }) {
 export function ProxyCell({ account }: { account: AccountRecord }) {
   const proxy = account.proxy
   const source = proxy?.config?.source || proxy?.source
-  const label = proxy?.label || (source === 'custom' ? '自定义代理' : '已设置')
+  const label = proxy?.label || (source === 'custom' ? t('自定义代理') : t('已设置'))
   const broken = proxy?.error
   const pool = proxyPoolSnapshot()
   const poolItems = Array.isArray(pool) ? pool : []
@@ -958,7 +986,7 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
   if (source === 'pool' && proxy?.config?.proxyId) current = `${POOL_VALUE_PREFIX}${proxy.config.proxyId}`
   else if (proxy) current = PROXY_CUSTOM_CURRENT
 
-  const items: Array<{ value: string; label: string; disabled?: boolean }> = [{ value: '', label: '直连' }]
+  const items: Array<{ value: string; label: string; disabled?: boolean }> = [{ value: '', label: t('直连') }]
   for (const item of poolItems) {
     // 文案是「名字（协议 主机:端口）」—— 名字是用户在「网络代理」页起的，
     // 地址是后端解析出来的实时值（见 poolItemLabel）。同一格里多条目同名时
@@ -968,32 +996,34 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
   if (pool === null) {
     // 还没读到（首帧 / 自愈 effect 尚未跑完）：给一句「读取中」而不是
     // 「还没有代理」—— 后者会让用户以为池是空的
-    items.push({ value: '__hint_pool__', label: '正在读取代理列表…', disabled: true })
+    items.push({ value: '__hint_pool__', label: t('正在读取代理列表…'), disabled: true })
   } else if (!poolItems.length) {
     // 池为空 / 读取失败各说明一句：后者是故障（页面侧在节流重试），前者是
     // 「还没配」—— 两种都不该静默成「只有直连」
     items.push({
       value: '__hint_pool__',
-      label: poolError() ? '代理列表读取失败（重试中）' : '还没有代理（去「网络代理」页添加）',
+      label: poolError() ? t('代理列表读取失败（重试中）') : t('还没有代理（去「网络代理」页添加）'),
       disabled: true,
     })
   }
   if (current === PROXY_CUSTOM_CURRENT) {
     // 补位项：不带动任何写操作（PROXY_CUSTOM_CURRENT 在 applyProxyPick 里被忽略），
     // 只是把当前值原样显示出来
-    const prefix = source === 'clash' ? 'Clash 出口：' : source === 'custom' ? '自定义：' : ''
-    items.push({ value: PROXY_CUSTOM_CURRENT, label: `${prefix}${label}${broken ? '（不可用）' : ''}` })
+    const prefix = source === 'clash' ? t('Clash 出口：') : source === 'custom' ? t('自定义：') : ''
+    items.push({ value: PROXY_CUSTOM_CURRENT, label: `${prefix}${label}${broken ? t('（不可用）') : ''}` })
   } else if (source === 'pool' && !poolItems.some(item => `${POOL_VALUE_PREFIX}${item.id}` === current)) {
     // 池引用但条目已不在池里（被删 / Clash 侧删了出口）：补位显示当前值
-    items.push({ value: current, label: `${label}${broken ? '（不可用）' : ''}` })
+    items.push({ value: current, label: `${label}${broken ? t('（不可用）') : ''}` })
   }
-  items.push({ value: PROXY_CUSTOM_EDIT, label: '自定义代理…' })
+  items.push({ value: PROXY_CUSTOM_EDIT, label: t('自定义代理…') })
 
   const title = broken
-    ? `代理不可用：${proxy?.error}（转发时会回退直连）；选「自定义代理…」去修改`
+    ? t('代理不可用：{error}（转发时会回退直连）；选「自定义代理…」去修改', { error: broken })
     : source === 'clash' || source === 'custom'
-      ? `当前：${label}（未经过代理池 —— 可在「网络代理」页把出口同步进池后来这里改选）`
-      : `当前：${proxy ? label : '直连'}；选项来自「网络代理」页；「自定义代理…」打开完整设置`
+      ? t('当前：{label}（未经过代理池 —— 可在「网络代理」页把出口同步进池后来这里改选）', { label })
+      : t('当前：{label}；选项来自「网络代理」页；「自定义代理…」打开完整设置', {
+        label: proxy ? label : t('直连'),
+      })
   const selected = items.find(item => item.value === current)
 
   return (
@@ -1002,8 +1032,8 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
           换成组件库的 Select 之后触发器没有 .select-trigger 这个类名（它走 data-slot），
           所以把描边色直接写在工具类上（见最终报告里变死的 CSS） */}
       <SelectTrigger className={cn('w-full', broken && 'border-destructive-bd')}
-        title={title} aria-label='出网代理'>
-        <SelectValue>{selected?.label || '直连'}</SelectValue>
+        title={title} aria-label={t('出网代理')}>
+        <SelectValue>{selected?.label || t('直连')}</SelectValue>
       </SelectTrigger>
       <SelectContent>
         {items.map(item => (
@@ -1055,19 +1085,19 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
         <Button variant='outline' size='xs' disabled={claimBusy}
           title={claimedToday(account)
             ? claimDoneTitle(account)
-            : '探测并领取官方限时体验套餐（每天一期，需要过一次人机验证）'}
-          onClick={() => void claim()}>领套餐</Button>
+            : t('探测并领取官方限时体验套餐（每天一期，需要过一次人机验证）')}
+          onClick={() => void claim()}>{t('领套餐')}</Button>
       ) : null}
       {canUsage ? (
         <Button variant='outline' size='xs' disabled={usageBusy}
-          title='查询该账号剩余余额（读数显示在余额列）'
+          title={t('查询该账号剩余余额（读数显示在余额列）')}
           onClick={() => {
             setUsageBusy(true)
             void queryUsageOnce(account.id).finally(() => setUsageBusy(false))
-          }}>余额</Button>
+          }}>{t('余额')}</Button>
       ) : null}
-      <Button variant='outline' size='xs' title='备注名 / 启用 / 代理'
-        onClick={() => openSettingsDialog(account.id)}>设置</Button>
+      <Button variant='outline' size='xs' title={t('备注名 / 启用 / 代理')}
+        onClick={() => openSettingsDialog(account.id)}>{t('设置')}</Button>
       <MoreMenu account={account} atFront={atFront} />
     </div>
   )
@@ -1096,36 +1126,36 @@ export function MoreMenu({ account, atFront }: { account: AccountRecord; atFront
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger render={<Button variant='outline' size='xs' title='更多操作' />}>⋯</PopoverTrigger>
+      <PopoverTrigger render={<Button variant='outline' size='xs' title={t('更多操作')} />}>⋯</PopoverTrigger>
       <PopoverContent align='end' sideOffset={4} className='w-[172px] p-1.5'>
         <div className='flex flex-col gap-0.5'>
           <Button variant='ghost' size='sm' className={dangerClass}
             onClick={() => { setOpen(false); void setAccountEnabled(account.id, !enabled) }}>
-            {enabled ? '禁用' : '启用'}
+            {enabled ? t('禁用') : t('启用')}
           </Button>
           <Button variant='ghost' size='sm' className={itemClass} disabled={atFront}
-            title={atFront ? '已在全局队列第一位' : '仅将优先级调整到全局第一位，不改变启用状态'}
+            title={atFront ? t('已在全局队列第一位') : t('仅将优先级调整到全局第一位，不改变启用状态')}
             onClick={() => { setOpen(false); shared().wbApp?.runAccountAction?.('switch', account.id) }}>
-            设为首选
+            {t('设为首选')}
           </Button>
           <Button variant='ghost' size='sm' className={itemClass}
-            title='在账号设置的「基本」分组里设置该账号同时最多处理的请求数'
+            title={t('在账号设置的「基本」分组里设置该账号同时最多处理的请求数')}
             onClick={() => { setOpen(false); openSettingsDialog(account.id) }}>
-            并发上限：{maxConcurrent > 0 ? maxConcurrent : '不限'}
+            {t('并发上限：{value}', { value: maxConcurrent > 0 ? maxConcurrent : t('不限') })}
           </Button>
           {account.hasRefreshToken ? (
             <Button variant='ghost' size='sm' className={itemClass}
               onClick={() => { setOpen(false); shared().wbApp?.runAccountAction?.('refresh', account.id) }}>
-              刷新 Token
+              {t('刷新 Token')}
             </Button>
           ) : null}
           <div className='my-1 h-px bg-hairline' />
           <Button variant='ghost' size='sm' className={dangerClass}
             title={isDesktopAccount(account)
-              ? '删除这条账号记录（不会影响客户端自己的登录态；之后可再点「导入桌面端登录态」加回来）'
+              ? t('删除这条账号记录（不会影响客户端自己的登录态；之后可再点「导入桌面端登录态」加回来）')
               : undefined}
             onClick={() => { setOpen(false); shared().wbApp?.runAccountAction?.('remove', account.id) }}>
-            删除账号
+            {t('删除账号')}
           </Button>
         </div>
       </PopoverContent>
@@ -1151,36 +1181,36 @@ function LimitPanel({ account, onClose, onClear }: {
 }) {
   const entries = activeLimits(account)
   const close = (
-    <Button variant='ghost' size='icon-xs' className='panel-close' title='收起' onClick={onClose}>✕</Button>
+    <Button variant='ghost' size='icon-xs' className='panel-close' title={t('收起')} onClick={onClose}>✕</Button>
   )
   if (!entries.length) {
     // 已展开但记录恰好全部过期时给一句中性说明 —— 数据是两次读盘之间变了的，
     // 不该渲染成一块空面板
-    return <div className='row-panel limit-panel'>当前没有限流中的模型。{close}</div>
+    return <div className='row-panel limit-panel'>{t('当前没有限流中的模型。')}{close}</div>
   }
   return (
     <div className='row-panel limit-panel'>
       {close}
       <div className='lp-head'>
         <b>{displayNameOf(account)}</b>
-        <span className='muted'>{entries.length} 个模型限流中 · 记录来自上游 429 / 限额码，到恢复时间自动解除</span>
-        <Button variant='outline' size='xs' title='清掉该账号全部模型的限流标记'
-          onClick={() => onClear('')}>全部清除</Button>
+        <span className='muted'>{t('{n} 个模型限流中 · 记录来自上游 429 / 限额码，到恢复时间自动解除', { n: entries.length })}</span>
+        <Button variant='outline' size='xs' title={t('清掉该账号全部模型的限流标记')}
+          onClick={() => onClear('')}>{t('全部清除')}</Button>
       </div>
       {entries.map(entry => {
         const reset = formatResetText(entry.resetAt)
-        const reason = entry.message || (entry.status ? `上游返回 ${entry.status}` : '')
+        const reason = entry.message || (entry.status ? t('上游返回 {status}', { status: entry.status }) : '')
         return (
           <div className='lp-row' key={entry.model}>
             <span className='lp-model' title={entry.model}>{entry.model}</span>
-            <Badge variant='warning' shape='tag'>限流中</Badge>
-            <span className='lp-reset' title='到恢复时间后自动解除，无需手动操作'>
-              {reset === RESET_UNKNOWN ? '恢复时间未知' : `${reset} 恢复`}
+            <Badge variant='warning' shape='tag'>{t('限流中')}</Badge>
+            <span className='lp-reset' title={t('到恢复时间后自动解除，无需手动操作')}>
+              {reset === RESET_UNKNOWN ? t('恢复时间未知') : t('{time} 恢复', { time: reset })}
             </span>
             <span className='lp-reason' title={reason}>{reason}</span>
             <Button variant='outline' size='2xs'
-              title='清掉本机的限流标记，立刻重新尝试该模型（上游若仍在限流会再次被标记）'
-              onClick={() => onClear(entry.model)}>清除标记</Button>
+              title={t('清掉本机的限流标记，立刻重新尝试该模型（上游若仍在限流会再次被标记）')}
+              onClick={() => onClear(entry.model)}>{t('清除标记')}</Button>
           </div>
         )
       })}
@@ -1225,58 +1255,58 @@ export function TableHead({ namesHidden, allPicked, somePicked, disabled, onTogg
   disabled: boolean
   onToggleAll: (picked: boolean) => void
 }) {
-  const grip = <span className='col-grip' title='拖动调整列宽（双击还原）' />
+  const grip = <span className='col-grip' title={t('拖动调整列宽（双击还原）')} />
   return (
     <thead>
       <tr>
         <th className='cell-pick' data-col='pick'>
           {/* 表头这颗「全选」与批量栏那颗是**同一个选择**（表头入口是表格化之后补的） */}
           <Checkbox id='acct-select-all' checked={allPicked} indeterminate={!allPicked && somePicked}
-            disabled={disabled} aria-label='全选当前筛选结果'
-            title='全选 / 取消全选当前筛选结果（与批量栏同一个选择）'
+            disabled={disabled} aria-label={t('全选当前筛选结果')}
+            title={t('全选 / 取消全选当前筛选结果（与批量栏同一个选择）')}
             onCheckedChange={next => onToggleAll(next)} />
         </th>
         <th className='cell-priority' data-col='priority'>
-          <span className='th-label' title='全局一条队列：数值越小越先用，不分提供商'>
-            优先级<span className='th-hint'>全局队列</span>
+          <span className='th-label' title={t('全局一条队列：数值越小越先用，不分提供商')}>
+            {t('优先级')}<span className='th-hint'>{t('全局队列')}</span>
           </span>
           {grip}
         </th>
         <th className='cell-provider' data-col='provider'>
-          <span className='th-label'>提供商</span>{grip}
+          <span className='th-label'>{t('提供商')}</span>{grip}
         </th>
         <th className='cell-account' data-col='account'>
           <span className='th-label'>
-            账号
+            {t('账号')}
             <NameEyeButton hidden={namesHidden} />
           </span>
           {grip}
         </th>
         <th className='cell-proxy' data-col='proxy'>
-          <span className='th-label' title='该账号出网走的代理（Clash 出口 / 自定义 / 直连）；点击可修改'>代理</span>
+          <span className='th-label' title={t('该账号出网走的代理（Clash 出口 / 自定义 / 直连）；点击可修改')}>{t('代理')}</span>
           {grip}
         </th>
         <th className='cell-connections' data-col='connections'>
-          <span className='th-label' title='此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示'>连接数</span>
+          <span className='th-label' title={t('此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示')}>{t('连接数')}</span>
           {grip}
         </th>
         <th className='cell-status' data-col='status'>
-          <span className='th-label'>状态</span>{grip}
+          <span className='th-label'>{t('状态')}</span>{grip}
         </th>
         <th className='cell-limits' data-col='limits'>
-          <span className='th-label' title='该账号当前限流中的模型；点徽章看明细'>
-            限流<span className='th-hint'>按模型</span>
+          <span className='th-label' title={t('该账号当前限流中的模型；点徽章看明细')}>
+            {t('限流')}<span className='th-hint'>{t('按模型')}</span>
           </span>
           {grip}
         </th>
         <th className='cell-expiry' data-col='expiry'>
-          <span className='th-label'>有效期</span>{grip}
+          <span className='th-label'>{t('有效期')}</span>{grip}
         </th>
         <th className='cell-usage' data-col='usage'>
-          <span className='th-label'>余额</span>{grip}
+          <span className='th-label'>{t('余额')}</span>{grip}
         </th>
         {/* 最后一列不给把手：它绝对定位在右缘，钉在表格右缘会顶出一条横向滚动条 */}
-        <th className='cell-actions' data-col='actions'><span className='th-label'>操作</span></th>
+        <th className='cell-actions' data-col='actions'><span className='th-label'>{t('操作')}</span></th>
       </tr>
     </thead>
   )
@@ -1288,7 +1318,7 @@ export function TableHead({ namesHidden, allPicked, somePicked, disabled, onTogg
  * 「现在处于打码状态」不用悬停就能看出来。
  */
 export function NameEyeButton({ hidden }: { hidden: boolean }) {
-  const label = hidden ? '显示账号名' : '隐藏账号名（名字显示为星号）'
+  const label = hidden ? t('显示账号名') : t('隐藏账号名（名字显示为星号）')
   return (
     <button type='button' className={`name-eye${hidden ? ' on' : ''}`} title={label} aria-label={label}
       aria-pressed={hidden} onClick={() => toggleNamesHidden()}

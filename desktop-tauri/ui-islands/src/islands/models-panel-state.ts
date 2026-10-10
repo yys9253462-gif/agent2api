@@ -22,6 +22,7 @@ import { buildIndex as buildReasoningIndex } from './models-reasoning'
 import * as customSource from './models-custom-source'
 import type { CustomProviderRecord, ManageMapping, ManageModel, ManageView } from './models-custom-source'
 import type { SegmentedControlOption } from '@ui'
+import { t } from '../i18n'
 
 /* ─── 类型 ───────────────────────────────────── */
 
@@ -171,9 +172,9 @@ export const GROUP_LIMIT = 8
 const FILTERS_KEY = 'workbuddy-desktop-models-filters'
 
 const MODEL_STATES: readonly string[] = ['all', 'enabled', 'disabled', 'mapped']
-/** 状态分段控件上的标签（键与 MODEL_STATES 一一对应，顺序也照它） */
+/** 状态分段控件上的标签（键与 MODEL_STATES 一一对应，顺序也照它；只有展示串走 t()，value 是匹配/落盘用的枚举值） */
 const MODEL_STATE_LABEL: Record<string, string> = {
-  all: '全部', enabled: '已启用', disabled: '已禁用', mapped: '有映射',
+  all: t('全部'), enabled: t('已启用'), disabled: t('已禁用'), mapped: t('有映射'),
 }
 /** 选项提到模块级：SegmentedControl 每拿到新数组都要重新量滑块位置，常量能省掉这轮测量 */
 export const MODEL_STATE_OPTIONS: readonly SegmentedControlOption<string>[] = MODEL_STATES.map(value => ({
@@ -187,17 +188,17 @@ export const MODEL_STATE_OPTIONS: readonly SegmentedControlOption<string>[] = MO
 const COLUMNS: ColumnDecl[] = [
   // 「选择」列：整行的批量操作入口（照账号页勾选列的口径 —— 列设置里要有名字，
   // 表格里那格是「全选」复选框，没有表头文案）
-  { key: 'check', label: '选择', align: 'center' },
-  { key: 'model', label: '上游模型' },
-  { key: 'rate', label: '倍率' },
-  { key: 'source', label: '来源' },
+  { key: 'check', label: t('选择'), align: 'center' },
+  { key: 'model', label: t('上游模型') },
+  { key: 'rate', label: t('倍率') },
+  { key: 'source', label: t('来源') },
   // 能力位两列（顺序、文案与 model-capability 的键序对应）：数值合并在
   // 「上下文 / 输出」一格里，三个布尔合并成一列徽章 —— 分成五列会把
   // 复合控件最宽的「模型映射」列挤到不可用（列数取舍见交付说明）
-  { key: 'budget', label: '上下文 / 输出' },
-  { key: 'caps', label: '能力' },
-  { key: 'alias', label: '模型映射' },
-  { key: 'act', label: '操作', align: 'right' },
+  { key: 'budget', label: t('上下文 / 输出') },
+  { key: 'caps', label: t('能力') },
+  { key: 'alias', label: t('模型映射') },
+  { key: 'act', label: t('操作'), align: 'right' },
 ]
 
 /**
@@ -456,7 +457,7 @@ export function upstreamOptions(providerId: string): UpstreamOption[] {
     .map(model => ({
       id: model.id,
       // 展示名与 id 不同才补在括号里，避免出现「GLM-5.3（GLM-5.3）」这种重复
-      label: model.name && model.name !== model.id ? `${model.id}（${model.name}）` : model.id,
+      label: model.name && model.name !== model.id ? t('{id}（{name}）', { id: model.id, name: model.name }) : model.id,
       off: model.enabled === false,
     }))
 }
@@ -515,7 +516,7 @@ export function registerColumnSettings(): void {
   if (colSettings) return
   const handle = shared().wbColSettings?.register({
     id: 'models',
-    label: '模型管理表',
+    label: t('模型管理表'),
     columns: COLUMNS,
     mount: () => document.querySelector('.page[data-page="gateway"] .panel-head .head-actions'),
     buttonPlacement: 'last',
@@ -557,7 +558,7 @@ export async function load({ force = false }: { force?: boolean } = {}): Promise
   } catch (error) {
     if (seq !== loadSeq) return
     render()
-    toast(`读取模型清单失败：${errorMessage(error)}`, 'err')
+    toast(t('读取模型清单失败：{message}', { message: errorMessage(error) }), 'err')
   } finally {
     if (seq === loadSeq) loading = false
   }
@@ -603,28 +604,28 @@ export async function writeBinding(
 ): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.setBinding(provider, alias, target, change)
   const api = shared().workbuddyDesktop
-  if (!api) throw new Error('后端桥不可用')
+  if (!api) throw new Error(t('后端桥不可用'))
   return api.addModelMapping(alias, target, provider, change.reasoning, change.enabled)
 }
 
 export async function writeRemoveMapping(provider: string, alias: string, target: string): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.removeMapping(provider, alias, target)
   const api = shared().workbuddyDesktop
-  if (!api) throw new Error('后端桥不可用')
+  if (!api) throw new Error(t('后端桥不可用'))
   return api.removeModelMapping(alias, target, provider)
 }
 
 export async function writeAddModel(provider: string, id: string): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.addModel(provider, id)
   const api = shared().workbuddyDesktop
-  if (!api) throw new Error('后端桥不可用')
+  if (!api) throw new Error(t('后端桥不可用'))
   return api.addCustomModel(provider, id)
 }
 
 export async function writeRemoveModel(provider: string, id: string): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.removeModel(provider, id)
   const api = shared().workbuddyDesktop
-  if (!api) throw new Error('后端桥不可用')
+  if (!api) throw new Error(t('后端桥不可用'))
   return api.removeCustomModel(provider, id)
 }
 
@@ -644,7 +645,7 @@ export async function writeCapabilities(
 ): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.setCapabilities(provider, id, capabilities)
   const api = shared().workbuddyDesktop
-  if (!api) throw new Error('后端桥不可用')
+  if (!api) throw new Error(t('后端桥不可用'))
   return api.setModelCapabilities(provider, id, capabilities)
 }
 
@@ -661,7 +662,7 @@ export async function runRowAction(key: string, run: () => Promise<unknown>, don
     accept(await run())
     if (doneText) toast(doneText)
   } catch (error) {
-    toast(`操作失败：${errorMessage(error)}`, 'err')
+    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
   } finally {
     const pending = new Set(snapshot.pending)
     pending.delete(key)
@@ -758,7 +759,7 @@ export async function removeCustomProvider(providerId: string): Promise<void> {
   const api = shared().wbCustomProvidersUi
   // 正常加载顺序下它一定在（custom-provider-ui.js 在本岛之后加载）。真缺了就说一声 ——
   // 点了 × 什么都不发生比报错更难查
-  if (!api?.remove) { toast('删除入口未就绪，请重试或重启应用', 'err'); return }
+  if (!api?.remove) { toast(t('删除入口未就绪，请重试或重启应用'), 'err'); return }
   if (!(await api.remove(providerId))) return
   // 重拉而非只重绘：该家从后端目录里消失了（它的模型不再参与路由），内置家那份 manage
   // 视图里的承载关系可能跟着变
@@ -847,7 +848,7 @@ export function refreshModels(): void {
   const custom = customSource.isCustom(provider)
   const name = custom
     ? (customSource.record(provider)?.name || provider)
-    : '内置提供商'
+    : t('内置提供商')
   shared().wbModelsFetchModal?.open({
     providerId: provider,
     custom,

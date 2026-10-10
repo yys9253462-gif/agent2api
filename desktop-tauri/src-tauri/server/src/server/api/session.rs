@@ -1244,6 +1244,66 @@ fn render_codearts_callback(outcome: crate::server::core::login::codearts::Callb
     }
 }
 
+// ─── GET /oauth-callback（Antigravity 的 Google OAuth 登录回调）────
+
+/// Antigravity 网页登录的回调（**浏览器 302 到这里**，查询串带 `code` / `state`）。
+///
+/// ── 路径为什么是 `/oauth-callback`（连字符）而不是 CodeArts 的 `/oauth/callback` ──
+/// 它是发起授权时交给 Google 的 `redirect_uri` 的路径，参考实现
+/// （`Antigravity-Manager/src-tauri/src/modules/oauth_server.rs`）逐字使用
+/// `/oauth-callback`；Google 的 desktop 型 client 允许 loopback 任意端口 +
+/// 这个路径。它与 CodeArts 的 `/oauth/callback`（多一个斜杠）是两个路径，
+/// 同一端口上共存不冲突。
+///
+/// ── 为什么免鉴权（挂 public 组）──────────────────────────────
+/// 调用方是**用户的浏览器**（Google 授权页完成后顶层导航回来），它当然没有
+/// 我们的 API Key。与 CatPaw / Accio / CodeArts 几条 loopback 回调同一取舍；
+/// 安全性由本次登录任务生成的不可预测 state 承担（逐字比对见
+/// `core::login::submit_login_callback` 的 Antigravity 分支）。
+///
+/// ── 与「手动粘贴回调 URL」共用同一收尾 ────────────────────────
+/// 远程 / Docker 场景下浏览器可能到不了本机端口，用户会把地址栏整条 URL 粘
+/// 回登录弹窗；那条入口同样落到 `submit_login_callback`（Accio 同款理由），
+/// 本函数只负责把浏览器看到的结果渲染成人话。
+pub async fn login_antigravity_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    if task_state.trim().is_empty() || code.trim().is_empty() {
+        return oauth_callback_page(400, "登录失败：回调缺少 state 或授权码，请重新发起网页登录。");
+    }
+    let callback_url = antigravity_callback_url(&code, &task_state);
+    match state
+        .login()
+        .submit_login_callback(&task_state, &callback_url)
+        .await
+    {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
+            oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。")
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
+            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
+        }
+        Err(error) => {
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
+/// 把 `code` / `state` 还原成标准回调 URL（与 Google 交回我们的形态同款）。
+/// 只用于走 `submit_login_callback` 的解析路径（它只读查询串）。
+fn antigravity_callback_url(code: &str, state: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("code", code);
+    query.append_pair("state", state);
+    format!("http://localhost/oauth-callback?{}", query.finish())
+}
+
 // ─── POST /api/session/refresh ──────────────────────────────
 
 /// POST /api/session/refresh

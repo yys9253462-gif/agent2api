@@ -17,7 +17,8 @@
 //!   request.rs      传输层：请求发送、上游错误解析、追踪 id（**不认识 provider**）
 //!   sse.rs          SSE reasoning 帧合并（跨 chunk 半行缓冲）+ usage 旁路提取
 //!   aggregate.rs    非流式聚合（SSE → 完整 chat.completion）+ usage 旁路提取
-//!   translate.rs    上游响应协议翻译（Anthropic SSE → chat SSE；ZCode 活动套餐）
+//!   translate.rs    上游响应协议翻译（Anthropic / NDJSON / Gemini 三条翻译流）
+//!                    ——ZCode 活动套餐、Command Code、Antigravity 三家各一台
 //!   usage.rs        usage 旁路槽：token 用量 / 承载 provider+账号 / 尝试次数
 //!
 //! ── provider 差异去哪了（Agent2API 改造 W2b-T3）───────────────
@@ -26,7 +27,7 @@
 //! 本目录只通过 `ProviderAdapter` 契约（`providers::adapter`）使用它们。
 //! 这里出现的 `ProviderKind` 只作**身份标识**使用（候选链的元素、
 //! 日志里的 provider id、记账槽里的 provider 字段），没有任何
-//! 「如果 provider 是 X 就怎么做」的分支 —— 四家 provider 在 `adapter_for`
+//! 「如果 provider 是 X 就怎么做」的分支 —— 各家 provider 在 `adapter_for`
 //! 里都已接上真身适配器（那个 match 是穷举的，加新 kind 会在编译期被拦住），
 //! 编排层不需要为任何一家写特判。
 //!

@@ -1,3 +1,5 @@
+import { t } from '../i18n'
+
 /**
  * 账号页各文件共用的**类型与全局桥读取**（非岛：`.ts` 不被 import.meta.glob 当岛加载）。
  *
@@ -349,9 +351,9 @@ export function poolItemAddress(item: PoolItem): string {
  */
 export function poolItemLabel(item: PoolItem): string {
   const name = item.name || item.id
-  const address = item.resolveError ? '解析失败' : poolItemAddress(item)
-  const parts = [address, item.enabled === false ? '已禁用' : ''].filter(Boolean)
-  return parts.length ? `${name}（${parts.join(' · ')}）` : name
+  const address = item.resolveError ? t('解析失败') : poolItemAddress(item)
+  const parts = [address, item.enabled === false ? t('已禁用') : ''].filter(Boolean)
+  return parts.length ? t('{name}（{parts}）', { name, parts: parts.join(' · ') }) : name
 }
 
 /**

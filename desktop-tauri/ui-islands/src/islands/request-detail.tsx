@@ -5,6 +5,7 @@ import {
   DialogHeader, DialogTitle, SegmentedControl, Spinner, Table, TableBody,
   TableCell, TableHead, TableHeader, TableRow, type SegmentedControlOption,
 } from '@ui'
+import { t } from '../i18n'
 
 /**
  * 「请求日志」页的**详情弹窗**（请求详情 / 预览对话 / 原始报文 · 三标签）。
@@ -56,9 +57,9 @@ import {
 type TabKey = 'detail' | 'preview' | 'raw'
 
 const TAB_OPTIONS: readonly SegmentedControlOption<TabKey>[] = [
-  { value: 'detail', label: '请求详情' },
-  { value: 'preview', label: '预览对话' },
-  { value: 'raw', label: '原始报文' },
+  { value: 'detail', label: t('请求详情') },
+  { value: 'preview', label: t('预览对话') },
+  { value: 'raw', label: t('原始报文') },
 ]
 /** 默认标签恒为「请求详情」（旧实现同此；`raw` 到达前根本不在选项里） */
 const DEFAULT_TAB: TabKey = 'detail'
@@ -176,6 +177,8 @@ type SharedWindow = {
   wbRequestPhase?: { badgeHtml?: (entry: unknown) => string; elapsedLineHtml?: (entry: unknown) => string }
   /** 提供商展示名目录（后端 label → 目录 → 原样回显 id） */
   wbProviders?: { labelOf?: (id: string) => string }
+  /** Token 读数的量级词与分档（units.js；中文「万 / 亿」与英文「k / M」的切换在那边一处） */
+  wbUnits?: { formatTokens?: (value: unknown) => string }
 }
 
 function shared(): SharedWindow {
@@ -185,7 +188,7 @@ function shared(): SharedWindow {
 /** 后端桥：拿不到就抛（旧实现是模块加载时取一次 workbuddyDesktop，取不到即抛） */
 function api() {
   const bridge = shared().workbuddyDesktop
-  if (!bridge) throw new Error('后端桥不可用')
+  if (!bridge) throw new Error(t('后端桥不可用'))
   return bridge
 }
 
@@ -212,9 +215,9 @@ function fmtDuration(ms: unknown): string {
   const rounded = Math.round(Number(ms) || 0)
   if (rounded < 1000) return `${rounded}ms`
   const seconds = Math.floor(rounded / 1000)
-  if (seconds >= 60) return `${Math.floor(seconds / 60)}分${seconds % 60}秒`
+  if (seconds >= 60) return t('{m}分{s}秒', { m: Math.floor(seconds / 60), s: seconds % 60 })
   const millis = rounded % 1000
-  return millis > 0 ? `${seconds}秒${millis}ms` : `${seconds}秒`
+  return millis > 0 ? t('{s}秒{ms}ms', { s: seconds, ms: millis }) : t('{n}秒', { n: seconds })
 }
 
 /** 首响：没有值（null / 0 / 旧数据）显示「-」，不走 fmtDuration 避免假 0ms */
@@ -224,15 +227,16 @@ function fmtFirstResponse(ms: unknown): string {
   return fmtDuration(value)
 }
 
-/** 令牌读数：精确值 + 千分位（与列表 formatTokens 同源；0 就显示 0） */
+/** 令牌读数：量级词与分档交给 units.js 的 formatTokens（与列表 / 报表页同一口径，
+ *  中文「万 / 亿」与英文「k / M」的切换在那边一处）；桥不在位时退回精确千分位 */
 function fmtTokens(value: unknown): string {
-  return (Number(value) || 0).toLocaleString('zh-CN')
+  return shared().wbUnits?.formatTokens?.(value) ?? (Number(value) || 0).toLocaleString('zh-CN')
 }
 
 /** 进行中行的「已用时」：取整秒，不足 1 秒也显示 1 秒（列表同款） */
 function fmtElapsed(ts: RequestRow['ts']): string {
   const elapsed = Math.max(0, Date.now() - (Number(ts) || 0))
-  return `${Math.max(1, Math.floor(elapsed / 1000))}秒`
+  return t('{n}秒', { n: Math.max(1, Math.floor(elapsed / 1000)) })
 }
 
 /** 成功口径与后端 RequestEntry::is_success 对齐：2xx 且没有错误摘要 */
@@ -271,11 +275,11 @@ function errorMessage(error: unknown): string {
 
 /** 调试报文的四段（顺序即阅读顺序：请求 → 响应，头 → 体；键名是后端契约） */
 const DEBUG_SEGS: readonly { label: string; pick: (data: DebugTraffic) => string }[] = [
-  { label: '请求头', pick: data => jsonText(data.requestHeaders) },
-  { label: '请求体', pick: data => jsonText(data.requestBody) },
-  { label: '响应头', pick: data => jsonText(data.responseHeaders) },
+  { label: t('请求头'), pick: data => jsonText(data.requestHeaders) },
+  { label: t('请求体'), pick: data => jsonText(data.requestBody) },
+  { label: t('响应头'), pick: data => jsonText(data.responseHeaders) },
   // 响应体是原始文本（SSE），不是 JSON —— 不经过 jsonText 的序列化
-  { label: '响应体', pick: data => (data.responseBody ? String(data.responseBody) : '') },
+  { label: t('响应体'), pick: data => (data.responseBody ? String(data.responseBody) : '') },
 ]
 /* ─── 小零件 ─────────────────────────────────── */
 
@@ -319,9 +323,9 @@ function StatusCell({ row }: { row: RequestRow }) {
     // .req-live-dot（1.2s 脉动 + reduced-motion 降级），组件库的 BadgeDot 是静态圆点
     if (!phase?.badgeHtml) {
       return (
-        <Badge variant='info' shape='tag' title='请求正在转发中，用时列显示的是已用时'>
+        <Badge variant='info' shape='tag' title={t('请求正在转发中，用时列显示的是已用时')}>
           <BadgeDot className='req-live-dot' />
-          进行中
+          {t('进行中')}
         </Badge>
       )
     }
@@ -340,10 +344,10 @@ function StatusCell({ row }: { row: RequestRow }) {
   const status = Number(row.status) || 0
   const ok = isOk(row)
   // 2xx 却带错误摘要（流式请求在响应体阶段失败）单看数字会以为成功，给 title 说明
-  const title = !ok && status >= 200 && status < 300 ? `HTTP ${status}，但响应体阶段出错` : ''
+  const title = !ok && status >= 200 && status < 300 ? t('HTTP {status}，但响应体阶段出错', { status }) : ''
   return (
     <Badge variant={ok ? 'success' : 'destructive'} shape='tag' title={title || undefined}>
-      {status || '失败'}
+      {status || t('失败')}
     </Badge>
   )
 }
@@ -367,8 +371,8 @@ function ModelCell({ row }: { row: RequestRow }) {
   const downText = tag(client, clientLevel)
   return (
     <span className='flex flex-col gap-0.5'>
-      <span title={`转发到上游的模型：${upText}`}>⬆️ {upText}</span>
-      <span className='text-muted-foreground' title={`下游请求的模型：${downText}`}>⬇️ {downText}</span>
+      <span title={t('转发到上游的模型：{model}', { model: upText })}>⬆️ {upText}</span>
+      <span className='text-muted-foreground' title={t('下游请求的模型：{model}', { model: downText })}>⬇️ {downText}</span>
     </span>
   )
 }
@@ -379,10 +383,13 @@ function attemptResult(item: AttemptDetail): React.ReactNode {
   const hasStatus = item?.status !== null && item?.status !== undefined && Number.isFinite(status)
   const error = item?.error ? String(item.error) : ''
   if (error) {
-    return <span className='break-words text-destructive'>失败{hasStatus ? `（${String(status)}）` : ''}：{error}</span>
+    const text = hasStatus
+      ? t('失败（{status}）：{error}', { status: String(status), error })
+      : t('失败：{error}', { error })
+    return <span className='break-words text-destructive'>{text}</span>
   }
-  if (hasStatus) return <span className='text-success'>成功（{String(status)}）</span>
-  return <span className='text-muted-foreground'>无结果记录</span>
+  if (hasStatus) return <span className='text-success'>{t('成功（{status}）', { status: String(status) })}</span>
+  return <span className='text-muted-foreground'>{t('无结果记录')}</span>
 }
 
 /**
@@ -398,7 +405,7 @@ function AttemptsTable({ row }: { row: RequestRow }) {
     <Table className='text-[11.5px]'>
       <TableHeader>
         <TableRow className={NO_HOVER}>
-          {['轮次', '提供商', '账号', '结果', '体积', '内部重试', '提示'].map(label => (
+          {[t('轮次'), t('提供商'), t('账号'), t('结果'), t('体积'), t('内部重试'), t('提示')].map(label => (
             <TableHead key={label} className={ATTEMPT_HEAD}>{label}</TableHead>
           ))}
         </TableRow>
@@ -409,9 +416,11 @@ function AttemptsTable({ row }: { row: RequestRow }) {
           const retryTitle = retries.map(retry => {
             const delayMs = Number(retry?.delayMs)
             const delay = Number.isFinite(delayMs) && delayMs > 0
-              ? `，${delayMs >= 1000 ? `${Math.round(delayMs / 1000)}秒` : `${Math.round(delayMs)}毫秒`}后重试`
+              ? (delayMs >= 1000
+                  ? t('，{n}秒后重试', { n: Math.round(delayMs / 1000) })
+                  : t('，{n}毫秒后重试', { n: Math.round(delayMs) }))
               : ''
-            return `${String(retry?.reason || '未知原因')}${delay}`
+            return `${String(retry?.reason || t('未知原因'))}${delay}`
           }).join('\n')
           const notice = String(item?.notice ?? '').trim()
           // 体积：上游那两道墙都按请求体字节判（413 / PARSE_REQUEST_DATA_EXCEPTION），
@@ -425,13 +434,13 @@ function AttemptsTable({ row }: { row: RequestRow }) {
                 : `${bodyRaw} B`
             : '—'
           const bodyTitle = Number.isFinite(bodyRaw) && bodyRaw > 0
-            ? `实际发给上游 ${bodyRaw.toLocaleString()} 字节`
+            ? t('实际发给上游 {bytes} 字节', { bytes: bodyRaw.toLocaleString() })
             : undefined
           return (
             <TableRow key={index} className={NO_HOVER}>
               <TableCell className={ATTEMPT_CELL}>{index + 1}</TableCell>
               <TableCell className={ATTEMPT_CELL}>
-                {providerName(item) || (item?.provider ? String(item.provider) : '未知')}
+                {providerName(item) || (item?.provider ? String(item.provider) : t('未知'))}
               </TableCell>
               <TableCell className={ATTEMPT_CELL}>{item?.account ? String(item.account) : '—'}</TableCell>
               <TableCell className={ATTEMPT_CELL}>{attemptResult(item)}</TableCell>
@@ -439,7 +448,7 @@ function AttemptsTable({ row }: { row: RequestRow }) {
                 {bodyText}
               </TableCell>
               <TableCell className={`${ATTEMPT_CELL} whitespace-nowrap`} title={retryTitle || undefined}>
-                {retries.length ? `↻ ${retries.length} 次` : '-'}
+                {retries.length ? t('↻ {n} 次', { n: retries.length }) : '-'}
               </TableCell>
               <TableCell className={ATTEMPT_CELL}>{notice || '—'}</TableCell>
             </TableRow>
@@ -448,7 +457,9 @@ function AttemptsTable({ row }: { row: RequestRow }) {
         {details.length < attempts ? (
           <TableRow className={NO_HOVER}>
             <TableCell colSpan={7} className={`${ATTEMPT_CELL} text-muted-foreground`}>
-              另有 {attempts - details.length} 次尝试未记录明细（只保留最早的 {details.length} 条）
+              {t('另有 {missing} 次尝试未记录明细（只保留最早的 {kept} 条）', {
+                missing: attempts - details.length, kept: details.length,
+              })}
             </TableCell>
           </TableRow>
         ) : null}
@@ -461,50 +472,56 @@ function AttemptsTable({ row }: { row: RequestRow }) {
 function DetailPane({ row }: { row: RequestRow | null }) {
   // 列表在点开前恰好刷新过：行对象按 id 反查不到。详情标签只吃 row，
   // 没有可显示的数据 —— 说清原因让用户关掉重开，比一片空字段诚实
-  if (!row) return <Empty text='列表数据已刷新，请重试（关闭后重新打开这条详情）' />
+  if (!row) return <Empty text={t('列表数据已刷新，请重试（关闭后重新打开这条详情）')} />
   const account = String(row.accountName ?? '').trim()
   return (
     // 值列基色打在 table 上靠继承（继承永远输给元素上的直接声明），格内的错误红 / 成功绿不会被压住
     <Table className='text-[12.5px] text-subtle [&_tr:last-child>td]:border-b-0 [&_tr:last-child>th]:border-b-0'>
       <TableBody>
-        <Field label='时间'>{fmtTime(row.ts)}</Field>
-        <Field label='状态'><StatusCell row={row} /></Field>
-        <Field label='耗时'>
+        <Field label={t('时间')}>{fmtTime(row.ts)}</Field>
+        <Field label={t('状态')}><StatusCell row={row} /></Field>
+        <Field label={t('耗时')}>
           {/* 进行中显示已用时：首响还没发生，不写假数字（与列表同款） */}
           {isRunning(row) ? (
             <>
               {fmtElapsed(row.ts)}
-              <span className='text-[11.5px] text-muted-foreground'>（请求仍在转发中）</span>
+              <span className='text-[11.5px] text-muted-foreground'>{t('（请求仍在转发中）')}</span>
             </>
           ) : (
-            <>{fmtDuration(row.durationMs)} / 首帧 {fmtFirstResponse(row.firstResponseMs)}</>
+            <>{t('{duration} / 首帧 {first}', {
+              duration: fmtDuration(row.durationMs), first: fmtFirstResponse(row.firstResponseMs),
+            })}</>
           )}
         </Field>
-        <Field label='重试次数'>{String(Number(row.attempts) || 1)}</Field>
-        <Field label='模型'><ModelCell row={row} /></Field>
-        <Field label='提供商'>
+        <Field label={t('重试次数')}>{String(Number(row.attempts) || 1)}</Field>
+        <Field label={t('模型')}><ModelCell row={row} /></Field>
+        <Field label={t('提供商')}>
           {providerName(row) || '—'}
-          {account ? <span className='text-[11.5px] text-muted-foreground'>（账号：{account}）</span> : null}
+          {account ? <span className='text-[11.5px] text-muted-foreground'>{t('（账号：{account}）', { account })}</span> : null}
         </Field>
-        <Field label='令牌'>
-          输入 {fmtTokens(row.promptTokens)} · 输出 {fmtTokens(row.completionTokens)} · 总计{' '}
-          {fmtTokens(row.totalTokens)} · 缓存读 {fmtTokens(row.cacheReadTokens)}
+        <Field label={t('令牌')}>
+          {t('输入 {input} · 输出 {output} · 总计 {total} · 缓存读 {cache}', {
+            input: fmtTokens(row.promptTokens),
+            output: fmtTokens(row.completionTokens),
+            total: fmtTokens(row.totalTokens),
+            cache: fmtTokens(row.cacheReadTokens),
+          })}
         </Field>
         {/* 测试发起的请求**按需多一行**：它是这一条明细的性质（走的是真实转发链路、但不进报表），
             正常转发的行不必为此多读一行「正常转发」 —— 那种字段每个租户都有时等于没有 */}
         {row.isTest ? (
-          <Field label='来源'>
+          <Field label={t('来源')}>
             <Badge variant='brand' shape='tag'
-              title='模型管理页操作列那颗「测试」发起的请求：与真实请求同一条转发链路，但不计入报表统计'>
-              模型测试
+              title={t('模型管理页操作列那颗「测试」发起的请求：与真实请求同一条转发链路，但不计入报表统计')}>
+              {t('模型测试')}
             </Badge>
           </Field>
         ) : null}
-        <Field label='错误'>
+        <Field label={t('错误')}>
           {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}
         </Field>
-        <Field label='尝试明细'><AttemptsTable row={row} /></Field>
-        <Field label='敏感词'>
+        <Field label={t('尝试明细')}><AttemptsTable row={row} /></Field>
+        <Field label={t('敏感词')}>
           {/* 命中标签（与列表「敏」标签同一套紫，这里展开写词与次数） */}
           {Array.isArray(row.sensitiveHits) && row.sensitiveHits.length ? (
             <span className='inline-flex flex-wrap gap-1.5'>
@@ -528,18 +545,18 @@ function DetailPane({ row }: { row: RequestRow | null }) {
  * 结果（内部自带各层降级）。
  */
 function PreviewPane({ state }: { state: RawState }) {
-  if (!state) return <Empty text='正在读取…' loading />
+  if (!state) return <Empty text={t('正在读取…')} loading />
   const body = state === 'gone' ? null : state.body
   // 气泡 HTML 由 conversation-preview.js 产出（纯函数，内部已对原文转义），
   // 这里原样注入 —— 迁移只换外壳，不重写渲染
   const html = body
     ? shared().wbConversationPreview?.render?.(body.requestBody, body.responseBody) || ''
     : ''
-  if (!html) return <Empty text='无报文原文（可能已被清理或超出保留范围）' />
+  if (!html) return <Empty text={t('无报文原文（可能已被清理或超出保留范围）')} />
   return (
     <div>
       {state !== 'gone' && state.truncated ? (
-        <div className='mb-2 text-[11.5px] text-warning'>正文超过单条上限，可能已被截断</div>
+        <div className='mb-2 text-[11.5px] text-warning'>{t('正文超过单条上限，可能已被截断')}</div>
       ) : null}
       <div dangerouslySetInnerHTML={{ __html: html }} />
     </div>
@@ -556,8 +573,8 @@ function RawPane({ data }: { data: DebugTraffic }) {
   const status = data.status === null || data.status === undefined ? '-' : String(data.status)
   const meta = [
     data.url ? `URL: ${data.url}` : '',
-    data.provider ? `提供商: ${data.provider}` : '',
-    `上游状态码: ${status}`,
+    data.provider ? t('提供商: {provider}', { provider: String(data.provider) }) : '',
+    t('上游状态码: {status}', { status }),
   ].filter(Boolean)
   return (
     <div className='flex flex-col gap-4'>
@@ -576,7 +593,7 @@ function RawPane({ data }: { data: DebugTraffic }) {
                 {text}
               </pre>
             ) : (
-              <Empty text='这条请求没有保存这一段报文' />
+              <Empty text={t('这条请求没有保存这一段报文')} />
             )}
           </div>
         )
@@ -642,13 +659,13 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
       }
       setDebug({ data })
       setHint(data.truncated
-        ? '报文超过单条上限，请求体 / 响应体已按上限截断'
-        : '内容按原样保存，请求头中的凭据字段已替换为 [redacted]')
+        ? t('报文超过单条上限，请求体 / 响应体已按上限截断')
+        : t('内容按原样保存，请求头中的凭据字段已替换为 [redacted]'))
     } catch (error) {
       if (isStale()) return
       setDebug('gone')
       // 调试模式没开是最常见的原因（后端 404 的文案已说明），底栏 hint 提一句
-      setHint('在设置 → 通用里开启「调试模式」后，新发生的请求才会保存报文')
+      setHint(t('在设置 → 通用里开启「调试模式」后，新发生的请求才会保存报文'))
       console.warn('读取调试报文失败（原始报文标签隐藏）:', errorMessage(error))
     }
   }
@@ -695,9 +712,9 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
     if (!ask) return
     // 危险操作走自绘确认弹窗（原生 confirm 在 Tauri WebView 里不弹窗，见 app.js）
     const ok = await ask({
-      title: '终止请求',
-      html: '确定终止这条正在转发的请求？<br>上游连接会立即断开，明细将记为「请求已被手动终止」。',
-      okText: '终止',
+      title: t('终止请求'),
+      html: t('确定终止这条正在转发的请求？<br>上游连接会立即断开，明细将记为「请求已被手动终止」。'),
+      okText: t('终止'),
       okClass: 'danger',
     })
     if (!ok) return
@@ -708,11 +725,11 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
       await api().terminateStatsRequest(id)
       if (!aliveRef.current) return
       setTerminate('accepted')
-      setHint('已受理终止：上游连接已断开，列表稍后刷新为「请求已被手动终止」')
+      setHint(t('已受理终止：上游连接已断开，列表稍后刷新为「请求已被手动终止」'))
     } catch (error) {
       if (!aliveRef.current) return
       setTerminate('idle')
-      setHint(`终止失败：${errorMessage(error)}`)
+      setHint(t('终止失败：{error}', { error: errorMessage(error) }))
     }
   }
 
@@ -729,11 +746,11 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
       {/* 旧实现是 .modal-wide（min(920px, 100%)），这里覆盖 DialogContent 的默认宽度 */}
       <DialogContent className='w-[min(920px,calc(100vw-48px))]'>
         <DialogHeader>
-          <DialogTitle>请求详情</DialogTitle>
+          <DialogTitle>{t('请求详情')}</DialogTitle>
         </DialogHeader>
         <DialogBody ref={bodyRef} className='gap-3'>
           <SegmentedControl options={tabOptions} value={active} onValueChange={switchTab}
-            aria-label='详情内容' className='self-start' />
+            aria-label={t('详情内容')} className='self-start' />
           {/* 三个 pane 常驻（用 hidden 切显示，不卸载）：切换标签时 pane 的 DOM 与展开态
               原样保留，滚动位置由上面的 layout effect 还原。pane 不标 role="tabpanel" ——
               分段控件是 radiogroup 语义（不是 tablist），孤立的 tabpanel 是残缺结构 */}
@@ -751,11 +768,11 @@ function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
           {/* 终止只在行仍进行中时出现（旧实现用 hidden 切，这里条件渲染） */}
           {isRunning(row) ? (
             <Button variant='destructive' disabled={terminate !== 'idle'}
-              onClick={() => { void handleTerminate() }} title='断开上游连接，明细记为「请求已被手动终止」'>
-              终止请求
+              onClick={() => { void handleTerminate() }} title={t('断开上游连接，明细记为「请求已被手动终止」')}>
+              {t('终止请求')}
             </Button>
           ) : null}
-          <Button variant='outline' onClick={onClose}>关闭</Button>
+          <Button variant='outline' onClick={onClose}>{t('关闭')}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

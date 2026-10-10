@@ -16,6 +16,7 @@
  * 例外是弹性列（FLEX_COLUMNS）：它**不写宽度**，吃表格的剩余宽度。
  */
 
+import { t } from '../i18n'
 import type { Align } from './accounts-shared'
 
 /** 列定义项（表头文案 / 小注 / 悬停说明 / 默认对齐 / 旧版默认对齐） */
@@ -51,35 +52,35 @@ export type AccountColumn = {
  * 到一条中轴，比左对齐更好扫读）。legacyAlign 只写在「上一版默认与新版不同」的列上。
  */
 export const ACCOUNT_COLUMNS: AccountColumn[] = [
-  { key: 'pick', label: '选择', align: 'center', legacyAlign: 'left' },
+  { key: 'pick', label: t('选择'), align: 'center', legacyAlign: 'left' },
   {
-    key: 'priority', label: '优先级', hint: '全局队列',
-    title: '全局一条队列：数值越小越先用，不分提供商',
+    key: 'priority', label: t('优先级'), hint: t('全局队列'),
+    title: t('全局一条队列：数值越小越先用，不分提供商'),
     align: 'center', legacyAlign: 'left',
   },
-  { key: 'provider', label: '提供商', align: 'center', legacyAlign: 'left' },
-  { key: 'account', label: '账号', align: 'center', legacyAlign: 'left' },
+  { key: 'provider', label: t('提供商'), align: 'center', legacyAlign: 'left' },
+  { key: 'account', label: t('账号'), align: 'center', legacyAlign: 'left' },
   {
-    key: 'proxy', label: '代理',
-    title: '该账号出网走的代理（Clash 出口 / 自定义 / 直连）；点击可修改',
+    key: 'proxy', label: t('代理'),
+    title: t('该账号出网走的代理（Clash 出口 / 自定义 / 直连）；点击可修改'),
     align: 'center',
   },
   {
-    key: 'connections', label: '连接数',
-    title: '此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示',
+    key: 'connections', label: t('连接数'),
+    title: t('此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示'),
     align: 'center',
   },
-  { key: 'status', label: '状态', align: 'center', legacyAlign: 'left' },
+  { key: 'status', label: t('状态'), align: 'center', legacyAlign: 'left' },
   {
-    key: 'limits', label: '限流', hint: '按模型',
-    title: '该账号当前限流中的模型；点徽章看明细',
+    key: 'limits', label: t('限流'), hint: t('按模型'),
+    title: t('该账号当前限流中的模型；点徽章看明细'),
     align: 'center', legacyAlign: 'left',
   },
-  { key: 'expiry', label: '有效期', align: 'center', legacyAlign: 'left' },
+  { key: 'expiry', label: t('有效期'), align: 'center', legacyAlign: 'left' },
   // 「余额」列只放读数（查询按钮在操作列）：一个只显示余额数字的列叫「余额 / 积分」
   // 会让人以为这里还能点。而「余额」这个词也容得下各家的不同叫法（积分 / 余额）
-  { key: 'usage', label: '余额', align: 'center', legacyAlign: 'left' },
-  { key: 'actions', label: '操作', align: 'right' },
+  { key: 'usage', label: t('余额'), align: 'center', legacyAlign: 'left' },
+  { key: 'actions', label: t('操作'), align: 'right' },
 ]
 
 /** 优先级号段（与后端 priority.rs 的 MIN/MAX/DEFAULT 逐字一致） */

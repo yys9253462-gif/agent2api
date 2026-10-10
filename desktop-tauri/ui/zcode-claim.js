@@ -47,15 +47,15 @@
   const describeError = error => {
     if (error instanceof Error && error.message) return error.message;
     const text = String(error ?? '').trim();
-    return text || '未知错误';
+    return text || wbI18n.t('未知错误');
   };
 
   /** 权益的周期 → 给人看的一小段（每日额度与一次性活动额度要能分开） */
   function describePeriod(period) {
     const value = String(period || '').trim().toLowerCase();
-    if (value === 'daily') return '每日';
-    if (value === 'monthly') return '每月';
-    if (value === 'weekly') return '每周';
+    if (value === 'daily') return wbI18n.t('每日');
+    if (value === 'monthly') return wbI18n.t('每月');
+    if (value === 'weekly') return wbI18n.t('每周');
     return '';
   }
 
@@ -73,7 +73,7 @@
         return `${escapeHtml(item.showName || '')}${quota}${period ? `（${period}）` : ''}`;
       })
       .filter(Boolean);
-    return `<b>${escapeHtml(plan.name || plan.planId || '套餐')}</b>${mark || ''}`
+    return `<b>${escapeHtml(plan.name || plan.planId || wbI18n.t('套餐'))}</b>${mark || ''}`
       + (window_ ? `（${escapeHtml(window_)}）` : '')
       + (grants.length ? `<br><span class="muted">${grants.join(' · ')}</span>` : '')
       + (plan.description ? `<br><span class="muted">${escapeHtml(plan.description)}</span>` : '');
@@ -96,7 +96,7 @@
    * 外面的 change 监听按它认这一次选择。
    */
   function describePlanOption(plan, checked, claimedToday) {
-    const mark = claimedToday ? ' <span class="zcode-claim-taken">（今日已领）</span>' : '';
+    const mark = claimedToday ? ' ' + wbI18n.t('<span class="zcode-claim-taken">（今日已领）</span>') : '';
     return `<li><label class="zcode-claim-option${claimedToday ? ' taken' : ''}">`
       + `<input type="radio" name="zcode-claim-plan" value="${escapeHtml(plan.planId || '')}"`
       + `${checked ? ' checked' : ''}${claimedToday ? ' disabled' : ''}>`
@@ -104,10 +104,16 @@
       + '</label></li>';
   }
 
-  /** 额度 → 紧凑串（`100000000` → `1亿`）：活动发的就是这种 9 位数，原样显示读不动 */
+  /**
+   * 额度 → 紧凑串（`100000000` → `1亿`）：活动发的就是这种 9 位数，原样显示读不动。
+   * 量级词优先走 units.js 的共享实现（按界面语言给万/亿、万/億、만/억、k/M，并跟随
+   * 设置页的中文口径开关）；它没就位时回落到下面这份紧凑除法 + 亿/万 后缀。
+   */
   function formatUnits(value) {
     const number = Number(value);
     if (!Number.isFinite(number)) return String(value ?? '');
+    const shared = window.wbUnits?.formatTokens;
+    if (typeof shared === 'function') return shared(number);
     const compact = (scaled, suffix) => {
       const text = scaled.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
       return `${text}${suffix}`;
@@ -149,11 +155,11 @@
     const api = bridge();
     const accountId = String(account?.id || '');
     if (!accountId) {
-      window.wbApp.toast('账号信息不完整，请刷新后重试', 'warn');
+      window.wbApp.toast(wbI18n.t('账号信息不完整，请刷新后重试'), 'warn');
       return null;
     }
     if (!api?.zcodeClaimPreview || !api?.zcodeClaim) {
-      window.wbApp.toast('当前环境不支持领取（桥接方法缺失）', 'warn');
+      window.wbApp.toast(wbI18n.t('当前环境不支持领取（桥接方法缺失）'), 'warn');
       return null;
     }
 
@@ -162,17 +168,17 @@
     try {
       preview = await api.zcodeClaimPreview(accountId);
     } catch (error) {
-      window.wbApp.toast(`探测套餐失败：${describeError(error)}`, 'warn');
+      window.wbApp.toast(wbI18n.t('探测套餐失败：{message}', { message: describeError(error) }), 'warn');
       return null;
     }
     if (!preview?.deployed) {
       // 上游活动接口还没部署 —— 活动开抢前的**正常**状态，不是错误
-      window.wbApp.toast('当前没有可领取的套餐（活动尚未开始）');
+      window.wbApp.toast(wbI18n.t('当前没有可领取的套餐（活动尚未开始）'));
       return null;
     }
     const plans = Array.isArray(preview.plans) ? preview.plans : [];
     if (plans.length === 0) {
-      window.wbApp.toast('当前没有可领取的套餐');
+      window.wbApp.toast(wbI18n.t('当前没有可领取的套餐'));
       return null;
     }
 
@@ -189,7 +195,7 @@
     const selectable = options.filter(item => !item.claimed);
     if (selectable.length === 0) {
       // 全领过了：不弹窗、不报错（这是正常状态，不是失败）
-      window.wbApp.toast('今天这些套餐都已领取过；活动按自然日发新套餐，明天可再领');
+      window.wbApp.toast(wbI18n.t('今天这些套餐都已领取过；活动按自然日发新套餐，明天可再领'));
       return null;
     }
     // 默认目标：可领的那几份里优先级最高的那个（后端在 planId 为空时也是这个口径）
@@ -214,21 +220,25 @@
     if (pickable) document.addEventListener('change', rememberPick, true);
 
     const claimedNote = options.some(item => item.claimed)
-      ? '<p class="muted">标「今日已领」的那几份今天已经领过了，可以改选其他还没领的。</p>'
+      ? wbI18n.t('<p class="muted">标「今日已领」的那几份今天已经领过了，可以改选其他还没领的。</p>')
       : '';
     let ok;
     try {
       ok = await window.wbConfirm?.ask?.({
-        title: '领取 ZCode 限时套餐',
-        html: `账号：<b>${escapeHtml(account.name || accountId)}</b><br>`
+        title: wbI18n.t('领取 ZCode 限时套餐'),
+        html: wbI18n.t('账号：<b>{name}</b><br>', {
+          name: escapeHtml(account.name || accountId),
+        })
           + (pickable
-            ? `选择要领取的套餐：<ul class="zcode-claim-plans pickable">${
+            ? wbI18n.t('选择要领取的套餐：') + `<ul class="zcode-claim-plans pickable">${
               options.map(item => describePlanOption(item.plan, item.plan === target, item.claimed)).join('')}</ul>`
-            : `可领取的套餐：<ul class="zcode-claim-plans">${options.map(item => describePlan(item.plan)).join('')}</ul>`)
+            : wbI18n.t('可领取的套餐：') + `<ul class="zcode-claim-plans">${options.map(item => describePlan(item.plan)).join('')}</ul>`)
           + claimedNote
-          + '<p class="muted">官方要求一次人机验证（滑块），完成后即可领取。'
-          + '活动期内每天发一份新套餐，同一份当天重复领取会提示「已领取过」，次日可再领。</p>',
-        okText: pickable ? '领取所选套餐' : `领取「${escapeHtml(target.name || target.planId || '套餐')}」`,
+          + wbI18n.t('<p class="muted">官方要求一次人机验证（滑块），完成后即可领取。'
+            + '活动期内每天发一份新套餐，同一份当天重复领取会提示「已领取过」，次日可再领。</p>'),
+        okText: pickable ? wbI18n.t('领取所选套餐') : wbI18n.t('领取「{name}」', {
+          name: escapeHtml(target.name || target.planId || wbI18n.t('套餐')),
+        }),
       });
     } finally {
       if (pickable) document.removeEventListener('change', rememberPick, true);
@@ -248,7 +258,7 @@
     } catch (error) {
       // 取配置失败不等于不能领：按「不需要验证码」试一次，上游要的话会回
       // 3007，那时再如实告诉用户「验证码校验未通过」
-      window.wbApp.toast(`获取风控配置失败，将直接尝试领取：${describeError(error)}`, 'warn');
+      window.wbApp.toast(wbI18n.t('获取风控配置失败，将直接尝试领取：{message}', { message: describeError(error) }), 'warn');
     }
 
     const callClaim = captchaVerifyParam => api.zcodeClaim(
@@ -263,7 +273,7 @@
       try {
         return reportOutcome(await callClaim(''));
       } catch (error) {
-        window.wbApp.toast(`领取失败：${describeError(error)}`, 'warn');
+        window.wbApp.toast(wbI18n.t('领取失败：{message}', { message: describeError(error) }), 'warn');
         return null;
       }
     }
@@ -275,7 +285,7 @@
     // 的问题（见 aliyun-captcha.js 里 solve 的说明）。
     const captcha = window.wbAliyunCaptcha;
     if (!captcha) {
-      window.wbApp.toast('验证码组件未加载，请重启应用后重试', 'warn');
+      window.wbApp.toast(wbI18n.t('验证码组件未加载，请重启应用后重试'), 'warn');
       return null;
     }
 
@@ -296,10 +306,10 @@
     } catch (error) {
       // 用户主动取消验证码不算失败（与 AutoClaw 登录那边同一处置）
       if (error instanceof captcha.CaptchaCancelledError) {
-        window.wbApp.toast('已取消领取');
+        window.wbApp.toast(wbI18n.t('已取消领取'));
         return null;
       }
-      window.wbApp.toast(`领取失败：${describeError(error)}`, 'warn');
+      window.wbApp.toast(wbI18n.t('领取失败：{message}', { message: describeError(error) }), 'warn');
       return null;
     }
     return reportOutcome(outcome?.result);
@@ -319,18 +329,21 @@
         .filter(Boolean)
         .join(' → ');
       window.wbApp.toast(
-        `✅ 领取成功：${result.planId || ''}${window_ ? `（${window_}）` : ''}`,
+        wbI18n.t('✅ 领取成功：{planId}{period}', {
+          planId: result.planId || '',
+          period: window_ ? `（${window_}）` : '',
+        }),
       );
       // 领到的额度**不在**默认那条转发通道上（编码套餐走开放平台、活动套餐走
       // 官方活动端点），所以顺手说一句去哪儿切 —— 否则用户领完直接发请求，会
       // 拿到「套餐已到期」而完全不知道这回事（见 providers::zcode::plan）
       window.wbApp.toast(
-        '这份额度走「活动套餐」通道：若转发时提示编码套餐已到期，'
-        + '在账号设置里把「使用套餐」切到活动套餐即可',
+        wbI18n.t('这份额度走「活动套餐」通道：若转发时提示编码套餐已到期，'
+          + '在账号设置里把「使用套餐」切到活动套餐即可'),
       );
       return result;
     }
-    const label = result?.failureLabel || '未领取成功';
+    const label = result?.failureLabel || wbI18n.t('未领取成功');
     window.wbApp.toast(`${label}${result?.message ? `：${result.message}` : ''}`, 'warn');
     return result;
   }

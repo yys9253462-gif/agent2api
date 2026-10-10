@@ -1,5 +1,5 @@
 /* Agent2API · 自定义标题栏（桌面端） */
-/* global workbuddyDesktop, wbIcons */
+/* global workbuddyDesktop, wbIcons, wbI18n */
 
 /**
  * 主窗口去掉系统装饰后的自绘标题条（src-tauri 建窗处 decorations(false)）。
@@ -70,7 +70,7 @@
   // 左侧品牌区（图标复用 icons.js 的 brand，与侧栏品牌区 / 应用图标同一造型）。
   // 文案取自桥接层注入的 title —— 与窗口标题、托盘提示同一份（开发版带
   // "Dev" 标记，两个实例同时跑时一眼能分清）；旧壳没注入时回落到发布版文案。
-  const appTitle = bridge.title || 'Agent2API · 多提供商本地网关';
+  const appTitle = bridge.title || wbI18n.t('Agent2API · 多提供商本地网关');
   const brand = document.createElement('div');
   brand.className = 'titlebar-brand';
   brand.innerHTML =
@@ -92,10 +92,10 @@
     btn.setAttribute('aria-label', label);
     return btn;
   };
-  const minBtn = makeBtn('min', '最小化');
+  const minBtn = makeBtn('min', wbI18n.t('最小化'));
   minBtn.innerHTML = ICONS.minimize;
-  const maxBtn = makeBtn('max', '最大化');
-  const closeBtn = makeBtn('close', '关闭');
+  const maxBtn = makeBtn('max', wbI18n.t('最大化'));
+  const closeBtn = makeBtn('close', wbI18n.t('关闭'));
   closeBtn.innerHTML = ICONS.close;
   actions.append(minBtn, maxBtn, closeBtn);
   bar.appendChild(actions);
@@ -109,7 +109,7 @@
   const paintMax = () => {
     maxBtn.innerHTML = maximized ? ICONS.restore : ICONS.maximize;
     maxBtn.classList.toggle('is-maximized', maximized);
-    maxBtn.title = maximized ? '还原' : '最大化';
+    maxBtn.title = maximized ? wbI18n.t('还原') : wbI18n.t('最大化');
     maxBtn.setAttribute('aria-label', maxBtn.title);
   };
 

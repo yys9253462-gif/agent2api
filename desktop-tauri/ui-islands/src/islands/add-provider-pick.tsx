@@ -17,8 +17,9 @@ import { accountCountOf, shared } from './add-account-bridge'
 import type { CustomProviderRecord } from './add-account-bridge'
 import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
 import { ADD_SEG_CLASS } from './add-provider-blocks'
+import { t } from '../i18n'
 
-/** 第 1 步的账号类型：Agent（内置八家）/ 预置 API / 自定义 / 导入 */
+/** 第 1 步的账号类型：Agent（内置家）/ 预置 API / 自定义 / 导入 */
 export type AccountType = 'proxy' | 'preset' | 'custom' | 'import'
 
 export const TYPE_PROXY: AccountType = 'proxy'
@@ -50,13 +51,15 @@ export function typeValueOf(value: string): AccountType {
 
 /**
  * 内置家的真实图标：`id → assets/providers/<file>.png`，图取自各客户端安装目录
- * 内嵌的图标（与系统里显示的为同一张；AutoClaw 国内 / 国际版、Cline 两种账号、
- * Accio / ZCode 两地各自共用一张 —— 它们本来就是同一个客户端）。
+ * 内嵌的图标（与系统里显示的为同一张；AutoClaw / WorkBuddy 各自两地、Cline 两种
+ * 账号、Accio / ZCode 两地共用一张 —— 它们本来就是同一个客户端）。
  * 自定义家与没收录图标的家回落到首字母徽章。
- * 导出共用：签到中心的提供商行用同一份映射（checkin-page.tsx），别处不要照抄。
+ * 导出共用：账号表的提供商徽章（accounts-panels 的 ProviderCell）、模型管理页
+ * （models-page）与签到中心的提供商行（checkin-page）用同一份映射，别处不要照抄。
  */
 export const PROVIDER_ICONS: Record<string, string> = {
   workbuddy: 'assets/providers/workbuddy.png',
+  'workbuddy-intl': 'assets/providers/workbuddy.png',
   raccoon: 'assets/providers/raccoon.png',
   catpaw: 'assets/providers/catpaw.png',
   autoclaw: 'assets/providers/autoclaw.png',
@@ -78,7 +81,25 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // KukuAI：取自客户端 `GenFlowPro.exe` 的 RT_ICON 资源（256×256 那张，
   // 与系统里显示的应用图标为同一张）
   kuku: 'assets/providers/kuku.png',
+  // MonkeyCode：取自客户端 asar 内嵌的应用图标（`electron/icon.png`，与系统里
+  // 显示的应用图标为同一张；国内 / 国际版共用这一张，同 AutoClaw 的形态）
+  monkeycode: 'assets/providers/monkeycode.png',
+  'monkeycode-intl': 'assets/providers/monkeycode.png',
+  // Command Code / Antigravity：这两家没有可解的本地安装包，图取自官方资产 ——
+  // Command Code 用官网 `apple-touch-icon.png`（黑底 + 白结的应用图标形态；官方
+  // brand 页那种「白描边框 + 满幅黑底」的变体在 13px 徽章里会糊），Antigravity
+  // 用官方 press 页的「Icon - Full Color」（antigravity.google/press）
+  commandcode: 'assets/providers/commandcode.png',
+  antigravity: 'assets/providers/antigravity.png',
 }
+
+/**
+ * 新接入、尚在观察期的家：添加账号页的卡片名字后跟一枚 `(beta)`（由
+ * `ProviderCard` 渲染）。它只是**入口页的提示**，不是家本身的属性 ——
+ * 账号表徽章、模型管理页都不跟着变；判据是「转发通道刚上线」，
+ * 观察期结束后从这张表里删掉即可。
+ */
+const BETA_PROVIDERS = new Set(['monkeycode', 'monkeycode-intl', 'commandcode', 'antigravity'])
 
 type CardItem = {
   id: string
@@ -86,11 +107,12 @@ type CardItem = {
   count: number
   preset?: boolean
   custom?: boolean
+  beta?: boolean
 }
 
 /**
  * 第 1 步的卡片列表数据，按账号类型分三段：
- *   · Agent —— 内置家来自 providers 摘要（现有八家）；
+ *   · Agent —— 内置家来自 providers 摘要；
  *   · 预置 API —— 预置目录的官方与托管端点，点一张卡 = 创建这一家并预填；
  *     **已建过同名家的预置卡不再出现**（那张已建卡就在「自定义」段里）；
  *   · 自定义 —— 已建的自定义家（customList），每张卡是「给这家加账号」的对象。
@@ -136,6 +158,7 @@ function providerCards(accountType: AccountType): CardItem[] {
         id,
         label: labelOf(id, String(item.label || item.id || '')),
         count: Number(item.count) || 0,
+        beta: BETA_PROVIDERS.has(id),
       }
     })
     : [{ id: WORKBUDDY_PROVIDER, label: WORKBUDDY_ENTRY_LABEL, count: accountCountOf(WORKBUDDY_PROVIDER) }]
@@ -177,9 +200,9 @@ function Logo({ item }: { item: CardItem }): React.ReactElement {
  * 分开了，整段都是同一类，再给每张卡挂一枚「预置 / 自定义」徽章只是噪音。
  */
 function cardMeta(item: CardItem): string {
-  if (item.preset) return '点开即预填，填 Key 接入'
-  if (item.custom) return item.count ? `${item.count} 个账号，点击添加` : '点击添加账号'
-  return item.count ? `${item.count} 个账号` : '还没有账号'
+  if (item.preset) return t('点开即预填，填 Key 接入')
+  if (item.custom) return item.count ? t('{n} 个账号，点击添加', { n: item.count }) : t('点击添加账号')
+  return item.count ? t('{n} 个账号', { n: item.count }) : t('还没有账号')
 }
 
 function ProviderCard({ item, onPick }: { item: CardItem; onPick: (id: string) => void }): React.ReactElement {
@@ -193,7 +216,10 @@ function ProviderCard({ item, onPick }: { item: CardItem; onPick: (id: string) =
     >
       <Logo item={item} />
       <span className='add-provider-info'>
-        <span className='add-provider-name'>{item.label}</span>
+        <span className='add-provider-name'>
+          {item.label}
+          {item.beta ? <span className='add-provider-beta'>(beta)</span> : null}
+        </span>
         <span className='add-provider-meta'>{cardMeta(item)}</span>
       </span>
       <span className='add-provider-go'>›</span>
@@ -216,8 +242,8 @@ function NewProviderCard({ onPick }: { onPick: (id: string) => void }): React.Re
     >
       <span className='add-provider-logo is-new'>＋</span>
       <span className='add-provider-info'>
-        <span className='add-provider-name'>新建自定义提供商</span>
-        <span className='add-provider-meta'>接入一个兼容上游</span>
+        <span className='add-provider-name'>{t('新建自定义提供商')}</span>
+        <span className='add-provider-meta'>{t('接入一个兼容上游')}</span>
       </span>
       <span className='add-provider-go'>›</span>
     </button>
@@ -258,18 +284,18 @@ export function PickStep({
     // 分段与列表同一块：两者是同一个问题的两面（「给什么形态的上游加账号」→
     // 「给哪一家加」），分两块带边框会让人以为是两个独立步骤
     <DialogSection>
-      <h3>选择提供商</h3>
+      <h3>{t('选择提供商')}</h3>
       {/* 分段与搜索同一行：左边选形态，右边是这一屏的过滤器 */}
       <div className='add-pick-row' style={importing ? { display: 'none' } : undefined}>
         <SegmentedControl
-          aria-label='账号类型'
+          aria-label={t('账号类型')}
           className={ADD_SEG_CLASS}
           options={[
             { value: TYPE_PROXY, label: 'Agent' },
-            { value: TYPE_PRESET, label: '预置 API' },
-            { value: TYPE_CUSTOM, label: '自定义' },
+            { value: TYPE_PRESET, label: t('预置 API') },
+            { value: TYPE_CUSTOM, label: t('自定义') },
             // 「导入」分段暂时收起（见 IMPORT_SEGMENT_ENABLED）：整段不生成
-            ...(IMPORT_SEGMENT_ENABLED ? [{ value: TYPE_IMPORT, label: '导入' }] : []),
+            ...(IMPORT_SEGMENT_ENABLED ? [{ value: TYPE_IMPORT, label: t('导入') }] : []),
           ]}
           value={accountType}
           onValueChange={value => onAccountTypeChange(typeValueOf(value))}
@@ -280,9 +306,9 @@ export function PickStep({
             <InputGroupInput
               id='add-provider-search'
               type='search'
-              placeholder='搜索提供商…'
+              placeholder={t('搜索提供商…')}
               autoComplete='off'
-              aria-label='搜索提供商'
+              aria-label={t('搜索提供商')}
               value={search}
               onChange={event => onSearchChange(event.currentTarget.value)}
             />
@@ -296,13 +322,13 @@ export function PickStep({
         className='add-provider-grid'
         id='add-provider-grid'
         role='listbox'
-        aria-label='选择要添加账号的提供商'
+        aria-label={t('选择要添加账号的提供商')}
         style={importing ? { display: 'none' } : undefined}
       >
         {newCard ? <NewProviderCard onPick={onPick} /> : null}
         {hit.map(item => <ProviderCard key={item.id} item={item} onPick={onPick} />)}
         {!hit.length && keyword ? (
-          <div className='add-provider-empty'>{`没有匹配「${search.trim()}」的提供商`}</div>
+          <div className='add-provider-empty'>{t('没有匹配「{keyword}」的提供商', { keyword: search.trim() })}</div>
         ) : null}
       </div>
     </DialogSection>

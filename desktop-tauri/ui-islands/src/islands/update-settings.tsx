@@ -21,6 +21,7 @@ import {
   shared, toast, type ProxySelection, type UpdateTokenStatus,
   EMPTY_PROXY_SELECTION,
 } from './update-shared'
+import { t } from '../i18n'
 
 /**
  * 「更新设置」弹窗（设置页「软件更新」面板头部那颗按钮打开）。
@@ -77,29 +78,29 @@ const GITHUB_TOKENS_URL = 'https://github.com/settings/tokens/new?description='
 /** 令牌一栏的状态徽章 + 一句说明（完整原因放徽章的悬停提示里，不占版面） */
 function tokenStatus(token: UpdateTokenStatus | null): { badge: React.ReactNode; hint: string } {
   if (!token) {
-    return { badge: <Badge shape='tag' variant='outline'>读取中</Badge>, hint: '' }
+    return { badge: <Badge shape='tag' variant='outline'>{t('读取中')}</Badge>, hint: '' }
   }
   if (token.error) {
     return {
-      badge: <Badge shape='tag' variant='destructive' title={token.error}>无法解密</Badge>,
-      hint: '重新粘贴保存一次即可自愈',
+      badge: <Badge shape='tag' variant='destructive' title={token.error}>{t('无法解密')}</Badge>,
+      hint: t('重新粘贴保存一次即可自愈'),
     }
   }
   if (token.filled && token.origin === 'stored') {
     return {
-      badge: <Badge shape='tag' variant='success'>已填写</Badge>,
-      hint: '已加密存储在本地，不显示具体值；粘贴新令牌可覆盖',
+      badge: <Badge shape='tag' variant='success'>{t('已填写')}</Badge>,
+      hint: t('已加密存储在本地，不显示具体值；粘贴新令牌可覆盖'),
     }
   }
   if (token.filled) {
     return {
-      badge: <Badge shape='tag' variant='secondary'>环境变量</Badge>,
-      hint: '已配置 GITHUB_TOKEN 环境变量，界面保存的令牌优先于它',
+      badge: <Badge shape='tag' variant='secondary'>{t('环境变量')}</Badge>,
+      hint: t('已配置 GITHUB_TOKEN 环境变量，界面保存的令牌优先于它'),
     }
   }
   return {
-    badge: <Badge shape='tag' variant='outline'>未填写</Badge>,
-    hint: '填写后检查限额 60 → 5000 次/小时（创建令牌无需勾选任何权限）',
+    badge: <Badge shape='tag' variant='outline'>{t('未填写')}</Badge>,
+    hint: t('填写后检查限额 60 → 5000 次/小时（创建令牌无需勾选任何权限）'),
   }
 }
 
@@ -151,9 +152,9 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
       const interval = Math.max(CHECK_INTERVAL_MIN_MINUTES, Math.round(Number(saved?.interval) || 0))
       setCheckTask({ enabled, interval })
       setIntervalDraft(String(interval))
-      toast('✅ 自动检查更新已保存')
+      toast(t('✅ 自动检查更新已保存'))
     } catch (error) {
-      toast(`保存失败：${errorMessage(error)}`, 'err')
+      toast(t('保存失败：{error}', { error: errorMessage(error) }), 'err')
     } finally {
       setCheckBusy(false)
     }
@@ -163,7 +164,10 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
   async function saveCheckInterval(): Promise<void> {
     const value = Math.round(Number(intervalDraft))
     if (!Number.isFinite(value) || value < CHECK_INTERVAL_MIN_MINUTES || value > CHECK_INTERVAL_MAX_MINUTES) {
-      toast(`检查间隔必须是 ${CHECK_INTERVAL_MIN_MINUTES} ~ ${CHECK_INTERVAL_MAX_MINUTES} 分钟`, 'err')
+      toast(t('检查间隔必须是 {min} ~ {max} 分钟', {
+        min: CHECK_INTERVAL_MIN_MINUTES,
+        max: CHECK_INTERVAL_MAX_MINUTES,
+      }), 'err')
       return
     }
     if (checkTask && value === checkTask.interval) return
@@ -178,7 +182,7 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
   async function saveToken(): Promise<void> {
     const value = draft.trim()
     if (!value) {
-      toast('请先粘贴 GitHub 令牌', 'err')
+      toast(t('请先粘贴 GitHub 令牌'), 'err')
       return
     }
     setBusy(true)
@@ -186,10 +190,10 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
       const result = await shared().workbuddyDesktop?.setUpdateToken({ token: value })
       setToken(result ?? null)
       setDraft('')
-      if (result?.saved === false) toast('令牌已生效，但写入磁盘失败（重启后会丢失）', 'err')
-      else toast('✅ GitHub 令牌已保存（加密存储，界面不再显示）')
+      if (result?.saved === false) toast(t('令牌已生效，但写入磁盘失败（重启后会丢失）'), 'err')
+      else toast(t('✅ GitHub 令牌已保存（加密存储，界面不再显示）'))
     } catch (error) {
-      toast(`保存失败：${errorMessage(error)}`, 'err')
+      toast(t('保存失败：{error}', { error: errorMessage(error) }), 'err')
     } finally {
       setBusy(false)
     }
@@ -200,9 +204,9 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
     try {
       const result = await shared().workbuddyDesktop?.setUpdateToken({ token: null })
       setToken(result ?? null)
-      toast('✅ 已清除界面保存的 GitHub 令牌（环境变量若配置过则继续生效）')
+      toast(t('✅ 已清除界面保存的 GitHub 令牌（环境变量若配置过则继续生效）'))
     } catch (error) {
-      toast(`清除失败：${errorMessage(error)}`, 'err')
+      toast(t('清除失败：{error}', { error: errorMessage(error) }), 'err')
     } finally {
       setBusy(false)
     }
@@ -211,8 +215,8 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
   const status = tokenStatus(token)
   const stored = Boolean(token?.error) || token?.origin === 'stored'
   const placeholder = token?.filled && token?.origin !== 'env'
-    ? '已填写（粘贴新令牌可覆盖）'
-    : '粘贴 GitHub 令牌（ghp_… / github_pat_…）'
+    ? t('已填写（粘贴新令牌可覆盖）')
+    : t('粘贴 GitHub 令牌（ghp_… / github_pat_…）')
 
   return (
     // 受控 open（面板按 settingsOpen 条件渲染本组件）：关窗一律由 onClose 收口，
@@ -221,7 +225,7 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
       {/* 默认 620px 对这两节内容太宽（右侧一截空白），收窄成一个紧凑的设置小窗 */}
       <DialogContent className='w-[min(460px,calc(100vw-48px))]'>
         <DialogHeader>
-          <DialogTitle>更新设置</DialogTitle>
+          <DialogTitle>{t('更新设置')}</DialogTitle>
         </DialogHeader>
         {/* DialogBody 自带 gap-4，这里收紧到 gap-3.5；每节是一个子元素，
             节内间距自己控（不与 gap 叠加） */}
@@ -230,12 +234,12 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
               读数没到位时控件禁用（保持 null → 不猜开关状态） */}
           <div>
             <div className='flex items-center justify-between gap-2'>
-              <div className='text-[13px] font-semibold text-foreground'>自动检查更新</div>
+              <div className='text-[13px] font-semibold text-foreground'>{t('自动检查更新')}</div>
               <Switch
                 checked={checkTask?.enabled === true}
                 disabled={checkBusy || !checkTask}
                 onCheckedChange={next => void saveCheckTask({ enabled: next === true })}
-                aria-label='自动检查更新'
+                aria-label={t('自动检查更新')}
               />
             </div>
             <div className='mt-1.5 flex items-center gap-2'>
@@ -254,9 +258,14 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
                     void saveCheckInterval()
                   }
                 }}
-                aria-label='检查间隔（分钟）'
+                aria-label={t('检查间隔（分钟）')}
               />
-              <span className='text-[12px] text-subtle'>分钟（{CHECK_INTERVAL_MIN_MINUTES} ~ {CHECK_INTERVAL_MAX_MINUTES}）</span>
+              <span className='text-[12px] text-subtle'>
+                {t('分钟（{min} ~ {max}）', {
+                  min: CHECK_INTERVAL_MIN_MINUTES,
+                  max: CHECK_INTERVAL_MAX_MINUTES,
+                })}
+              </span>
               <Button
                 variant='outline'
                 size='sm'
@@ -266,11 +275,11 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
                 }
                 onClick={() => void saveCheckInterval()}
               >
-                保存
+                {t('保存')}
               </Button>
             </div>
             <div className='mt-1.5 text-[12px] text-subtle'>
-              到点自动向 GitHub 查询新版本，查到就走「检测到更新」弹窗；关闭后「检查更新」按钮仍可手动触发
+              {t('到点自动向 GitHub 查询新版本，查到就走「检测到更新」弹窗；关闭后「检查更新」按钮仍可手动触发')}
             </div>
           </div>
 
@@ -278,16 +287,16 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
 
           {/* 出网代理：说明都在下拉的悬停提示里，这里只留标题与控件 */}
           <div>
-            <div className='text-[13px] font-semibold text-foreground'>出网代理</div>
+            <div className='text-[13px] font-semibold text-foreground'>{t('出网代理')}</div>
             <div className='mt-1.5'>
               <Select value={pick.current} onValueChange={value => void handlePick(String(value))}>
                 {/* 线路不可用时描边标红（照账号页 ProxyCell 的口径），原因看 title */}
                 <SelectTrigger
                   className={cn('w-full', pick.broken && 'border-destructive-bd')}
                   title={pick.title}
-                  aria-label='更新出网代理'
+                  aria-label={t('更新出网代理')}
                 >
-                  <SelectValue className='min-w-0 truncate'>{pick.selected?.label || '直连'}</SelectValue>
+                  <SelectValue className='min-w-0 truncate'>{pick.selected?.label || t('直连')}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   {pick.items.map(item => (
@@ -303,14 +312,14 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
           {/* GitHub 令牌：标题行右侧就是快捷跳转（预设好备注、无需勾选权限） */}
           <div>
             <div className='flex items-center justify-between gap-2'>
-              <div className='text-[13px] font-semibold text-foreground'>GitHub 令牌</div>
+              <div className='text-[13px] font-semibold text-foreground'>{t('GitHub 令牌')}</div>
               <Button
                 variant='outline'
                 size='xs'
-                title='在默认浏览器中打开 GitHub 的令牌创建页（备注已预设，无需勾选任何权限，直接点 Generate token）'
+                title={t('在默认浏览器中打开 GitHub 的令牌创建页（备注已预设，无需勾选任何权限，直接点 Generate token）')}
                 onClick={() => void openExternal(GITHUB_TOKENS_URL)}
               >
-                打开 GitHub 令牌页面
+                {t('打开 GitHub 令牌页面')}
               </Button>
             </div>
             <div className='mt-1.5 flex items-center gap-2'>
@@ -335,11 +344,11 @@ export function UpdateSettingsDialog({ open, onClose }: { open: boolean; onClose
                 }}
               />
               <Button variant='default' size='sm' disabled={busy || !draft.trim()} onClick={() => void saveToken()}>
-                保存
+                {t('保存')}
               </Button>
               {stored ? (
                 <Button variant='outline' size='sm' disabled={busy} onClick={() => void clearToken()}>
-                  清除
+                  {t('清除')}
                 </Button>
               ) : null}
             </div>

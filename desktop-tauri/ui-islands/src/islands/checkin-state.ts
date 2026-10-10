@@ -19,6 +19,7 @@ import {
   errorMessage, formatTime, shared, toast,
   type OnboardingTask, type OnboardingTaskRaw,
 } from './accounts-shared'
+import { t } from '../i18n'
 
 /* ─── 快照类型（/api/checkin-center 的响应，字段可能缺，逐个归一）─── */
 
@@ -273,7 +274,7 @@ function numberOf(value: unknown): number {
 export async function loadCheckinCenter(): Promise<void> {
   try {
     const data = await bridge().getCheckinCenter?.()
-    if (!data) throw new Error('后端未返回签到中心数据')
+    if (!data) throw new Error(t('后端未返回签到中心数据'))
     patch({
       snapshot: data,
       loaded: true,
@@ -363,18 +364,22 @@ export async function runAllCheckin(): Promise<void> {
       const active = numberOf(result.active)
       const total = numberOf(result.total)
       const failed = numberOf(result.failedCount)
-      const activeText = active > 0 ? `，日活保活 ${active} 个` : ''
+      const activeText = active > 0 ? t('，日活保活 {n} 个', { n: active }) : ''
       if (failed > 0) {
-        toast(`签到完成：${succeeded}/${total} 成功${activeText}，${failed} 个失败`, 'err')
+        toast(t('签到完成：{succeeded}/{total} 成功{active}，{failed} 个失败', {
+          succeeded, total, active: activeText, failed,
+        }), 'err')
       } else {
-        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取${activeText}`)
+        toast(t('✅ 签到完成：{succeeded}/{total} 个账号成功领取{active}', {
+          succeeded, total, active: activeText,
+        }))
       }
       // 余额读数是账号页自己缓存里的，不查它还是签到前的旧值（不 await：
       // 那是账号页的动作层，静默刷新，结果落在余额列上）
       accountsView().wbAccountsView?.refreshUsageAfterCheckin?.(null)
     }
   } catch (error) {
-    toast(`签到失败：${errorMessage(error)}`, 'err')
+    toast(t('签到失败：{error}', { error: errorMessage(error) }), 'err')
   } finally {
       patch({ runningAll: false })
       await loadCheckinCenter()
@@ -418,24 +423,24 @@ export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | '
       | undefined
     const activity = row?.activity as { pokeSucceeded?: boolean | null } | null | undefined
     if (row?.error) {
-      toast(`签到失败：${row.error}`, 'err')
+      toast(t('签到失败：{error}', { error: String(row.error) }), 'err')
     } else if (mode === 'keepalive') {
       // 只保活：结果就一句话（保活成功 / 失败），不存在领取语义
-      if (activity?.pokeSucceeded === true) toast(`✅ ${claim?.msg || '活跃保活完成'}`)
-      else toast(claim?.msg || '活跃保活失败', 'err')
+      if (activity?.pokeSucceeded === true) toast(t('✅ {message}', { message: claim?.msg || t('活跃保活完成') }))
+      else toast(claim?.msg || t('活跃保活失败'), 'err')
     } else if (claim?.success === true) {
-      toast(`✅ ${claim.msg || '签到成功'}`)
+      toast(t('✅ {message}', { message: claim.msg || t('签到成功') }))
     } else if (claim?.alreadyCompleted === true) {
-      toast(claim?.msg || '今日已领取', 'err')
+      toast(claim?.msg || t('今日已领取'), 'err')
     } else if (activity?.pokeSucceeded === true) {
       // 完整模式：保活成功但没领到 —— 后端 msg 把「活动未开启」一并交代
-      toast(`✅ ${claim?.msg || '活跃保活完成，但活动未开启'}`)
+      toast(t('✅ {message}', { message: claim?.msg || t('活跃保活完成，但活动未开启') }))
     } else {
-      toast(claim?.msg || '未领取', 'err')
+      toast(claim?.msg || t('未领取'), 'err')
     }
     accountsView().wbAccountsView?.refreshUsageAfterCheckin?.(id)
   } catch (error) {
-    toast(`签到失败：${errorMessage(error)}`, 'err')
+    toast(t('签到失败：{error}', { error: errorMessage(error) }), 'err')
   } finally {
     const rest = new Set(getCheckinStore().signing)
     rest.delete(busyKey)
@@ -463,10 +468,10 @@ export async function saveAutoCheckin(patchBody: Record<string, unknown>, label:
     const next = await bridge().saveAutoCheckin?.(patchBody)
     if (next) {
       patch({ snapshot: mergeAuto(next), autoTimeDraft: null })
-      toast(`已保存：${label}`)
+      toast(t('已保存：{label}', { label }))
     }
   } catch (error) {
-    toast(`保存失败：${errorMessage(error)}`, 'err')
+    toast(t('保存失败：{error}', { error: errorMessage(error) }), 'err')
   } finally {
     patch({ autoSaving: false })
   }
@@ -483,7 +488,7 @@ export async function submitAutoTime(value: string): Promise<void> {
   if (!time) return
   await saveAutoCheckin(
     { enabled: getCheckinStore().snapshot?.auto?.enabled === true, time },
-    '签到触发时刻',
+    t('签到触发时刻'),
   )
 }
 
@@ -496,7 +501,7 @@ export async function toggleAutoProvider(optionId: string, checked: boolean): Pr
   else picked.delete(optionId)
   // 顺序取 providerOptions 的注册顺序（与后端落盘口径一致）
   const providers = options.map(option => option.id).filter(id => picked.has(id))
-  await saveAutoCheckin({ providers }, '签到提供商')
+  await saveAutoCheckin({ providers }, t('签到提供商'))
 }
 
 /** 快照里只换 auto 段（保存响应是新状态，其余快照原样保留） */
@@ -529,10 +534,10 @@ export async function submitKeepaliveModels(value: string): Promise<void> {
     if (next) {
       const current = getCheckinStore().snapshot
       patch({ snapshot: current ? { ...current, keepalive: next } : current, keepaliveDraft: null })
-      toast('已保存：保活模型链')
+      toast(t('已保存：保活模型链'))
     }
   } catch (error) {
-    toast(`保存失败：${errorMessage(error)}`, 'err')
+    toast(t('保存失败：{error}', { error: errorMessage(error) }), 'err')
   } finally {
     patch({ keepaliveSaving: false })
   }
@@ -662,7 +667,7 @@ export async function claimOnboarding(id: string): Promise<void> {
     const rows = Array.isArray(data?.results) ? data.results : []
     for (const row of rows) {
       const key = typeof row?.key === 'string' ? row.key : ''
-      if (key && row?.ok !== true) failedKeys.set(key, String(row?.error || '领取失败'))
+      if (key && row?.ok !== true) failedKeys.set(key, String(row?.error || t('领取失败')))
     }
     const server = normalizeTasks(data?.tasks)
     const merged = (server.length ? server : onboardingOf(id).tasks).map(task => ({
@@ -686,9 +691,9 @@ export async function claimOnboarding(id: string): Promise<void> {
     })
     const failed = merged.filter(task => task.error && !task.done).length
     if (failed) {
-      toast(`新手任务有 ${failed} 项领取失败，可重试`, 'err')
+      toast(t('新手任务有 {n} 项领取失败，可重试', { n: failed }), 'err')
     } else if (claimedCount) {
-      toast(`✅ 新手任务领取完成，累计 ${numberOf(data?.earned)} 积分`)
+      toast(t('✅ 新手任务领取完成，累计 {n} 积分', { n: numberOf(data?.earned) }))
     }
   } catch (error) {
     const message = errorMessage(error)
@@ -700,7 +705,7 @@ export async function claimOnboarding(id: string): Promise<void> {
         error: task.done ? undefined : message,
       })),
     })
-    toast(`领取失败：${message}`, 'err')
+    toast(t('领取失败：{error}', { error: message }), 'err')
   } finally {
     await loadCheckinCenter()
   }
@@ -723,17 +728,18 @@ export function historyLine(entry: CheckinHistoryEntry): string {
   const total = numberOf(entry.total)
   const skipped = numberOf(entry.skipped)
   const failed = numberOf(entry.failedCount)
-  const parts = [`成功 ${succeeded}`]
-  if (active > 0) parts.push(`保活 ${active}`)
-  if (skipped > 0) parts.push(`跳过 ${skipped}`)
-  if (failed > 0) parts.push(`失败 ${failed}`)
-  return `${parts.join(' · ')}${total ? `（共 ${total} 个账号）` : ''}`
+  const parts = [t('成功 {n}', { n: succeeded })]
+  if (active > 0) parts.push(t('保活 {n}', { n: active }))
+  if (skipped > 0) parts.push(t('跳过 {n}', { n: skipped }))
+  if (failed > 0) parts.push(t('失败 {n}', { n: failed }))
+  return `${parts.join(' · ')}${total ? t('（共 {n} 个账号）', { n: total }) : ''}`
 }
 
 /** 「下次执行」的人话（today / tomorrow 相对面板时刻） */
 export function nextRunText(auto: AutoCheckinState | null | undefined): string {
-  if (auto?.enabled !== true) return '未开启'
+  if (auto?.enabled !== true) return t('未开启')
   const at = Number(auto.nextRunAt)
-  if (!Number.isFinite(at) || at <= 0) return formatTime(at) || `每天 ${auto.time}`
-  return `${formatTime(at)}（每天 ${auto.time}）`
+  const time = auto.time ?? ''
+  if (!Number.isFinite(at) || at <= 0) return formatTime(at) || t('每天 {time}', { time })
+  return t('{date}（每天 {time}）', { date: formatTime(at), time })
 }

@@ -48,6 +48,7 @@
 import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
+import { t } from '../i18n'
 import {
   Button,
   Checkbox,
@@ -182,7 +183,7 @@ function AccountsPage() {
       colSettingsRegistered = true
       colHandle = shared().wbColSettings?.register({
         id: 'accounts',
-        label: '账号表',
+        label: t('账号表'),
         columns: ACCOUNT_COLUMNS.map(column => ({
           key: column.key,
           label: column.label,
@@ -222,8 +223,8 @@ function AccountsPage() {
     switch (key) {
       case 'pick':
         return (
-          <Checkbox checked={ctx.picked} data-pick={account.id} title='勾选后可批量操作'
-            aria-label='勾选后可批量操作'
+          <Checkbox checked={ctx.picked} data-pick={account.id} title={t('勾选后可批量操作')}
+            aria-label={t('勾选后可批量操作')}
             onCheckedChange={next => togglePick(account.id, next)} />
         )
       case 'priority':
@@ -251,8 +252,8 @@ function AccountsPage() {
     }
   }
 
-  const providerOptions = [{ value: 'all', label: `全部（${all.length}）` }]
-    .concat(summaries.map(item => ({ value: item.id, label: `${item.label}（${item.count}）` })))
+  const providerOptions = [{ value: 'all', label: t('全部（{n}）', { n: all.length }) }]
+    .concat(summaries.map(item => ({ value: item.id, label: t('{label}（{count}）', { label: item.label, count: item.count }) })))
 
   return (
     <>
@@ -262,11 +263,11 @@ function AccountsPage() {
               分段按钮会随家数增长把工具条挤成一团；选项里带账号数，于是「哪家有账号、
               各有多少」不用切页就能看到 */}
           <div className='group' data-provider-group='1'>
-            <span className='label'>提供商</span>
+            <span className='label'>{t('提供商')}</span>
             <Select value={store.filter.provider} onValueChange={value => setProviderFilter(String(value))}>
-              <SelectTrigger className='max-w-[200px] min-w-[130px]' aria-label='按提供商筛选账号'>
+              <SelectTrigger className='max-w-[200px] min-w-[130px]' aria-label={t('按提供商筛选账号')}>
                 <SelectValue>
-                  {providerOptions.find(item => item.value === store.filter.provider)?.label || '全部'}
+                  {providerOptions.find(item => item.value === store.filter.provider)?.label || t('全部')}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
@@ -279,54 +280,54 @@ function AccountsPage() {
           <div className='divider' data-provider-divider='1' />
 
           <div className='group'>
-            <span className='label'>状态</span>
+            <span className='label'>{t('状态')}</span>
             {/* 两个筛选维度是**受控**的（取值与计数都以 store 为准），限流组在状态筛成
                 「禁用」时置灰 —— 已禁用账号既不算正常也不算已限流 */}
             <SegmentedControl options={[
-              { value: 'all', label: '全部', count: counts.enabledAll ?? 0 },
-              { value: 'enabled', label: '启用', count: counts.enabled ?? 0 },
-              { value: 'disabled', label: '禁用', count: counts.disabled ?? 0 },
+              { value: 'all', label: t('全部'), count: counts.enabledAll ?? 0 },
+              { value: 'enabled', label: t('启用'), count: counts.enabled ?? 0 },
+              { value: 'disabled', label: t('禁用'), count: counts.disabled ?? 0 },
             ]} value={store.filter.enabled} onValueChange={value => setSegmentFilter('enabled', value)}
-              aria-label='启用状态' />
+              aria-label={t('启用状态')} />
           </div>
 
           <div className='group'>
-            <span className='label'>限额</span>
+            <span className='label'>{t('限额')}</span>
             <SegmentedControl options={[
-              { value: 'all', label: '全部', count: counts.limitAll ?? 0 },
-              { value: 'normal', label: '正常', count: counts.normal ?? 0, disabled: store.filter.enabled === 'disabled' },
-              { value: 'limited', label: '已限流', count: counts.limited ?? 0, disabled: store.filter.enabled === 'disabled' },
+              { value: 'all', label: t('全部'), count: counts.limitAll ?? 0 },
+              { value: 'normal', label: t('正常'), count: counts.normal ?? 0, disabled: store.filter.enabled === 'disabled' },
+              { value: 'limited', label: t('已限流'), count: counts.limited ?? 0, disabled: store.filter.enabled === 'disabled' },
             ]} value={store.filter.limit} onValueChange={value => setSegmentFilter('limit', value)}
-              aria-label='限额状态' />
+              aria-label={t('限额状态')} />
           </div>
 
           <div className='actions'>
             {/* 「添加账号」的打开逻辑归 add-account.js（它按同一个 id 绑了监听），这里再挂
                 一次 onClick 是**冗余保险**：万一那个脚本的绑定因加载顺序没接上，按钮仍可用
                 （openModal / resetAddStep 都是幂等的，重复调用无副作用） */}
-            <Button id='btn-add-account-2' variant='default' title='登录 / 导入一个新账号'
+            <Button id='btn-add-account-2' variant='default' title={t('登录 / 导入一个新账号')}
               onClick={() => {
                 shared().wbAddAccountModal?.open?.()
                 shared().wbAccountAddForms?.syncAddProvider?.()
-              }}>添加账号</Button>
+              }}>{t('添加账号')}</Button>
             <Button id='btn-query-usage' variant='outline'
               disabled={store.usageBusy || !all.some(supportsUsage)}
-              title='查询全部账号的余额（含已禁用账号 —— 禁用只表示不参与转发）'
-              onClick={() => void queryAllUsage()}>{store.usageBusy ? '查询中…' : '查询余额'}</Button>
+              title={t('查询全部账号的余额（含已禁用账号 —— 禁用只表示不参与转发）')}
+              onClick={() => void queryAllUsage()}>{store.usageBusy ? t('查询中…') : t('查询余额')}</Button>
           </div>
         </div>
 
         <div className={cn('batch-bar', active && 'active')} id='batch-bar'>
           <label className='batch-select-all'>
             <Checkbox id='batch-select-all' checked={allPicked} indeterminate={!allPicked && somePicked}
-              disabled={!visibleIds.length} aria-label='全选当前筛选结果'
+              disabled={!visibleIds.length} aria-label={t('全选当前筛选结果')}
               onCheckedChange={next => setAllPicked(visibleIds, next)} />
             <span id='batch-select-label'>
-              {visibleIds.length ? `全选当前筛选结果（${visibleIds.length} 个）` : '没有可全选的账号'}
+              {visibleIds.length ? t('全选当前筛选结果（{n} 个）', { n: visibleIds.length }) : t('没有可全选的账号')}
             </span>
           </label>
           <span className='batch-count'>
-            已选 <b id='batch-count'>{store.selected.size}</b> 个 · 共 <b id='accounts-count'>{all.length}</b> 个
+            {t('已选')} <b id='batch-count'>{store.selected.size}</b> {t('个 · 共')} <b id='accounts-count'>{all.length}</b> {t('个')}
           </span>
           {/* 摘要只列**有账号**的家：这一段回答的是「账号分别落在谁家」，而「Cline Pass 0」
               这类只占宽度、不提供信息。完整清单仍在下拉里，含 0 的家，筛选口径不变 */}
@@ -335,26 +336,26 @@ function AccountsPage() {
           </span>
           {hiddenByFilter ? (
             <span className='batch-hidden' id='batch-hidden-hint'>
-              另有 {hiddenByFilter} 个已勾选账号被当前筛选隐藏，仍会参与操作
+              {t('另有 {n} 个已勾选账号被当前筛选隐藏，仍会参与操作', { n: hiddenByFilter })}
             </span>
           ) : null}
           <div className='batch-actions'>
             {/* 「列设置」按钮由 wbColSettings.register 插进这个容器的最前面（命令式，
                 插入位置由那边决定，本岛只留容器） */}
             <Button id='btn-batch-open' variant='outline' disabled={!active}
-              onClick={() => openBatchDialog([...store.selected], 'enable')}>批量操作</Button>
+              onClick={() => openBatchDialog([...store.selected], 'enable')}>{t('批量操作')}</Button>
             <Button id='btn-batch-clear' variant='outline' disabled={!active}
-              onClick={() => clearSelection()}>取消选择</Button>
+              onClick={() => clearSelection()}>{t('取消选择')}</Button>
           </div>
         </div>
 
         <div className='acct-scroll' id='account-list' ref={listRef}>
           {!loaded ? (
-            <div className='empty'><span className='spinner' />正在加载…</div>
+            <div className='empty'><span className='spinner' />{t('正在加载…')}</div>
           ) : !all.length ? (
-            <div className='empty'>暂无账号，请点击右上角「添加账号」</div>
+            <div className='empty'>{t('暂无账号，请点击右上角「添加账号」')}</div>
           ) : !visible.length ? (
-            <div className='empty'>当前筛选条件下没有账号</div>
+            <div className='empty'>{t('当前筛选条件下没有账号')}</div>
           ) : (
             <table className='acct-table' ref={setTableElement}
               style={{ minWidth: `${tableMinWidth(columns.map(column => column.key))}px` }}>

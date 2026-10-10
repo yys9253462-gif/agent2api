@@ -1,6 +1,6 @@
 # Agent2API · Multi-Provider Local Gateway
 
-[简体中文](./README.md) | **English**
+[简体中文](./README.md) | **English** | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
 Wraps the login state of several AI desktop clients into a local **OpenAI-compatible API gateway**, exposing a single `base_url` and bundling multi-provider account management, model management (enable / disable / delete / alias), content redaction, egress proxying and request reporting — plus a ready-to-run Tauri desktop app. Any OpenAI client that accepts a custom `base_url` can call these providers' model quota through `http://127.0.0.1:3065/v1` — no API key, no client source changes needed.
 
@@ -20,13 +20,16 @@ Reverse-proxy capabilities at a glance (✓ supported · ✗ not supported · �
 | CodeArts | ✓ | ✓ one-shot rotation | ✓ remote (three sources merged) | ✓ two ledgers | — | ✓ daily welfare (manual) |
 | Trae | ✓ | ✓ single-use rotation | ✓ remote only | ✓ two ledgers | — | — |
 | Loomy (iFlytek) | ✓ | ✗ no refresh flow | ✓ remote only | ✓ two point ledgers | ✓ daily gifted-points refresh | — |
+| MonkeyCode (Chaitin, domestic / international) | ✓ | ✗ no refresh flow | ✓ remote only | — | — | — |
+| Command Code | ✓ | ✗ static API key | ✓ remote + static fallback | — | — | — |
+| Antigravity (Google, Gemini) | ✓ | ✓ | ✓ remote + static fallback | — | — | — |
 | Custom providers | ✓ chat passthrough / Responses / Anthropic | — | ✓ manual + server-side fetch | — | — | — |
 
 The three chat entry points (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, plus `/v1/messages/count_tokens`) and `/v1/models` behave identically for every platform — the differences above are only about what each upstream can do. Model mapping, the global priority queue, 429 fallback, egress proxying, content redaction and request reporting apply to all platforms alike.
 
 > **This project is for learning and discussion only.** It reuses the login state of your own accounts through a local reverse proxy; forwarding requests in the shape of a non-official client may violate the upstream services' terms of service, and any risk (including rate limiting or account bans) is borne by the user. Commercial use and circumventing billing are prohibited. See [Usage Notice](#usage-notice) and [LICENSE](./LICENSE).
 >
-> This is a personal, local-purpose proxy tool. It is unaffiliated with Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (Raccoon), Zhipu (AutoClaw/autoglm), Alibaba Cloud (Qoder / Accio), Huawei Cloud (CodeArts), ByteDance (Trae), iFlytek (Loomy), Cline and their official products; every interface shape comes from observing each vendor's desktop client traffic, and upstream may change at any time.
+> This is a personal, local-purpose proxy tool. It is unaffiliated with Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (Raccoon), Zhipu (AutoClaw/autoglm), Alibaba Cloud (Qoder / Accio), Huawei Cloud (CodeArts), ByteDance (Trae), iFlytek (Loomy), Chaitin (MonkeyCode), Command Code, Google (Antigravity), Cline and their official products; every interface shape comes from observing each vendor's desktop client traffic, and upstream may change at any time.
 
 ---
 
@@ -47,7 +50,7 @@ The three chat entry points (`/v1/chat/completions`, `/v1/responses`, `/v1/messa
 Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**.
 
 1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration.
-2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline / Accio international / Accio domestic / ZCode domestic / ZCode international / CodeArts / Trae / Loomy), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again; CodeArts and Trae only offer web login and pasted credentials; Loomy only offers SMS sign-in and pasted session).
+2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline / Accio international / Accio domestic / ZCode domestic / ZCode international / CodeArts / Trae / Loomy / KukuAI / MonkeyCode domestic / MonkeyCode international / Command Code / Antigravity), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again; CodeArts and Trae only offer web login and pasted credentials; Loomy only offers SMS sign-in and pasted session; MonkeyCode, Command Code and Antigravity only accept pasted credentials).
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
@@ -81,6 +84,10 @@ print(resp.choices[0].message.content)
 ```
 
 **Pages running in a browser** (a self-built web UI, a single-file frontend app, …) that call this endpoint with `fetch` will fail with "cannot connect to the API": the gateway surface does **not** answer CORS by default, so the preflight (OPTIONS) lands on the API-key check and gets a 401 (a cross-origin preflight never carries the `Authorization` header) and the real request is never sent. Two ways out: ① turn on "Security → Gateway CORS" in Settings — the gateway then answers exactly like the panel does (preflight allowed, responses carry `Access-Control-Allow-*` with origin `*`, effective immediately). Note the gateway is the surface that really forwards upstream and spends quota: with `*` and no API key configured, any web page could drive your local gateway, so configure a "Gateway Key" as well; ② make the page same-origin — run a small local static server that also reverse-proxies `/v1` to `127.0.0.1:3065`, which removes cross-origin entirely and needs no relaxation at all.
+
+### LAN access
+
+By default the gateway only listens on `127.0.0.1`, so only this machine can use it. After turning on "Settings → General → LAN access", the gateway listens on all network adapters instead, and devices on the same LAN just point their API base URL at this machine's IP (the UI shows the full address, e.g. `http://192.168.1.5:3065/v1`) to share the same set of accounts. For safety, enabling it requires registering a panel administrator first: the management API then demands an admin session or a gateway key, and while no key is enabled the forwarding API refuses service too (the enable flow adds a "default" key automatically). You can also optionally expose the web management panel to the LAN (other devices open this machine's IP in a browser and manage it, with an admin login); it stays off by default, and the desktop panel is served only by the app itself. Changes take effect after the app restarts.
 
 ---
 
@@ -120,7 +127,7 @@ Environment variables (all optional — nothing needs to be preset):
 
 Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
 
-**Web panel capability notes** (all differences stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; AutoClaw / CatPaw / Accio / CodeArts / Trae web-login callbacks hit the machine's own port, so from a remote panel use pasted credentials instead; Raccoon web login and "import desktop login state" are unavailable (use pasted credentials; Loomy, CodeArts and Trae have no desktop login state to import either).
+**Web panel capability notes** (all differences stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; AutoClaw / CatPaw / Accio / CodeArts / Trae web-login callbacks hit the machine's own port, so from a remote panel use pasted credentials instead; Raccoon web login and "import desktop login state" are unavailable (use pasted credentials; Loomy, CodeArts and Trae have no desktop login state to import either; MonkeyCode, Command Code and Antigravity likewise only accept pasted credentials).
 
 ---
 
@@ -219,13 +226,30 @@ agent2api/
 │  │  │  │  │                   errors (error classification and dead-config list) /
 │  │  │  │  │                   models (get_detail_param catalog) /
 │  │  │  │  │                   usage (entitlement packs + plan quota, two accounts) / profile (identity parsing)
-│  │  │  │  │  └─ loomy/        Loomy (iFlytek): login (SMS code) / credentials (14-day session, no
-│  │  │  │  │                   refresh flow) / sign (client HMAC-SHA1 headers) / endpoints /
-│  │  │  │  │                   client (integration gateway) / models (/api/v1/models remote only,
-│  │  │  │  │                   no built-in fallback) / balance (permanent + daily gifted points) /
-│  │  │  │  │                   checkin (first login of the day refreshes the gifted points)
+│  │  │  │  │  ├─ loomy/        Loomy (iFlytek): login (SMS code) / credentials (14-day session, no
+│  │  │  │  │  │                refresh flow) / sign (client HMAC-SHA1 headers) / endpoints /
+│  │  │  │  │  │                client (integration gateway) / models (/api/v1/models remote only,
+│  │  │  │  │  │                no built-in fallback) / balance (permanent + daily gifted points) /
+│  │  │  │  │  │                checkin (first login of the day refreshes the gifted points)
+│  │  │  │  │  ├─ monkeycode/  MonkeyCode (Chaitin, domestic + international): region (two sites) /
+│  │  │  │  │  │                adapter / endpoints (paths, cookie name, interface_type -> CLI map) /
+│  │  │  │  │  │                client / credentials (session + imageId) / login (paste session and discovery) /
+│  │  │  │  │  │                models (one slot per site, remote only) / task (create task) /
+│  │  │  │  │  │                stream (WS task stream) / translate (ACP events -> chat frames, with
+│  │  │  │  │  │                auto-approval of tools and auto-reply to agent questions)
+│  │  │  │  │  ├─ commandcode/  Command Code: adapter / endpoints / credentials / login /
+│  │  │  │  │  │                fingerprint (deterministic device fingerprint + 8h reporting) / models /
+│  │  │  │  │  │                plan (8-key envelope, params rewrite, session id derivation)
+│  │  │  │  │  └─ antigravity/  Antigravity (Google, Gemini): oauth (refresh token + single-flight) /
+│  │  │  │  │                   project (loadCodeAssist -> onboardUser discovery) / credentials /
+│  │  │  │  │                   endpoints (three environment bases and header set) / login /
+│  │  │  │  │                   models (fetchAvailableModels + built-in fallback + real-name mapping) / adapter
+│  │  │  │  ├─ protocol/        Protocol translation layer (per-vendor wire <-> standard chat SSE request/response
+│  │  │  │  │                   translation: Anthropic Messages / Responses / NDJSON (Command Code) /
+│  │  │  │  │                   Gemini envelope (Antigravity), plus tool plans and history repair)
 │  │  │  │  ├─ upstream/        Forwarding orchestration: global account queue loop (provider_loop) + request body
-│  │  │  │  │                   handling (payload) + SSE passthrough/aggregation + usage side-channel extraction
+│  │  │  │  │                   handling (payload) + SSE passthrough/aggregation + usage side-channel extraction +
+│  │  │  │  │                   translation stream wiring for non-chat protocols (translate: three in parallel)
 │  │  │  │  ├─ account_store/   Account storage (global priority, rate-limit cooldown, per-vendor add and import)
 │  │  │  │  ├─ models/          Model catalog internals (built-in WorkBuddy list + /v3/config refresh)
 │  │  │  │  ├─ model_rules.rs   Model management rules (disable / hide / mapping alias)
@@ -291,7 +315,7 @@ The root project has no runtime dependencies; `package.json` only provides the s
 
 ### For learning and discussion only
 
-This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, Alibaba and Qoder / Accio, Huawei Cloud and CodeArts, ByteDance and Trae, or iFlytek and Loomy.
+This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, Alibaba and Qoder / Accio, Huawei Cloud and CodeArts, ByteDance and Trae, iFlytek and Loomy, Chaitin and MonkeyCode, Command Code, or Google and Antigravity.
 
 ### About the reverse-proxy behaviour
 

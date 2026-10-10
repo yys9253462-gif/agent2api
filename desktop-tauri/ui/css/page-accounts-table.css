@@ -241,6 +241,7 @@
 .pbadge {
   display: inline-flex;
   align-items: center;
+  gap: 5px;
   max-width: 100%;
   padding: 1px 8px;
   border: 1px solid var(--border);
@@ -252,6 +253,24 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 收录过图标的家在名字前挂一枚 13px 小图（PROVIDER_ICONS，与卡片 / 模型管理页
+   同一份）。图与名字同一行居中；圆角略收，自带透明底的图不至于显得比文字重 */
+.pbadge .pbadge-ico {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+  object-fit: contain;
+}
+/* 名字段单独成盒才能吃到 ellipsis —— 裸文本节点在 flex 容器里只是匿名项，
+   父级的 text-overflow 对它不生效（图标固定 13px 不参与截断） */
+.pbadge .pbadge-txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pbadge.p-workbuddy { background: var(--primary-soft); border-color: var(--primary-bd); color: var(--primary-fg); }
@@ -671,8 +690,13 @@
 }
 
 /* 读数按钮：整行可点（那格本来就是「一眼看出还剩多少」，加一个点击态不换语义），
-   视觉上与 .usage-sum 同字号同色，只加一个 caret 提示「点开还有明细」 */
+   视觉上与 .usage-sum 同字号同色，只加一个 caret 提示「点开还有明细」。
+   读数**居中**：本形态只有 CodeArts 一家用，两个权益档的读数（「可用 —积分」/
+   「可用 11000 积分」）在同一列里居中后不再贴着左边的套餐徽标；caret 改绝对
+   定位、不占布局宽度 —— 留在流里的话读数会被它的宽度挤得偏左，「居中」名不
+   副实。两侧对称留白因此由 .val 的 padding 承担，且长读数不会与 caret 叠字。 */
 .usage-toggle {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 5px;
@@ -688,6 +712,10 @@
 }
 .usage-toggle:hover { background: var(--row-hover); border-color: var(--hairline); }
 .usage-toggle .val {
+  flex: 1;
+  text-align: center;
+  /* 与 caret 的占位对称（caret 在右 8px 处、宽约 6px）：读数再长也不叠字 */
+  padding: 0 14px;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   overflow: hidden;
@@ -696,19 +724,21 @@
   min-width: 0;
 }
 .usage-toggle .caret {
-  margin-left: auto;
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
   color: var(--text-3);
   font-size: 9px;
   line-height: 1;
   transition: transform 0.15s;
-  flex: none;
 }
 .usage-toggle.ok .val { color: var(--ok); font-weight: 600; }
 .usage-toggle.warn .val { color: var(--warn); font-weight: 600; }
 .usage-toggle.bad .val { color: var(--danger); }
 .usage-toggle.muted .val { color: var(--text-3); }
 .usage-cell.open .usage-toggle { background: var(--primary-soft); border-color: var(--primary-bd); }
-.usage-cell.open .usage-toggle .caret { transform: rotate(180deg); }
+.usage-cell.open .usage-toggle .caret { transform: translateY(-50%) rotate(180deg); }
 
 /* ── token 组的平铺行（对话 token / 福利模型日额度）───
    这两行是「这账号现在能不能跑」的直接标志，直接住在余额格里不折叠；

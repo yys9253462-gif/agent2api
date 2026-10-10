@@ -7,6 +7,7 @@ import {
 } from './update-shared'
 import { showUpdateModal } from './update-modal'
 import { UpdateSettingsDialog } from './update-settings'
+import { t } from '../i18n'
 
 /**
  * Agent2API · 设置页「软件更新」面板（React 岛）。
@@ -101,9 +102,9 @@ const INITIAL_SNAPSHOT: Snapshot = {
   checkedAt: 0,
   repository: '',
   // 初值与 index.html 静态骨架逐字一致：首屏在 load() 跑起来之前就长这样
-  badgeText: '未检查',
+  badgeText: t('未检查'),
   badgeTone: '',
-  stateText: '点击「检查更新」查询最新发布版本。',
+  stateText: t('点击「检查更新」查询最新发布版本。'),
   stateError: false,
   percent: 0,
   phase: 'idle',
@@ -151,20 +152,20 @@ function isMacInstaller(info: UpdateInfo | null): boolean {
 /** 「开始下载」时的提示：说明下载完会发生什么 */
 function downloadHint(info: UpdateInfo | null): string {
   return isMacInstaller(info)
-    ? '正在下载安装包…（下载完成后会挂载磁盘映像，把应用拖进「应用程序」即可完成安装）'
-    : '正在下载安装包…（下载完成后启动安装程序需要管理员权限，会弹出 UAC 确认框）'
+    ? t('正在下载安装包…（下载完成后会挂载磁盘映像，把应用拖进「应用程序」即可完成安装）')
+    : t('正在下载安装包…（下载完成后启动安装程序需要管理员权限，会弹出 UAC 确认框）')
 }
 
 /** 「安装包已就绪」的提示：说明下一步该做什么 */
 function readyHint(info: UpdateInfo | null, name: string): string {
   return isMacInstaller(info)
-    ? `安装包已就绪：${name}。点击「打开安装包」后会挂载磁盘映像，把应用拖进「应用程序」即可完成安装。`
-    : `安装包已就绪：${name}。点击「安装并重启」后需要管理员权限，会弹出 UAC 确认框。`
+    ? t('安装包已就绪：{name}。点击「打开安装包」后会挂载磁盘映像，把应用拖进「应用程序」即可完成安装。', { name })
+    : t('安装包已就绪：{name}。点击「安装并重启」后需要管理员权限，会弹出 UAC 确认框。', { name })
 }
 
 /** 安装按钮的文案：macOS 不重启（dmg 与运行中的进程没有文件冲突） */
 function installButtonText(info: UpdateInfo | null): string {
-  return isMacInstaller(info) ? '打开安装包' : '安装并重启'
+  return isMacInstaller(info) ? t('打开安装包') : t('安装并重启')
 }
 
 /* ─── 共享快照（外部 store）──────────────────── */
@@ -241,19 +242,27 @@ function setState(text: string, isError = false): void {
 function renderCheckResult(): void {
   const { info, checkedAt } = snapshot
   if (!info) return
-  const at = checkedAt ? `（检查于 ${formatClock(checkedAt)}）` : ''
+  const at = checkedAt ? t('（检查于 {time}）', { time: formatClock(checkedAt) }) : ''
   if (info.hasUpdate === true) {
-    setBadge('有新版本', 'warn')
-    setState(`发现新版本 ${info.latestVersion}（当前 ${info.currentVersion}）。${at}`)
+    setBadge(t('有新版本'), 'warn')
+    setState(t('发现新版本 {latest}（当前 {current}）。{at}', {
+      latest: String(info.latestVersion || ''),
+      current: String(info.currentVersion || ''),
+      at,
+    }))
   } else if (info.hasUpdate === false) {
-    setBadge('已是最新', 'ok')
-    setState(`当前已是最新版本（${info.currentVersion}）。${at}`)
+    setBadge(t('已是最新'), 'ok')
+    setState(t('当前已是最新版本（{current}）。{at}', { current: String(info.currentVersion || ''), at }))
   } else {
     // hasUpdate 为 null：版本号无法比较（本地是开发版或 tag 非语义化）
-    setBadge('无法比较', 'warn')
+    setBadge(t('无法比较'), 'warn')
     setState(info.latestVersion
-      ? `最新发布版本为 ${info.latestVersion}，但当前版本号「${info.currentVersion || '未知'}」无法解析，未做新旧判断。${at}`
-      : `仓库暂无发布版本。${at}`)
+      ? t('最新发布版本为 {latest}，但当前版本号「{current}」无法解析，未做新旧判断。{at}', {
+        latest: info.latestVersion,
+        current: info.currentVersion || t('未知'),
+        at,
+      })
+      : t('仓库暂无发布版本。{at}', { at }))
   }
 }
 
@@ -280,8 +289,13 @@ function renderTask(task: DownloadTask | null | undefined): boolean {
     const mb = (Number(task.received) || 0) / 1024 / 1024
     const totalMb = (Number(task.total) || 0) / 1024 / 1024
     publish({ phase: 'downloading', percent })
-    setBadge('下载中', 'warn')
-    setState(`正在下载 ${task.filename || '安装包'}：${percent}%（${mb.toFixed(1)} / ${totalMb.toFixed(1)} MB）`)
+    setBadge(t('下载中'), 'warn')
+    setState(t('正在下载 {name}：{percent}%（{received} / {total} MB）', {
+      name: task.filename || t('安装包'),
+      percent,
+      received: mb.toFixed(1),
+      total: totalMb.toFixed(1),
+    }))
     return true
   }
 
@@ -289,14 +303,14 @@ function renderTask(task: DownloadTask | null | undefined): boolean {
   publish({ percent: 0 })
 
   if (task.error) {
-    setBadge('下载失败', 'bad')
-    setState(`下载失败：${task.error}`, true)
+    setBadge(t('下载失败'), 'bad')
+    setState(t('下载失败：{error}', { error: task.error }), true)
     publish({ phase: 'failed' })
     return true
   }
   if (task.canceled) {
-    setBadge('已取消', 'warn')
-    setState('下载已取消，可重新点击「下载并安装」。')
+    setBadge(t('已取消'), 'warn')
+    setState(t('下载已取消，可重新点击「下载并安装」。'))
     // 回到 idle：按钮文案变回「下载并安装」（旧实现同样只改文案，不动显隐）
     publish({ phase: 'idle' })
     return true
@@ -304,7 +318,7 @@ function renderTask(task: DownloadTask | null | undefined): boolean {
   if (task.done && task.path) {
     const path = task.path
     const name = task.filename || path
-    setBadge('可安装', 'ok')
+    setBadge(t('可安装'), 'ok')
     publish({ phase: 'ready', readyPath: path })
     // 下载完成即自动安装（含「下载中切走、回来时已经下完」这条重入路径）。只有同一
     // 路径已经自动装过一次才不再重复触发 —— 那时任务仍停在「已完成」（UAC 被拒 /
@@ -312,8 +326,8 @@ function renderTask(task: DownloadTask | null | undefined): boolean {
     if (path !== autoInstalledPath) {
       autoInstalledPath = path
       setState(isMacInstaller(snapshot.info)
-        ? '安装包已下载完成，正在挂载磁盘映像…'
-        : '安装包已下载完成，正在启动安装程序（需要管理员权限，会弹出 UAC 确认框）…')
+        ? t('安装包已下载完成，正在挂载磁盘映像…')
+        : t('安装包已下载完成，正在启动安装程序（需要管理员权限，会弹出 UAC 确认框）…'))
       void install(path)
     } else {
       setState(readyHint(snapshot.info, name))
@@ -340,7 +354,7 @@ async function pollProgress(): Promise<void> {
     renderTask(task)
   } catch (error) {
     stopPolling()
-    setState(`读取下载进度失败：${errorMessage(error)}`, true)
+    setState(t('读取下载进度失败：{error}', { error: errorMessage(error) }), true)
   }
 }
 
@@ -363,13 +377,13 @@ async function install(path: string): Promise<void> {
     const result = await api.runInstaller(path, true)
     const willRestart = result?.restart !== false
     setState(willRestart
-      ? '安装程序已启动，本程序将退出以便完成覆盖安装。安装程序需要管理员权限，会弹出 UAC 确认框，请选择「是」。'
-      : '安装包已挂载，请在弹出的窗口里把应用拖进「应用程序」完成安装。安装完成后重新打开本程序即可。')
+      ? t('安装程序已启动，本程序将退出以便完成覆盖安装。安装程序需要管理员权限，会弹出 UAC 确认框，请选择「是」。')
+      : t('安装包已挂载，请在弹出的窗口里把应用拖进「应用程序」完成安装。安装完成后重新打开本程序即可。'))
   } catch (error) {
-    setBadge('启动失败', 'bad')
+    setBadge(t('启动失败'), 'bad')
     // UAC 被拒时壳侧返回的提示已经说明「可重新点击安装并重启」，这里原样透出，不额外
     // 包装 —— 用户照着做就能重试成功（按钮仍在，见 phase === 'ready'）
-    setState(`启动安装程序失败：${errorMessage(error)}`, true)
+    setState(t('启动安装程序失败：{error}', { error: errorMessage(error) }), true)
   }
 }
 
@@ -380,12 +394,12 @@ async function check(): Promise<UpdateInfo | null> {
   if (busy) return null
   busy = true
   publish({ checking: true })
-  setBadge('检查中', 'warn')
-  setState('正在查询 GitHub 上的最新发布版本…')
+  setBadge(t('检查中'), 'warn')
+  setState(t('正在查询 GitHub 上的最新发布版本…'))
   let result: UpdateInfo | null = null
   try {
     const api = shared().workbuddyDesktop
-    if (!api) throw new Error('后端桥不可用')
+    if (!api) throw new Error(t('后端桥不可用'))
     const info = await api.checkUpdate()
     result = info ?? null
     // 时刻以后端返回的为准：这一下可能落在定时任务刚查完的缓存上，用本地时钟会把
@@ -397,8 +411,8 @@ async function check(): Promise<UpdateInfo | null> {
     result = null
     // 失败：版本号回到「—」、日志回到未检查态（都是派生，清空 info 即可）
     publish({ info: null, checkedAt: 0 })
-    setBadge('检查失败', 'bad')
-    setState(`检查更新失败：${errorMessage(error)}`, true)
+    setBadge(t('检查失败'), 'bad')
+    setState(t('检查更新失败：{error}', { error: errorMessage(error) }), true)
   } finally {
     busy = false
     publish({ checking: false })
@@ -438,8 +452,8 @@ async function syncFromCache(): Promise<void> {
     showUpdateModal(cached, openAndDownload)
     return
   }
-  setBadge('未检查')
-  setState('点击「检查更新」查询 GitHub 上的最新发布版本。')
+  setBadge(t('未检查'))
+  setState(t('点击「检查更新」查询 GitHub 上的最新发布版本。'))
 }
 
 /**
@@ -470,16 +484,16 @@ async function downloadOrCancel(): Promise<void> {
   if (current.phase === 'downloading') {
     try {
       await shared().workbuddyDesktop?.cancelUpdate()
-      setState('正在取消下载…')
+      setState(t('正在取消下载…'))
     } catch (error) {
-      toast(`取消失败：${errorMessage(error)}`, 'err')
+      toast(t('取消失败：{error}', { error: errorMessage(error) }), 'err')
     }
     return
   }
 
   const asset = current.info?.asset
   if (!asset?.url) {
-    toast('没有可下载的安装包', 'err')
+    toast(t('没有可下载的安装包'), 'err')
     return
   }
   // 按钮不可见就不该从这里发起下载（openAndDownload 的自动触发也走这条路）
@@ -493,12 +507,12 @@ async function downloadOrCancel(): Promise<void> {
     // 下载完成时自动安装
     autoInstalledPath = null
     publish({ phase: 'downloading', readyPath: '', percent: 0 })
-    setBadge('下载中', 'warn')
+    setBadge(t('下载中'), 'warn')
     setState(downloadHint(current.info))
     startPolling()
   } catch (error) {
-    setBadge('下载失败', 'bad')
-    setState(`下载失败：${errorMessage(error)}`, true)
+    setBadge(t('下载失败'), 'bad')
+    setState(t('下载失败：{error}', { error: errorMessage(error) }), true)
   } finally {
     busy = false
     publish({ actionBusy: false })
@@ -590,12 +604,12 @@ function downloadButton(snap: Snapshot): { label: string; disabled: boolean } | 
   const actionable = snap.info?.hasUpdate === true && !!snap.info?.asset?.url
   if (!actionable && snap.phase !== 'downloading' && snap.phase !== 'ready') return null
   const label = snap.phase === 'downloading'
-    ? '取消下载'
+    ? t('取消下载')
     : snap.phase === 'failed'
-      ? '重试下载'
+      ? t('重试下载')
       : snap.phase === 'ready'
         ? installButtonText(snap.info)
-        : '下载并安装'
+        : t('下载并安装')
   return { label, disabled: snap.actionBusy }
 }
 
@@ -606,7 +620,7 @@ function changelogCard(snap: Snapshot): React.ReactNode {
   if (!notes) {
     return (
       <div className='update-log-hint'>
-        {info ? '这个版本没有填写发布说明。' : '点击「检查更新」后，这里会显示最新版本的更新说明。'}
+        {info ? t('这个版本没有填写发布说明。') : t('点击「检查更新」后，这里会显示最新版本的更新说明。')}
       </div>
     )
   }
@@ -616,9 +630,9 @@ function changelogCard(snap: Snapshot): React.ReactNode {
   return (
     <div className='rel-note'>
       <div className='rel-note-head'>
-        <span className='rel-tag'>{String(info?.latestVersion || '最新版本')}</span>
+        <span className='rel-tag'>{String(info?.latestVersion || t('最新版本'))}</span>
         {/* 旧的 .badge.tag.warn → Badge 的 tag 形态 + warning 语义色 */}
-        {info?.prerelease === true ? <Badge shape='tag' variant='warning'>预发布</Badge> : null}
+        {info?.prerelease === true ? <Badge shape='tag' variant='warning'>{t('预发布')}</Badge> : null}
         {published ? <span className='rel-date'>{published}</span> : null}
       </div>
       <div className='rel-note-body'>
@@ -627,13 +641,13 @@ function changelogCard(snap: Snapshot): React.ReactNode {
             文本节点，于是旧实现那几处 esc() 在这里天然不需要。 */}
         {html ? <div className='md-body' dangerouslySetInnerHTML={{ __html: html }} /> : (
           <div className='md-body'>
-            <p className='md-body-empty'>这个版本没有填写发布说明。</p>
+            <p className='md-body-empty'>{t('这个版本没有填写发布说明。')}</p>
           </div>
         )}
         {pageUrl ? (
           <div className='rel-foot'>
             <a href={pageUrl} data-external={pageUrl} target='_blank' rel='noopener'>
-              在 GitHub 查看完整说明
+              {t('在 GitHub 查看完整说明')}
             </a>
           </div>
         ) : null}
@@ -658,18 +672,22 @@ function UpdatePanel() {
   const repo = snap.repository ? `https://github.com/${snap.repository}` : ''
   const owner = snap.repository ? `https://github.com/${snap.repository.split('/')[0]}` : ''
   const latestLabel = snap.info?.latestVersion
-    ? `${snap.info.latestVersion}${snap.info.prerelease ? '（预发布）' : ''}`
+    ? (snap.info.prerelease
+      ? t('{version}（预发布）', { version: snap.info.latestVersion })
+      : snap.info.latestVersion)
     : '—'
   const tag = String(snap.info?.latestVersion || '').trim()
-  const logMeta = tag ? `${tag}${snap.checkedAt ? ` · 检查于 ${formatClock(snap.checkedAt)}` : ''}` : ''
+  const logMeta = tag
+    ? `${tag}${snap.checkedAt ? t(' · 检查于 {time}', { time: formatClock(snap.checkedAt) }) : ''}`
+    : ''
 
   return (
     <section className='panel' onClick={handleExternalClick}>
       <div className='panel-head'>
-        <h2>软件更新</h2>
+        <h2>{t('软件更新')}</h2>
         <span
           className='tip-q'
-          data-tip='更新包从 GitHub 发布页下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。检查更新与下载安装包的出网线路、GitHub 令牌都在「更新设置」里：线路默认直连（直连失败时自动借 Clash Verge 的混合端口重试一次），选定指定出口后只走该出口；填写 GitHub 令牌可把检查限额从 60 次/小时提高到 5000 次/小时。'
+          data-tip={t('更新包从 GitHub 发布页下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。检查更新与下载安装包的出网线路、GitHub 令牌都在「更新设置」里：线路默认直连（直连失败时自动借 Clash Verge 的混合端口重试一次），选定指定出口后只走该出口；填写 GitHub 令牌可把检查限额从 60 次/小时提高到 5000 次/小时。')}
         ></span>
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像徽章文案与语义色（配色经
             data-tone 传；设置页顶栏那枚镜像目前还不读它，保持一致没坏处） */}
@@ -682,14 +700,14 @@ function UpdatePanel() {
           <Button
             id='btn-update-settings'
             variant='outline'
-            title='出网线路与 GitHub 令牌设置'
+            title={t('出网线路与 GitHub 令牌设置')}
             onClick={() => setSettingsOpen(true)}
           >
-            更新设置
+            {t('更新设置')}
           </Button>
           {/* 旧 class="primary" → variant="default"；无 class → variant="outline" */}
           <Button id='btn-update-check' variant='outline' disabled={snap.checking} onClick={() => void check()}>
-            {snap.checking ? '检查中…' : '检查更新'}
+            {snap.checking ? t('检查中…') : t('检查更新')}
           </Button>
           {button ? (
             <Button
@@ -707,12 +725,12 @@ function UpdatePanel() {
         {/* 当前版本 → 最新版本两个读数同一行，窗口放不下时靠 .update-version 的 wrap 换行 */}
         <div className='update-version'>
           <span className='version-pill'>
-            <span className='k'>当前版本</span>
+            <span className='k'>{t('当前版本')}</span>
             <span className='v' id='update-current'>{snap.info?.currentVersion || '—'}</span>
           </span>
           <span className='version-arrow'>→</span>
           <span className='version-pill new'>
-            <span className='k'>最新版本</span>
+            <span className='k'>{t('最新版本')}</span>
             <span className='v' id='update-latest'>{latestLabel}</span>
           </span>
         </div>
@@ -733,14 +751,13 @@ function UpdatePanel() {
         {owner && repo ? (
           <div className='update-author' id='update-author'>
             <div className='update-author-text'>
-              <strong>关于作者</strong>
+              <strong>{t('关于作者')}</strong>
               <span>
-                本工具由{' '}
+                {t('本工具由')}{' '}
                 <a id='update-author-link' href={owner} data-external={owner} target='_blank' rel='noopener'>
                   {snap.repository.split('/')[0]}
                 </a>{' '}
-                个人开发并开源维护，免费使用、不带广告，也不会收集你的账号数据。如果它帮到了你，欢迎到项目仓库点个
-                Star 支持一下。
+                {t('个人开发并开源维护，免费使用、不带广告，也不会收集你的账号数据。如果它帮到了你，欢迎到项目仓库点个 Star 支持一下。')}
               </span>
             </div>
             <div className='update-author-actions'>
@@ -750,9 +767,9 @@ function UpdatePanel() {
                 size='sm'
                 variant='outline'
                 data-external={repo}
-                title='在浏览器中打开项目仓库，点 Star 支持作者'
+                title={t('在浏览器中打开项目仓库，点 Star 支持作者')}
               >
-                收藏项目
+                {t('收藏项目')}
               </Button>
             </div>
           </div>
@@ -762,7 +779,7 @@ function UpdatePanel() {
             （与上方「最新版本」同源） */}
         <div className='update-log' id='update-notes'>
           <div className='update-log-head'>
-            <span className='update-log-title'>更新日志</span>
+            <span className='update-log-title'>{t('更新日志')}</span>
             <span className='update-log-meta' id='update-log-meta'>{logMeta}</span>
           </div>
           <div className='update-log-body' id='update-log-body'>{changelogCard(snap)}</div>

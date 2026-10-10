@@ -779,6 +779,59 @@ impl LoginService {
             }
             return result.map(LoginCallbackSubmission::Completed);
         }
+        // Antigravity 的回调同样是标准 `code` / `state` 查询串（Google OAuth
+        // 授权码 + loopback）。与 Accio 同款，这里同时服务两个入口：
+        //   ① 浏览器直接落到网关的 `/oauth-callback` 路由（public 回调 handler
+        //      把 URL 转交进来）；
+        //   ② 网页端 / Docker 用户在登录弹窗里手工粘贴整条回调 URL（浏览器
+        //      到不了容器内的 loopback 端口时）。
+        // 两条入口的收尾完全一致：state 与任务逐字比对 → 适配器换码落账号。
+        if kind == ProviderKind::Antigravity {
+            let parsed = url::Url::parse(callback_url).map_err(|_| {
+                GatewayError::with_status(400, "Antigravity 登录回调地址无效")
+            })?;
+            let params: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+                return Err(GatewayError::with_status(400, format!("授权被拒绝（{error}）")));
+            }
+            let callback_state = params.get("state").map(String::as_str).unwrap_or("");
+            let code = params.get("code").map(String::as_str).unwrap_or("");
+            if callback_state.trim() != state {
+                return Err(GatewayError::with_status(400, "回调地址与当前 Antigravity 登录任务不匹配"));
+            }
+            return match adapter_for(kind)
+                .exchange_login_code(&self.store, code, state)
+                .await
+            {
+                Ok(account_id) => {
+                    let session = json!({
+                        "accountUid": account_id,
+                        "nickname": Value::Null,
+                        "edition": task.edition,
+                        "provider": task.provider,
+                    });
+                    handle.update(|task| {
+                        task.done = true;
+                        task.session = Some(session);
+                        task.finished_at = Some(logging::now_ms());
+                    });
+                    Ok(LoginCallbackSubmission::Completed(account_id))
+                }
+                Err(error) => {
+                    // 与 Accio / Raccoon 同一处置：失败要落定任务错误，
+                    // 否则前端会一直等到 5 分钟超时
+                    finish_task_error(&handle, &error.message);
+                    logging::log(
+                        "[Login]",
+                        &format!("❌ Antigravity 网页登录换取凭证失败: {}", error.message),
+                    );
+                    Err(error)
+                }
+            };
+        }
         // AutoClaw OAuth 回调 URL 里没有网关自己的 task state，手工提交时由
         // 请求体的 state 先锁定这次任务，再按回调路径识别 Zai / Google。
         if crate::server::core::providers::autoclaw::Region::from_provider_id(&task.provider).is_some() {

@@ -12,7 +12,7 @@
 //! ```
 //!
 //! 曾经是「外层按 provider 路由优先级轮询、内层在该家账号里选路」两层循环；
-//! 现在四家账号排在同一条队里，先用哪一家由账号优先级本身决定，provider
+//! 现在各家的账号排在同一条队里，先用哪一家由账号优先级本身决定，provider
 //! 只是每个账号的属性（决定用哪个适配器发）。候选池按 provider 过滤只剩一个
 //! 目的：不把不提供该模型的家的账号放进来。
 //!
@@ -31,12 +31,14 @@
 //! `retry_advice` 给出。这样既能满足契约，又不会让具体错误码漏进本文件。
 //!
 //! ── 有状态 provider 的分流（W5-T-d4，架构文档 §4.2.1）─────────
-//! 有状态 provider（CatPaw）**只替换「一次发送」，不替换账号循环**：选路、
+//! 有状态 provider（如 CatPaw；清单见各自 `mod.rs` 的 `is_stateful`）
+//! **只替换「一次发送」，不替换账号循环**：选路、
 //! telemetry 记账全部共用；不走 `build_chat_request` 那条路，因为会话式协议的
 //! 「一次发送」是 round + turn + 工具循环，产出的是同形的 `ForwardOutcome`
 //! 而不是 `reqwest::Response`。分流点是账号循环里的一处 `if adapter.is_stateful()`，
-//! 实现见 `attempt_stateful`（只做「凭证 → 记账 → 转发 → 错误透传」，
-//! 三个分类动作不适用：CatPaw 的原项目没有多账号轮换也没有限额码）。
+//! 实现见 `attempt_stateful`（只做「凭证 → 记账 → 转发 → 错误透传」；
+//! 无状态路径的重试 / 刷新动作不套用，适配器给的 `classify_conversation_error`
+//! 只取其中的限额**记账**语义，标记冷却后仍按队列顺延）。
 //!
 //! ── 内容处理（系统提示词 + 脱敏）在哪一步生效 ─────────────────
 //! 见 `payload.rs`：两层处理只在某一家即将发送前落到**副本**上。本文件负责
@@ -889,6 +891,8 @@ async fn attempt_queue(
                 headers: plan.headers,
                 payload,
                 proxy: target.proxy.clone(),
+                // 能力位由适配器给；账号已配代理时它不参与（proxy 优先）
+                system_proxy_when_unset: adapter.system_proxy_when_unset(),
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -1271,23 +1275,58 @@ async fn attempt_queue(
 
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
-        // ZCode 的活动套餐通道说 Anthropic，先过一层翻译折成 chat 帧
-        // （见 `upstream::translate` 与 `providers::zcode::plan`）。
+        // 三条例外各有一台翻译状态机（见 `upstream::translate` 的模块头）：
+        //   - ZCode 的活动套餐通道说 Anthropic SSE；
+        //   - Command Code 说 NDJSON（`application/x-ndjson`，**HTTP 恒 200**、
+        //     错误在流内），那家返回的 200 不代表这一轮生成成功 —— 成败由
+        //     翻译状态机折出的错误帧表达，与另外两处出口共用同一套下行语义；
+        //   - Antigravity 说 Gemini v1internal SSE（`data: {"response":{…}}`
+        //     信封，字段路径是 Gemini 方言）——上游状态码仍是成败判据，
+        //     翻译机只折字节形态（流内错误另走错误帧）。
         // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
+        // 说 chat 的家（含自定义家）跳过这一整段，直接走下面的原生路径。
         if response_protocol
-            == crate::server::core::providers::adapter::UpstreamResponse::Anthropic
+            != crate::server::core::providers::adapter::UpstreamResponse::Chat
         {
+            use crate::server::core::providers::adapter::UpstreamResponse;
             // 状态码要在 consume response 之前取（与 chat 路径同一时机）
             let status = response.status().as_u16();
             let translated: futures::stream::BoxStream<
                 'static,
                 Result<bytes::Bytes, std::io::Error>,
-            > = Box::pin(super::translate::AnthropicToChatStream::new(
-                response,
-                &wire_model,
-                ctx.telemetry,
-            ));
+            > = match response_protocol {
+                UpstreamResponse::Anthropic => Box::pin(
+                    super::translate::AnthropicToChatStream::new(
+                        response,
+                        &wire_model,
+                        ctx.telemetry,
+                    ),
+                ),
+                UpstreamResponse::CommandCodeNdjson => Box::pin(
+                    super::translate::CommandCodeToChatStream::new(
+                        response,
+                        &wire_model,
+                        ctx.telemetry,
+                    ),
+                ),
+                UpstreamResponse::AntigravityGemini => Box::pin(
+                    super::translate::AntigravityToChatStream::new(
+                        response,
+                        &wire_model,
+                        ctx.telemetry,
+                    ),
+                ),
+                // 外层 `if` 已排除它，这一支只为 match 的穷尽性存在，**不可能
+                // 走到**。真走到说明分派被改坏了：报内部错误而不是 panic
+                // （release 是 `panic=abort`，一处 panic 带走整个网关）。
+                UpstreamResponse::Chat => {
+                    return Err(GatewayError::with_status(
+                        500,
+                        "内部错误：Chat 协议不该进入上游响应翻译分派",
+                    ))
+                }
+            };
             if ctx.stream {
                 return Ok(ForwardOutcome::Stream {
                     status,
@@ -1484,7 +1523,7 @@ async fn attempt_custom(
     }
 }
 
-/// **有状态 provider** 的一次转发（架构文档 §4.2.1；当前只有 CatPaw）。
+/// **有状态 provider** 的一次转发（架构文档 §4.2.1；`is_stateful` 为 true 的家走这条）。
 ///
 /// ── 共用与不共用的部分（与无状态路径逐条对照）───────────────
 /// ```text
