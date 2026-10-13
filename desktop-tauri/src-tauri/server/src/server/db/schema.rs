@@ -154,12 +154,23 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 它不是配置项（配置写入绝不能动它，否则用户配好的代理会被改一次 API Key
     // 清空）。条目不落独立表、只整份读写，理由见那个模块头。
     "proxyPool",
+    // 订阅（core::subscriptions）：整份 `{items: [...]}` 一个键 —— 「网络代理」
+    // 页「订阅」区块维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
+    // 清单。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能动它。
+    "subscriptions",
     // OfficeAce 模型可用性探测的结论（core::providers::officeace::probe）：
     // 整份 `{unavailable:[…], probedAt, account}` 一个键。探测「目录里列着、这个
     // 号实际打不通」的模型（上游回 81004/81009），结论由 `advertise_models` 用来
     // 默认隐藏它们。属于「其它零散状态」——不是配置项，配置写入绝不能动它
     // （否则每次改配置都让隐藏集合清零、客户端又照着一个一个试）。
     "officeaceModelProbe",
+    // models.dev 模型元数据的刷新结果（core::model_meta::snapshot）：整份
+    // 「上次成功拉到的精简索引」一个键（文件形态与内嵌快照逐字相同，生成口径见
+    // `scripts/sync-modelsdev.mjs`）。**不是**配置项 —— 配置写入绝不能动它，
+    // 否则用户改一次 API Key 就退回发版时那份更旧的内嵌快照。
+    // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
+    // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
+    "modelsDevCatalog",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。

@@ -1,16 +1,22 @@
 //! OfficeAce 自助 OAuth：**不需要桌面端**，全链路在网关这一侧跑完。
 //!
-//! ── 七步（依据：officeace2api 的 `oauth.mjs` 与 opencode-officeace-auth 的
-//! `index.mjs`，两处逐条一致）─────────────────────────────────
+//! ── 九步（依据：本机 OfficeAce 的 `green-package/api/dist/auth/huawei-oauth.js`
+//! 与 `officeace2api` 的 `oauth.mjs`，两处逐条一致；⑥a/⑥b 是 2026-10-13 补的，
+//! 此前缺了它们 —— 已开通账号照报「没套餐」、未开通账号没有开通的路）─────
 //! ```text
 //! ① POST {cloud}/v1/claw/auth/state                     → state（无鉴权）
 //! ② 本地生成 PKCE(S256) 与一对 P-256 DPoP 密钥
 //! ③ 拼 authorizeUrl，让用户去浏览器登华为云
 //! ④ GET  {cloud}/v1/claw/auth/code?state=<state>        ← 整件事的钥匙
 //!      202 = 还没登完；404 = state 不认识/过期；200 = 拿到 authorization code
-//! ⑤ POST {sts}/v1/oauth2/tokens（表单 + `DPoP:` 头）    → 临时 AK/SK/STS/project_id
+//! ⑤ POST {sts}/v1/oauth2/tokens（表单 + `DPoP:` 头）    → 临时 AK/SK/STS
+//!      （响应**不带 project_id**，IAM OAuth2 的既成事实）
 //! ⑥ GET  {cloud}/v1/claw/client-permission-validate（SDK-HMAC 签名）
-//!      → model_auth_info.model_app_key / model_app_secret + model_api_url_base
+//!      → 身份三件套 + `subscription.model_info`（**可能为空** = 尚未开通）
+//! ⑥a GET  {iam}/v3/projects（SDK-HMAC 签名，仅 project_id 空时）
+//!      → 按 region 名匹配补 project_id（官方 `resolveProjectId` 同口径）
+//! ⑥b POST {cloud}/v1/claw/client-subscription（body `{}`，仅 model_info 空时）
+//!      → 把服务开通，成功返回顶层 `model_info`（官方对「未开通」的处置）
 //! ⑦ 入库：网关 Basic 那对**不过期**，临时凭据用来续期与额度/签到
 //! ```
 //!
@@ -40,6 +46,8 @@ use crate::server::core::providers::codearts::credentials::DpopKeyPair;
 use crate::server::core::providers::codearts::dpop::DpopKey;
 use crate::server::core::providers::officeace::signer::{self, Algorithm, Credential as SigningCredential};
 use crate::server::logging;
+
+use super::provision;
 
 /// 云端总控基址（`/v1/claw/*` 都挂在这里）。
 pub const CLOUD_BASE: &str = "https://agentarts.cn-southwest-2.myhuaweicloud.com";
@@ -248,21 +256,50 @@ impl LoginFlow {
     }
 
     /// ⑤⑥⑦：拿授权码换临时凭据，再用它换网关 Basic 那对。
+    ///
+    /// ── 与官方实现对齐的四步（此前只有第 2 步，两端的坑都踩了）──
+    ///   1. 令牌响应**不带** `project_id`（IAM OAuth2 实测如此）→ 从 IAM keystone
+    ///      按 region 补一个（查不到不阻断：validate 那一发不缺它也过）；
+    ///   2. `client-permission-validate` 拿身份与（可能为空的）`model_info`；
+    ///   3. `model_info` 为空 = **账号尚未开通**（正常状态，不是错误）→ 打一发
+    ///      `client-subscription`（body `{}`）开通，成功即返回 `model_info`；
+    ///   4. 从 `model_info` 解网关三件套落盘。
     pub async fn finish(&self, code: &str) -> Result<GatewayCredential, String> {
-        let (temporary, expires_at, identity, refresh_token) = self.exchange_code(code).await?;
-        let gateway = self.fetch_gateway_credential(&temporary).await?;
+        let (mut temporary, expires_at, identity, refresh_token) =
+            self.exchange_code(code).await?;
+        // ① project_id 补查（见模块头 ⑦ 与 provision 模块头）
+        if temporary.project_id.is_empty() {
+            if let Some(project_id) = provision::resolve_project_id(&temporary, REGION).await {
+                temporary.project_id = project_id;
+            }
+        }
+        // ② 权限校验：identity +（可能为空的）model_info
+        let (account_id, permission_principal, model_info) =
+            self.fetch_permission(&temporary).await?;
+        // ③ 没开通就开通一次 —— 官方对「model_info 为空」的处置就是这条路：
+        //    新账号在这里从零开通，已开通账号不会走到（第 ② 步直接带回 model_info）
+        let model_info = if model_info.is_object() {
+            model_info
+        } else {
+            logging::log(
+                "[Login]",
+                "OfficeAce 账号尚未开通，尝试自动开通（client-subscription）",
+            );
+            provision::subscribe_model_info(CLOUD_BASE, &temporary, None).await?
+        };
+        let (base_url, model_app_key, model_app_secret) = gateway_of(&model_info)?;
         // principal id 两个来源：令牌 `user_profile` 优先（它就在身份本身里），
         // 没有就退 `client-permission-validate` 回的那个
         let principal_id = if identity.principal_id.is_empty() {
-            gateway.4
+            permission_principal
         } else {
             identity.principal_id
         };
         Ok(GatewayCredential {
-            base_url: gateway.0,
-            model_app_key: gateway.1,
-            model_app_secret: gateway.2,
-            account_id: gateway.3,
+            base_url,
+            model_app_key,
+            model_app_secret,
+            account_id,
             principal_id,
             access_key_id: temporary.access_key_id,
             secret_access_key: temporary.secret_access_key,
@@ -481,22 +518,26 @@ impl LoginFlow {
         ))
     }
 
-    /// ⑥ 用临时凭据问云端要网关 Basic 那对（SDK-HMAC-SHA256 签名）。
+    /// ⑥ 用临时凭据做一次权限校验（SDK-HMAC-SHA256 签名）。
     ///
-    /// 返回 `(网关基址, app key, app secret, account_id, principal_id)` ——
-    /// 后两项只用来给账号名兜底。
-    async fn fetch_gateway_credential(
+    /// 返回 `(account_id, principal_id, model_info)`：身份两项只用来给账号名兜底；
+    /// `model_info` **可能为空对象**——那是「账号尚未开通」的正常形态（官方同样把
+    /// 它当分支而不是错误），交由 [`super::provision`] 决定是否走开通，不在这一层报错。
+    async fn fetch_permission(
         &self,
         temporary: &SigningCredential,
-    ) -> Result<(String, String, String, String, String), String> {
+    ) -> Result<(String, String, Value), String> {
         let url = format!("{CLOUD_BASE}/v1/claw/client-permission-validate");
+        // 头对齐官方 `checkPermission`：订阅类型头 +（signer 自动补的）
+        // `X-Security-Token` / `X-Project-ID`。GET 无 body、也就**不带**
+        // `Content-Type`（官方不带；实测带不带都能过，但不带才与官方签名头集合一致）。
         let headers = signer::sign(&signer::SignRequest {
             algorithm: Algorithm::Sdk,
             method: "GET",
             url: &url,
             headers: &[(
-                "Content-Type".to_string(),
-                "application/json;charset=utf8".to_string(),
+                provision::SUBSCRIPTION_TYPE_HEADER.0.to_string(),
+                provision::SUBSCRIPTION_TYPE_HEADER.1.to_string(),
             )],
             body: b"",
             credential: temporary,
@@ -512,7 +553,7 @@ impl LoginFlow {
         let response = request
             .send()
             .await
-            .map_err(|error| format!("开通校验失败：{}", egress::describe_error_detail(&error)))?;
+            .map_err(|error| format!("权限校验失败：{}", egress::describe_error_detail(&error)))?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
         let payload = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
@@ -522,51 +563,17 @@ impl LoginFlow {
                 .and_then(Value::as_str)
                 .or_else(|| payload.get("error_code").and_then(Value::as_str))
                 .unwrap_or("");
-            return Err(format!("开通校验失败（HTTP {status}）：{detail}"));
+            return Err(format!("权限校验失败（HTTP {status}）：{detail}"));
         }
+        // `model_info` 的两种位置（实测）：validate 嵌在 `subscription.model_info`；
+        // 开通那一发在顶层。两层都兜，非对象一律当「没有」。
         let model_info = payload
             .get("model_info")
             .or_else(|| payload.get("subscription").and_then(|value| value.get("model_info")))
             .or_else(|| payload.get("modelInfo"))
-            .unwrap_or(&Value::Null);
-        let auth_info = model_info.get("model_auth_info").unwrap_or(&Value::Null);
-        let app_key = auth_info
-            .get("model_app_key")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let app_secret = auth_info
-            .get("model_app_secret")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if app_key.is_empty() {
-            let pending = payload
-                .get("subscription")
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str)
-                == Some("PENDING");
-            return Err(if pending {
-                "这个账号还没开通服务，需要先在客户端里兑换邀请码；开通后再重新登录一次即可".to_string()
-            } else {
-                "云端没返回模型网关信息，可能该账号没有可用套餐".to_string()
-            });
-        }
-        let host = model_info
-            .get("model_api_url_base")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches('/')
-            .to_string();
-        let base_url = if host.is_empty() {
-            String::new()
-        } else if host.ends_with("/v2") {
-            format!("https://{host}")
-        } else {
-            format!("https://{host}/v2")
-        };
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or(Value::Null);
         let account_id = payload
             .get("account_id")
             .and_then(Value::as_str)
@@ -581,8 +588,48 @@ impl LoginFlow {
             .unwrap_or("")
             .trim()
             .to_string();
-        Ok((base_url, app_key, app_secret, account_id, principal_id))
+        Ok((account_id, principal_id, model_info))
     }
+}
+
+/// 从 `model_info` 解网关三件套：基址（规范化到 `/v2`）+ app key/secret。
+///
+/// 两个入口共用：validate 的 `subscription.model_info` 与开通那一发的顶层
+/// `model_info`（实测两处字段名一致：`model_api_url_base` /
+/// `model_auth_info.model_app_key` / `model_app_secret`）。
+fn gateway_of(model_info: &Value) -> Result<(String, String, String), String> {
+    let auth_info = model_info.get("model_auth_info").unwrap_or(&Value::Null);
+    let app_key = auth_info
+        .get("model_app_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let app_secret = auth_info
+        .get("model_app_secret")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if app_key.is_empty() || app_secret.is_empty() {
+        return Err("云端返回了模型信息，但缺少模型网关凭据（model_app_key / model_app_secret）".to_string());
+    }
+    let host = model_info
+        .get("model_api_url_base")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let base_url = if host.is_empty() {
+        String::new()
+    } else if host.ends_with("/v2") {
+        format!("https://{host}")
+    } else {
+        format!("https://{host}/v2")
+    };
+    Ok((base_url, app_key, app_secret))
 }
 
 /// 从令牌端点的**响应体**里取身份信息：一发里有两枚 JWT，名字可能装在任意一枚里。

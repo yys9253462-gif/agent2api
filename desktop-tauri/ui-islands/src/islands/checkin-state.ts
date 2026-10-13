@@ -134,6 +134,8 @@ export type CheckinCenterSnapshot = {
      *  曾还有一条 CodeArts 福利行（带 `welfare` 台账），2026-10 它的每日福利并入
      *  每日签到后后端把那条撤了 —— 见 `api::checkin_center` 的说明。 */
     plans: Array<{ id: string; name: string; provider?: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
+    /** 成长任务行的账号清单（WorkBuddy 国内版；任务详情前端展开时惰性查询） */
+    growth?: Array<{ id: string; name: string; provider?: string }>
   }
   auto: SchedulesSnapshot
   /** WorkBuddy 国际版日活保活的模型链（后端快照直接给当前生效值 + 缺省值） */
@@ -171,6 +173,74 @@ export type OnboardingCache = {
   settled?: boolean
   /** 结算时刻（后端记忆里的 `at`；仅 `settled` 时有） */
   settledAt?: number
+}
+
+/* ─── 成长任务（WorkBuddy 国内版；GET/POST /api/accounts/{id}/growth*）─── */
+
+/** 一条成长任务的展示行（`GET /api/accounts/{id}/growth` 的 tasks 元素） */
+export type GrowthTaskRow = {
+  code: string
+  title: string
+  description?: string
+  /** not_accepted / accepted / completed / claimed（上游口径） */
+  status: string
+  current: number
+  target: number
+  locked?: boolean
+  unlockAt?: unknown
+  /** 在映射表里（未支持的任务执行时会保守跳过，界面如实标注） */
+  supported: boolean
+  unforgeable?: boolean
+  unforgeableReason?: string
+  kind?: string
+  source?: string
+}
+
+/** 执行结果的逐任务行（`POST .../growth/run` 的 results 元素） */
+export type GrowthRunRow = {
+  code: string
+  /** done / already / skipped / failed（school 段同形） */
+  outcome: string
+  message: string
+  credit?: number
+  energy?: number
+}
+
+/** 成长任务账号的惰性缓存（status: idle = 还没查过） */
+export type GrowthCache = {
+  status: 'idle' | 'loading' | 'loaded' | 'error'
+  error?: string
+  checkedAt?: number
+  /** 能量余额 / 连登天数（只读读数；拉不到 null） */
+  energy: number | null
+  streak: number | null
+  tasks: GrowthTaskRow[]
+  travel: {
+    hasBuddy?: boolean | null
+    buddyName?: string
+    state?: string
+    dailyLimitReached?: boolean
+    rewardCredit?: number
+    error?: string | null
+  } | null
+  school: {
+    inPeriod?: boolean
+    tasks?: GrowthTaskRow[]
+    lottery?: { balance?: number; totalEarned?: number } | null
+    error?: string | null
+  } | null
+  /** 全量执行在途 */
+  running: boolean
+  /** 开学季 + 抽奖在途 */
+  runningSchool: boolean
+  /** 猫猫旅行巡检在途 */
+  runningTravel: boolean
+  /** 最近一次执行的结果行（任务 + 开学季归并在这里展示） */
+  results?: GrowthRunRow[]
+  /** 最近一次抽奖结果文本（开学季「执行并抽奖」后回填） */
+  lotteryText?: string
+  /** 最近一次开学季任务执行的逐条概要（「执行并抽奖」后回填） */
+  schoolText?: string
 }
 
 /* ─── 本岛用到的桥（在 accounts-shared 的 AccountsBridge 之上补签到两组）─── */
@@ -215,6 +285,35 @@ type CheckinBridge = {
     unclaimed?: unknown
     settled?: unknown
     settledAt?: unknown
+    /** 后端对本次领取结果的一句话交代（OfficeAce 会回，见 checkin-state 的 claimOnboarding） */
+    message?: unknown
+  } | null | undefined>
+  /** 成长任务盘点（只读；与 bridge.rs、web_shim.rs 三处成对） */
+  getGrowthStatus?(id: string): Promise<{
+    energy?: unknown
+    streak?: unknown
+    tasks?: { tasks?: unknown; error?: unknown }
+    travel?: unknown
+    school?: unknown
+  } | null | undefined>
+  /** 成长任务执行（**单任务**；界面的「一键完成」在本地循环逐条调用） */
+  runGrowthTask?(id: string, code: string, mode?: string): Promise<{
+    code?: unknown
+    outcome?: unknown
+    message?: unknown
+    credit?: unknown
+    energy?: unknown
+  } | null | undefined>
+  /** 开学季任务 + 可选抽奖 */
+  runGrowthSchool?(id: string, lottery?: boolean): Promise<{
+    results?: unknown
+    lottery?: unknown
+  } | null | undefined>
+  /** 猫猫旅行巡检一次 */
+  runGrowthTravel?(id: string): Promise<{
+    outcome?: unknown
+    message?: unknown
+    credit?: unknown
   } | null | undefined>
 }
 
@@ -296,6 +395,8 @@ export type CheckinStore = {
   signing: ReadonlySet<string>
   /** 新手任务的按账号缓存（Loomy / 小浣熊） */
   onboarding: ReadonlyMap<string, OnboardingCache>
+  /** 成长任务的按账号缓存（WorkBuddy 国内版） */
+  growth: ReadonlyMap<string, GrowthCache>
 }
 
 let store: CheckinStore = {
@@ -312,6 +413,7 @@ let store: CheckinStore = {
   keepaliveDraft: null,
   signing: new Set<string>(),
   onboarding: new Map<string, OnboardingCache>(),
+  growth: new Map<string, GrowthCache>(),
 }
 
 const subscribers = new Set<() => void>()
@@ -672,7 +774,7 @@ export async function submitKeepaliveModels(models: string[]): Promise<void> {
  * 实查发现（`refresh`），后端届时也会清掉记忆。
  */
 async function autoProcessOnboarding(
-  rows: Array<{ id: string; settled?: OnboardingSettledRaw }>,
+  rows: Array<{ id: string; provider?: string; settled?: OnboardingSettledRaw }>,
 ): Promise<void> {
   for (const row of rows) {
     if (settledOf(row.id)) continue
@@ -680,7 +782,11 @@ async function autoProcessOnboarding(
   }
   for (const row of rows) {
     const cache = getCheckinStore().onboarding.get(row.id)
-    if (cache?.status === 'loaded' && cache.unclaimed > 0 && !cache.claiming && !cache.settled) {
+    if (cache?.status !== 'loaded' || cache.claiming || cache.settled) continue
+    // OfficeAce：奖励由上游按天自动发放、账本条目一律已到账（待领数恒 0），
+    // 「有没有待领」判不出「今天结算过没」—— 与官方客户端每小时自动 claim 同一
+    // 动作，这里进来就触发一次（幂等；结算后 settled 置位，当天不再重打）
+    if (row.provider === 'officeace' || cache.unclaimed > 0) {
       await claimOnboarding(row.id)
     }
   }
@@ -789,8 +895,13 @@ export async function claimOnboarding(id: string): Promise<void> {
       settledAt: settled ? numberOf(data?.settledAt) || undefined : undefined,
     })
     const failed = merged.filter(task => task.error && !task.done).length
+    // 后端交代本次结果时以它为准（OfficeAce 会回「本次到账 N 积分」/「今天的
+    // 奖励已发放」——那种上游的账本条目一律已到账，"有几项 done" 的口径不成立）
+    const message = typeof data?.message === 'string' ? data.message.trim() : ''
     if (failed) {
       toast(t('新手福利有 {n} 项领取失败，可重试', { n: failed }), 'err')
+    } else if (message) {
+      toast(message, 'ok')
     } else if (claimedCount) {
       toast(t('✅ 新手福利领取完成，累计 {n} 积分', { n: numberOf(data?.earned) }))
     }
@@ -807,6 +918,239 @@ export async function claimOnboarding(id: string): Promise<void> {
     toast(t('领取失败：{error}', { error: message }), 'err')
   } finally {
     await loadCheckinCenter()
+  }
+}
+
+/* ─── 成长任务（惰性查询 + 执行；WorkBuddy 国内版）─── */
+
+function normalizeGrowthTasks(raw: unknown): GrowthTaskRow[] {
+  const list = Array.isArray(raw) ? raw : []
+  return list
+    .map(item => {
+      const row = (item ?? {}) as Record<string, unknown>
+      const code = typeof row.code === 'string' ? row.code : ''
+      if (!code) return null
+      return {
+        code,
+        title: typeof row.title === 'string' && row.title ? row.title : code,
+        description: typeof row.description === 'string' ? row.description : '',
+        status: typeof row.status === 'string' ? row.status : '',
+        current: numberOf(row.current),
+        target: numberOf(row.target),
+        locked: row.locked === true,
+        unlockAt: row.unlockAt,
+        supported: row.supported === true,
+        unforgeable: row.unforgeable === true,
+        unforgeableReason: typeof row.unforgeableReason === 'string' ? row.unforgeableReason : '',
+        kind: typeof row.kind === 'string' ? row.kind : '',
+        source: typeof row.source === 'string' ? row.source : '',
+      } as GrowthTaskRow
+    })
+    .filter((row): row is GrowthTaskRow => row !== null)
+}
+
+function normalizeGrowthResults(raw: unknown): GrowthRunRow[] {
+  const list = Array.isArray(raw) ? raw : []
+  return list
+    .map(item => {
+      const row = (item ?? {}) as Record<string, unknown>
+      const code = typeof row.code === 'string' ? row.code : ''
+      if (!code) return null
+      return {
+        code,
+        outcome: typeof row.outcome === 'string' ? row.outcome : 'failed',
+        message: typeof row.message === 'string' ? row.message : '',
+        credit: numberOf(row.credit),
+        energy: numberOf(row.energy),
+      } as GrowthRunRow
+    })
+    .filter((row): row is GrowthRunRow => row !== null)
+}
+
+function growthOf(id: string): GrowthCache {
+  return store.growth.get(id) ?? {
+    status: 'idle', energy: null, streak: null, tasks: [],
+    travel: null, school: null,
+    running: false, runningSchool: false, runningTravel: false,
+  }
+}
+
+function patchGrowth(id: string, next: Partial<GrowthCache>): void {
+  const map = new Map(store.growth)
+  map.set(id, { ...growthOf(id), ...next })
+  patch({ growth: map })
+}
+
+/** 某账号的成长任务清单当前是否展开（与新手任务共用 `expanded` 集合） */
+export function growthExpanded(id: string): boolean {
+  return store.expanded.has(`growth:${id}`)
+}
+
+/** 展开 / 收起一个账号的成长任务清单 */
+export function toggleGrowthExpand(id: string): void {
+  const key = `growth:${id}`
+  const next = new Set(store.expanded)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  patch({ expanded: next })
+}
+
+/**
+ * 查询一个账号的成长任务盘点（只读）。
+ *
+ * 后端一次拉四块（成长任务 / 能量 / 猫猫旅行 / 开学季概况），某一块失败只在该块
+ * 给 error（不至于整行变红）；这里如实把每块的失败都收进 cache。
+ */
+export async function queryGrowth(id: string): Promise<void> {
+  const current = growthOf(id)
+  if (current.status === 'loading' || current.running) return
+  patchGrowth(id, { status: 'loading', error: undefined })
+  try {
+    const data = await bridge().getGrowthStatus?.(id)
+    const tasksBlock = (data?.tasks ?? {}) as { tasks?: unknown; error?: unknown }
+    const travel = (data?.travel ?? null) as GrowthCache['travel']
+    const schoolRaw = (data?.school ?? null) as (GrowthCache['school'] & { tasks?: unknown }) | null
+    patchGrowth(id, {
+      status: 'loaded',
+      checkedAt: Date.now(),
+      energy: data?.energy === null || data?.energy === undefined ? null : numberOf(data.energy),
+      streak: data?.streak === null || data?.streak === undefined ? null : numberOf(data.streak),
+      tasks: normalizeGrowthTasks(tasksBlock.tasks),
+      travel,
+      school: schoolRaw
+        ? { ...schoolRaw, tasks: normalizeGrowthTasks(schoolRaw.tasks) }
+        : null,
+      // 任务列表本身的失败挂在行级 error 上（账号级 status 仍是 loaded ——
+      // 其余三块有数据可看，不该整行显示成「查询失败」）
+      error: typeof tasksBlock.error === 'string' ? tasksBlock.error : undefined,
+    })
+  } catch (error) {
+    patchGrowth(id, { status: 'error', error: errorMessage(error) })
+  }
+}
+
+/**
+ * 执行成长任务（`mode=full` 点亮+领奖；`mode=claim` 只领已完成奖励）。
+ *
+ * ── 为什么在本地循环而不是一次全量请求 ──────────────────────
+ * 后端把执行拆成**单任务**端点：全量逐条留 1s+ 写间隔（上游风控口径）会超过
+ * 管理 API 的 60 秒转发超时，一次全量请求会被中途掐断。这里逐条 await、
+ * 逐条把结果落进 `results` —— 界面实时看到进度，失败的任务不影响后续。
+ *
+ * ── 挑选口径 ────────────────────────────────────────────────
+ * 只跑映射表支持、非不可伪造、未锁定的任务；`claim` 模式再收窄到「已完成」的
+ * （点亮是写操作，不属于「领取」的语义）。
+ */
+export async function runGrowth(id: string, mode: 'full' | 'claim'): Promise<void> {
+  const current = growthOf(id)
+  if (current.running) return
+  const targets = (current.tasks ?? []).filter(task => {
+    if (!task.supported || task.unforgeable === true) return false
+    if (task.locked === true) return false
+    if (mode === 'claim') {
+      return task.status === 'completed' || (task.current >= task.target && task.status !== 'claimed')
+    }
+    return task.status !== 'claimed'
+  })
+  if (targets.length === 0) {
+    toast(t('没有需要执行的任务'))
+    return
+  }
+  patchGrowth(id, { running: true, results: [], error: undefined })
+  let credit = 0
+  let energy = 0
+  let done = 0
+  let failed = 0
+  for (const task of targets) {
+    try {
+      const data = await bridge().runGrowthTask?.(id, task.code, mode)
+      const row = normalizeGrowthResults([data])[0]
+      if (row) {
+        // 逐条落进 results（用户在展开面板里实时看到「跑到哪一条了」）
+        patchGrowth(id, { results: [...(growthOf(id).results ?? []), row] })
+        credit += row.credit ?? 0
+        energy += row.energy ?? 0
+        if (row.outcome === 'done' || row.outcome === 'already') done += 1
+        if (row.outcome === 'failed') failed += 1
+      }
+    } catch (error) {
+      failed += 1
+      patchGrowth(id, {
+        results: [...(growthOf(id).results ?? []), {
+          code: task.code,
+          outcome: 'failed',
+          message: errorMessage(error),
+          credit: 0,
+          energy: 0,
+        }],
+      })
+    }
+  }
+  patchGrowth(id, { running: false })
+  if (failed > 0) {
+    toast(t('成长任务完成（{done} 项成功、{failed} 项失败），积分 +{credit} 能量 +{energy}', {
+      done, failed, credit, energy,
+    }), 'err')
+  } else {
+    toast(t('✅ 成长任务执行完成：积分 +{credit} 能量 +{energy}', { credit, energy }))
+  }
+  // 执行会改任务状态：重查一次让清单回到最新（读路径，不再写）
+  await queryGrowth(id)
+}
+
+/** 执行开学季任务；`lottery=true` 时任务后把抽奖余额抽空。 */
+export async function runGrowthSchool(id: string, lottery: boolean): Promise<void> {
+  const current = growthOf(id)
+  if (current.runningSchool) return
+  patchGrowth(id, { runningSchool: true, error: undefined })
+  try {
+    const data = await bridge().runGrowthSchool?.(id, lottery)
+    const results = normalizeGrowthResults(data?.results)
+    const lotteryRaw = (data?.lottery ?? null) as { message?: unknown; drawn?: unknown; credit?: unknown } | null
+    patchGrowth(id, {
+      runningSchool: false,
+      results,
+      // 逐条概要（开学季的任务码与成长任务不同集合，不塞进任务行的 resultOf 匹配；
+      // 直接把执行结论拼成一行文本给界面展示）
+      schoolText: results.length
+        ? results.map(row => `${row.code}：${row.message}`).join('；')
+        : undefined,
+      lotteryText: lotteryRaw
+        ? String(lotteryRaw.message ?? t('已抽 {n} 次', { n: numberOf(lotteryRaw.drawn) }))
+        : undefined,
+      checkedAt: Date.now(),
+    })
+    if (lotteryRaw) {
+      toast(t('开学季执行完成：{message}', { message: String(lotteryRaw.message ?? '') }))
+    } else {
+      toast(t('✅ 开学季任务执行完成'))
+    }
+    await queryGrowth(id)
+  } catch (error) {
+    patchGrowth(id, { runningSchool: false, error: errorMessage(error) })
+    toast(t('开学季执行失败：{error}', { error: errorMessage(error) }), 'err')
+  }
+}
+
+/** 猫猫旅行巡检一次（无猫领养 / 空闲派出 / 到站领奖，只推进一步）。 */
+export async function runGrowthTravel(id: string): Promise<void> {
+  const current = growthOf(id)
+  if (current.runningTravel) return
+  patchGrowth(id, { runningTravel: true, error: undefined })
+  try {
+    const data = await bridge().runGrowthTravel?.(id)
+    const message = String(data?.message ?? '')
+    const outcome = String(data?.outcome ?? '')
+    patchGrowth(id, { runningTravel: false, checkedAt: Date.now() })
+    if (outcome === 'failed') {
+      toast(t('猫猫旅行失败：{message}', { message }), 'err')
+    } else {
+      toast(t('猫猫旅行：{message}', { message }))
+    }
+    await queryGrowth(id)
+  } catch (error) {
+    patchGrowth(id, { runningTravel: false, error: errorMessage(error) })
+    toast(t('猫猫旅行失败：{error}', { error: errorMessage(error) }), 'err')
   }
 }
 

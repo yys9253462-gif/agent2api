@@ -356,9 +356,33 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
   padding: 12px 16px;
   border-bottom: 1px solid var(--hairline);
 }
-/* 关键词框吃掉剩余宽度（与日志页 .log-filters 的 search 框同一取舍） */
-.ck-records-search { flex: 1 1 140px; min-width: 140px; }
+/* 筛选行：时间档位 / 结果 / 提供商在左，关键词与读数在右（中间的 .spacer 把两侧顶开）。
+   除搜索框外一律不压缩（分段控件与下拉被挤扁就没法读了）—— 弹性只留给搜索框，
+   它的宽度与收缩下限写在 JSX 的工具类上（组件库 Input 自带 w-full，且工具类是分层
+   + !important 的，页面 CSS 里的 width / flex-basis 压不过它，见 checkin-records-tab.tsx
+   那处注释）；这条 `> *` 只是给不支持工具类那几个控件的兜底，两处不冲突 */
+.ck-records-filters > * { flex-shrink: 0; }
+/* 读数在换行后也靠右（一行放得下时由 .spacer 顶开，两者不冲突） */
+.ck-records-filters > .panel-sub { margin-left: auto; }
 .ck-records-scroll { overflow-x: auto; }
+
+/* 列宽。table-layout: fixed 下按 colgroup 分配：时间列是**定宽 px**（它装的是
+   formatTime 的完整输出，宽窄窗口都要一行放下），其余五列按百分数吃掉剩余宽度
+   （合计 100%）。没拖过的列走这里的默认值；拖过的列由 table-columns.js 把覆盖
+   宽度写成 <col> 的 inline width，优先于这里的默认值。改默认列宽时与
+   checkin-records-tab.tsx 的 RECORD_COLUMNS 一起看（那边是列的集合与顺序） */
+.ck-records-table { table-layout: fixed; }
+.ck-records-table col.ck-col-time { width: 160px; }
+.ck-records-table col.ck-col-account { width: 18%; }
+.ck-records-table col.ck-col-provider { width: 10%; }
+.ck-records-table col.ck-col-source { width: 11%; }
+.ck-records-table col.ck-col-outcome { width: 13%; }
+.ck-records-table col.ck-col-detail { width: 48%; }
+/* 表头格是列宽把手的定位锚（.col-grip 绝对定位挂在它的右缘，见 components.css） */
+.ck-records-table thead th { position: relative; }
+/* 内容超出列宽就裁掉，不压到相邻列上：列宽可以拖，要看全就把这一列拖宽
+   （定宽列与弹性列的取舍口径见 table-columns.js 的模块头） */
+.ck-records-table td { overflow: hidden; }
 /* 时间列定宽：时间与北京日期两行都不换行 */
 .ck-records-table .ck-col-time { white-space: nowrap; }
 .ck-record-date {
@@ -369,12 +393,6 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 .ck-record-source { font-variant-numeric: tabular-nums; }
 .ck-record-reason { margin-left: 6px; color: var(--text-3); font-size: 11.5px; }
 .ck-record-detail-fail { color: var(--danger); }
-.ck-records-foot {
-  display: flex;
-  justify-content: flex-end;
-  padding: 10px 16px;
-  border-top: 1px solid var(--hairline);
-}
 
 /* ── 空态 / 加载态（整页级与卡内共用）── */
 .ck-empty {

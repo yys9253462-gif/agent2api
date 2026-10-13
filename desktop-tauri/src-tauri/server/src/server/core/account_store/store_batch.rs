@@ -1,6 +1,6 @@
 //! 账号批量操作（Agent2API W3-T4 从 `store_crud.rs` 拆出，单文件行数约定）。
 //!
-//!   batch_update  批量修改（启用状态 / 代理；逐账号调 apply_patch）
+//!   batch_update  批量修改（启用状态 / 代理 / 并发上限；逐账号调 apply_patch）
 //!   batch_remove  批量删除（不存在的 id 记入 failed，不中断整批）
 //!
 //! ── 与单账号操作的关系 ──────────────────────────────────────
@@ -19,12 +19,13 @@ use serde_json::{json, Map, Value};
 use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
+use crate::server::core::account_store::store_crud::normalize_max_concurrent;
 use crate::server::core::account_store::store_util::truncate_chars;
 use crate::server::core::proxies::describe_account_proxy;
 use crate::server::logging;
 
 impl AccountStore {
-    /// 批量修改账号（目前支持启用状态与代理）。
+    /// 批量修改账号（目前支持启用状态、代理与并发上限）。
     ///
     /// 语义上是「对每个选中账号各跑一次 update_account」，但整批只落盘一次。
     /// 单个账号失败不中断整批：结果里分别记 ok / failed（含原因）。
@@ -39,8 +40,8 @@ impl AccountStore {
         let Some(patch_object) = patch.as_object() else {
             return Err(AccountStoreError::bad_request("批量修改内容必须是 JSON 对象"));
         };
-        // 批量场景只开放「启用状态」与「代理」：优先级必须唯一，逐账号指定才有意义，
-        // 备注名逐个改也说不通，都留给单账号设置面板
+        // 批量场景只开放「启用状态」「代理」「并发上限」：优先级必须唯一，逐账号
+        // 指定才有意义，备注名逐个改也说不通，都留给单账号设置面板
         let mut allowed = Map::new();
         let mut enabled_value = false;
         if let Some(value) = patch_object.get("enabled") {
@@ -53,8 +54,17 @@ impl AccountStore {
                 .unwrap_or(Value::Null);
             allowed.insert("proxy".to_string(), normalized);
         }
+        if let Some(value) = patch_object.get("maxConcurrent") {
+            // 校验先做**一次**（与单账号同一份，见 `normalize_max_concurrent`）：
+            // 丢进循环里逐账号报错会把同一个 400 说 N 遍，而这是「参数写错了」，
+            // 不是「某个账号存不下」—— 后者才该记进 failed。
+            let next = normalize_max_concurrent(value)?;
+            allowed.insert("maxConcurrent".to_string(), Value::from(next));
+        }
         if allowed.is_empty() {
-            return Err(AccountStoreError::bad_request("批量修改目前只支持启用状态与代理"));
+            return Err(AccountStoreError::bad_request(
+                "批量修改目前只支持启用状态、代理与并发上限",
+            ));
         }
 
         let _guard = self.guard();
@@ -147,6 +157,13 @@ impl AccountStore {
                     .to_string()
             };
             summary.push(format!("代理 → {label}"));
+        }
+        if let Some(value) = allowed.get("maxConcurrent").and_then(Value::as_u64) {
+            summary.push(if value == 0 {
+                "并发上限 → 不限".to_string()
+            } else {
+                format!("并发上限 → {value}")
+            });
         }
         let changed_count = ok
             .iter()

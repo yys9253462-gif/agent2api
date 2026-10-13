@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.0.2"
+version = "3.0.3"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -113,6 +113,10 @@ rusqlite = { version = "0.40", features = ["bundled", "backup", "hooks"] }
 # 管理面板登录的密码哈希（AGENT2API_ADMIN_PASSWORD_HASH）：
 # bcrypt 与 htpasswd -nBC 的输出格式互通，生成命令无需额外工具
 bcrypt = "0.15"
+# 订阅区块的「二维码导入」（api/subscriptions 的 decode-qr）：从剪贴板 /
+# 截图里解出订阅链接。rqrr 是纯 Rust 的 QR 解码器，配已有的 image 依赖用
+# （to_luma8 转灰度后 detect_grids），不新增图片解码栈。
+rqrr = "0.11"
 
 # AutoClaw 凭证解密的 DPAPI（providers/autoclaw/crypto.rs）。仅 Windows
 # 目标生效；其它平台该适配器的「导入桌面端登录态」是桩实现。

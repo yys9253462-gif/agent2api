@@ -240,11 +240,27 @@ fn parse_ms(value: Option<&Value>) -> i64 {
     }
 }
 
+/// 积分数值取整（**向下**）—— 口径说明见 [`summarize`]；负值 / 非有限值一律 0。
+fn whole_points(value: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        0.0
+    } else {
+        value.floor()
+    }
+}
+
 /// 把 `/v1/subscription` 归一成 `query_usage` 的形状（见 `adapter::ProviderAdapter`
 /// 的 `query_usage` 契约）。
 ///
 /// 只算**未过期**的额度（过期条目不计入，与参考实现的 `summarizeSubscription` 一致）；
 /// `available` = 套餐剩余 + 奖励剩余。
+///
+/// ── 为什么剩余量要取整（2026-10-13，用户报「可用 6499.331797714286 积分」）──
+/// 上游的 `current_value` 是**带小数的字符串**（实测 `"0.6682022857142857"`：
+/// 模型调用的消耗按比例折算成积分的零头），相减之后剩余量就拖着一长串小数。
+/// 而积分本身是整数概念（套餐 500、奖励按千发放），余额列又只有几十像素宽 ——
+/// 6499.331797714286 既挤又读不出信息。口径取**向下取整**：积分的用途是
+/// 「还能用多少」的判断依据，宁可少报不到 1 分的零头，也不虚报。
 pub fn summarize(subscription: &Value) -> Value {
     let now = crate::server::logging::now_ms();
     let mut plan_total = 0.0;
@@ -299,8 +315,10 @@ pub fn summarize(subscription: &Value) -> Value {
         .filter(|bonus| bonus.expires_at == 0 || bonus.expires_at > now)
         .map(|bonus| bonus.used)
         .sum();
-    let plan_remaining = (plan_total - plan_used).max(0.0);
-    let bonus_remaining = (bonus_total - bonus_used).max(0.0);
+    // 剩余量一律向下取整（口径见函数文档）：余额列 / 明细弹层读的都是这三处，
+    // 取整后「可用 = 套餐 + 奖励」的加法仍自洽（三处同口径）
+    let plan_remaining = whole_points(plan_total - plan_used);
+    let bonus_remaining = whole_points(bonus_total - bonus_used);
     let available = plan_remaining + bonus_remaining;
     let status = subscription
         .get("subscribe_status")
@@ -321,7 +339,7 @@ pub fn summarize(subscription: &Value) -> Value {
             "remainQuota": plan_remaining,
             "totalQuota": plan_total,
             "searches": if search_total > 0.0 {
-                json!({ "remaining": (search_total - search_used).max(0.0), "total": search_total })
+                json!({ "remaining": whole_points(search_total - search_used), "total": search_total })
             } else {
                 Value::Null
             },

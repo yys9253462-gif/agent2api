@@ -325,8 +325,8 @@
 }
 
 /* 用时：等宽 + 右对齐，相邻行的数字能直接竖着比大小。
-   两行：总用时（主读数）+ 首响（次读数，淡一档，与用量列的 sub 同一手法）——
-   OmniProxy 的用时列就是这个形态。只有数据行是两行，表头仍是单行文本
+   两行：总用时（主读数）+ 首响（次读数，淡一档，与用量列的 sub 同一手法）。
+   只有数据行是多行，表头仍是单行文本
    （所有排版声明都带 .req-row 前缀限定在数据行上，见上方 .req-time 的说明）。 */
 .req-row .req-dur {
   display: flex;
@@ -353,8 +353,8 @@
   font-size: 11px;
 }
 
-/* 用量两行：in / out / all 与 缓存读取 / 命中率。
-   等宽 + tabular-nums，超出省略（完整两行读数在 title 里）。 */
+/* 用量两行：in / out / all 与 缓存读取 / 命中率（生成速度 tok/s 跟在命中率后，同一行）。
+   等宽 + tabular-nums，超出省略（完整读数在 title 里）。 */
 .req-row .req-usage {
   display: flex;
   flex-direction: column;

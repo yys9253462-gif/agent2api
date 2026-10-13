@@ -47,10 +47,11 @@ import {
   displayNameOf, expiryMillis, formatIntervalSeconds, formatResetText,
   formatTokenCount, identifierOf, isDesktopAccount, isEnabled, isFreePlan, planBadgeLabel,
   providerFeatures,
-  providerOf, RESET_UNKNOWN, supportsClaim, supportsUsage, supportsUsageDetail,
+  providerOf, RESET_UNKNOWN, supportsClaim, supportsCreditDetail, supportsUsage, supportsUsageDetail,
   tokenBlockedOf, tokenCountdownText, tokenDisableTriggeredOf, tokenReadingForRule,
   tokenRulesOf, tokenWindowInfo, zcodePlanStateLabel,
 } from './accounts-domain'
+import { CreditDetailButton, creditRowsOf } from './accounts-credit-detail'
 import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
   connectionsOf, maskName, openBatchDialog, openSettingsDialog, openZcodePlans,
@@ -99,9 +100,14 @@ export function OrderCell({ account, rank }: { account: AccountRecord; rank: num
  * 分组带的 ⋯ 菜单：整组启用 / 禁用、批量操作本组、折叠本组。
  *
  * 「整组启用 / 禁用」直接落批量端点（一次改一组，与单行开关同一口径）；
- * 「批量操作本组…」打开既有的批量弹窗并**预选本组**（改代理这类要挑参数的动作用它，
- * 不必再新造一套界面）；折叠那一项与组头那颗箭头同一个状态 —— **它是个开关**，
- * 所以文案必须跟着当前状态变：已经收起的那一组，这一项写「展开这一组」才是它真做的事。
+ * 「批量操作本组」打开既有那一个批量弹窗（改代理、设置并发上限这类要挑参数的
+ * 动作用它）—— 挑参数的动作个个都要在弹窗里给一档，但**入口只留这一个**，
+ * 不为每件参数化动作在菜单里再各开一项；折叠那一项与组头那颗箭头同一个状态 ——
+ * **它是个开关**，所以文案必须跟着当前状态变：已经收起的那一组，这一项写
+ * 「展开这一组」才是它真做的事。
+ *
+ * 这一项**不带省略号**（别照「开弹窗就加 …」的惯例补回来）：同菜单其余项都不带，
+ * 而它后面还空着半截宽度，尾巴上那一个 … 只会被读成「文字被截断了」。
  */
 function GroupMenu({ group, ids, collapsed }: { group: AccountGroup; ids: string[]; collapsed: boolean }) {
   const [open, setOpen] = React.useState(false)
@@ -124,7 +130,7 @@ function GroupMenu({ group, ids, collapsed }: { group: AccountGroup; ids: string
           <Button variant='ghost' size='sm' className={itemClass}
             title={t('打开批量操作弹窗，并预选这一组的账号（改代理等动作在弹窗里挑参数）')}
             onClick={() => { setOpen(false); openBatchDialog(ids, 'proxy') }}>
-            {t('批量操作本组…')}
+            {t('批量操作本组')}
           </Button>
           <div className='my-1 h-px bg-hairline' />
           <Button variant='ghost' size='sm' className={itemClass}
@@ -328,6 +334,18 @@ function numberText(value: unknown): string {
   if (value === null || value === undefined || value === '') return '—'
   const number = Number(value)
   return Number.isFinite(number) ? String(number) : String(value)
+}
+
+/**
+ * 余额读数 → 明细弹层头部那一行（套餐 / 状态 / 到期 / 余量）。
+ *
+ * 与悬停提示共用 `subscriptionText`：那一行的措辞是既有产物，弹层里再写一份
+ * 迟早会与悬停说的不一样（同一份数据两种说法，用户只能猜哪个对）。
+ * 形状判据照旧按字段探测（不是按 provider）。
+ */
+function creditSubscriptionOf(entry: UsageEntry): string {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return ''
+  return subscriptionText((entry as Record<string, unknown>).subscription)
 }
 
 /**
@@ -919,6 +937,19 @@ export function UsageCell({ account }: { account: AccountRecord }) {
       {t('待生效 {n} 份', { n: pending.length })}
     </Badge>
   ) : null
+  // 积分明细入口（`creditDetail` 能力位：WorkBuddy 两家与 Trae）。同一档「读数可用」
+  // 的判据：查询失败 / 未配置时连读数本身都没有，挂一个点开是空框的入口更糟。
+  // 空数组同样不挂 —— 后端不写 `credits` 键就是「这家这次没有逐份读数」
+  // （企业账号、上游没给包），界面不去证明一个空清单。
+  const creditRows = summary.kind === 'ok' || summary.kind === 'warn' ? creditRowsOf(entry) : []
+  const creditDetail = supportsCreditDetail(account) && creditRows.length
+    ? {
+      rows: creditRows,
+      subscriptionLine: creditSubscriptionOf(entry),
+      kind: summary.kind,
+      title: summary.title,
+    }
+    : null
   if (supportsUsageDetail(account)) {
     const usable = summary.kind === 'ok' || summary.kind === 'warn'
     const detail = usable ? usageDetailOf(entry) : null
@@ -939,22 +970,37 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   // 给它配个进度条会把一句错误装饰成一条可信的读数
   const pool = summary.kind === 'ok' || summary.kind === 'warn' ? usagePool(entry) : null
   if (!pool) {
+    // 有明细时读数整行就是按钮（`.usage-toggle`，与 CodeArts 那格同款）；
+    // 没有时仍是那条不可点的纯读数
     return (
       <span className='usage-sum-wrap'>
-        <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+        {creditDetail ? (
+          <CreditDetailButton variant='sum' {...creditDetail}>{summary.text}</CreditDetailButton>
+        ) : (
+          <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+        )}
         {blockedBadge}
         {pendingBadge}
         {tokenSub}
       </span>
     )
   }
+  const poolLine = (
+    <>
+      {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
+      <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
+    </>
+  )
   return (
     <span className='usage-pool' title={summary.title}>
       {pool.planName ? <span className='usage-pool-name'>{pool.planName}</span> : null}
-      <span className='usage-pool-line'>
-        {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
-        <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
-      </span>
+      {/* 进度条与读数一起住在按钮里：点条或点读数都开明细（只让读数可点的话，
+          这一格里最显眼的那条又变成了难点中的东西） */}
+      {creditDetail ? (
+        <CreditDetailButton variant='pool' {...creditDetail}>{poolLine}</CreditDetailButton>
+      ) : (
+        <span className='usage-pool-line'>{poolLine}</span>
+      )}
       {blockedBadge}
       {pendingBadge}
       {tokenSub}

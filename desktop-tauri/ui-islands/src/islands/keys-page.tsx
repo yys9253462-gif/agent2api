@@ -739,7 +739,7 @@ function KeysPage() {
   /* ─── 渲染 ─────────────────────────────── */
 
   const keys = keysOf(data)
-  /** 客户端分页（通用表格外壳）：Key 通常只有几把，但口径与其它四张表保持一致 */
+  /** 客户端分页（通用表格外壳）：Key 通常只有几把，但口径与其它五张表保持一致 */
   const paging = useClientPaging(keys.length, 'keys')
   const list = paging.paged ? paging.slice(keys) : keys
   const columns = visibleColumns()

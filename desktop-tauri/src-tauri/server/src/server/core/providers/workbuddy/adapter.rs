@@ -462,6 +462,29 @@ impl ProviderAdapter for WorkBuddyAdapter {
         true
     }
 
+    /// 丢弃「整片只有换行」的 content 分片：**要丢**。
+    ///
+    /// 实测（生产库 `request_raw` 存的下发字节，两天 58 发本家 200 请求）：
+    /// copilot.tencent.com 会在相邻正文分片之间插一帧 `delta.content` 只含换行的
+    /// 分片 —— 同一个流里还在发 `: heartbeat` 注释行，那才是它的本意保活手段。
+    /// 20 发带这类分片（34.5%），脏请求里它们占正文分片中位 13.4%（区间
+    /// 1.2%–30.8%），干净请求恒 0（二值分布）。**与耗时无关**：脏的中位 12.1 秒、
+    /// 干净的 14.3 秒（完整口径与五种实测形态见 `upstream::sse` 模块头）。
+    /// 客户端按 markdown 渲染时一个换行就是一个 `<br>`，
+    /// 「Let me run the unit tests」被排成一行一个词。
+    ///
+    /// ── 与本家「透传逐字节不变」那条硬要求的关系 ────────────────
+    /// 那条要求说的是**网关不得擅自改写上游帧**；这里丢的正是上游擅自塞进
+    /// 正文的节拍，而且是**显式开关**（判据见 `upstream::sse::is_newline_keepalive`，
+    /// 关掉即回到逐字节一致）。本家这一位只是"允许"，真正生效还要
+    /// `stripNewlineKeepalive` 开着（`/api/keepalive-strip` 或环境变量
+    /// `AGENT2API_STRIP_NEWLINE_KEEPALIVE`，**默认关**）。
+    /// 取舍：模型若真有一个「单独成片」的换行，会被
+    /// 一起吃掉 —— 少一个换行的外观损失，换掉整屏断句。
+    fn sse_strip_newline_chunks(&self) -> bool {
+        true
+    }
+
     /// workbuddy 支持主动刷新（`/auth/token/refresh` + `X-Refresh-Token` 头，
     /// 实现见 `AuthService::refresh_account`）。
     fn supports_refresh(&self) -> bool {
@@ -510,24 +533,36 @@ impl ProviderAdapter for WorkBuddyAdapter {
         true
     }
 
-    /// 查积分简报 —— **转调既有计费服务，形状一个字不改**。
+    /// 查积分简报（**既有五键逐字保留**）+ 逐份积分包明细。
     ///
-    /// ── 为什么形状不归一化（这是硬要求）─────────────────────────
-    /// `query_credits_summary` 返回的
+    /// ── 为什么既有形状不归一化（这是硬要求）─────────────────────
     /// `{kind, unlimited, totalLeft, planLeft, bonusLeft}` 是改造前就有的既有契约，
-    /// 前端一直按它渲染（余额列的读数，见 `ui/accounts-table.js` 的 `usageSummary`）。
+    /// 前端一直按它渲染（余额列的读数，见 `ui/accounts-table.js` 的 `usageSummary`，
+    /// 后端 `usage_records::extract_remaining` 也认 `totalLeft` 这一个键）。
     /// 把它包装成 trait 文档里那套 `{available, unit, wallets, subscription}`
-    /// 会让那一格的显示退化 —— 那是明令禁止的。四家的形状在
-    /// `query_usage` 的文档里写清楚了：新移植的两家走统一形状，本家保持原样，
-    /// 前端按字段探测两套形状（`totalLeft` 键就是本家形状的判别键）。
+    /// 会让那一格的显示退化 —— 那是明令禁止的。所以这里是**加**不是换：
+    /// 五个既有键由 `billing::credits_summary_from` 原样产出（与
+    /// `query_credits_summary` 同一份逻辑），新挂上去的只有两项：
+    ///
+    ///   * `credits[]`      —— 逐份积分包明细（面额 / 已用 / 剩余 / 领取 / 到期），
+    ///                        账号页的「积分明细」弹层读它（能力位 `creditDetail`）；
+    ///   * `subscription`   —— 当前生效套餐的名字与到期时刻，弹层头部那一行。
+    ///
+    /// 成长在一处、退化在另一处才叫「不改形状」：既有键一个不动、读数与悬停提示
+    /// 逐字不变，新增的两个键只有弹层在读。
+    ///
+    /// ── 为什么是 `query_usage` 而不是 `query_credits_summary` ─────
+    /// 后者只回三个数（它内部那次查询的 `resources` 被丢掉了）。这里要明细，
+    /// 就得拿查询的完整成果；两个都调会让**同一个上游接口被打两次**
+    /// （批量查询时按账号翻倍）。所以调 `query_usage` 一次，再用
+    /// `credits_summary_from` 摊出那份简报 —— 与改造前的响应逐字相同。
     ///
     /// ── 与 `api::accounts` 里那条老路径的关系 ────────────────────
     /// 这里构造的 `BillingService::new(AuthService::for_store(store.clone()))`
     /// 与 `ServerState::billing()` **是同一个东西**：后者是
     /// `BillingService::new(AuthService::new(store, default_context()))`，
     /// 而 `AuthService::for_store` 用的也是 `default_context()`
-    /// （见 `core::auth::AuthService::for_store`）。因此接口层可以统一走适配器，
-    /// 拿到的结果与改造前逐字相同 —— 不必按 provider 在接口层再分一条老路径。
+    /// （见 `core::auth::AuthService::for_store`）。因此接口层可以统一走适配器。
     ///
     /// `session` 传 `None` 会让计费服务回落到 `auth.get_current_session()`
     /// （那是「当前账号」的语义）。这里必须传**指定账号**的会话：
@@ -549,12 +584,77 @@ impl ProviderAdapter for WorkBuddyAdapter {
             let billing = crate::server::core::billing::BillingService::new(
                 AuthService::for_store(store.clone()),
             );
-            billing
-                .query_credits_summary(Some(&entry.session), None)
+            let usage = billing
+                .query_usage(Some(&entry.session), None)
                 .await
-                .map_err(|error| error.to_gateway_error())
+                .map_err(|error| error.to_gateway_error())?;
+            let mut document = crate::server::core::billing::credits_summary_from(&usage);
+            let Some(object) = document.as_object_mut() else {
+                return Ok(document);
+            };
+            // 企业账号没有资源包（那份额度是「本周期已用 / 上限」一笔账，
+            // 见 `get_enterprise_usage`）：明细与套餐两项都不挂，界面退回单行读数
+            let packs = crate::server::core::billing::credit_packs_from(&usage);
+            if !packs.is_empty() {
+                object.insert("credits".to_string(), Value::Array(packs));
+            }
+            if let Some(subscription) = subscription_of(&usage) {
+                object.insert("subscription".to_string(), subscription);
+            }
+            Ok(document)
         })
     }
+}
+
+/// `get_personal_usage` 的成果 → 统一契约里的 `subscription`（账号页弹层头部那一行）。
+///
+/// ── `planName` 为什么要分档改写 ──────────────────────────────
+/// 前端的套餐徽标按**上游原始名**分流（`isFreePlan` 只认 `^free$`、
+/// `planBadgeLabel` 只认 `^trial$` —— ZCode 现网就给的这两个词），而本家的
+/// `planName` 是商品码的中文名（「免费版每日额度」这类），照直传进去会让
+/// **免费账号徽标走付费样式**、而且名字长到一行放不下。所以这里按
+/// `editionType` 把两档免费/试用的名字归一成 ZCode 那两个词，其余（专业版 /
+/// 进阶版 / 旗舰版 / 青春版）保留商品名 —— 那几档正是用户要一眼看见的。
+///
+/// 企业账号（`kind: enterprise`）返回 `None`：那份读数没有套餐名，也没有
+/// 会到期的包，编一个套餐名出去比空着更容易被读错。
+fn subscription_of(usage: &Value) -> Option<Value> {
+    if usage.get("kind").and_then(Value::as_str) == Some("enterprise") {
+        return None;
+    }
+    let edition = usage.get("editionType").and_then(Value::as_str).unwrap_or("free");
+    let plan_name = match edition {
+        "free" => "Free".to_string(),
+        "pro_trial" => "Trial".to_string(),
+        _ => usage.get("planName").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+    };
+    if plan_name.is_empty() {
+        return None;
+    }
+    let mut subscription = serde_json::Map::new();
+    subscription.insert("planName".to_string(), Value::String(plan_name));
+    subscription.insert(
+        "status".to_string(),
+        Value::String(
+            match edition {
+                "free" => "免费",
+                "pro_trial" => "试用",
+                _ => "付费",
+            }
+            .to_string(),
+        ),
+    );
+    // 三个可选数值：`usageLeft` / `usageTotal` 上游给的是**字符串**（Node 版
+    // `String(...)`），这里原样带出去 —— 前端 `subscriptionText` 本来就是
+    // `Number(...)` 读的（见 accounts-panels.tsx），两份形状不必统一成数字。
+    for (from, to) in [("expireAt", "expireAt"), ("usageLeft", "remainQuota"), ("usageTotal", "totalQuota")] {
+        if let Some(value) = usage.get(from) {
+            if !value.is_null() {
+                subscription.insert(to.to_string(), value.clone());
+            }
+        }
+    }
+    Some(Value::Object(subscription))
 }
 
 /// 本地区默认登录态的 access token（环境变量优先，其次账号存储派生的当前账号）。

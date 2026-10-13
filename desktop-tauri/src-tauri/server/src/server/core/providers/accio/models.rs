@@ -229,7 +229,7 @@ fn normalize_entry(entry: &Value) -> Value {
         .and_then(Value::as_array)
         .map(|items| items.iter().filter_map(Value::as_str).map(|text| Value::String(text.to_string())).collect())
         .unwrap_or_default();
-    json!({
+    let mut item = json!({
         // 对外 id 用老名字（能用的话），上游发送名走 `upstreamKey`
         "id": stable_id(&code, &display),
         "name": display,
@@ -237,19 +237,28 @@ fn normalize_entry(entry: &Value) -> Value {
         // 上游没给输出上限；与 contextWindow 同量级地给一个保守值会让界面误导，
         // 因此留空（`list_item` 在缺键时不输出这个字段）
         "supportsImages": multimodal,
-        "supportsReasoning": !efforts.is_empty(),
         // ADK 信封支持 functionCall / functionResponse，工具调用一律可用
         "supportsToolCall": true,
         "isDefault": entry.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
         "kind": "chat",
         // 自有键（进不了 /v1/models，路由与思考档位要用）
         "upstreamKey": code,
-        "reasoningEfforts": Value::Array(efforts),
+        "reasoningEfforts": Value::Array(efforts.clone()),
         // 思考档位落点，由目录里的 `protocol` 决定（见 `EffortPlacement`）
         "protocolKind": effort_placement(entry).as_str(),
         "modelDesc": entry.get("modelDesc").cloned().unwrap_or(Value::Null),
         "usageMultiple": entry.get("usageMultiple").cloned().unwrap_or(Value::Null),
-    })
+    });
+    // 「支持思考」不从这里推断（2026-10 改）：此前写的是
+    // `!efforts.is_empty()`，把「有没有**命名档位**」当成了「支不支持思考」——
+    // 只声明开关（`MiniMax-M3` 这类）的模型因此被标成「不支持思考」，
+    // 而 models.dev 的实验室自述说它支持。上游没给这个位，就别替它答：
+    // 有命名档位时按档位推断（那是上游数据），没有则留给 `core::model_meta`
+    // 由 models.dev 补（两边都没有就如实停在「未声明」）。
+    if !efforts.is_empty() {
+        item["supportsReasoning"] = Value::Bool(true);
+    }
+    item
 }
 
 /// 思考档位该放哪一层（`properties.reasoning_effort` 还是顶层 `reasoning_effort`）。

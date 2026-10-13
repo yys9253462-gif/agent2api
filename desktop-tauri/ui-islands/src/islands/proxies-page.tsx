@@ -79,11 +79,14 @@ import {
 } from '@ui'
 import { poolItemAddress } from './accounts-shared'
 import {
-  CLASH_READONLY_HINT, batchRemove, batchTest, clearSelection, durationText, errorMessage,
-  formatTime, getSnapshot, isClashItem, isPicked, items, loadPanel, pickableIds, removeItem,
-  saveItem, setAllPicked, subscribe, syncClash, testItem, toggleItem, togglePick, toast, wb,
+  batchRemove, batchTest, clearSelection, durationText, errorMessage,
+  formatTime, getSnapshot, isOrphanSubscriptionItem, isPicked, isReadonlyPoolItem,
+  isSubscriptionItem, items, loadPanel, pickableIds, readonlyHint, removeItem, saveItem,
+  setAllPicked, subscribe, syncClash, testItem, toggleItem, togglePick, toast, wb,
   type ProxyPoolItem,
 } from './proxies-state'
+import { SubscriptionSection } from './proxies-sub-view'
+import { loadSection } from './proxies-sub-state'
 import { t } from '../i18n'
 
 /* ─── 表格列 ─────────────────────────────────── */
@@ -104,7 +107,7 @@ function ProxiesPage() {
   const selectedIds = pickableIds()
   const allPicked = rows.length > 0 && rows.every(item => snapshot.selected.has(item.id))
   const somePicked = selectedCount > 0 && !allPicked
-  const clashPicked = rows.filter(item => snapshot.selected.has(item.id) && isClashItem(item)).length
+  const clashPicked = rows.filter(item => snapshot.selected.has(item.id) && isReadonlyPoolItem(item)).length
   const progress = snapshot.batchProgress
 
   function testCell(item: ProxyPoolItem): React.ReactNode {
@@ -150,7 +153,9 @@ function ProxiesPage() {
         )
       case 'kind':
         return item.source === 'clash' ? (
-          <Badge variant='secondary' title={CLASH_READONLY_HINT}>Clash Verge</Badge>
+          <Badge variant='secondary' title={readonlyHint(item)}>Clash Verge</Badge>
+        ) : item.source === 'subscription' ? (
+          <Badge variant='secondary' title={readonlyHint(item)}>{t('订阅')}</Badge>
         ) : (
           <Badge title={t('手动填写的地址与端口')}>{t('手动')}</Badge>
         )
@@ -166,18 +171,23 @@ function ProxiesPage() {
         )
       case 'state': {
         // 只读镜像：开关照常显示真实状态（Clash 里禁用了这里也看得见），但不给改
-        const readonly = isClashItem(item)
+        const readonly = isReadonlyPoolItem(item)
+        const hint = readonlyHint(item)
         return (
           <Switch checked={item.enabled} disabled={locked || readonly}
             aria-label={t('启用「{name}」', { name: item.name || t('未命名') })}
-            title={readonly ? CLASH_READONLY_HINT : undefined}
+            title={readonly ? hint : undefined}
             onCheckedChange={next => void toggleItem(item, next)} />
         )
       }
       case 'test':
         return testCell(item)
       case 'act': {
-        const readonly = isClashItem(item)
+        // 只读镜像不给编辑；孤儿订阅节点（所属订阅已删）**删除放行** ——
+        // 归属订阅已不存在，删除是清理它们的唯一出路（见 isWritablePoolItem）
+        const orphan = isOrphanSubscriptionItem(item)
+        const readonly = isReadonlyPoolItem(item)
+        const hint = readonlyHint(item)
         return (
           <div className='row-actions'>
             <Button size='sm' variant='ghost' disabled={locked || snapshot.testing !== null}
@@ -185,12 +195,12 @@ function ProxiesPage() {
               {snapshot.testing === item.id ? t('测试中…') : t('测试')}
             </Button>
             <Button size='sm' variant='ghost' disabled={locked || readonly}
-              title={readonly ? CLASH_READONLY_HINT : undefined}
+              title={readonly ? hint : undefined}
               onClick={() => setModal({ item })}>
               {t('编辑')}
             </Button>
-            <Button size='sm' variant='destructive' disabled={locked || readonly}
-              title={readonly ? CLASH_READONLY_HINT : undefined}
+            <Button size='sm' variant='destructive' disabled={locked || (readonly && !orphan)}
+              title={readonly ? hint : undefined}
               onClick={() => void removeItem(item)}>
               {t('删除')}
             </Button>
@@ -203,12 +213,21 @@ function ProxiesPage() {
   }
 
   return (
-    <section className='panel'>
-      <div className='panel-head'>
-        <h2>{t('网络代理')}</h2>
-        <span className='panel-sub'>
-          {ready ? t('{n} 个出口', { n: rows.length }) : t('加载中…')}
-        </span>
+    <>
+      {/* 订阅区块在代理池面板上方：节点由内核镜像进池（subscription 来源的
+          只读条目），先配订阅再在下面看/引用节点，视线自上而下 */}
+      <SubscriptionSection />
+
+      <section className='panel'>
+        <div className='panel-head'>
+          <h2>{t('代理池')}</h2>
+          <span className='panel-sub'>
+            {ready ? t('{n} 个出口', { n: rows.length }) : t('加载中…')}
+          </span>
+          {/* 来源说明：本表的条目不止手动添加的 —— 订阅与 Clash 的出口自动
+              镜像进来（只读），放在面板头让「源 → 消费」的关系一眼可见，
+              不必等用户看到页脚的 Clash 说明才反应过来 */}
+          <span className='text-[11px] text-subtle'>{t('订阅与 Clash 的出口自动镜像进来')}</span>
         <div className='head-actions'>
           {/* 同步放在刷新左边：它做的事比「刷新」多一层（把 Clash 的出口集合
               镜像进池），而进页面时的那次自动同步是静默的 —— 用户想在
@@ -219,7 +238,7 @@ function ProxiesPage() {
             {snapshot.syncing ? t('同步中…') : t('同步 Clash Verge')}
           </Button>
           <Button variant='outline' disabled={snapshot.loading || snapshot.batchBusy}
-            onClick={() => void loadPanel()}>
+            onClick={() => { void loadPanel(); void loadSection() }}>
             {snapshot.loading ? t('刷新中…') : t('刷新')}
           </Button>
           <Button variant='default' disabled={snapshot.batchBusy}
@@ -240,7 +259,7 @@ function ProxiesPage() {
         </span>
         {clashPicked ? (
           <span className='batch-hidden'>
-            {t('其中 {n} 条来自 Clash 同步：可参与批量测试，删除会跳过', { n: clashPicked })}
+            {t('其中 {n} 条是同步来的只读条目（Clash / 订阅）：可参与批量测试，删除会跳过', { n: clashPicked })}
           </span>
         ) : null}
         <div className='batch-actions'>
@@ -301,7 +320,7 @@ function ProxiesPage() {
               <tr>
                 <td colSpan={COLUMNS.length} className='empty'>
                   {ready
-                    ? t('还没有代理。点右上角「＋ 新增代理」手填一个，或点「同步 Clash Verge」把 Clash 的出口导进来。')
+                    ? t('还没有代理。点右上角「＋ 新增代理」手填一个，点「同步 Clash Verge」把 Clash 的出口导进来，或在上方「订阅」区块导入订阅节点。')
                     : t('加载中…')}
                 </td>
               </tr>
@@ -339,7 +358,8 @@ function ProxiesPage() {
           onClose={() => setModal(null)}
         />
       ) : null}
-    </section>
+      </section>
+    </>
   )
 }
 
@@ -544,7 +564,7 @@ declare global {
   }
 }
 
-window.wbProxiesPanel = { load: () => loadPanel() }
+window.wbProxiesPanel = { load: async () => { await loadPanel(); await loadSection() } }
 
 const PAGE_SELECTOR = '.page[data-page="proxies"]'
 
@@ -561,7 +581,7 @@ function mount(): void {
   createRoot(section).render(<ProxiesPage />)
   // 首屏若正停在本页就自拉一次（app.js 启动时的 showPage 早于本岛加载，
   // 那一次 load() 会丢；与 keys / models 各岛同一处兜底）
-  if (wb().wbApp?.currentPage === 'proxies') void loadPanel()
+  if (wb().wbApp?.currentPage === 'proxies') { void loadPanel(); void loadSection() }
 }
 
 // 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；

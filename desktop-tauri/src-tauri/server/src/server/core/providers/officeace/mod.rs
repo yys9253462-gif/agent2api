@@ -29,6 +29,7 @@ pub mod models;
 pub mod oauth;
 pub mod onboarding;
 pub mod probe;
+pub mod provision;
 pub mod signer;
 pub mod subscription;
 

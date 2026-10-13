@@ -54,6 +54,26 @@ use crate::server::core::providers::DEFAULT_PROVIDER_ID;
 use crate::server::core::proxies::describe_account_proxy;
 use crate::server::logging;
 
+/// 单账号并发上限的封顶值（0 = 不限）。界面输入框用的是同一个数
+/// （ui-islands 的 `CONC_MAX`）；两处要对得上，否则会「界面让填、接口回 400」。
+pub(crate) const MAX_CONCURRENT_LIMIT: u64 = 999;
+
+/// 归一 `maxConcurrent` 补丁值：必须是**非负整数**（`as_u64` 对浮点 / 负数 /
+/// 字符串一律返回 None）、封顶 [`MAX_CONCURRENT_LIMIT`]。
+///
+/// 单账号（`apply_patch`）与批量（`batch_update`）共用这一份：批量入口若各自
+/// 再写一遍校验，迟早漂成「设置弹窗按 999 挡、批量入口放进一个 5000」。
+pub(crate) fn normalize_max_concurrent(value: &Value) -> Result<u64, AccountStoreError> {
+    match value.as_u64() {
+        Some(number) if number <= MAX_CONCURRENT_LIMIT => Ok(number),
+        // 只有超限才走到这两条；文案说清范围，省得用户对着「非负整数」猜上限
+        Some(_) => Err(AccountStoreError::bad_request(
+            "并发上限必须是不大于 999 的非负整数",
+        )),
+        None => Err(AccountStoreError::bad_request("并发上限必须是非负整数")),
+    }
+}
+
 impl AccountStore {
     // ─── CRUD ────────────────────────────────────────────────
 
@@ -729,22 +749,10 @@ impl AccountStore {
         }
 
         if let Some(value) = patch.get("maxConcurrent") {
-            // 单账号并发上限：必须是**非负整数**（`as_u64` 对浮点 / 负数 /
-            // 字符串一律返回 None），封顶 999；0 = 不限。选路消费它时的口径
-            // 见 `routing::max_concurrent_of`（缺失 = 0 = 不限）。
-            const MAX_CONCURRENT_LIMIT: u64 = 999;
-            let next = match value.as_u64() {
-                Some(number) if number <= MAX_CONCURRENT_LIMIT => number,
-                // 999 以内才合法；文案说清范围，省得用户对着「非负整数」猜上限
-                Some(_) => {
-                    return Err(AccountStoreError::bad_request(
-                        "并发上限必须是不大于 999 的非负整数",
-                    ))
-                }
-                None => {
-                    return Err(AccountStoreError::bad_request("并发上限必须是非负整数"))
-                }
-            };
+            // 单账号并发上限：0 = 不限，封顶 999（校验与批量入口同一份，见
+            // `normalize_max_concurrent`）。选路消费它时的口径见
+            // `routing::max_concurrent_of`（缺失 = 0 = 不限）。
+            let next = normalize_max_concurrent(value)?;
             // 缺省记录无此键 = 不限（读侧按 0 处理），所以这里恒存显式数字
             let current = record.get("maxConcurrent").and_then(Value::as_u64).unwrap_or(0);
             if next != current {

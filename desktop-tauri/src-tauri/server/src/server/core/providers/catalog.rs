@@ -10,6 +10,7 @@ mod view;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::model_meta;
 use crate::server::core::model_rules;
 use crate::server::core::models::{model_id, ModelCatalog};
 use crate::server::core::providers::adapter::adapter_for;
@@ -29,8 +30,15 @@ pub use view::{
 
 /// 原始能力清单不应用绑定开关；关闭原始 ID 后，别名仍需解析到这条上游记录。
 ///
-/// 用户的能力位覆盖（`modelRules.capabilities`）在**这里**统一应用：本函数是
-/// 内置家全部出口（`/v1/models`、Anthropic 列表、管理视图）的清单源头，收在
+/// **models.dev 的补齐**（`core::model_meta`）在**这里**统一应用，分两步：
+///   ① 只填清单项里**上游没声明**的六个能力键（优先级见那个模块头：用户覆盖 >
+///      上游 > models.dev）；
+///   ② 把逐模型思考档位归一成出口那一对键（这家自己声明的 > models.dev 的）。
+/// 位置在用户覆盖**之前** —— 覆盖层是「用户明确指定」，永远最高，它顺带把被改
+/// 的键的来源标成 `user`（见 `model_rules::apply_capability_overrides`）。
+///
+/// 用户的能力位覆盖（`modelRules.capabilities`）同样在**这里**统一应用：本函数
+/// 是内置家全部出口（`/v1/models`、Anthropic 列表、管理视图）的清单源头，收在
 /// 一处就不会出现「管理页改了、下游没变」的分叉。覆盖只改元数据键，不参与
 /// 路由 / 启停（见 `model_rules` 模块头的能力位覆盖一节）。
 fn manifest_for(kind: ProviderKind) -> Vec<Value> {
@@ -42,6 +50,9 @@ fn manifest_for(kind: ProviderKind) -> Vec<Value> {
         {
             models.push(item);
         }
+    }
+    for item in models.iter_mut() {
+        model_meta::apply(item);
     }
     model_rules::apply_capability_overrides(kind_id(kind), &mut models);
     models

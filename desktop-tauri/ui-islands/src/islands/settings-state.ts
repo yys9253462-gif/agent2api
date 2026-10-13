@@ -56,6 +56,7 @@ import {
   type AppSettings,
   type ClineHeadersData,
   type GatewayBlocks,
+  type ModelsDevState,
   type NumberField,
   type PromptPatch,
 } from './settings-model'
@@ -86,6 +87,8 @@ export type BusyScope =
   | 'cors'
   | 'prompt'
   | 'captcha'
+  | 'modelsDev'
+  | 'modelsDevRefresh'
   | 'export'
   | 'import'
   | 'dbExport'
@@ -147,6 +150,20 @@ export type ClineHeadersState = {
 
 /** 网关面（/v1/*）跨域访问开关；与 SanitizeState 同形 */
 export type CorsState = { status: LoadStatus; on: boolean }
+
+/**
+ * models.dev 模型元数据：开关 + 「这份数据是什么时候的、有多少条」。
+ *
+ * `source` 三档与后端同字面量（`builtin` / `cache` / `network`），文案映射在
+ * 视图层；未知值原样回显（后端将来加了档位，界面不会显示成空白）。
+ */
+export type ModelsDevPanelState = {
+  status: LoadStatus
+  enabled: boolean
+  source: string
+  updatedAt: number
+  count: number
+}
 
 export type PromptState = {
   status: LoadStatus
@@ -246,6 +263,14 @@ export type SettingsSnapshot = {
   prompt: PromptState
   storage: StorageState
   captcha: { available: boolean; enabled: boolean }
+  /**
+   * models.dev 模型元数据（能力位与逐模型思考档位）。
+   *
+   * 与 `captcha` 的三态不同，这里多两项**读数**（来源与生成时刻、条数）：
+   * 这个开关的价值全在「那份元数据是什么时候的、有多少条」，只给一个布尔值
+   * 等于把功能做成一个不知道有没有生效的按钮。
+   */
+  modelsDev: ModelsDevPanelState
   ioFailure: IoFailure
   /** 保留期改小的确认框正文（非空即开着）；确认 / 取消都收口到 resolveRetentionConfirm */
   retentionConfirm: { head: string } | null
@@ -333,6 +358,7 @@ const INITIAL: SettingsSnapshot = {
     debug: null,
   },
   captcha: { available: true, enabled: false },
+  modelsDev: { status: 'loading', enabled: true, source: '', updatedAt: 0, count: 0 },
   ioFailure: null,
   retentionConfirm: null,
   // 整库备份：默认包含日志与调试报文（完整备份）；恢复确认弹窗默认关闭
@@ -1457,6 +1483,80 @@ export async function saveCaptcha(next: boolean): Promise<void> {
   }
 }
 
+/* ─── models.dev 模型元数据（能力位与逐模型思考档位）── */
+
+/** 把后端的响应折成面板状态（两处调用共用：读设置与刷新后的回读） */
+function modelsDevState(state: ModelsDevState | null | undefined): ModelsDevPanelState {
+  if (!state || typeof state !== 'object') {
+    return { status: 'unavailable', enabled: true, source: '', updatedAt: 0, count: 0 }
+  }
+  return {
+    status: 'ready',
+    // 缺字段时按「开」处理：这个开关默认开（后端同理），显示成关会让用户以为
+    // 自己没开过，而去拨一个本来已经生效的开关
+    enabled: state.modelsDevEnabled !== false,
+    source: typeof state.source === 'string' ? state.source : '',
+    updatedAt: Number(state.updatedAt) || 0,
+    count: Number(state.count) || 0,
+  }
+}
+
+async function loadModelsDev(): Promise<void> {
+  try {
+    const state = await shared().workbuddyDesktop?.getModelsDev?.()
+    publish({ modelsDev: modelsDevState(state) })
+  } catch (error) {
+    publish({ modelsDev: { ...snapshot.modelsDev, status: 'unavailable' } })
+    console.warn('读取 models.dev 元数据设置失败:', errorMessage(error))
+  }
+}
+
+export async function saveModelsDev(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('modelsDev')
+  publish({ modelsDev: { ...snapshot.modelsDev, enabled: next } })
+  try {
+    const state = await shared().workbuddyDesktop?.saveModelsDev?.(next)
+    publish({ modelsDev: modelsDevState(state) })
+    toast(next ? t('✅ models.dev 模型元数据已开启') : t('已关闭 models.dev 联网刷新'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadModelsDev() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/**
+ * 「立即刷新」：真去拉一次 models.dev（不是重读设置）。
+ *
+ * 与别处的刷新按钮语义不同 —— 那些按钮重读的是**本机配置**，这一个打的是
+ * **公网**，结果行按各家目录刷新那套三档文案讲清楚（成功 / 本次没刷 / 失败）。
+ */
+export async function refreshModelsDev(): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('modelsDevRefresh')
+  try {
+    const payload = await shared().workbuddyDesktop?.refreshModelsDev?.()
+    publish({ modelsDev: modelsDevState(payload?.status) })
+    const result = payload?.result
+    const status = String(result?.status || '')
+    if (status === 'refreshed') {
+      toast(t('models.dev 元数据已更新（{count} 条）', { count: Number(result?.count) || 0 }))
+    } else if (status === 'failed') {
+      toast(t('刷新失败：{message}', { message: String(result?.message || '') }), 'err')
+    } else {
+      // skipped：未到间隔 / 设置里关着 —— 原因由后端给，原样透出
+      toast(String(result?.message || t('本次无需刷新')))
+    }
+  } catch (error) {
+    toast(t('刷新失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadModelsDev()
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── 系统提示词（模式 + 文件 + 降级状态） ───── */
 
 export function renderPrompt(data?: unknown): void {
@@ -1966,6 +2066,7 @@ export async function load(): Promise<void> {
     loadPrompt(),
     loadStorage(),
     loadCaptcha(),
+    loadModelsDev(),
     // 软件更新面板是另一个岛（update-panel.tsx），切进设置页时让它自己刷新一次
     shared().wbUpdatePanel?.load?.(),
   ])

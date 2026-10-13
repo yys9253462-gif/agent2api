@@ -1037,15 +1037,27 @@ const BATCH_ACTIONS = [
   { value: 'enable', label: t('启用') },
   { value: 'disable', label: t('禁用') },
   { value: 'proxy', label: t('修改代理') },
+  { value: 'concurrency', label: t('设置并发上限') },
   { value: 'remove', label: t('删除') },
 ] as const
 
 function BatchDialog({ ids, action, onClose }: { ids: string[]; action: string; onClose: () => void }) {
   const [current, setCurrent] = React.useState(action)
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(null))
+  // 并发上限草稿：**不预填**。预填有两个坑：混选时每家现值不同（填谁都不对），
+  // 而 CodeArts 的公开读数是「配置与上游硬顶取大」后的结果，预填再确认会把
+  // 一个没配过的 3 物化进记录。空值 = 还没填，提交时显式拦下（见 run）。
+  const [concDraft, setConcDraft] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [result, setResult] = React.useState<React.ReactNode>('')
   const accounts = ids.map(id => findAccount(id)).filter((account): account is AccountRecord => account !== null)
+  /** 选中的账号里「本家没有『不限』这一档」的硬顶（CodeArts 3，其余 0）：只影响提示
+   *  文案 —— 这些家即使填 0、或填一个比硬顶更小的数，实际并发仍由硬顶决定
+   *  （见 store_util 的 `max_concurrent_public_for`）。空选区取 0 */
+  const concHardCap = accounts.reduce(
+    (cap, account) => Math.max(cap, Number(providerFeatures(providerOf(account)).concurrencyDefault) || 0),
+    0,
+  )
 
   /** 批量删除是不可逆操作，按数量做二次确认（原生 confirm 在 Tauri WebView 里直接放行） */
   function confirmBatchRemove(count: number): Promise<boolean> {
@@ -1068,6 +1080,18 @@ function BatchDialog({ ids, action, onClose }: { ids: string[]; action: string; 
         toast(errorMessage(error), 'err')
         return
       }
+    }
+    // 并发上限：与设置弹窗同一套归一（0~999 的整数，0 = 不限）。**必须显式填**：
+    // 空值不当 0 —— 否则「选错动作直接点执行」会把一批账号的并发限制全部清掉。
+    // 后端还会再挡一次（同一份校验），这里先挡是为了不把 400 当交互反馈
+    let maxConcurrent: number | undefined
+    if (current === 'concurrency') {
+      const raw = Number(concDraft.trim())
+      if (!concDraft.trim() || !Number.isFinite(raw) || raw < 0) {
+        toast(t('并发上限必须是 0~{max} 的整数', { max: CONC_MAX }), 'err')
+        return
+      }
+      maxConcurrent = Math.min(CONC_MAX, Math.round(raw))
     }
     if (current === 'remove' && !(await confirmBatchRemove(ids.length))) return
 
@@ -1092,14 +1116,15 @@ function BatchDialog({ ids, action, onClose }: { ids: string[]; action: string; 
     setBusy(true)
     setResult('')
     try {
-      const payload: { action: string; ids: string[]; proxy?: unknown } = { action: current, ids }
+      const payload: { action: string; ids: string[]; proxy?: unknown; maxConcurrent?: number } = { action: current, ids }
       if (current === 'proxy') payload.proxy = proxy
+      if (current === 'concurrency') payload.maxConcurrent = maxConcurrent
       const data = await shared().workbuddyDesktop?.batchAccounts?.(payload)
       const okCount = (data?.ok || []).filter(item => item.changes?.length).length
       const removedCount = (data?.removed || []).length
       const failed = data?.failed || []
       const succeeded = current === 'remove' ? removedCount : okCount
-      const verb = { enable: t('启用'), disable: t('禁用'), proxy: t('修改代理'), remove: t('删除') }[current] || current
+      const verb = { enable: t('启用'), disable: t('禁用'), proxy: t('修改代理'), concurrency: t('设置并发上限'), remove: t('删除') }[current] || current
       if (failed.length) {
         const detail = failed.slice(0, 3).map(item => labelOf(findAccount(String(item.id))) || item.id).join(t('、'))
         toast(t('{verb}完成：成功 {ok} 个，失败 {fail} 个（{detail}{more}）', {
@@ -1123,7 +1148,7 @@ function BatchDialog({ ids, action, onClose }: { ids: string[]; action: string; 
     }
   }
 
-const verb = { enable: t('启用'), disable: t('禁用'), proxy: t('修改代理'), remove: t('删除') }[current] || current
+const verb = { enable: t('启用'), disable: t('禁用'), proxy: t('修改代理'), concurrency: t('设置并发上限'), remove: t('删除') }[current] || current
 
   return (
     <Dialog open onOpenChange={next => { if (next || busy) return; onClose() }}>
@@ -1147,6 +1172,22 @@ const verb = { enable: t('启用'), disable: t('禁用'), proxy: t('修改代理
             {current === 'proxy' ? (
               <div className='mt-2.5'>
                 <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix='batch-proxy' />
+              </div>
+            ) : null}
+            {current === 'concurrency' ? (
+              <div className='mt-2.5'>
+                <div className='field-row'>
+                  <label htmlFor='batch-conc-input'>{t('并发上限')}</label>
+                  <Input id='batch-conc-input' type='number' min={0} max={CONC_MAX} step={1}
+                    className='max-w-[110px]' placeholder={t('不限')} value={concDraft}
+                    onChange={event => setConcDraft(event.currentTarget.value)} />
+                  <span className='detail'>{t('0 = 不限')}</span>
+                </div>
+                <p className='detail acct-dlg-hint'>
+                  {concHardCap > 0
+                    ? t('并发上限 0~{max}；有上游硬顶的家（如 CodeArts）以它的硬顶为准；达到上限的账号会被跳过、请求转给其他账号', { max: CONC_MAX })
+                    : t('并发上限 0~{max}；达到上限的账号会被跳过、请求转给其他账号', { max: CONC_MAX })}
+                </p>
               </div>
             ) : null}
           </DialogSection>

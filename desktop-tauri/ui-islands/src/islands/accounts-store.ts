@@ -68,16 +68,18 @@ const NAMES_HIDDEN_KEY = 'workbuddy-desktop-accounts-names-hidden'
 /**
  * 读回筛选档位。
  *
- * 只认 enabled / limit 两个键：
+ * 只认 provider / enabled / limit 三个键：
  *   · `q`（搜索框）**不持久化** —— 下次打开页面看到一张被过滤过的表，而搜索框的
  *     内容又不在视野里，是最容易让人以为「账号丢了」的一种状态；
- *   · 老版本存盘里的 `provider` 直接丢掉（分组模式已经没有这一维了，留着它会让
- *     界面显示全部、实际却按某个家过滤）。
+ *   · `provider` **照收**（与两档分段同一档的「怎么看这张表」偏好）：存盘里那个家
+ *     已经没了的情况由 `normalizeProviderFilter` 复位成「全部」，不靠读盘时丢弃 ——
+ *     读盘丢弃会让「上次筛的是谁家」无缘无故地丢，而它本来还能自愈。
  */
 function loadFilter(): AccountFilter {
-  const defaults: AccountFilter = { enabled: 'all', limit: 'all', q: '' }
+  const defaults: AccountFilter = { provider: 'all', enabled: 'all', limit: 'all', q: '' }
   const stored = shared().wbFilterMemory?.load(FILTERS_KEY, defaults) || defaults
   return {
+    provider: String(stored.provider || 'all'),
     enabled: String(stored.enabled || 'all'),
     limit: String(stored.limit || 'all'),
     q: '',
@@ -176,12 +178,12 @@ export type GroupView = {
  * 与 `visibleList` 同源 —— 组内可见行按组序拼起来就是可见列表的顺序。
  *
  * ── 唯一一条「整组不显示」的规则：没有可见的行 ──────────────────
- * 筛选（状态 / 限额）或搜索把这一家的行全裁掉了就不渲染它 —— 留一段只有组头的空壳
- * 只是占地方。它由**筛选自己**决定：状态筛「启用」时全禁用的家自然一条不剩而被收走，
- * 而状态筛「全部」时它们都在（那正是「全部」该有的样子）。
+ * 筛选（提供商 / 状态 / 限额）或搜索把这一家的行全裁掉了就不渲染它 —— 留一段只有组头
+ * 的空壳只是占地方。它由**筛选自己**决定：状态筛「启用」时全禁用的家自然一条不剩而被
+ * 收走，而状态筛「全部」时它们都在（那正是「全部」该有的样子）。
  *
  * ⚠️ 曾经还有第二条规则：「一个启用的都没有」的组一律不显示。它与「状态 = 全部」
- * 直接冲突 —— 用户把两个筛选都拨回「全部」，那些**整家全禁用**的分组（往往正是账号
+ * 直接冲突 —— 用户把筛选都拨回「全部」，那些**整家全禁用**的分组（往往正是账号
  * 最多的几家）仍连着账号一起消失，而分段徽标上写的还是全部账号数。分组带上本来就写着
  * 「N 个账号 · 启用 0 · 禁用 N」，一家是不是全禁用由它自己说清楚，不该由「整组消失」
  * 来表达。这条规则已删除。
@@ -216,8 +218,9 @@ export function seats(): Map<string, { position: number; total: number }> {
 /* ─── 筛选 ─────────────────────────────────── */
 
 function persistFilter(): void {
-  // 只落 enabled / limit：搜索词（q）是一次性的动作，不跨次启动（见 loadFilter）
+  // 只落 provider / enabled / limit：搜索词（q）是一次性的动作，不跨次启动（见 loadFilter）
   shared().wbFilterMemory?.save(FILTERS_KEY, {
+    provider: store.filter.provider,
     enabled: store.filter.enabled,
     limit: store.filter.limit,
   })
@@ -227,6 +230,14 @@ function persistFilter(): void {
 export function setSearchFilter(value: string): void {
   if (store.filter.q === value) return
   patch({ filter: { ...store.filter, q: value } })
+}
+
+/** 提供商下拉：'all' 或某个 provider id。与两档分段同一档的偏好，落盘 + 重绘 */
+export function setProviderFilter(value: string): void {
+  const provider = value || 'all'
+  if (store.filter.provider === provider) return
+  patch({ filter: { ...store.filter, provider } })
+  persistFilter()
 }
 
 /** 切了档位：落盘 + 重绘。限流维度与启用状态联动 —— 状态筛成「禁用」时正常 / 有限流
@@ -240,12 +251,30 @@ export function setSegmentFilter(key: 'enabled' | 'limit', value: string): void 
 
 /** 有没有任何筛选 / 搜索在生效（顺序锁定与「清除筛选」提示共用这一条口径） */
 export function filterActive(): boolean {
-  return store.filter.enabled !== 'all' || store.filter.limit !== 'all' || store.filter.q.trim() !== ''
+  return store.filter.provider !== 'all'
+    || store.filter.enabled !== 'all'
+    || store.filter.limit !== 'all'
+    || store.filter.q.trim() !== ''
 }
 
-/** 一键复位：搜索词 + 两个分段档位。筛选状态下列表被裁过，顺序拖不动 —— 想调整时点它 */
+/** 一键复位：搜索词 + 三个筛选档位（提供商 / 状态 / 限额）。
+ *  筛选状态下列表被裁过，顺序拖不动 —— 想调整时点它 */
 export function clearFilter(): void {
-  patch({ filter: { enabled: 'all', limit: 'all', q: '' } })
+  patch({ filter: { provider: 'all', enabled: 'all', limit: 'all', q: '' } })
+  persistFilter()
+}
+
+/**
+ * 提供商筛选指向的家已经不在摘要里（账号删光、家也删了）就复位成「全部」。
+ *
+ * 不复位的话界面会说谎：下拉里找不到那一项，回落显示「全部」，而列表仍被那个
+ * 家过滤着。仍在摘要里、只是一条账号都没有的家**不复位** —— 用户可能正要去添加。
+ */
+export function normalizeProviderFilter(): void {
+  const provider = store.filter.provider
+  if (provider === 'all') return
+  if (providerSummaryList().some(item => item.id === provider)) return
+  patch({ filter: { ...store.filter, provider: 'all' } })
   persistFilter()
 }
 

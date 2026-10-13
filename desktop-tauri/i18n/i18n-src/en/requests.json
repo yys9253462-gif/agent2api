@@ -112,6 +112,7 @@
   "清理失败：{message}": "Clear failed: {message}",
   "清理方式": "Clear mode",
   "清理请求日志": "Clear request logs",
+  "生成速度：输出 token ÷ 流式段用时（总用时 − 首响）；流式段不足总用时一半时按总用时计": "Generation speed: output tokens ÷ streaming time (total duration − TTFB); falls back to total duration when the streaming window is under half the request",
   "用时": "Duration",
   "用量": "Usage",
   "确定对<strong>全部</strong>请求日志执行「<strong>{label}</strong>」？将处理 <strong>{count}</strong> 条，此操作无法恢复。": "Run \"<strong>{label}</strong>\" on <strong>all</strong> request logs? This will process <strong>{count}</strong> entries and cannot be undone.",

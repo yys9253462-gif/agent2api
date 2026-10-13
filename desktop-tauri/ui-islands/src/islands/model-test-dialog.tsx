@@ -446,7 +446,11 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   // 「关闭思考」两档（off / none）不给：它们在**映射**上的含义是「不注入」，而写进**请求体**
   // 就是一个上游不认识的档位 —— CatPaw 的 resolve_effort 对表外值当场 400。要「不注入」，
   // 选「跟随映射」这一项（映射上没绑等级时它本来就不注入）
-  const levelOptions = reasoningLevels(getSnapshot().data)
+  //
+  // 候选按**这一个模型**自己认识的档位取（见 `models-reasoning.levels` 的三级回落）：
+  // 测试弹窗是「这一家 × 这一个模型」的探针，给它列一堆该模型不认的档位，
+  // 测出来的 400 是档位选错了、不是链路问题 —— 那正是这颗按钮最没用的用法。
+  const levelOptions = reasoningLevels(getSnapshot().data, model)
     .filter(level => level !== 'off' && level !== 'none')
   const followLabel = defaultClosed
     ? t('跟随映射（该行未启用，本次不注入）')

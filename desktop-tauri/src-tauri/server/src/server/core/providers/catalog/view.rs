@@ -7,6 +7,7 @@ use serde_json::{json, Map, Value};
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::capability;
 use crate::server::core::key_scope::{self, KeyScope};
+use crate::server::core::model_meta;
 use crate::server::core::model_rules;
 use crate::server::core::models::{list_item, list_response_from, model_id, suggest_from};
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
@@ -210,11 +211,17 @@ pub fn manage_view(store: &AccountStore) -> Value {
                 "source": source, "enabled": enabled, "aliases": aliases,
                 "capabilities": capability::effective(&item),
                 "capOverrides": cap_overrides,
-                // 模型**自己能配哪些思考档位**（清单项里的可选键，只有给过依据
-                // 的家才有 —— 目前是 ZCode 的 GLM-5.3 家族，数据来自官方目录）。
+                // 每个能力键的**来源**（`upstream` / `modelsdev` / `user`，见
+                // `core::model_meta` 的模块头）。管理页据它把「上游实测」「社区
+                // 库补的」「用户改的」三档分开显示 —— 没有它，六个键看起来一样
+                // 可信，而它们的可信度差着量级。缺失（没有这个键）= 那一项没有
+                // 任何来源（未声明）。
+                "capSources": item.get("capSources"),
+                // 模型**自己能配哪些思考档位**（出口键名，由 `core::model_meta`
+                // 在清单成型处归一：这家自己声明的 > models.dev 的 effort 列表）。
                 // 与上面 `mappings[].reasoning`（用户给某条映射**指定**的档位）
                 // 是两件事：这里回答「这个模型支持哪些档」，那里回答「这条映射
-                // 用哪一档」。缺失（null）= 该模型未声明，界面据此不显示这一行。
+                // 用哪一档」。缺失（null）= 该模型未声明，界面据此回落通用档位表。
                 "reasoningLevels": item.get("reasoningLevels"),
                 "reasoningDefaultLevel": item.get("reasoningDefaultLevel"),
                 // 这一家的清单是什么时候拉到的（毫秒；0 = 从未成功拉过）。
@@ -239,7 +246,15 @@ pub fn manage_view(store: &AccountStore) -> Value {
             "dangling": true, "carried": carried,
         }));
     }
-    json!({ "models": models, "mappings": mappings, "reasoningLevels": model_rules::REASONING_LEVELS })
+    json!({
+        "models": models,
+        "mappings": mappings,
+        "reasoningLevels": model_rules::REASONING_LEVELS,
+        // models.dev 元数据的当前状态（`builtin` / `cache` / `network` + 生成
+        // 时刻 + 条数）。它服务的是「这份档位/能力是什么时候的数据」这个问题 ——
+        // 界面上那些档位来自哪一份、新不新，只能由这里回答。
+        "modelsDev": model_meta::status(),
+    })
 }
 
 #[cfg(test)]

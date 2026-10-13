@@ -244,7 +244,13 @@ export type AccountsBridge = {
   getRoutingConfig(): Promise<Record<string, unknown> | null | undefined>
   setRoutingConfig(patch: Record<string, unknown>): Promise<Record<string, unknown> | null | undefined>
   getRoutingQueue(model?: string): Promise<Record<string, unknown> | null | undefined>
-  batchAccounts(payload: { action: string; ids: string[]; proxy?: unknown }): Promise<{
+  /**
+   * 批量操作（后端 `POST /api/accounts/batch`）。`proxy` 与 `maxConcurrent` 是
+   * 两个带参动作的载荷：前者对应 action=proxy（null = 改为直连），后者对应
+   * action=concurrency（0 = 不限）。**两条桥都按字段白名单转发**（bridge.rs /
+   * web_shim.rs），加参数时两处都要补 —— 漏了会静默丢参数，服务端只报「缺字段」。
+   */
+  batchAccounts(payload: { action: string; ids: string[]; proxy?: unknown; maxConcurrent?: number }): Promise<{
     ok?: Array<{ id?: string; changes?: string[] }>
     removed?: unknown[]
     failed?: Array<{ id?: string; error?: string }>

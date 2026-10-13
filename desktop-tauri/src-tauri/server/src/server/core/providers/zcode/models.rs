@@ -34,43 +34,54 @@ use serde_json::{json, Value};
 
 use super::region::Region;
 
-/// 一个模型的静态规格
+/// 一个模型的静态规格。
+///
+/// ── 为什么只有三个字段（2026-10 收窄）─────────────────────────
+/// 这里原来是「上下文 / 输出上限 / 是否思考 / 是否视觉」四列，全部转录自参考实现
+/// 的常量表。它们既不来自上游接口、也没有逐条实测，而且已经能被证伪（models.dev
+/// 的实验室自述：`glm-5.1` 的输出上限是 131K 而我们标 64K，`glm-5` 的窗口是
+/// 204800 而我们标 200000）。**没有依据的声明比空着更糟** —— 下游会照它构造请求
+/// （按虚高的窗口堆历史）或据此拒绝能力，而界面上看不出这是猜的。
+///
+/// 所以：能力位与上下限一律**不在这里声明**，由 `core::model_meta` 从 models.dev
+/// 补齐（那份对本家每一支模型都有收录）；只有下面这两个字段是本模块真正要用的 ——
+/// `max_output` 服务思考预算截顶（`zcode::reasoning`，内部安全上限），
+/// `reasoning` 只给**目录明确写过**的两档视觉模型（见 `MODELS` 的注释）。
 struct Spec {
     /// 上游模型 id（**原样转发**，不做任何改名）
     id: &'static str,
     /// 展示名
     name: &'static str,
-    /// 上下文窗口
-    context: i64,
-    /// 最大输出
+    /// 最大输出（**内部**用：思考预算截顶的上限，不直接出口）
     max_output: i64,
-    /// 是否支持思考
-    reasoning: bool,
-    /// 是否支持图像输入
-    vision: bool,
+    /// 是否把「支持思考」**声明给下游**。`None` = 不声明（交给 models.dev）。
+    reasoning: Option<bool>,
 }
 
-/// 编码套餐的模型表（规格同步自参考实现，注释里的数字来自其 `models.ts`）。
+/// 编码套餐的模型表（id / 展示名 / 内部输出上限，见 `Spec` 的说明）。
 ///
 /// 顺序 = 展示顺序：能力由强到弱、同代相邻，便于管理页阅读。
 const MODELS: &[Spec] = &[
-    Spec { id: "glm-5.3", name: "GLM-5.3", context: 1_000_000, max_output: 128_000, reasoning: true, vision: false },
-    // `glm-5.3-flash` **有视觉**：目录（`agent/configs` 的 `capabilities.vision`）
-    // 与实测（2026-09-30 发一张红色 4×4 PNG，它答「红色」；同一张图打
-    // `glm-5.3` 被 400 拒掉，原文是「messages.content.type 参数非法，取值范围
-    // ['text']」）两处一致 —— 改造前这里标的是 `false`，属清单与事实不符。
-    Spec { id: "glm-5.3-flash", name: "GLM-5.3 Flash", context: 1_000_000, max_output: 128_000, reasoning: true, vision: true },
-    Spec { id: "glm-5.2", name: "GLM-5.2", context: 1_000_000, max_output: 128_000, reasoning: true, vision: false },
-    Spec { id: "glm-5.1", name: "GLM-5.1", context: 200_000, max_output: 64_000, reasoning: true, vision: false },
-    Spec { id: "glm-5", name: "GLM-5", context: 200_000, max_output: 64_000, reasoning: true, vision: false },
-    Spec { id: "glm-5-turbo", name: "GLM-5 Turbo", context: 200_000, max_output: 64_000, reasoning: true, vision: false },
-    Spec { id: "glm-4.7", name: "GLM-4.7", context: 200_000, max_output: 131_072, reasoning: true, vision: false },
-    Spec { id: "glm-4.6", name: "GLM-4.6", context: 200_000, max_output: 131_072, reasoning: true, vision: false },
-    Spec { id: "glm-4.5-air", name: "GLM-4.5 Air", context: 131_072, max_output: 98_304, reasoning: true, vision: false },
-    // 视觉两档：不支持思考，能力位与其它档不同（目录里要如实标出来，
-    // 否则客户端会按「支持思考」去发 `thinking`，上游直接拒）
-    Spec { id: "glm-4.6v", name: "GLM-4.6V", context: 131_072, max_output: 32_768, reasoning: false, vision: true },
-    Spec { id: "glm-5v-turbo", name: "GLM-5V Turbo", context: 200_000, max_output: 131_072, reasoning: false, vision: true },
+    Spec { id: "glm-5.3", name: "GLM-5.3", max_output: 128_000, reasoning: None },
+    // `glm-5.3-flash` 的视觉位由 models.dev 给出（目录 `agent/configs` 的
+    // `capabilities.vision` 与实测一致：2026-09-30 发一张红色 4×4 PNG 它答「红色」；
+    // 同一张图打 `glm-5.3` 被 400 拒掉，原文是「messages.content.type 参数非法，
+    // 取值范围 ['text']」）。
+    Spec { id: "glm-5.3-flash", name: "GLM-5.3 Flash", max_output: 128_000, reasoning: None },
+    Spec { id: "glm-5.2", name: "GLM-5.2", max_output: 128_000, reasoning: None },
+    Spec { id: "glm-5.1", name: "GLM-5.1", max_output: 64_000, reasoning: None },
+    Spec { id: "glm-5", name: "GLM-5", max_output: 64_000, reasoning: None },
+    Spec { id: "glm-5-turbo", name: "GLM-5 Turbo", max_output: 64_000, reasoning: None },
+    Spec { id: "glm-4.7", name: "GLM-4.7", max_output: 131_072, reasoning: None },
+    Spec { id: "glm-4.6", name: "GLM-4.6", max_output: 131_072, reasoning: None },
+    Spec { id: "glm-4.5-air", name: "GLM-4.5 Air", max_output: 98_304, reasoning: None },
+    // 视觉两档**反对**思考，这两行是本表唯一保留 `reasoning` 的地方：
+    // 目录里明确写着它们不支持思考，且标错的方向是不对称的 —— 声明成 true 会让
+    // 客户端按「支持思考」去发 `thinking`，上游直接拒（400）；声明成 false 只是
+    // 让客户端不启用思考。models.dev 对这两支给的是 true（那是实验室 API 的口径，
+    // 与本通道的目录不一致），按「上游声明 > models.dev」取本目录的 false。
+    Spec { id: "glm-4.6v", name: "GLM-4.6V", max_output: 32_768, reasoning: Some(false) },
+    Spec { id: "glm-5v-turbo", name: "GLM-5V Turbo", max_output: 131_072, reasoning: Some(false) },
 ];
 
 /// 一个模型的**目录补充信息**（`agent/configs` 的 `builtinModels[]`）
@@ -127,6 +138,21 @@ const CATALOG_EXTRAS: &[Extra] = &[
 
 /// 本家的模型清单（聚合目录认的形态）。
 ///
+/// ── 只声明**有据可依**的键（2026-10 起）────────────────────────
+/// 出口只留两类：
+///   · **协议级事实**：`supportsToolCall`（编码套餐的客户端本身就是靠工具调用跑
+///     agent 循环）；两档视觉模型的 `supportsReasoning: false`（目录明确写过，
+///     见 `MODELS` 的注释）；
+///   · `CATALOG_EXTRAS` 里**有注记**的项（5.3 家族的档位来自官方目录、5.2 来自
+///     智谱公开文档、视频位逐条注明是否有依据）。
+/// 其余（上下文 / 输出上限 / 图片 / 思考）由 `core::model_meta` 从 models.dev
+/// 补齐 —— 那一份对本家的每一支模型都收录（见同步脚本产出的快照），
+/// 而原先转录自参考实现的那些值已被证伪（理由见 `Spec` 的说明）。
+///
+/// **规格表本身保留**：`models::max_output` 仍是本家思考预算截顶的内部上限
+/// （见 `zcode::reasoning`）—— 那是「别让 max_tokens 超过上游能返的量」的安全
+/// 兜底，与对下游声明什么无关；保守值的代价只是截顶更早，方向安全。
+///
 /// `region` 当前**不影响**返回值（两地清单相同，见模块头），参数保留是为了
 /// 让调用点写成 `models::list(region)` —— 将来若真出现地区差异（例如某地上了
 /// 独家模型），改这一处即可，不必回头改所有调用点。
@@ -137,13 +163,11 @@ pub fn list(_region: Region) -> Vec<Value> {
             let mut item = json!({
                 "id": spec.id,
                 "name": spec.name,
-                "maxInputTokens": spec.context,
-                "maxOutputTokens": spec.max_output,
-                // 编码套餐的模型都支持工具调用（客户端本身就是靠它跑 agent 循环）
                 "supportsToolCall": true,
-                "supportsImages": spec.vision,
-                "supportsReasoning": spec.reasoning,
             });
+            if let Some(reasoning) = spec.reasoning {
+                item["supportsReasoning"] = Value::Bool(reasoning);
+            }
             if let Some(extra) = CATALOG_EXTRAS.iter().find(|extra| extra.id == spec.id) {
                 append_catalog_extras(&mut item, extra);
             }

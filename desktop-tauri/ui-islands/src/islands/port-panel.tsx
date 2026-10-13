@@ -68,6 +68,33 @@ import { t } from '../i18n'
 const FALLBACK_PORT = 3065
 
 /**
+ * web 模式（面板由网关自己托管）下**地址栏就是权威的网关地址**。
+ *
+ * 为什么不能沿用「壳侧上报的端口」：`getBackendStatus` 给的是**进程自己监听的端口**，
+ * 而 Docker 端口映射、反向代理、内网穿透之后，外面的真实地址进程从原理上不可知
+ * —— 拿容器内的 `127.0.0.1:3065` 拼出来的地址，指向的是访问者自己的电脑。浏览器
+ * 自带的那一份（`location.origin`）天然穿透这三层，是唯一正确的答案。
+ *
+ * 项目自己已经这么用过：小浣熊网页登录的回调 URL 就是用 `location.origin` 拼的
+ * （`web_shim::buildRaccoonWebAuthUrl`）。两处口径从这里起一致。
+ *
+ * **桌面模式必须保持现状**：那时 origin 是 Tauri 的自定义协议（`tauri://localhost`
+ * 之类），不是网关地址，真端口只能问壳侧。所以这个函数在非 web 模式返回 null，
+ * 由调用方回落到端口路径。
+ */
+function webOrigin(): string | null {
+  if (shared().workbuddyDesktop?.platform !== 'web') return null
+  const origin = typeof window === 'undefined' ? '' : window.location?.origin
+  // 非 http(s) 场景（file:// 等）origin 是字面量 "null"，那不是可用地址
+  return origin && origin !== 'null' ? origin : null
+}
+
+/** 本次该展示的网关基址：web 模式信地址栏，桌面模式用壳侧上报的真实端口 */
+function gatewayBaseFor(port: number, current: string): string {
+  return webOrigin() ?? (port ? `http://127.0.0.1:${port}` : current)
+}
+
+/**
  * 壳侧 `backend_status` 返回的启动失败详情（Rust 的 StartupFailure，
  * camelCase 序列化）。`label` 是侧栏那一行用的短标签（「端口被占用」这类），
  * 由后端给 —— 界面不自己拼，否则侧栏、弹窗、日志里会出现三套说法。
@@ -106,6 +133,10 @@ type PortOccupantInfo = {
 
 /** 本岛用到的壳侧接口：端口探测、结束占用进程、写盘、重启（见 bridge.rs） */
 type PortBridge = {
+  /** 桥接层注入的平台标识（'windows' / 'macos' / 'linux' / 'web'）。
+   *  本面板读它是为了区分「网页端托管面板」与桌面壳 —— 两者算网关地址的
+   *  依据不同（见 webOrigin）。 */
+  readonly platform?: string
   getBackendStatus(): Promise<BackendStatus | null | undefined>
   getPortOccupant(): Promise<PortOccupantInfo | null | undefined>
   endPortOccupant(): Promise<{ released?: boolean } | null | undefined>
@@ -166,7 +197,9 @@ type PortSnapshot = {
 
 let snapshot: PortSnapshot = {
   backend: null,
-  gatewayBase: `http://127.0.0.1:${FALLBACK_PORT}`,
+  // web 模式下到这里就已经能拿到地址栏（web_shim 注入在 `<head>` 之后、所有界面脚本
+  // 之前），所以初值直接给真地址 —— 不必先闪一下 `127.0.0.1:3065` 再改成对的
+  gatewayBase: gatewayBaseFor(0, `http://127.0.0.1:${FALLBACK_PORT}`),
 }
 
 /** 快照的订阅者（当前只有状态条那一个 root） */
@@ -239,8 +272,9 @@ async function sync(): Promise<void> {
     const next: PortSnapshot = {
       // 就绪与否、失败原因都可能在这一刻变化；字段缺失按「没查过」处理
       backend: status ?? null,
-      // 取不到端口就保持原值：页面照常显示，不留空也不报错
-      gatewayBase: port ? `http://127.0.0.1:${port}` : current.gatewayBase,
+      // web 模式取地址栏（端口映射 / 反代 / 穿透后的真实地址）；桌面模式取端口，
+      // 取不到就保持原值：页面照常显示，不留空也不报错
+      gatewayBase: gatewayBaseFor(port, current.gatewayBase),
     }
     if (next.gatewayBase !== current.gatewayBase) paintGatewayAddress(next.gatewayBase)
     publish(next)

@@ -36,23 +36,48 @@
 //! 统计）。本模块返回同一形状，于是工作流/日志/界面三处的口径与 WorkBuddy、
 //! 小浣熊完全一致，不需要为第三家再加分支。
 //!
+//! ── 活动福利（Weekly Perks 等「活跃即发」活动，2026-10 加）──────
+//! 这类活动没有领取接口、由服务端在账号**登录活跃**时自动入账。签到链的做法：
+//! 签到完成后读一次积分流水，**今天还没到账**就顺带触发一次「登录」（token
+//! 刷新，`refresh::refresh` 的 force 通道），复核之后把状态放进
+//! `promotionReward` 字段（读侧实现见 `promotion` 模块头）。
+//!
+//! 触发动作的安全性有实测依据（2026-10-13）：服务端虽会**轮换** refresh_token，
+//! 但**旧令牌可重复使用**（同一旧 refresh_token 连续刷新两次均成功）—— 因此
+//! 这个刷新不会顶掉桌面端的登录态。刷新失败只记日志、不阻断签到（活动福利是
+//! 附加收益，见 `attach_today_reward` 的兜底说明）。
+//!
+//! 已到账时**不触发**（用户当天开过客户端就已经拿到，不重复刷新）。
+//!
 //! ── 为什么带一个只读的任务列表调用 ─────────────────────────
 //! `GET autoclaw-task-list` 能拿到所有任务的完成状态。它在**签到失败时**提供
 //! 归因：拿不到列表说明登录态有问题，能拿到而 `daily_signin` 已完成，则说明
 //! 是「今天已签到」而不是「接口坏了」。因此只在需要解释失败时才拉它，
 //! 正常路径不多花一次往返。
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
+use crate::server::logging;
 
 use super::balance::{userapi_get, userapi_post};
 use super::credentials;
+use super::promotion;
+use super::refresh;
 use super::region::Region;
 
 /// 每日签到任务的 id（源实现 `DAILY_SIGNIN_TASK_ID`）
 const DAILY_SIGNIN_TASK_ID: &str = "daily_signin";
+
+/// 触发「登录活跃」后、复核活动福利到账前等的一拍。
+///
+/// 实测（2026-10-13）：刷新 16:18:46 → 服务端入账 16:18:48（约 2 秒）。
+/// 签到本身耗时通常已覆盖一部分等待，所以这里只补 1.5 秒再复核 —— 复核不到
+/// 也不影响结论（下一次签到/查询会看到，活动福利按天入账、当天都在流水里）。
+const PROMOTION_SETTLE_MS: u64 = 1500;
 
 /// 签到接口路径（源实现 `completeClientTask`）
 const TASK_COMPLETE_PATH: &str = "/autoclaw-proxy/proxy/autoclaw-task-complete";
@@ -60,7 +85,7 @@ const TASK_COMPLETE_PATH: &str = "/autoclaw-proxy/proxy/autoclaw-task-complete";
 /// 任务列表路径（源实现 `getTaskList`；`?lang=` 可选，省略时上游给默认语言）
 const TASK_LIST_PATH: &str = "/autoclaw-proxy/proxy/autoclaw-task-list";
 
-/// AutoClaw 账号的每日签到。
+/// AutoClaw 账号的每日签到（**含活动福利触发与附加**）。
 ///
 /// 返回 `{success, msg, ...}` —— `success` 的口径是「**本次真的领到了积分**」，
 /// 而不是「HTTP 通了」。今天已领过时 `success: false` 且 msg 说明原因；
@@ -68,7 +93,82 @@ const TASK_LIST_PATH: &str = "/autoclaw-proxy/proxy/autoclaw-task-list";
 ///
 /// `region` 决定账号在哪一家的记录里找、请求打哪个 userapi 域：两地的任务体系
 /// 各自独立（同一套接口路径、两个站点），不能跨地区查。
+///
+/// ── 执行顺序（活动福利见模块头）──────────────────────────────
+///   1. **签到先行**：task-complete 的成败就是这条结果行的成败（账号不存在 /
+///      凭证失效等在这里直接返回错误，不做多余的查询与触发）；
+///   2. 读一次积分流水，判断今天的活动福利是否已到账（只读）；
+///   3. 未到账 → 触发一次「登录活跃」（token 刷新）—— **已到账不触发**，
+///      用户当天开过客户端时这里零副作用；签到耗时已充当服务端发放延迟的
+///      一部分，触发后再等一拍复核一次。
 pub async fn claim_daily_signin(
+    region: Region,
+    store: &AccountStore,
+    account_id: &str,
+) -> Result<Value, GatewayError> {
+    let claim = run_daily_signin(region, store, account_id).await?;
+
+    let mut reward = promotion::today_reward(region, store, account_id)
+        .await
+        .unwrap_or(Value::Null);
+    let granted = reward.get("granted").and_then(Value::as_bool) == Some(true);
+
+    if !granted && trigger_login_active(region, store, account_id).await {
+        tokio::time::sleep(Duration::from_millis(PROMOTION_SETTLE_MS)).await;
+        if let Ok(retry) = promotion::today_reward(region, store, account_id).await {
+            reward = retry;
+        }
+    }
+    Ok(attach_today_reward(claim, reward))
+}
+
+/// 触发一次「登录活跃」—— 刷新 token，让服务端把今天的活动福利发出来。
+///
+/// ── 为什么不自己做请求，而是复用 `refresh` ───────────────────
+/// 刷新链的验签头（appId/appKey）、400002 降级、单飞与缓存写回都只有一份实现
+///（`refresh.rs`）；在这里另起一套必然与它分叉。`force = true` 是无条件刷新
+///（`false` 只在临期才刷，而这里的目的是「触发登录」而不是「续期」）。
+///
+/// ── 返回值与容错 ────────────────────────────────────────────
+/// 返回是否**尝试并成功**触发了刷新（调用方据此决定要不要多等一拍复核）。
+/// 失败（没有 refreshToken / 网络问题 / 登录态失效）只记日志并返回 false ——
+/// 活动福利是附加收益，绝不因它把一次真签到判成失败。
+async fn trigger_login_active(region: Region, store: &AccountStore, account_id: &str) -> bool {
+    let record = store.autoclaw_account_record(region, account_id);
+    // 与签到同一判据：非空 id 必须命中记录，否则不该拿桌面端登录态去刷
+    if !account_id.is_empty() && record.is_none() {
+        return false;
+    }
+    let Ok(credentials) = credentials::snapshot_for(record.as_ref(), region) else {
+        return false;
+    };
+    if !credentials.can_refresh() {
+        logging::verbose(
+            "[AutoClaw]",
+            &format!("账号 {account_id} 没有 refreshToken，跳过活动福利触发"),
+        );
+        return false;
+    }
+    match refresh::refresh(&credentials, true).await {
+        Ok(_) => {
+            logging::verbose(
+                "[AutoClaw]",
+                &format!("账号 {account_id} 已刷新登录态（触发活动福利发放）"),
+            );
+            true
+        }
+        Err(error) => {
+            logging::verbose(
+                "[AutoClaw]",
+                &format!("账号 {account_id} 活动福利触发刷新失败: {}", error.message),
+            );
+            false
+        }
+    }
+}
+
+/// 签到任务本身（原主体；活动福利的触发与附加在外面那层包装里）。
+async fn run_daily_signin(
     region: Region,
     store: &AccountStore,
     account_id: &str,
@@ -181,4 +281,33 @@ async fn describe_task_state(
     } else {
         None
     }
+}
+
+/// 把今日活动福利状态附加到签到结果上（`reward` 由调用方查明）。
+///
+/// ── 为什么查询失败只给 null、不升级为错误 ─────────────────────
+/// 活动福利是签到结果之外的**附加信息**（来源不同：签到打 task-complete，
+/// 福利读积分流水）。把它做成「查不到就签到失败」会让一次网络抖动否决一次
+/// 真实签到 —— 与 `balance.rs` 给「订阅失败不影响积分结果」的兜底同一取向。
+///
+/// 已到账时把收益拼进 `msg`（「…（活动福利 +800 已到账）」）：签到记录台账与
+/// 面板展示读的都是这一条 msg，用户在一个地方就能看清「今天到底拿到了什么」。
+/// 未到账**不改 msg** —— 活动有期限，结束后每天提示「未到账」只会变成噪音；
+/// 状态仍在 `promotionReward` 字段里，给需要的地方读。
+fn attach_today_reward(mut claim: Value, reward: Value) -> Value {
+    let granted = reward.get("granted").and_then(Value::as_bool).unwrap_or(false);
+    let points = reward.get("points").and_then(Value::as_i64).unwrap_or(0);
+    if let Some(object) = claim.as_object_mut() {
+        if granted && points > 0 {
+            let base = object.get("msg").and_then(Value::as_str).unwrap_or("").to_string();
+            if !base.is_empty() {
+                object.insert(
+                    "msg".to_string(),
+                    json!(format!("{base}（活动福利 +{points} 已到账）")),
+                );
+            }
+        }
+        object.insert("promotionReward".to_string(), reward);
+    }
+    claim
 }

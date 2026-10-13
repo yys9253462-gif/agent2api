@@ -72,6 +72,20 @@ type ProviderFeatures = {
    */
   usageDetail?: boolean
   /**
+   * 余额格的读数旁边要不要挂「积分明细」入口（逐份积分包：面额 / 已用 / 剩余 +
+   * 领取 → 到期）—— 只有 WorkBuddy 两家与 Trae。
+   *
+   * 与 `usageDetail` 的差别是**动不动排版**：那个会把这格换成「套餐徽标 + 读数
+   * 按钮」的整套两行形态（CodeArts 的余额是两台网关的加总，一行分不出权益差别，
+   * 所以值得换）；这两家的读数本身（WorkBuddy 的「可用 N」、Trae 的套餐名 +
+   * 进度条 + 剩 x / 共 y）已经回答了用户最常问的那句，明细是**加一层**而不是
+   * 换一层 —— 换过去 Trae 那格会丢掉进度条。
+   *
+   * 判据同样按能力位而不是形状探测：后端 `credits[]` 是这两家（以及以后愿意
+   * 照这个行形状出数据的家）的**承诺** —— 点开一定有逐份读数，不是点开一个空框。
+   */
+  creditDetail?: boolean
+  /**
    * 这一家「并发上限」的默认值（>0 = 本家**没有**「不限」这一档）。
    * CodeArts 的 3 是上游硬顶（超过直接回 HTTP 400，且那是账号级冲突、不降级换号），
    * 所以那一家把 `0` 解释成「按默认 3」而不是「不做并发过滤」；后端同一口径写在两处
@@ -97,12 +111,17 @@ type ProviderFeatures = {
  * 用户才有「去配置」的入口。
  */
 const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
-  workbuddy: { usage: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 余额格读数旁边挂「积分明细」：后端 `query_usage` 在既有
+  //   积分简报之外还出 `credits[]`（逐份积分包的面额 / 已用 / 剩余 / 领取 / 到期，
+  //   见 providers::workbuddy::adapter 的 query_usage）。两地区能力一致，
+  //   两项都要登记（漏一个那一家就掉进 GENERIC_FEATURES）。
+  //   enterprise 账号没有资源包、后端不挂 `credits`，界面按空数组自然退回原样。
+  workbuddy: { usage: true, creditDetail: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
   // WorkBuddy 国际版（拆家后的第二家，见 providers::workbuddy::region）：
   //   `edition: false` 是因为注册名「WorkBuddy 国际版」自带地区，再拼一次会
   //   得到「WorkBuddy 国际版 国际版」（`editionSuffix` 虽有「名字已含就不拼」
   //   的兜底，这里直接写 false 更清楚，与 `zcode-intl` 同款）。
-  'workbuddy-intl': { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  'workbuddy-intl': { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   raccoon: { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
   catpaw: { usage: true, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
   // AutoClaw 两个地区能力完全一致，差别只在域名；两项都必须登记 —— 漏了哪一项，
@@ -155,7 +174,11 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id，不把它做成账号字段。
   // `usage: true` 对应 providers::trae::usage（上游两份账：ide_user_ent_usage 的权益包/
   // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
-  trae: { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 同一份 ent_usage 里还读得到**逐份权益包**的
+  //   `start_time` / `expire_time`（领取 → 到期），后端摊成 `credits[]`
+  //   （见 providers::trae::usage 的 credit_rows）。签到发的包会按天堆起来，
+  //   哪一份先作废只有这份清单答得上来。
+  trae: { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   // Loomy（讯飞）。各位各有出处：
   // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
   //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
@@ -745,6 +768,16 @@ export function supportsUsageDetail(account: AccountRecord | null | undefined): 
 }
 
 /**
+ * 余额格的读数旁边要不要挂「积分明细」入口（见 ProviderFeatures.creditDetail）。
+ *
+ * 与 `supportsUsageDetail` 是两件事：那个是**整套两行形态**（会替掉读数本来的
+ * 排版），这个是**只加一个入口**（读数末尾的小箭头）。所以判据也不能共用。
+ */
+export function supportsCreditDetail(account: AccountRecord | null | undefined): boolean {
+  return Boolean(providerFeatures(providerOf(account)).creditDetail)
+}
+
+/**
  * 上游套餐名是否为免费版（`^free$`，不区分大小写）。
  *
  * 判定必须比**上游原始名**（后端 `plan_name` 取 `package_name_en`，现网给过 `Free`），
@@ -838,12 +871,13 @@ export function welfareTodoTitle(state: WelfareState): string {
   return t('{tried}探测并领取官方每日登录赠送的套餐积分（到账进套餐积分，不增加福利模型 token 池）', { tried })
 }
 
-/* ─── 筛选维度（enabled / limit / q 三维各自独立）─────────────
-   分组模式（账号页按家分组）去掉了「提供商」这一维：家的维度已经由页面结构本身
-   表达（一家一段），再挂一个下拉筛同一件事，只会让「现在看的是哪几家」有两个说法。
-   `q` 是搜索框（账号名 / 备注 / 邮箱 / 标识），与另外两维共用同一条可见性口径。 */
+/* ─── 筛选维度（provider / enabled / limit / q 四维各自独立）───
+   `provider` 是工具条最前那颗下拉（'all' = 不限）：分组之后「哪一家」虽然由页面
+   结构本身表达，但「只看某一家」仍是常用动作 —— 分组带收起得掉一家，却收不掉
+   其余那几家；账号多了之后，把别家整体请出视野正是筛选该干的事。
+   `q` 是搜索框（账号名 / 备注 / 邮箱 / 标识），与另外三维共用同一条可见性口径。 */
 
-export type AccountFilter = { enabled: string; limit: string; q: string }
+export type AccountFilter = { provider: string; enabled: string; limit: string; q: string }
 
 /** 余额读数的查找口（账号 → `usageEntryOf` 的结果）；不传视作「都没有读数」 */
 export type UsageLookup = (account: AccountRecord) => UsageEntry | undefined
@@ -888,6 +922,12 @@ export function matchQuery(account: AccountRecord, filter: AccountFilter): boole
   return haystack.some(value => String(value || '').toLowerCase().includes(q))
 }
 
+/** 提供商维度：'all' 不限；其余按 provider id 精确相等（与 `providerOf` 同一口径 ——
+ *  字段缺失的老记录归默认家，不会因为筛选而漏掉） */
+export function matchProvider(account: AccountRecord, filter: AccountFilter): boolean {
+  return filter.provider === 'all' || providerOf(account) === filter.provider
+}
+
 export function matchEnabled(account: AccountRecord, filter: AccountFilter): boolean {
   if (filter.enabled === 'all') return true
   return filter.enabled === 'enabled' ? isEnabled(account) : !isEnabled(account)
@@ -906,19 +946,20 @@ export function matchLimit(
   return filter.limit === 'limited' ? limited : !limited
 }
 
-/** 单条账号是否通过当前筛选（三个维度的合取）。`visibleAccounts` 就是它在列表上的 filter */
+/** 单条账号是否通过当前筛选（四个维度的合取）。`visibleAccounts` 就是它在列表上的 filter */
 export function matchesFilter(
   account: AccountRecord,
   filter: AccountFilter,
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
 ): boolean {
-  return matchEnabled(account, filter)
+  return matchProvider(account, filter)
+    && matchEnabled(account, filter)
     && matchLimit(account, filter, usageOf, tokenUsageOf)
     && matchQuery(account, filter)
 }
 
-/** 当前筛选条件下的可见账号（三个维度同时生效） */
+/** 当前筛选条件下的可见账号（四个维度同时生效） */
 export function visibleAccounts(
   all: AccountRecord[] | null | undefined,
   filter: AccountFilter,
@@ -931,6 +972,8 @@ export function visibleAccounts(
 /**
  * 分段计数：某分段显示的数字 = 「其余维度保持当前选择、本维度取该值」的账号数。
  * 「可见列表」与「分段计数」共用这一份口径 —— 否则徽标数字与点进去看到的结果会各算各的。
+ * 提供商那一维不给自己算分段（它是下拉，数字直接写在选项里，见 accounts-page），
+ * 但**要进其余分段的取景框**：切了家之后，状态 / 限额徽标就该跟着只数这一家。
  */
 export function filterCounts(
   all: AccountRecord[] | null | undefined,
@@ -940,7 +983,8 @@ export function filterCounts(
 ): Record<string, number> {
   const list = all || []
   const scope = (except: 'enabled' | 'limit') => list.filter(account =>
-    (except === 'enabled' || matchEnabled(account, filter))
+    matchProvider(account, filter)
+    && (except === 'enabled' || matchEnabled(account, filter))
     && (except === 'limit' || matchLimit(account, filter, usageOf, tokenUsageOf))
     && matchQuery(account, filter))
 

@@ -138,6 +138,10 @@ pub mod loomy;
 pub mod monkeycode;
 pub mod officeace;
 pub mod onboarding_memory;
+/// **本地就绪闸门**：一条通道在「还没出本机就注定发不出去」时，让选路绕开它
+/// （当前唯一的用户是 ZCode 活动套餐的令牌池，判据与取舍见模块头）。
+/// 不进身份体系：它是各家的共用设施，只按 provider id 记状态。
+pub mod readiness;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;

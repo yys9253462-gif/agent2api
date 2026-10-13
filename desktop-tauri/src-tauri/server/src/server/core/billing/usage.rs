@@ -103,6 +103,13 @@ impl BillingService {
                 } else {
                     Some(parse_time(item.get("CycleEndTime")) + 1000)
                 };
+                // ── 领取时刻（`CreateTime`）：与上面两个时间**不是一回事** ────
+                // 这份包被发出来的时刻（官方发放记录里的「领取时间」）在这里，
+                // 而 `DeductionStartTime` 是开始抵扣、`CycleStartTime` 是本周期的
+                // 起点 —— 日额度包三者能差一整天（昨天发出、今天 0 点起算）。
+                // 界面那句「领取 …」问的是「这笔什么时候到手的」，所以另存一个
+                // 键，不拿 startAt 顶替（口径见 `credit_packs_from`）。
+                let create_at = time_or_null(item.get("CreateTime")).map(epoch_to_millis);
                 // expireAt 的排序键：缺失视为 Infinity（排在最后）
                 let expire_sort = expire_at.map(|value| value as f64).unwrap_or(f64::INFINITY);
                 let name = label_of(&package_code)
@@ -133,8 +140,15 @@ impl BillingService {
                 resource.insert("used".to_string(), json_number((total - left).max(0.0)));
                 resource.insert("left".to_string(), json_number(left));
                 resource.insert("startAt".to_string(), timestamp_json(start_at));
+                resource.insert("createAt".to_string(), timestamp_json(create_at));
                 resource.insert("expireAt".to_string(), timestamp_json(expire_at));
                 resource.insert("refreshAt".to_string(), timestamp_json(refresh_at));
+                // 来源一句话（`AccountAttributes` 里的 `grantReason`：官方活动发放 /
+                // 拉新奖励 / 每日签到…）。上游没给就**整个不写这个键** —— 写空串
+                // 会让界面多出一个没有内容的来源标签。
+                if let Some(reason) = grant_reason(item) {
+                    resource.insert("grantReason".to_string(), Value::String(reason));
+                }
                 // 排序辅助字段：排序后会被删掉，不属于契约
                 resource.insert("__expireSort".to_string(), json_number(expire_sort));
                 resource.insert(
@@ -368,49 +382,17 @@ impl BillingService {
     /// 总剩余含加油包等全部资源包，因此可能大于后两项之和（买了加油包时）。
     /// 企业账号没有套餐/奖励之分：totalLeft 即剩余额度，后两项为 null
     /// （不限量时为 null + unlimited 标记）。
+    ///
+    /// 摊平逻辑在 [`credits_summary_from`]（纯函数）：账号页那条链要**一次**
+    /// 上游查询同时拿到这份简报与逐份明细，两边各查一次等于把上游调用翻倍
+    /// （见 `providers::workbuddy::adapter` 的 `query_usage`）。
     pub async fn query_credits_summary(
         &self,
         session: Option<&Value>,
         locale: Option<&str>,
     ) -> Result<Value, BillingError> {
         let usage = self.query_usage(session, locale).await?;
-        let kind = usage.get("kind").and_then(Value::as_str).unwrap_or("personal");
-        if kind == "enterprise" {
-            let unlimited = usage.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
-            return Ok(json!({
-                "kind": "enterprise",
-                "unlimited": unlimited,
-                "totalLeft": if unlimited {
-                    Value::Null
-                } else {
-                    usage.get("usageLeft").and_then(to_int).map(Value::from).unwrap_or(Value::Null)
-                },
-                "planLeft": Value::Null,
-                "bonusLeft": Value::Null,
-            }));
-        }
-        let mut total_left: i64 = 0;
-        let mut plan_left: i64 = 0;
-        let mut bonus_left: i64 = 0;
-        if let Some(resources) = usage.get("resources").and_then(Value::as_array) {
-            for item in resources {
-                let left = item.get("left").and_then(to_int).unwrap_or(0);
-                total_left += left;
-                let code = item.get("packageCode").and_then(Value::as_str);
-                if is_plan_base(code) {
-                    plan_left += left;
-                } else if is_bonus(code) {
-                    bonus_left += left;
-                }
-            }
-        }
-        Ok(json!({
-            "kind": "personal",
-            "unlimited": false,
-            "totalLeft": total_left,
-            "planLeft": plan_left,
-            "bonusLeft": bonus_left,
-        }))
+        Ok(credits_summary_from(&usage))
     }
 
     /// 用量提示（productFeatures.BillingNotice 开启时桌面端会轮询）。
@@ -430,4 +412,148 @@ impl BillingService {
             Ok(Value::Null)
         }
     }
+}
+
+// ─── 纯函数：`query_usage` 的成果 → 两种摊平形状 ──────────────────
+//
+// 这两个函数都不发请求、也不看时钟：只是把 `resources[]` 换个形状给不同的消费方。
+// 放在 billing 而不是各家适配器里，是因为**资源包的行形状只有这一处定义**
+// （`get_personal_usage` 里逐键组装的那个 Map）—— 造形状与换形状分在两个文件里，
+// 以后加字段时必有一边被忘掉。
+
+/// 资源包时间字段的 epoch → 毫秒。
+///
+/// 上游有的字段给秒、有的给毫秒（`CreateTime` 是毫秒，而 `DeductionEndTime`
+/// 在参考实现里也按毫秒读）。分界取 1e11：秒级 epoch 到公元 5138 年都不会越过
+/// 它，毫秒级从 1973 年起就在它之上 —— 与前端 `subscriptionText` 判 `expireAt`
+/// 用的是同一个数。
+fn epoch_to_millis(value: i64) -> i64 {
+    if value > 100_000_000_000 {
+        value
+    } else {
+        value.saturating_mul(1000)
+    }
+}
+
+/// `AccountAttributes[]` 里的 `grantReason`（发放原因）；没有 / 空白 → `None`。
+fn grant_reason(item: &Value) -> Option<String> {
+    let list = item.get("AccountAttributes").and_then(Value::as_array)?;
+    for attribute in list {
+        if attribute.get("Key").and_then(Value::as_str) != Some("grantReason") {
+            continue;
+        }
+        let value = attribute.get("Value").and_then(Value::as_str).unwrap_or("").trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// 积分简报（`{kind, unlimited, totalLeft, planLeft, bonusLeft}`）。
+///
+/// 这是账号页余额列的**既有形状**，逐字不变（判别键与消费方见
+/// `providers::workbuddy::adapter` 的 `query_usage`）。企业账号没有套餐 / 奖励
+/// 之分：`totalLeft` 即剩余额度，后两项为 null（不限量时 totalLeft 也是 null）。
+pub fn credits_summary_from(usage: &Value) -> Value {
+    let kind = usage.get("kind").and_then(Value::as_str).unwrap_or("personal");
+    if kind == "enterprise" {
+        let unlimited = usage.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
+        return json!({
+            "kind": "enterprise",
+            "unlimited": unlimited,
+            "totalLeft": if unlimited {
+                Value::Null
+            } else {
+                usage.get("usageLeft").and_then(to_int).map(Value::from).unwrap_or(Value::Null)
+            },
+            "planLeft": Value::Null,
+            "bonusLeft": Value::Null,
+        });
+    }
+    let mut total_left: i64 = 0;
+    let mut plan_left: i64 = 0;
+    let mut bonus_left: i64 = 0;
+    if let Some(resources) = usage.get("resources").and_then(Value::as_array) {
+        for item in resources {
+            let left = item.get("left").and_then(to_int).unwrap_or(0);
+            total_left += left;
+            let code = item.get("packageCode").and_then(Value::as_str);
+            if is_plan_base(code) {
+                plan_left += left;
+            } else if is_bonus(code) {
+                bonus_left += left;
+            }
+        }
+    }
+    json!({
+        "kind": "personal",
+        "unlimited": false,
+        "totalLeft": total_left,
+        "planLeft": plan_left,
+        "bonusLeft": bonus_left,
+    })
+}
+
+/// `resources[]` → 逐份积分包明细（账号页「积分明细」弹层的输入）。
+///
+/// 每份一行，字段与上游一一对应：
+/// ```text
+///   name / daily           这一份是什么
+///   total / used / remain  面额 / 已用 / 剩余（上游的数，不做二次计算）
+///   grantAt                领取（发放）时刻 —— 上游 CreateTime
+///   startAt / expireAt     生效 / 到期（抵扣起止）
+///   refreshAt              周期刷新时刻（日额度包没有）
+///   grantReason            来源一句话（上游没给则无此键）
+/// ```
+///
+/// ── 为什么直接透传 resources 而不是另算一份 ────────────────────
+/// 这些键在 `get_personal_usage` 里已按官方客户端口径解好了（含「缺失 ≠ 0」与
+/// 日额度包该读哪个到期字段）。本函数只补两件上游没做的事：改名为界面契约里的
+/// 名字、把**未知字段整个删掉**（`timestamp_json` 给缺失写出的是 `null`，而 JS
+/// 里 `Number(null) === 0` —— 界面按「有没有这个键」判空，写 null 会被画成 0）。
+///
+/// 顺序保留上游那份（已按套餐优先级 + 到期时间升序排过，见 `get_personal_usage`），
+/// 界面因此不必再排一次。
+pub fn credit_packs_from(usage: &Value) -> Vec<Value> {
+    let Some(resources) = usage.get("resources").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    resources.iter().map(credit_pack_of).collect()
+}
+
+/// 一份资源包 → 明细行（键名与顺序见 [`credit_packs_from`] 的文档）。
+fn credit_pack_of(item: &Value) -> Value {
+    let mut row = Map::new();
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    row.insert("name".to_string(), Value::String(name));
+    // 三个数：上游给什么写什么，缺失**不写键**（写成 0 就是那个「读一个不存在的
+    // 字段、渲染成剩余 0」的事故）
+    for (from, to) in [("total", "total"), ("used", "used"), ("left", "remain")] {
+        if let Some(value) = item.get(from) {
+            if !value.is_null() {
+                row.insert(to.to_string(), value.clone());
+            }
+        }
+    }
+    // 四个时刻：同上，null 一律不写
+    for to in ["createAt", "startAt", "expireAt", "refreshAt"] {
+        if let Some(value) = item.get(to) {
+            if !value.is_null() {
+                let key = if to == "createAt" { "grantAt" } else { to };
+                row.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    // 日额度包（每天重置、无到期作废）：界面对这一档的「到期」另有说法，
+    // 所以这一位必须如实带出去，不能靠名字猜
+    if item.get("isDaily").and_then(Value::as_bool) == Some(true) {
+        row.insert("daily".to_string(), Value::Bool(true));
+    }
+    if let Some(reason) = item.get("grantReason") {
+        if !reason.is_null() {
+            row.insert("grantReason".to_string(), reason.clone());
+        }
+    }
+    Value::Object(row)
 }
