@@ -39,6 +39,7 @@ import {
   ZOOM_PERCENTS,
   formatBytes,
   formatCount,
+  modelsDevStateText,
   openExternal,
   readThemeMode,
   readZoomPercent,
@@ -66,6 +67,7 @@ import {
   refreshCaptchaPool,
   refreshClineHeaders,
   refreshCors,
+  refreshModelsDev,
   refreshPrompt,
   refreshQueue,
   refreshRetention,
@@ -93,6 +95,7 @@ import {
   saveClineHeaders,
   saveCors,
   saveDebug,
+  saveModelsDev,
   savePromptFile,
   savePromptMode,
   saveProviderGatewayPrompt,
@@ -1278,6 +1281,32 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
             ))}
           </div>
           <div className='hint retention-note'>{NOTES.captchaPool}</div>
+        </div>
+      </section>
+
+      <section className='panel'>
+        <PanelHead
+          title={t('models.dev 模型元数据')}
+          tip={TIPS.modelsDev}
+          badge={snap.modelsDev.status === 'ready'
+            ? <StatusBadge tone='ok'>{t('{count} 条', { count: Number(snap.modelsDev.count).toLocaleString('zh-CN') })}</StatusBadge>
+            : snap.modelsDev.status === 'unavailable'
+              ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+              : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
+          actions={
+            <RefreshButton id='btn-modelsdev-refresh' onClick={() => void refreshModelsDev()} />
+          }
+        />
+        <div className='panel-body'>
+          <SwitchRow
+            id='settings-modelsdev'
+            label={t('用 models.dev 补齐上游没声明的模型能力与思考档位（联网刷新，内嵌快照始终生效）')}
+            checked={snap.modelsDev.enabled}
+            disabled={snap.modelsDev.status !== 'ready' || snap.busy === 'modelsDev'}
+            onCheckedChange={next => void saveModelsDev(next)}
+          />
+          <div className='settings-state'>{modelsDevStateText(snap.modelsDev)}</div>
+          <div className='hint retention-note'>{NOTES.modelsDev}</div>
         </div>
       </section>
 

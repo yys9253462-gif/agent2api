@@ -54,6 +54,11 @@ use request::{
 };
 use activity::normalize_activity_status;
 pub use activity::WorkbuddyActivity;
+// 账号页那条链要**一次**查询同时拿到积分简报与逐份明细（见
+// `providers::workbuddy::adapter` 的 `query_usage`）：简报的摊平逻辑与在本模块里，
+// 明细的行形状也定义在本模块（`get_personal_usage` 组装的 resources），
+// 所以这两个纯函数对外可见，而不是让适配器去认资源包的键名。
+pub use usage::{credit_packs_from, credits_summary_from};
 
 /// 计费接口单请求总超时（对照 Node 版 REQUEST_TIMEOUT_MS）
 const REQUEST_TIMEOUT_MS: u64 = 20_000;

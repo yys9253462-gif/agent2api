@@ -328,6 +328,20 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/proxies/pool/remove", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/test", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/sync-clash", any(api::accounts::proxies_entry))
+        // ── 订阅（「网络代理」页的订阅区块：机场订阅 → 内核本地监听器）──
+        // 固定路径 + api::subscriptions::entry 按 (方法, 剩余段) 分发（理由同上：
+        // 通配段与 404 兜底互相干扰）。内核命令是异步的（重启 / 拉订阅要几秒
+        // 到几十秒），写操作立即返回列表 + 内核快照，前端轮询看结果 ——
+        // 契约详见 api::subscriptions 的模块头。
+        .route("/api/subscriptions", any(api::subscriptions::entry))
+        .route("/api/subscriptions/add", any(api::subscriptions::entry))
+        .route("/api/subscriptions/save", any(api::subscriptions::entry))
+        .route("/api/subscriptions/refresh", any(api::subscriptions::entry))
+        .route("/api/subscriptions/remove", any(api::subscriptions::entry))
+        .route("/api/subscriptions/decode-qr", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/download", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/restart", any(api::subscriptions::entry))
         // ── 积分 / 签到 / 运营活动（对照 server.mjs 871-911 行）──
         // 六条都挂在 protected（Node 版每条都调了 checkApiKey），
         // 失败时的 body 是 OpenAI 风格（那几条在 server.mjs 的大 try 里）
@@ -420,6 +434,14 @@ pub fn panel_router(state: ServerState) -> Router {
         // 能力位覆盖（纠正对下游声明的那五个字段；只服务内置家，自定义家
         // 走 /api/custom-providers/models 的整表保存，见该 handler 的说明）
         .route("/api/models/capabilities", post(api::model_manage::set_capabilities))
+        // models.dev 模型元数据（上游没声明的能力位与逐模型思考档位由它补齐）：
+        // 开关 / 状态挂在设置页，刷新那条会**真打公网**（models.dev 的两份 JSON），
+        // 所以与 /api/models/refresh 同级挂 protected。
+        .route(
+            "/api/models/metadata",
+            get(api::model_meta::get_metadata).put(api::model_meta::put_metadata),
+        )
+        .route("/api/models/metadata/refresh", post(api::model_meta::refresh_metadata))
         // 模型测试（模型管理页操作列的「测试」）：会**真打上游、消耗额度**，
         // 与 /v1/chat/completions 同一量级的接口，必须挂 protected。
         // 结论失败也返回 2xx（上游的错误放在响应体的 status / error 里，
@@ -488,6 +510,16 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/cors",
             get(api::cors::get_cors).put(api::cors::put_cors),
+        )
+        // ── 保活换行丢弃开关 ──
+        // 与 /api/sanitize、/api/debug 同形的单开关端点（GET 读 / PUT 写），挂
+        // protected：它决定「声明了该能力位的提供商」的下发帧要不要丢掉只含换行
+        // 的 content 分片 —— 改的是客户端看到的字节，敏感度与那两者同级。
+        // 默认关（见 config::KEY_STRIP_NEWLINE_KEEPALIVE 的取舍说明）；在线可切是
+        // 为了让「在真流量上验一次、不对立刻撤回」不需要重新构建镜像。
+        .route(
+            "/api/keepalive-strip",
+            get(api::keepalive::get_keepalive_strip).put(api::keepalive::put_keepalive_strip),
         )
         // ── 机器人校验开关 ──
         // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：

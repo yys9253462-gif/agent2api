@@ -119,6 +119,26 @@ pub const KEY_CLINE_UPSTREAM_HEADERS: &str = "clineUpstreamHeaders";
 /// （见 `http::panel_router` 与 `http::cors`）。
 pub const KEY_CORS_ENABLED: &str = "corsEnabled";
 
+/// 「丢弃保活换行分片」开关的键（详见 `core::upstream::sse::is_newline_keepalive`）。
+///
+/// 打开后，**声明了该能力位的**提供商（目前只有 WorkBuddy 与 AutoClaw）在下发
+/// SSE 帧时丢掉「整片只由换行组成」的 content 分片 —— 那是那两条上游的保活节拍
+/// （同一个流里 `: heartbeat` 注释行也在发），客户端按 markdown 渲染就被排成
+/// 一行一个词。两天 58 发 WorkBuddy 200 请求里 20 发带这类分片（34.5%），
+/// 脏请求里它们占正文分片中位 13.4%（区间 1.2%–30.8%）。
+///
+/// **默认关闭**，与适配器那位 `sse_strip_newline_chunks()` 是**与**的关系：
+/// 能力位回答「这家的上游会不会发这种东西」，这个开关回答「本机要不要为它改写
+/// 下发帧」。默认关的理由不是怀疑判据，而是取舍的方向性 —— 开了之后，模型真
+/// 有一个「单独成片」的换行也会被一起吃掉；那是一处**看得见的外观损失**，
+/// 而它换掉的是一整屏断句。留一个不改代码就能开关的口子，是为了让这件事能在
+/// 真流量上验证与随时撤回（见 `api::keepalive` 的 `/api/keepalive-strip`）。
+///
+/// 部署级兜底：配置里没有这个键时读环境变量 `AGENT2API_STRIP_NEWLINE_KEEPALIVE`
+/// （`1` / `true` / `on` 才算开启，其余含空值都算关，见 `parse::env_strip_newline_keepalive`）
+/// —— Docker 部署想从第一次启动就打开的，不必先进面板点一次。
+pub const KEY_STRIP_NEWLINE_KEEPALIVE: &str = "stripNewlineKeepalive";
+
 /// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。
 ///
 /// **默认开启**：登录 / 注册是公开的认证边界，脚本可以无限打（暴破密码、
@@ -132,6 +152,18 @@ pub const KEY_CORS_ENABLED: &str = "corsEnabled";
 /// 在 compose / `.env` 里设它即可；设置页改过一次之后以库里的值为准
 /// （优先级「配置里的值 > 环境变量」）。
 pub const KEY_CAPTCHA_ENABLED: &str = "captchaEnabled";
+
+/// models.dev 模型元数据开关的键（config.json 键，见 `core::model_meta`）。
+///
+/// **默认开启**：它是「上游没声明的那几个能力键由社区库补上」这条链路的总闸
+/// ——关掉只影响**联网刷新**（内嵌快照仍生效，模型清单照常工作），所以默认开
+/// 的代价只是定时任务里多一次几 MB 的公网请求；而默认关的代价是「这个功能对
+/// 绝大多数用户等于不存在」（没人会去设置里找一个不知道自己需要的开关）。
+///
+/// 关闭后：`core::model_meta::refresh` 直接返回 skipped（不打网络），已经装载
+/// 的索引继续用（内存里的那份 + 库里的那份都不会被清掉）——「关掉」的语义是
+/// 「别再联网拉了」，不是「把已有数据扔掉」。
+pub const KEY_MODELS_DEV_ENABLED: &str = "modelsDevEnabled";
 
 /// 系统提示词模式的键（config.json 键，对应 workbuddy2api 的 `prompt.mode`）。
 ///

@@ -7,9 +7,8 @@
  * 不再需要 fillSelect / syncCustom / valueOf 三个 DOM 填充函数。
  *
  * 数据都不硬编码：
- *   · 候选等级 = 后端 `GET /api/models/manage` 的 `reasoningLevels`
- *     （= `model_rules::REASONING_LEVELS`，照抄 OmniProxy 的 GENERIC_REASONING_LEVELS），
- *     拿不到（旧版网关 / 首次加载失败）时才退回本地兜底表；
+ *   · 候选等级 = **目标模型自己声明的档位**（`reasoningLevels`）→ 后端下发的通用表
+ *     （= `model_rules::REASONING_LEVELS`）→ 本地兜底表，三级回落见 `levels()`；
  *   · 某条映射的等级 = 同一份响应顶层 `mappings` 里那条的 `reasoning` 字段，按
  *     (alias, target, provider) 三元组查 —— chip 上已经带着这个三元组，不必另加一份
  *     平行数组（两个数组一旦因过滤口径不同而对不上，界面上会出现「chip 在、等级丢了」
@@ -23,13 +22,43 @@
 export const CUSTOM_LEVEL = '__custom__'
 
 /**
- * 拿不到后端候选表时的兜底（与后端那份**同源**）。正常路径下永远用后端那一份，
- * 所以后端调整候选时前端零改动；这份只在「老网关 / 首次加载失败」时兜底。
+ * 拿不到「模型自己声明的档位」与后端候选表时的兜底（与后端那份**同源**）。
+ * 正常路径下永远用前两级，所以后端调整候选时前端零改动；这份只在
+ * 「模型未声明 + 老网关 / 首次加载失败」时兜底。
  */
 const FALLBACK_LEVELS: readonly string[] = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
-/** 候选等级：优先后端下发的（`data.reasoningLevels`） */
-export function levels(data: { reasoningLevels?: unknown } | null | undefined): string[] {
+/**
+ * 一条映射里本模块关心的字段（后端 / 目录缓存给的都是宽松 JSON）
+ */
+export type ReasoningMapping = {
+  alias?: unknown
+  target?: unknown
+  provider?: unknown
+  reasoning?: unknown
+}
+
+/**
+ * 某条映射能绑的**候选等级**：先看**目标模型自己认识哪些档位**，没有才用通用表。
+ *
+ * ── 三级回落 ────────────────────────────────────────────────
+ *   ① `model.reasoningLevels` —— 这个模型真实支持的档位（由后端归一：
+ *      这家自己声明的 > models.dev 的 effort 列表，见 `core::model_meta`）。
+ *      例如 GLM-5.3 只有 low / high / max 三档，给一个它不认识的 `minimal`
+ *      只是把未知参数推给上游；
+ *   ② 没拿到（模型未声明 / 这家没数据）→ 后端下发的通用候选表
+ *      （`model_rules::REASONING_LEVELS`，照抄 OmniProxy 的通用表）；
+ *   ③ 连后端都没给（旧版网关 / 首次加载失败）→ 本地兜底表（与后端同源）。
+ *
+ * 「自定义等级」入口在任何一档都存在：候选表之外的等级照旧能填能存，
+ * 只是不参与转发（判据在后端 `effort_rank`）。
+ */
+export function levels(
+  data: { reasoningLevels?: unknown } | null | undefined,
+  model?: { reasoningLevels?: unknown } | null | undefined,
+): string[] {
+  const declared = declaredLevels(model)
+  if (declared.length) return declared
   const list = data?.reasoningLevels
   if (Array.isArray(list) && list.length) {
     return list.filter((level): level is string => typeof level === 'string')
@@ -37,12 +66,27 @@ export function levels(data: { reasoningLevels?: unknown } | null | undefined): 
   return [...FALLBACK_LEVELS]
 }
 
-/** 一条映射里本模块关心的字段（后端 / 目录缓存给的都是宽松 JSON） */
-export type ReasoningMapping = {
-  alias?: unknown
-  target?: unknown
-  provider?: unknown
-  reasoning?: unknown
+/** 模型自己声明的档位（空串 / 非字符串一律丢弃；没有这个键 = 未声明 → 空数组） */
+function declaredLevels(model?: { reasoningLevels?: unknown } | null): string[] {
+  const raw = model?.reasoningLevels
+  if (!Array.isArray(raw)) return []
+  return raw.filter(
+    (level): level is string => typeof level === 'string' && level.trim() !== '',
+  )
+}
+
+/** 多条映射共用的候选：**交集**（批量设置档位时只列所有目标都认识的档位） */
+export function commonLevels(
+  data: { reasoningLevels?: unknown } | null | undefined,
+  models: ReadonlyArray<{ reasoningLevels?: unknown } | null | undefined>,
+): string[] {
+  const known = models.map(declaredLevels).filter(list => list.length > 0)
+  // 任一目标未声明（或一个目标都没有）→ 无法求交集，回落通用表：
+  // 用一个子集去限制用户，等于替上游猜它认不认
+  if (!known.length || known.length !== models.length) return levels(data)
+  const [first, ...rest] = known
+  const shared = first.filter(candidate => rest.every(list => list.includes(candidate)))
+  return shared.length ? shared : levels(data)
 }
 
 /** 三元组 → 索引键（小写；用不可能出现在任何名字里的 \u0001 作分隔符） */

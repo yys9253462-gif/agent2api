@@ -484,6 +484,40 @@ function formatDuration(ms: unknown): string {
 }
 
 /**
+ * 生成速度（tok/s）的悬停说明：口径与回落规则都在这里说清 —— 显示出来的数可能
+ * 按流式段算、也可能按总用时算（回落），不说明白会让人拿它对不上别的工具。
+ */
+const SPEED_TIP = t('生成速度：输出 token ÷ 流式段用时（总用时 − 首响）；流式段不足总用时一半时按总用时计')
+
+/** 流式段的下界（毫秒）：低于它按总用时计，见 tokensPerSecond */
+const STREAM_MS_FLOOR = 500
+
+/**
+ * 生成速度（tok/s）：输出 token ÷ 流式段用时（总用时 − 首响）。
+ *
+ * 分母刻意**不含**「等首帧」的时间 —— 那段若是模型的静默思考（首帧前上游一字节
+ * 不发），算进去会把生成速度压得明显偏低。但反过来，流式段只是一条**短尾巴**时
+ * 也不能按它算：思考型上游常常整段思考都不发帧，token 在首帧后的一个小窗口里
+ * 一股脑到达（上游缓冲、聚合路径、隐藏思考都是这个形态），486 token ÷ 0.6 秒
+ * 窗口能算出 800+ tok/s 的假速度 —— 那测的是「下发得快」，不是「生成得快」。
+ * 所以护栏两条，不满足就回落按总用时计（宁可给保守的平均速度，不给天文数字）：
+ *   · 流式段 ≥ STREAM_MS_FLOOR（非流式响应 duration ≈ 首响，分母趋零）；
+ *   · 流式段 ≥ 总用时的一半（内容段要撑得起请求，短尾窗口的读数不可信）。
+ * 输出 / 总用时为 0（失败行 token 清零、旧行）→ 空串，调用方整行省掉。
+ * 进行中行没有 completionTokens（收尾才记账），自然走空串 —— 速度只有终态行才有。
+ */
+function tokensPerSecond(entry: RequestEntry): string {
+  const tokens = Number(entry.completionTokens) || 0
+  const duration = Number(entry.durationMs) || 0
+  if (tokens <= 0 || duration <= 0) return ''
+  const first = Number(entry.firstResponseMs)
+  const streamMs = Number.isFinite(first) && first > 0 && first < duration ? duration - first : 0
+  const streaming = streamMs >= STREAM_MS_FLOOR && streamMs * 2 >= duration
+  const rate = tokens / ((streaming ? streamMs : duration) / 1000)
+  return `${rate >= 100 ? Math.round(rate) : rate.toFixed(1)} tok/s`
+}
+
+/**
  * 首响：上游首帧到达相对请求开始的耗时（OmniProxy 的 ttfb 同义）。null（旧数据没有该字段 /
  * 请求在首帧之前就失败）显示「-」—— 走 formatDuration 会把 null 算成 0ms，假数字比空占位更糟。
  */
@@ -900,10 +934,18 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       const line2 = t('缓存读取: {cache} / 命中率: {rate}', {
         cache: formatTokens(entry.cacheReadTokens), rate: cacheRate(entry),
       })
+      // 生成速度跟在命中率后面（**同一行**，不另起一行）：速度是「token ÷ 时间」的
+      // 导出量，归在用量读数一族；只有成功行有 token（失败行清零），拿不到就不加。
+      // 整行 nowrap，超宽省略 —— 完整读数在 title 里（与该列既有手法同一套）
+      const speed = tokensPerSecond(entry)
+      const line2full = speed ? `${line2} · ${speed}` : line2
       return (
-        <span key={key} className={className} title={`${line1}\n${line2}`}>
+        <span key={key} className={className} title={[line1, line2full].filter(Boolean).join('\n')}>
           <span className='req-usage-line'>{line1}</span>
-          <span className='req-usage-line sub'>{line2}</span>
+          <span className='req-usage-line sub'>
+            {line2}
+            {speed ? <span title={SPEED_TIP}> · {speed}</span> : null}
+          </span>
         </span>
       )
     }

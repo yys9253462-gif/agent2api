@@ -4,16 +4,22 @@
 //! `https://opencode.ai/zen/v1` 的**免费档**模型（`*-free` / `big-pickle` 等）
 //! 在直连时会回 403：
 //! ```text
-//! {"type":"error","error":{"type":"FreeTierError",
-//!  "message":"OpenCode's free tier can only be used from within OpenCode"}}
+//! {"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free
+//!  tier can only be used from within OpenCode. Download it at
+//!  https://opencode.ai and keep building."}}
 //! ```
-//! 上游用三道校验把免费档锁在官方 CLI 里（对照实现
+//! 上游用四道校验把免费档锁在官方 CLI 里（对照实现
 //! `github.com/rockswang/wild-work/internal/oczen`）：
 //!   1. 匿名凭证是**字面量** `public`（`Authorization: Bearer public`）；
 //!   2. 会话头须匹配 `ses_<12位小写 hex><14位 Base62>`；
 //!   3. 请求体须是「智能体形态」：`stream: true` 且 `tools` 里同时含
-//!      `bash` 与 `read` 两个 function。
-//! 本模块就实现这三条。**它是有意为之的 opt-in**：只在提供商记录显式写了
+//!      `bash` 与 `read` 两个 function；
+//!   4. 会话 id 的**低 12 位须落在 `0xFC0` 及以上**（见 [`LOW12_FLOOR`]）。
+//! 第 4 条是 2026-10-13 才量出来的：在那之前上游只校验第 2 条的**形状**，
+//! 取值随便。它把「按形状伪造」这条路堵成了「按取值伪造」—— 派生值在 48 位
+//! 空间里均匀随机，只有 64/4096 落在放行区间。
+//!
+//! 本模块就实现这四条。**它是有意为之的 opt-in**：只在提供商记录显式写了
 //! `clientEmulation: "opencode"` 时才生效（预置卡「OpenCode Zen」会带上
 //! 它），手写的家与本网关的其它路径完全不受影响。
 //!
@@ -25,14 +31,20 @@
 //!     保留其 `tool_choice`（改掉会破坏调用工具的客户端），此时桩工具与真
 //!     工具并列存在 —— 上游要的就是这个形态；
 //!   · 上游随时可能收紧这套校验（历史上有过多次），失效时表现为 403
-//!     `FreeTierError`。那是上游行为，不是本网关的 bug：关掉这个开关改用
-//!     付费 Key 即可。
+//!     `FreeTierError`。2026-10-13 收紧的那一次（新增第 4 条取值校验）现场
+//!     很好认：**每个账号都 403、且错误文案末尾多了**
+//!     `Download it at https://opencode.ai and keep building.` **这一句**。
+//!     之所以是「必然 403」而不是「偶尔 403」：模型测试这条路径的会话种子
+//!     固定（提示词默认「你好」），派生出的 id 也固定，一次落在区间外就次次
+//!     落在区间外。再遇到这类 403，排查顺序是**会话 id 的取值 → 凭证 →
+//!     请求体**，最后才怀疑上游改了规则（改规则的判据是「四条的产物都对、
+//!     却仍然 403」）。
 //!
 //! ── 与其它模块的分工 ────────────────────────────────────────
-//! 本模块**只回答三件事**：请求体补齐（[`ensure_agent_shape`]）、会话头
-//! （[`session_id`]）、伪装头集合（[`apply_headers`]）。发不发、发给谁由
-//! `providers::custom::forward` 决定；记录字段的读写与校验在
-//! `core::custom_providers`。
+//! 本模块**只回答四件事**：请求体补齐（[`ensure_agent_shape`]）、会话 id 与
+//! 它是否合格（[`session_id`] / [`is_acceptable_session_id`]）、伪装头集合
+//! （[`apply_headers`]）。发不发、发给谁由 `providers::custom::forward` 决定；
+//! 记录字段的读写与校验在 `core::custom_providers`。
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -87,10 +99,15 @@ pub fn conversation_seed(body: &Value) -> String {
 
 /// 任意种子 → 上游要求的 `ses_<12位小写 hex><14位 Base62>` 会话 id。
 ///
-/// 已经是合法形态时**原样返回**（保住调用方自带的亲和键）：判据与上游一致
-/// —— 前缀 `ses_`、其后 12 位小写 hex、再 14 位 Base62。
+/// 合格（形状与取值，见 [`is_acceptable_session_id`]）时**原样返回** ——
+/// 保住调用方自带的亲和键；不合格的种子当普通字符串重新派生。
+///
+/// 派生时低 12 位钉死为 [`LOW12_TAG`]（官方客户端的产出值），其余 36 位与
+/// 14 位尾段都来自 `SHA-256(种子)`：**同一场对话仍映射到同一个 id**，上游
+/// 按会话做的提示词缓存亲和因此不受影响（这条是取首轮 user 消息当种子的
+/// 原因，见 [`conversation_seed`]）。
 pub fn session_id(seed: &str) -> String {
-    if valid_session_id(seed) {
+    if is_acceptable_session_id(seed) {
         return seed.to_string();
     }
     let seed = if seed.is_empty() {
@@ -101,8 +118,14 @@ pub fn session_id(seed: &str) -> String {
         seed.to_string()
     };
     let digest = Sha256::digest(format!("ses\u{0}{seed}").as_bytes());
-    let hex: String = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("ses_{hex}{}", base62_fixed(&digest[6..16], 14))
+    // 低 12 位按官方客户端钉死（理由见 LOW12_TAG 的注释）：直接用散列前
+    // 6 字节的话，低 12 位是均匀随机的，只有 64/4096 落在放行区间。
+    let mut bits = 0u64;
+    for byte in &digest[..6] {
+        bits = (bits << 8) | u64::from(*byte);
+    }
+    let bits = (bits & !0xFFF) | u64::from(LOW12_TAG);
+    format!("ses_{bits:012x}{}", base62_fixed(&digest[6..16], 14))
 }
 
 /// `ses_` + 12 位小写 hex + 14 位 Base62（上游 2026-09-16 起对其它形状一律 403）
@@ -114,6 +137,40 @@ fn valid_session_id(text: &str) -> bool {
     let (hex, tail) = rest.split_at(12);
     hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         && tail.bytes().all(|byte| BASE62.contains(&byte))
+}
+
+/// 会话 id 低 12 位的**取值下界**。
+///
+/// 2026-10-13 对 `POST /zen/v1/chat/completions` 实测的翻转点：低 12 位
+/// `0xFBF`（4031）被拒、`0xFC0`（4032）放行。上游**只看这 12 位** ——
+/// `ses_0000000fffff`（数值极小）放行、`ses_ecbcb548a000`（数值极大）被拒，
+/// 可见与 id 的数值大小无关；本机历史上 23 个真实 id 的低 12 位全是 `0xFFE`。
+/// 5 月、6 月的真实 id 一样放行，阈值在 146 秒内没有移动 —— 这一条**不是**
+/// 时间新鲜度校验，是纯粹的位模式校验。
+const LOW12_FLOOR: u16 = 0xFC0;
+
+/// 会话 id 低 12 位的**产出值**：官方客户端实测恒为该值，落在放行区间正中。
+///
+/// 判据用 [`LOW12_FLOOR`]、产出用本值，两者刻意分开：判据是「上游当时认
+/// 什么」，本值是「官方客户端发什么」，将来上游若再收紧，改哪里一目了然。
+const LOW12_TAG: u16 = 0xFFE;
+
+/// 这个字符串能不能**直接当会话头发出去**：形状（[`valid_session_id`]）与
+/// 取值（低 12 位 ≥ [`LOW12_FLOOR`]）都合格才算。
+///
+/// 拆成两个判据是刻意的：形状是 2026-09 立的规矩、取值是 2026-10 加的，
+/// 合成一个函数会让「这个 id 为什么被重算」将来无从追查。
+pub fn is_acceptable_session_id(text: &str) -> bool {
+    if !valid_session_id(text) {
+        return false;
+    }
+    // `ses_` 之后 12 位是 hex（valid_session_id 已保证是 ASCII），取末 3 位
+    // 即低 12 位。用 get 而不是直接切片：本模块的硬约束是不 panic。
+    let Some(hex) = text.get(4..16) else { return false };
+    let Some(low) = hex.get(9..12).and_then(|tail| u16::from_str_radix(tail, 16).ok()) else {
+        return false;
+    };
+    low >= LOW12_FLOOR
 }
 
 /// 随机种子（`getrandom` 失败时退回时间戳 —— 这里只是会话 id 的熵，

@@ -56,10 +56,16 @@ export type ManageModel = {
   /** 被用户覆盖过的能力键（只有内置家给；自定义家的一切都是用户填的，恒空） */
   capOverrides?: unknown
   /**
-   * 模型**自己能配哪些思考档位**（可选键：只有给过依据的家才有 —— 目前是
-   * ZCode 的 GLM-5.3 家族，数据来自该家官方目录）。**只读**，不参与保存：
-   * 用户能改的是「某条映射用哪一档」（`ManageMapping.reasoning`），
-   * 改不了上游认哪几个档位。
+   * 每个能力键的**来源**（`{键: 'upstream' | 'modelsdev' | 'user'}`，缺的键 =
+   * 那一项没有来源）。管理页据此把「上游实测 / 社区库补的 / 用户改的」分开显示 ——
+   * 三个值长得一样、可信度差着量级（见 `core::model_meta` 的模块头）。
+   */
+  capSources?: unknown
+  /**
+   * 模型**自己能配哪些思考档位**（出口键名，由后端在清单成型处归一：这家自己
+   * 声明的 > models.dev 的 effort 列表；缺失 = 未声明，界面回落通用档位表）。
+   * **只读**，不参与保存：用户能改的是「某条映射用哪一档」
+   * （`ManageMapping.reasoning`），改不了上游认哪几个档位。
    */
   reasoningLevels?: unknown
   /** 默认思考档位（与 `reasoningLevels` 同源；缺失 = 未声明） */

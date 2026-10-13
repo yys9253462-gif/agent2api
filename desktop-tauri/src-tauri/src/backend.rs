@@ -690,6 +690,10 @@ pub fn shutdown(state: &AppState) {
     // 会整段跳过，留下一个仍在轮询的循环。stop 自身也是幂等的（task 取走后
     // 再调直接返回），所以不破坏本函数「重复调用无副作用」的既有语义。
     server::core::auto_checkin::stop_global();
+    // 代理内核（mihomo sidecar）：停服务之前先杀它 —— 它是独立子进程，
+    // 父进程退出不会自动带走（Windows 上尤其如此），留着会占着监听端口，
+    // 下次启动还得清理（启动时也有兜底清理，但正常退出就该在这里杀干净）。
+    server::core::sub_kernel::shutdown();
 
     let Ok(mut guard) = state.backend.lock() else {
         return;

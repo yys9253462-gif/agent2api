@@ -115,6 +115,42 @@ pub async fn fetch_with_egress(
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, UpdateError> {
+    fetch_via_candidates("[Update]", url, headers, timeout_ms)
+        .await
+        .map_err(|detail| UpdateError::new(format!("无法连接 GitHub：{detail}")))
+}
+
+/// 非 GitHub 的**公网**端点出网（目前只有 models.dev 模型元数据用它）。
+///
+/// 与 [`fetch_with_egress`] 是同一份候选出口实现、同一套「只有网络层失败才换
+/// 出口」的判定，唯一差别在失败文案：那条链路的所有调用方都是 GitHub，文案写死
+/// 了「无法连接 GitHub」；这里从 URL 取主机名 —— 对着 models.dev 报「无法连接
+/// GitHub」会把排查方向直接带偏。日志标签也换成调用方的（`[Models]`）。
+///
+/// 沿用 `updateProxy` / Clash / 直连这条既有链路而不是新加一个配置键：它回答的
+/// 问题就是「这台机器的公网怎么出去」，与具体访问哪个公网站点无关。
+pub async fn fetch_public(
+    url: &str,
+    headers: &[(String, String)],
+    timeout_ms: Option<u64>,
+) -> Result<reqwest::Response, String> {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| url.to_string());
+    fetch_via_candidates("[Models]", url, headers, timeout_ms)
+        .await
+        .map_err(|detail| format!("无法连接 {host}：{detail}"))
+}
+
+/// 候选出口依次尝试的共用实现：返回第一个连上的响应，全部失败时把最后一条
+/// 错误链作为 `Err(String)` 交给调用方去拼自己的文案（见上面两个函数）。
+async fn fetch_via_candidates(
+    tag: &str,
+    url: &str,
+    headers: &[(String, String)],
+    timeout_ms: Option<u64>,
+) -> Result<reqwest::Response, String> {
     let candidates = resolve_egress_candidates();
     let multiple = candidates.len() > 1;
     let mut last_error: Option<reqwest::Error> = None;
@@ -133,24 +169,23 @@ pub async fn fetch_with_egress(
         match builder.send().await {
             Ok(response) => {
                 if multiple && proxy.is_some() {
-                    logging::verbose("[Update]", &format!("经 {label} 访问成功"));
+                    logging::verbose(tag, &format!("经 {label} 访问成功"));
                 }
                 return Ok(response);
             }
             Err(error) => {
                 logging::verbose(
-                    "[Update]",
+                    tag,
                     &format!("经 {label} 访问失败: {}", egress::describe_error_detail(&error)),
                 );
                 last_error = Some(error);
             }
         }
     }
-    let detail = match &last_error {
+    Err(match &last_error {
         Some(error) => egress::describe_error_detail(error),
         None => "未知错误".to_string(),
-    };
-    Err(UpdateError::new(format!("无法连接 GitHub：{detail}")))
+    })
 }
 
 /// 出网候选的展示形态（供日志/排障；不含凭证）。

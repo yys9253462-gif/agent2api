@@ -167,17 +167,51 @@ export function reasoningLevelsOf(
 }
 
 /** 单键的 tooltip 文案（表格里四枚徽章与数值列共用） */
-export function capabilityTip(key: CapabilityKey, value: unknown, overridden: boolean): string {
+export function capabilityTip(
+  key: CapabilityKey,
+  value: unknown,
+  overridden: boolean,
+  source: CapabilitySource | '' = '',
+): string {
   const label = CAPABILITY_LABELS[key]
   const suffix = overridden ? t('（已被手动覆盖，弹窗里可恢复继承）') : ''
+  const origin = capabilitySourceText(source)
   if (isTokenKey(key)) {
     if (value === null || value === undefined) return t('{label}：上游未声明{suffix}', { label, suffix })
-    return t('{label}：{value}（对下游声明的精确值）{suffix}', { label, value: exactTokens(value), suffix })
+    return t('{label}：{value}（对下游声明的精确值）{origin}{suffix}', { label, value: exactTokens(value), origin, suffix })
   }
   const state = capabilityState(value)
-  if (state === 'on') return t('{label}：支持{suffix}', { label, suffix })
-  if (state === 'off') return t('{label}：不支持{suffix}', { label, suffix })
+  if (state === 'on') return t('{label}：支持{origin}{suffix}', { label, origin, suffix })
+  if (state === 'off') return t('{label}：不支持{origin}{suffix}', { label, origin, suffix })
   return t('{label}：上游未声明（下游会按不支持处理）{suffix}', { label, suffix })
+}
+
+/**
+ * 一个能力键的**来源**（后端在清单成型处标好，见 `core::model_meta`）。
+ *
+ *   `upstream` 上游清单自己声明的（这条转发通道的真实情况）
+ *   `modelsdev` 上游没声明、由 models.dev 补的（社区库的数据）
+ *   `user` 用户在「模型能力」里手工改的（永远最高）
+ *
+ * 空串 = 没有来源（未声明）。三档的可信度差着量级，所以界面上必须分开说 ——
+ * 三个值长得一模一样、来源却不同，用户没法判断该不该信。
+ */
+export type CapabilitySource = 'upstream' | 'modelsdev' | 'user'
+
+/** 读某个键的来源（后端没标 / 值不认识 → 空串） */
+export function capSourceOf(
+  model: { capSources?: unknown } | null | undefined,
+  key: CapabilityKey,
+): CapabilitySource | '' {
+  const raw = (model?.capSources as Record<string, unknown> | undefined)?.[key]
+  return raw === 'upstream' || raw === 'modelsdev' || raw === 'user' ? raw : ''
+}
+
+/** 来源短语（放在值后面；`upstream` 不给短语 —— 「继承上游」由调用方按场景措辞） */
+export function capabilitySourceText(source: CapabilitySource | ''): string {
+  if (source === 'modelsdev') return t('（由 models.dev 补齐）')
+  if (source === 'user') return t('（手动设定）')
+  return ''
 }
 
 /**

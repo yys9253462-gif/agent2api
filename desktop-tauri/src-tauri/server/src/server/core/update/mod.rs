@@ -25,7 +25,11 @@
 //! （reqwest 的 bytes_stream 本身就是 async，每条 chunk 的落盘量很小）。
 
 mod check;
-mod client;
+// 公网出网的候选出口实现（`fetch_public`）也被 `core::model_meta`（models.dev
+// 元数据刷新）复用：那条链路回答的是「这台机器的公网怎么出去」，与访问哪个
+// 公网站点无关，为它复制一份候选解析只会多一处会漂移的知识。因此对本 crate
+// 可见，对外仍不暴露。
+pub(crate) mod client;
 mod token;
 mod version;
 

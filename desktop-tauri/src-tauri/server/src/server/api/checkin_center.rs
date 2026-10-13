@@ -234,6 +234,25 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         })
         .collect();
 
+    // 成长任务分组：WorkBuddy 国内版账号（`growth::supports_growth`）——它是
+    // 上游任务树（建画布/用专家/发对话…）的载体，判据与执行体在
+    // `providers::workbuddy::growth`（从参考项目 workbuddy2api 移植）。
+    // 与新手福利同一先例：快照只给账号入口清单（零上游请求），任务详情由
+    // 前端展开时按需调 `GET /api/accounts/{id}/growth`（那是一次上游查询）。
+    let growth_rows: Vec<Value> = accounts
+        .iter()
+        .filter(|account| {
+            crate::server::core::providers::workbuddy::growth::supports_growth(account)
+        })
+        .map(|account| {
+            json!({
+                "id": account_text(account, "id"),
+                "name": Value::from(account_text(account, "name")),
+                "provider": "workbuddy",
+            })
+        })
+        .collect();
+
     ok_json(json!({
         "daily": {
             "providers": provider_rows,
@@ -244,6 +263,7 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         "extras": {
             "onboarding": onboarding_rows,
             "plans": plan_rows,
+            "growth": growth_rows,
         },
         "auto": state.auto_checkin().state(),
         // WorkBuddy 国际版日活保活的模型链（签到中心可编辑；空清单回落缺省链）

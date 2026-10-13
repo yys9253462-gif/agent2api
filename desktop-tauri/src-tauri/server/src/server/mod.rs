@@ -366,6 +366,22 @@ impl ServerState {
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
         core::proxy_pool::install(db.clone());
+        // 订阅存储（「订阅」区块维护的订阅链接）：同一个 `Db`（与 proxyPool
+        // 同一形态）。位置只要求早于任何一次 `/api/subscriptions*` 请求。
+        core::subscriptions::install(db.clone());
+        // 订阅内核（mihomo sidecar）的命令 worker：单条队列串行消费内核操作
+        // （下载 / 重建配置 / 重启 / 停止），见 `core::sub_kernel` 的模块头。
+        core::sub_kernel::spawn_worker();
+        // 内核已安装且有启用的订阅 → 自动拉起（清理上次运行遗留的进程后
+        // 重建配置）。**未安装时不自动下载**：二进制 ~20-40MB，下载必须有
+        // 用户的手势（界面上的「下载内核」按钮），启动时静默拉网不合适。
+        if core::subscriptions::should_autostart() {
+            let providers = core::subscriptions::enabled_provider_inputs();
+            crate::spawn_task(async move {
+                core::sub_kernel::request_restart(providers);
+            });
+            logging::console_line("[Subscription]", "检测到已安装的代理内核与启用的订阅，后台自动拉起");
+        }
         // 模型清单的持久化缓存：把**同一个 `Db`** 传进去（与配置 / 日志库 /
         // 账号库同一形态）。各家的远程清单在进程重启后由它读回，不再回落到
         // 内置清单（见 `core::providers::catalog_cache` 的模块头）。
@@ -377,6 +393,11 @@ impl ServerState {
         // 与 catalog_cache 同一形态（kv 固定键 + 整份读写），位置只需早于
         // 第一次 `advertise_models`（那是纯读，未 install 时给空结论 = 不藏）。
         core::providers::officeace::probe::install(db.clone());
+        // models.dev 模型元数据（能力位 / 思考档位）的刷新结果也落同一个库
+        // （kv 的 `modelsDevCatalog` 键）。与 catalog_cache 同一形态：未 install
+        // 时只读内嵌快照（功能仍在，只是拿不到上次的刷新结果），所以位置不敏感；
+        // 放在这里是为了和另外两个 kv 使用者排在一起，便于核对「谁在用这个库」。
+        core::model_meta::install(db.clone());
         // ── 旧文件一次性迁移：**本切片起不再自动跑** ────────────────
         // 它现在由用户在升级弹窗里点「升级」触发（`POST /api/upgrade/run`）。
         // 为什么改成手动：需求是「弹窗告诉用户换了 SQLite，点升级才开始导」——
@@ -656,11 +677,25 @@ impl ServerState {
             // spawn 一次 `refresh_implemented`（对照 Node 的
             // `void refreshModelCatalog()`），那个行为在开关默认开启时保持不变。
         } else {
-            let reason = summary
-                .get("unavailableReason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(core::auth::UNCONFIGURED_REASON);
-            logging::log("[Init]", &format!("⚠️  暂无可用登录态: {reason}"));
+            // 「旧式单账号登录态没配」与「一个账号都没有」是两件事：前者在多账号
+            // （agent2api.db）部署里完全正常 —— 账号都在库里，跟 WorkBuddy 的
+            // auth.json 没关系。照旧无条件打警告，就会与上一行 `[Accounts] 账号列表: …`
+            // 自相矛盾，每次启动都报一条假警告（issue #178）。
+            let available = available_account_count(&state);
+            if available > 0 {
+                logging::log(
+                    "[Init]",
+                    &format!(
+                        "多账号模式：{available} 个账号可用（WorkBuddy 单账号登录态未配置）"
+                    ),
+                );
+            } else {
+                let reason = summary
+                    .get("unavailableReason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(core::auth::UNCONFIGURED_REASON);
+                logging::log("[Init]", &format!("⚠️  暂无可用登录态: {reason}"));
+            }
         }
 
         // 定时签到：开启时起调度，今天还没签且时间点已过则补签一次
@@ -705,6 +740,11 @@ impl ServerState {
         // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
+        // ZCode 活动套餐的「推理要不要验证码令牌」由上游配置说，每 5 分钟同步一次
+        // （判据、代价与三条口径见 `providers::zcode::config_sync` 的模块头）。
+        // 不进上面那张定时任务表：它没有「用户可配的间隔」、也不产生任何运行状态
+        // 要展示，硬塞进去只会多一条没人会去动的设置行。
+        core::providers::zcode::config_sync::spawn(state.store.clone());
 
         // 每账号自动余额查询的心跳循环：与上面的间隔型任务同一形态（一个进程
         // 一个循环，到点判定全在「记录 + 配置」上），只是排期按账号各自算，
@@ -825,6 +865,23 @@ fn env_flag(names: &[&str]) -> bool {
         }
     }
     false
+}
+
+/// 多账号库里**可用**的账号数（`available` = 启用且凭证完整）。
+///
+/// 判据与账号页、选路读的是同一份事实（`account_store::store_view` 的
+/// `public_account` 写这个键），所以这里不自己拼「启用 + 有凭证」两条件 ——
+/// 那是判据的第三份实现，迟早与前端徽章、选路口径分叉。
+///
+/// 用在启动横幅：多账号模式下一个可用账号都没有，与「旧式单账号登录态没配」
+/// 才该报同一条警告（issue #178）。
+fn available_account_count(state: &ServerState) -> usize {
+    core::routing::accounts_of(&state.store.list_accounts())
+        .iter()
+        .filter(|account| {
+            account.get("available").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+        .count()
 }
 
 /// 启动进程内服务器：同步 bind（失败立刻返回可读错误）+ 异步 serve。

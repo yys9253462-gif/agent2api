@@ -43,7 +43,7 @@ import {
   SelectValue,
 } from '@ui'
 import { isCustom, type ManageModel } from './models-custom-source'
-import { CUSTOM_LEVEL, levels as reasoningLevels } from './models-reasoning'
+import { CUSTOM_LEVEL, commonLevels } from './models-reasoning'
 import {
   accept, bindingsOf, errorMessage, getSnapshot, shared, toast, writeBinding, writeRemoveModel,
 } from './models-panel-state'
@@ -75,14 +75,20 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
   onDone: () => void
 }) {
   const [action, setAction] = React.useState<BatchAction>('enable')
-  // 思考等级草稿（照 MappingDialog 的形态）：'' = 清除 / 不覆盖、候选等级、CUSTOM_LEVEL
-  const [reasoning, setReasoning] = React.useState(() => {
-    const candidates = reasoningLevels(getSnapshot().data)
-    return { select: candidates[0] || '', custom: '' }
-  })
+  /**
+   * 思考等级草稿（照 MappingDialog 的形态）：'' = 清除 / 不覆盖、候选等级、CUSTOM_LEVEL。
+   *
+   * 候选取所选模型的**交集**（`commonLevels`）：批量设的同一个档位，只要有一个目标
+   * 不认识就等于白设一个它不认的参数；任何目标未声明档位时回落通用表 —— 拿一个子集
+   * 去限制用户，等于替上游猜它认不认。
+   */
+  const candidates = commonLevels(getSnapshot().data, models)
+  const [reasoning, setReasoning] = React.useState(() => ({
+    select: candidates[0] || '',
+    custom: '',
+  }))
   const [busy, setBusy] = React.useState(false)
   const [result, setResult] = React.useState<React.ReactNode>('')
-  const candidates = reasoningLevels(getSnapshot().data)
   const level = reasoning.select === CUSTOM_LEVEL ? reasoning.custom.trim() : reasoning.select
   const removableCount = models.filter(isRemovable).length
   const label = ACTIONS.find(item => item.value === action)?.label || t('操作')

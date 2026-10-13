@@ -681,11 +681,22 @@ body.queue-dragging * { cursor: grabbing !important; }
 }
 
 /* 读数按钮：整行可点（那格本来就是「一眼看出还剩多少」，加一个点击态不换语义），
-   视觉上与 .usage-sum 同字号同色，只加一个 caret 提示「点开还有明细」。
+   字号同 .usage-sum，另加一个 caret 提示「点开还有明细」。
    读数**居中**：本形态只有 CodeArts 一家用，两个权益档的读数（「可用 —积分」/
    「可用 11000 积分」）在同一列里居中后不再贴着左边的套餐徽标；caret 改绝对
    定位、不占布局宽度 —— 留在流里的话读数会被它的宽度挤得偏左，「居中」名不
-   副实。两侧对称留白因此由 .val 的 padding 承担，且长读数不会与 caret 叠字。 */
+   副实。两侧对称留白因此由 .val 的 padding 承担，且长读数不会与 caret 叠字。
+
+   ── 静息态**要有底色与描边**（2026-10 修）─────────────────────
+   这一枚原来在原处写的是 `border: 1px solid transparent; background: none`：
+   浅色主题下像一句读数旁边挂个 caret，还能认；深色主题里底色本身就是黑的，
+   "透明"等于"看不见" —— 用户的原话是「它的背景是黑的，然后你这个按钮也是黑的，
+   都看不到，除非我鼠标移到上面」。悬停那一块底色其实也不是下面那条规则给的：
+   通用 `button:hover:not(:disabled)` 的特异性 (0,2,1) 比 `.usage-toggle:hover`
+   (0,2,0) 高，一直是它在生效 —— 于是"静息全透明、一动鼠标才冒出一块"，正好是
+   最难用的那种组合。现在静息/悬停都直接取全站按钮那一套 `--control-*`，与同一
+   行的「余额 / 设置」同族；几何（宽度出血 / 内边距 / 圆角 / 字号）保持原样，
+   `.usage-toggle` 没声明的 `height: 30px`、`box-shadow` 仍按通用 button 来。 */
 .usage-toggle {
   position: relative;
   display: flex;
@@ -694,14 +705,20 @@ body.queue-dragging * { cursor: grabbing !important; }
   width: calc(100% + 16px);
   margin: 0 -8px;
   padding: 4px 8px;
-  border: 1px solid transparent;
+  border: 1px solid var(--control-border);
   border-radius: var(--r-xs);
-  background: none;
+  background: var(--control-bg);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.usage-toggle:hover { background: var(--row-hover); border-color: var(--hairline); }
+/* 悬停沿用全站按钮那套：与上面那条通用 `button:hover:not(:disabled)` 同色，但必须
+   自己写一遍并带上 `:not(:disabled)` —— 否则以后有人调通用悬停色，这一枚的静息态
+   与悬停态会各走各的（这正是上一版"两种底色"的来源） */
+.usage-toggle:hover:not(:disabled) {
+  background: var(--control-hover);
+  border-color: var(--control-border-hover);
+}
 .usage-toggle .val {
   flex: 1;
   text-align: center;
@@ -730,6 +747,10 @@ body.queue-dragging * { cursor: grabbing !important; }
 .usage-toggle.muted .val { color: var(--text-3); }
 .usage-cell.open .usage-toggle { background: var(--primary-soft); border-color: var(--primary-bd); }
 .usage-cell.open .usage-toggle .caret { transform: translateY(-50%) rotate(180deg); }
+/* 展开态按 aria-expanded 认（触发器自己会给）：入口不只有 `.usage-cell` 那一处
+   —— 积分明细那个入口（下面）没有那层包裹，按状态类写的规则到它身上就不生效了 */
+.usage-toggle[aria-expanded="true"] { background: var(--primary-soft); border-color: var(--primary-bd); }
+.usage-toggle[aria-expanded="true"] .caret { transform: translateY(-50%) rotate(180deg); }
 
 /* ── token 组的平铺行（对话 token / 福利模型日额度）───
    这两行是「这账号现在能不能跑」的直接标志，直接住在余额格里不折叠；
@@ -893,6 +914,128 @@ body.queue-dragging * { cursor: grabbing !important; }
   font-variant-numeric: tabular-nums;
 }
 .usage-pop-total .v small { font-size: 11px; font-weight: 500; color: var(--text-3); }
+
+/* ─── 余额格上的「积分明细」入口（creditDetail 能力位：WorkBuddy 两家与 Trae）───
+   入口就是**读数本体**，用的正是上面那套 `.usage-toggle`（整行可点、悬停有底色、
+   caret 绝对定位、展开态走 aria-expanded）—— 不做「读数 + 一个小箭头按钮」那种
+   两件式：箭头十来个像素，是这一列里最难点中的东西。两种格形态各配一个变体：
+
+     · 单行读数（WorkBuddy）→ 直接 `.usage-toggle`，`.val` 居中，与 CodeArts 同款；
+     · 主额度桶（Trae）→ 同一个 `.usage-toggle` 加 `.usage-pool-line` 把间距与
+       对齐改回桶那套（进度条与读数一起住在按钮里，左对齐 —— 左边有进度条，
+       居中会让条与读数分家）。
+
+   逐份明细的长度由上游说了算（每日签到发的包能堆到几十份），所以弹层给一个
+   最大高度 + 滚动：明细本来就是要翻的东西，但把整页顶下去不是。 */
+.usage-toggle.usage-pool-line {
+  gap: 6px;
+  /* 上下留白比单行那款更紧：这一行上面还有套餐名，桶形态本来就矮一号 */
+  padding: 2px 8px;
+  margin: 4px -8px 0;
+}
+/* 桶形态的读数占满剩余宽度并自己省略（与它在 .usage-pool-line 里时一致）；
+   右侧给绝对定位的 caret 留位 —— caret 不占布局宽度，不留位就会与长读数叠字 */
+.usage-toggle.usage-pool-line .usage-pool-view {
+  flex: 1;
+  padding-right: 12px;
+}
+
+/* 明细弹层：比 CodeArts 那份（288px）宽一点 —— 每行要多放「领取 → 到期」一行。
+   高度与滚动都写在**这一层**（`PopoverContent` 的直接子元素）上，而不是弹层自己：
+   弹层带着组件库编译出的 `overflow-hidden !important` 与
+   `max-h-[min(70vh,560px)] !important`，在它身上写 max-height / overflow 一律被
+   压掉 —— 明细一多，既滚不动（overflow 还是 hidden）又会被裁掉。滚动容器落在里层
+   就没有这个对手，也不必往自家样式里撒 !important。
+   内边距因此也归这一层（调用方不再给弹层挂 .usage-pop）。
+
+   高度：常规窗口 408px（约 7 份明细，再多就滚）；**60vh 是护栏** —— 窗口特别矮时
+   跟着缩，免得这一层比弹层自己的 70vh 上限还高，多出来的部分被弹层的
+   overflow:hidden 裁掉（那种情况下底部几行既看不见也滚不到）。 */
+.usage-pop-credit {
+  padding: 10px 14px 12px;
+  max-height: min(408px, 60vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* 这一层是弹层的初始焦点（见 accounts-credit-detail.tsx 的 initialFocus）：
+     聚焦它只是为了"别让焦点落到末尾那个组表头上、把列表拽到底部"，
+     不是要给用户一个可操作的目标 —— 所以不画焦点框。 */
+  outline: none;
+}
+
+/* ─── 末尾那组「已用完 / 已过期」（默认折叠）────────────────────
+   花不出去的明细收在这里，表头即开关。它是这一组的**页脚条**：铺满弹层宽度
+   （向两侧出血到内边距之外）、方角、无描边，靠一整条底色与上面那串记录分开 ——
+   比"飘在列表中间的小按钮"更像个收尾。
+
+   底色一开始写的是 `background: none`（当时按"分隔线"的思路做的），深色主题下
+   等于没有 —— 用户报的就是这个：「底部'已用完'的那个……也一样有这个问题」。
+   现在静息态取全站按钮那套 `--control-bg`，悬停 `--control-hover`（同样要带
+   `:not(:disabled)`，理由见 .usage-toggle 那段）。
+
+   三角的方向与 `.usage-toggle` 那个（朝下=点开一层，点开后翻上去）**相反**是有意的：
+   这一处收起时朝右（还有一段没收进来），展开后转向下 —— 说的事不一样。 */
+.usage-pop-spent {
+  margin-top: 8px;
+  border-top: 1px solid var(--hairline);
+}
+
+.usage-pop-spent-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 100% + 两侧内边距（容器 padding 是 10px 14px 12px），配负外边距铺到弹层边缘 */
+  width: calc(100% + 28px);
+  margin: 8px -14px 0;
+  padding: 6px 14px;
+  border: 0;
+  border-radius: 0;
+  background: var(--control-bg);
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-2);
+  text-align: left;
+  cursor: pointer;
+}
+.usage-pop-spent-head:hover:not(:disabled) { background: var(--control-hover); }
+/* 展开态与 .usage-toggle 的展开态同一语言（主色浅底），一眼看出这一组是开着的 */
+.usage-pop-spent-head[aria-expanded="true"] { background: var(--primary-soft); }
+/* 三角用 CSS 画（border 那套），不用 ▾ 这个字形：同一串 ▾ 在 9~10px 下各家字体的
+   墨迹差得远（这份界面里它已经缩成像个小点），而这一行整行就靠它表明"能点"。
+   尺寸写死 5×8px，旋转只负责方向：收起朝右（▸），展开转 90° 朝下（▾）。 */
+.usage-pop-spent-head .caret {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  transition: transform 0.15s;
+}
+.usage-pop-spent-head[aria-expanded="true"] .caret { transform: rotate(90deg); }
+/* 份数靠右，与每一行右侧的读数对齐成一列 */
+.usage-pop-spent-head .n { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* 弹层头部：套餐 / 状态 / 到期 / 余量（措辞与悬停提示同源，见 subscriptionText） */
+.usage-pop-sub {
+  padding-bottom: 8px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+/* 行里的第二行：领取时间 → 到期时间（+ 来源 / 每日重置） */
+.usage-pop-window {
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ─── 操作列 ─── */
 

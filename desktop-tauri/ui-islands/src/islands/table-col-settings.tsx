@@ -10,11 +10,11 @@ import { t } from '../i18n'
  *
  * ── 第一层：列配置的能力层（照旧保留）──────────────────────────
  * `register` / `apply` / `configOf` / `syncStaticHead` / `close` 五个方法是对外契约，
- * 四张表（账号表、模型管理、网关 Key、请求日志）在运行期调它们。它们读写的是一份
+ * 五张表（账号表、模型管理、网关 Key、请求日志、签到记录）在运行期调它们。它们读写的是一份
  * 「列 key → { 显示, 对齐 } 的有序配置」+ localStorage 持久化（键名前缀照旧），
- * 逻辑与口径逐字照抄 —— 这层不是「界面」，是四张表共用的**数据契约**：口径一动
+ * 逻辑与口径逐字照抄 —— 这层不是「界面」，是五张表共用的**数据契约**：口径一动
  * （`apply` 拿到的数组顺序、`configOf` 的返回形状、`syncStaticHead` 对静态表头做的事），
- * 四张表的列集合 / 顺序 / 对齐就会与面板各画一个样。所以这里只把它搬进 TS，不改行为。
+ * 五张表的列集合 / 顺序 / 对齐就会与面板各画一个样。所以这里只把它搬进 TS，不改行为。
  *
  * ── 第二层：浮层面板（本次换掉）────────────────────────────────
  * 外壳交给组件库的 `Popover`（Base UI，`modal={false}` 的非模态浮层）：定位（floating-ui）、
@@ -110,14 +110,14 @@ type ColConfigItem = { key: string; visible: boolean; align: Align }
 type ColumnDecl = {
   key: string
   label?: string
-  /** 默认是否显示（不声明即显示）；四张表当前都没用到，作为契约的一部分保留 */
+  /** 默认是否显示（不声明即显示）；五张表当前都没用到，作为契约的一部分保留 */
   visible?: boolean
   align?: Align
   /** 上一版的默认对齐：只给 normalize 分辨旧存盘里那一档是「用户挑的」还是「旧默认值」 */
   legacyAlign?: Align
 }
 
-/** register 的入参（四张表各给一份；mount 是元素、选择器或返回元素的函数） */
+/** register 的入参（五张表各给一份；mount 是元素、选择器或返回元素的函数） */
 type TableSpec = {
   id: string
   label?: string
@@ -130,7 +130,7 @@ type TableSpec = {
   buttonClass?: string
 }
 
-/** 登记项 = 声明 + 当前配置（配置是运行期被面板改写的那一份，四张表也读它） */
+/** 登记项 = 声明 + 当前配置（配置是运行期被面板改写的那一份，五张表也读它） */
 type TableEntry = TableSpec & { config: ColConfigItem[] }
 
 /** 存盘形态 v2：`{ v, defaults, items }`；v1 是裸数组（见 normalize） */
@@ -412,7 +412,7 @@ type PanelProps = {
 /**
  * 列设置面板。
  *
- * 配置本体**不放在组件 state 里**：那是能力层的东西（`spec.config`），四张表的
+ * 配置本体**不放在组件 state 里**：那是能力层的东西（`spec.config`），五张表的
  * `apply()` 也读同一份。组件里存副本必然漂移，所以只用一个自增的版本号触发重画，
  * 渲染时直接读 `spec.config`。
  */

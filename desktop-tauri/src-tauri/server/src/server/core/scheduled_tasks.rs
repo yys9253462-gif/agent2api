@@ -95,7 +95,7 @@ pub const TASKS: [TaskDef; 6] = [
     TaskDef {
         id: TASK_MODEL_REFRESH,
         label: "模型目录刷新",
-        description: "定期拉取最新模型清单，重启沿用排期与缓存。客户端读取模型列表的后台刷新也遵守本任务开关、间隔和失败冷却；手动获取模型可提前刷新。",
+        description: "定期拉取最新模型清单，重启沿用排期与缓存。客户端读取模型列表的后台刷新也遵守本任务开关、间隔和失败冷却；手动获取模型可提前刷新。同一轮顺带刷新 models.dev 模型元数据（能力位与思考档位，可在设置页单独关闭）。",
         unit: "minutes",
         runner: Runner::Backend,
         min: config::INTERVAL_MIN_MINUTES,
@@ -354,7 +354,28 @@ async fn run_backend(
             } else {
                 format!("成功 {refreshed} 家，跳过 {skipped} 家，失败 {failed} 家")
             };
-            (summary, failed == 0)
+            // models.dev 元数据搭同一条任务（它回答的是同一件事的另一半：清单与
+            // 元数据一起才是一份能用的模型表），但**排期独立** —— 各家的目录
+            // 缓存 TTL 与它无关，一方被跳过不该连带另一方也不刷。
+            //
+            // 它的失败**不改变本任务的成败**：元数据是补充信息，为它把整轮标成
+            // 失败会连带触发凭证那套失败冷却，进而拖住真正重要的模型清单刷新；
+            // 失败原因如实写进摘要（用户看得到），这是「不静默」与「不误伤」的
+            // 折中。
+            let metadata = crate::server::core::model_meta::refresh(manual, interval_ms(task)).await;
+            let metadata_note = match metadata.get("status").and_then(Value::as_str) {
+                Some("refreshed") => format!(
+                    "；models.dev 元数据已更新 {} 条",
+                    metadata.get("count").and_then(Value::as_u64).unwrap_or(0)
+                ),
+                Some("failed") => format!(
+                    "；models.dev 元数据刷新失败（{}）",
+                    metadata.get("message").and_then(Value::as_str).unwrap_or("未知原因")
+                ),
+                // skipped（未到间隔 / 设置里关了）不写进摘要：那是常态，写进去只是噪音
+                _ => String::new(),
+            };
+            (format!("{summary}{metadata_note}"), failed == 0)
         }
         _ => return Err("未知后端任务".to_string()),
     };

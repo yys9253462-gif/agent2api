@@ -12,6 +12,14 @@
 //! 第二条是 best-effort：它失败不阻塞积分读数（与参考实现同一取向 ——
 //! 这是展示动作，为了附加维度把整格变红是得不偿失）。
 //!
+//! ── 聚合读数之外还有一份逐包明细 ────────────────────────────
+//! `document()` 出的 `wallets` 回答「这个账号还剩多少」，而钱具体在哪个包里、
+//! 哪一份什么时候作废，只有**清单**答得上来 —— 那就是 `credits[]`
+//! （一行一份可见权益包，带领取 → 到期，见 [`credit_rows`]）。上游的
+//! `start_time` / `expire_time` 两个时间字段是这份明细的由来：本模块此前只读
+//! `end_time`（套餐周期边界），而积分包里真正决定"这笔钱什么时候没了"的是
+//! `expire_time`，两者在免费包里能差好几年。
+//!
 //! ── 三条不能"顺手美化"的读数纪律（全部由向量钉住）──────────────
 //!   1. **缺失 ≠ 0**。quota 里每个数值都是"上游没给"与"给了 0"两回事，
 //!      参考实现把它写成 `*int64` 就是这个原因；它修过的一个真实 bug 正是
@@ -126,6 +134,17 @@ pub struct Pack {
     pub product_type: i64,
     /// 套餐到期时间，**秒**级 epoch（本模块只把它换算成毫秒给界面，不参与额度判定）。
     pub end_time: i64,
+    /// 这份包的**开始/发放**时刻（上游 `entitlement_base_info.start_time`）——
+    /// 界面明细里「领取 …」那一半。同样只做展示，不参与任何判定。
+    ///
+    /// 取它而不是拿 `DeductionStartTime` 那类近似值顶替：每日签到发的包在这里
+    /// 是**发放当刻**，而周期字段只是"这一天/这个月的起点"，差着一整笔的来源。
+    pub start_time: i64,
+    /// 顶层 `expire_time`：这份包**作废**的时刻。0 = 上游没给。
+    ///
+    /// 与 `end_time` 不是一回事（见 [`credit_rows`] 的口径说明）：`end_time` 是
+    /// 订阅周期的边界，免费包里能比它晚出去好几年。
+    pub expire_time: i64,
     pub is_hide: bool,
     /// `None` = 缺省（视为 active）。`Some(3)` = 已取消。
     pub status: Option<i64>,
@@ -158,6 +177,9 @@ fn pack_of(entry: &Value) -> Pack {
     Pack {
         product_type: number(base.and_then(|info| info.get("product_type"))).unwrap_or(0),
         end_time: number(base.and_then(|info| info.get("end_time"))).unwrap_or(0),
+        // 这两个只给明细排版用，缺了就是 0（"上游没给"，不是"时刻是 0"）
+        start_time: number(base.and_then(|info| info.get("start_time"))).unwrap_or(0),
+        expire_time: number(entry.get("expire_time")).unwrap_or(0),
         is_hide: base.and_then(|info| info.get("is_hide")).and_then(Value::as_bool).unwrap_or(false),
         // 缺省与 null 都是 None（Go 的 `*int` 同义），判反会把整张清单剔空
         status: number(base.and_then(|info| info.get("status"))),
@@ -740,8 +762,121 @@ fn package_type_for(variant: &str) -> &'static str {
     }
 }
 
-/// 一次余额读取的全部结果（`document()` 的输入）。
+// ── 逐份明细（账号页「积分明细」弹层的输入）──────────────────
+
+/// 秒/毫秒混给的 epoch → 毫秒。
 ///
+/// 分界取 1e11（秒级到公元 5138 年也越不过它、毫秒级从 1973 年起就在它之上）——
+/// 与 `document` 里 `expireAt` 的判据、与 workbuddy 资源包的 `epoch_to_millis`
+/// 是同一个数，三处不能各写一个。
+fn to_millis(value: i64) -> i64 {
+    if value > 100_000_000_000 {
+        value
+    } else {
+        value.saturating_mul(1000)
+    }
+}
+
+/// 金额 → JSON：至多两位小数、整数不带小数点。
+///
+/// 积分池的数上游给的是浮点（`81.7668`），直接 `json!` 会打出四位小数；
+/// 而 `1550.0` 这种整数形态在 serde 里会写成 `1550.0`（前端 `Number()` 读得动，
+/// 但同一列里两种长度看起来像度量值）。整数输出整数形态，与 billing 那边
+/// `json_number` 是同一取向。
+fn amount_json(value: f64) -> Value {
+    let rounded = (value * 100.0).round() / 100.0;
+    if rounded.fract() == 0.0 {
+        json!(rounded as i64)
+    } else {
+        json!(rounded)
+    }
+}
+
+/// 逐份权益包的明细行（行形状与 workbuddy 的 `credit_packs_from` 逐键一致 ——
+/// 界面因此只写一个读取器）。
+///
+/// ── 一行一份，不按名字归并 ──────────────────────────────────
+/// 每日签到发的包会按天堆起来（社区实现实测能堆到 30 份同名包）。有实现按名字
+/// 归并（面板放不下），但「哪一份什么时候到期」正是这个弹层要回答的问题，
+/// 归并掉就等于把答案抹平 —— 明细的滚动交给界面（`.usage-pop` 有最大高度与
+/// 滚动条），这里如实一份一行。
+///
+/// ── 三个口径都是「上游给什么写什么」─────────────────────────
+///   * 额度**逐包选层**：有 `credits_limit` 的按积分（SOLO 积分制真正扣的那笔
+///     钱），没有的退回套餐的 `basic_usage_limit`（订阅制账户只有这个）；
+///     两层都没有的包仍然出一行（名字 + 到期时刻），但**一个数都不写**。
+///   * `grantAt` ← `entitlement_base_info.start_time`（这份包开始/发放的时刻）、
+///     `expireAt` ← 顶层 `expire_time`，没给才退回 `end_time`
+///     （两者分工见 [`Pack::expire_time`] 的说明）。
+///   * 缺失一律**不写这个键** —— 文件头第 1 条纪律：写成 0 会让界面把「没读到」
+///     画成「只剩 0」。
+///
+/// `doc_unit` 是主读数的单位：行自己的单位与它相同时不写 `unit` 键
+/// （同单位的行不必每行再标一遍「积分」）。
+pub fn credit_rows(packs: &[Pack], is_cn: bool, doc_unit: &str) -> Vec<Value> {
+    let mut rows: Vec<(i64, String, Value)> = Vec::new();
+    for pack in active_packs(packs) {
+        let quota = effective_quota(pack);
+        let name = if pack.display_desc.is_empty() {
+            product_type_identity(pack.product_type, is_cn).to_string()
+        } else {
+            pack.display_desc.clone()
+        };
+        let mut row = serde_json::Map::new();
+        row.insert("name".to_string(), json!(name.clone()));
+
+        // 额度口径逐包选（见函数头的说明）；`-1` 是「不限」，没有可写的数
+        let mut unlimited = false;
+        let (unit, total, used, remain) = if let Some(limit) = quota.credits_limit {
+            if limit == -1 {
+                unlimited = true;
+                ("积分", None, None, None)
+            } else {
+                let used = pack.usage.credits_amount.unwrap_or(0.0);
+                // 与官方 cashier 同款：先减再夹到非负（负数是超支，不写成负余额）
+                ("积分", Some(limit as f64), Some(used), Some((limit as f64 - used).max(0.0)))
+            }
+        } else if let Some(limit) = quota.basic_usage_limit {
+            // 套餐口径：剩余走 `pack_remain`（它已经处理了 bonus 的加法），
+            // 不在这里另算一遍 —— 两处各算一次迟早会漂
+            (
+                "额度",
+                Some(limit as f64),
+                pack.usage.basic_amount.map(|value| value as f64),
+                pack_remain(pack).map(|value| value as f64),
+            )
+        } else {
+            ("", None, None, None)
+        };
+        for (key, value) in [("total", total), ("used", used), ("remain", remain)] {
+            if let Some(value) = value {
+                row.insert(key.to_string(), amount_json(value));
+            }
+        }
+        if unlimited {
+            row.insert("unlimited".to_string(), Value::Bool(true));
+        }
+        if !unit.is_empty() && unit != doc_unit {
+            row.insert("unit".to_string(), json!(unit));
+        }
+
+        let expire = if pack.expire_time > 0 { pack.expire_time } else { pack.end_time };
+        if pack.start_time > 0 {
+            row.insert("grantAt".to_string(), json!(to_millis(pack.start_time)));
+        }
+        if expire > 0 {
+            row.insert("expireAt".to_string(), json!(to_millis(expire)));
+        }
+        // 排序键：最近到期的排前面 —— 明细要回答的第一个问题是「哪笔先作废」。
+        // 没给到期时刻的排最后（i64::MAX），同一时刻按名字稳定排序
+        // （否则每次刷新行序都在跳，看起来像数据在变）
+        rows.push((if expire > 0 { to_millis(expire) } else { i64::MAX }, name, Value::Object(row)));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    rows.into_iter().map(|(_, _, row)| row).collect()
+}
+
+/// 一次余额读取的全部结果（`document()` 的输入）。
 /// 三个补充维度（`fast_request_per` / `solo_parallel` / `solo_package`）在这里
 /// 已经是**定稿值**：先取 `pay_status`（与参考实现同口径），没取到才回退到
 /// 权益包的 quota（文件末尾那条增补说明）。`document()` 因此只负责排版，
@@ -759,6 +894,10 @@ pub struct Readout {
     pub pay_plan_type: String,
     /// 官方 `usage_summary`（总额/已用/消耗比），只做交叉核对。
     pub official: Option<OfficialSummary>,
+    /// 可见权益包的**原始清单**：`credits[]` 明细行的原料（见 [`credit_rows`]）。
+    /// 主读数用的是它的聚合结果，明细用的是一份行一份包 —— 两处读同一份数据，
+    /// 不各解析一遍上游响应。
+    pub packs: Vec<Pack>,
     /// `ide_user_pay_status` 的原始响应；`None` = 那次查询失败或 `code != 0`。
     pub pay_status: Option<Value>,
     /// 上游原始响应（排障与对拍用，界面默认不展示）。
@@ -771,6 +910,10 @@ pub struct Readout {
 /// "欠费 1 次"；它改由 `wallets[].balanceView` 用一句人话表达（"不限"）。
 /// 一家源都没有有限数时给 `null` —— 界面因此显示「可用 —」，
 /// 与"查到了 0"是两种读数，不能混。
+///
+/// `credits[]` 是**逐份权益包**的明细（领取 → 到期 + 面额/已用/剩余），
+/// 与 `wallets`（这一列的聚合读数）两回事：钱在哪个包里、哪一份先作废，
+/// 只有清单答得上来。有包才写这个键（见末尾的说明）。
 ///
 /// `is_cn` 由调用方按账号谱系给定（本家只有 SOLO：CN=true）。
 pub fn document(readout: &Readout, is_cn: bool) -> Value {
@@ -865,8 +1008,7 @@ pub fn document(readout: &Readout, is_cn: bool) -> Value {
     );
     // 到期时间：上游给的是**秒**级 epoch（>1e11 才当作毫秒用），界面按毫秒判。
     if summary.end_time > 0 {
-        let millis = if summary.end_time > 100_000_000_000 { summary.end_time } else { summary.end_time * 1000 };
-        subscription.insert("expireAt".to_string(), json!(millis));
+        subscription.insert("expireAt".to_string(), json!(to_millis(summary.end_time)));
     }
     let is_basic = summary.model == MODEL_BASIC && summary.remain_known;
     if is_basic {
@@ -875,6 +1017,11 @@ pub fn document(readout: &Readout, is_cn: bool) -> Value {
             subscription.insert("totalQuota".to_string(), json!(summary.total));
         }
     }
+
+    // 逐份明细（行形状与 workbuddy 的 `credit_packs_from` 一致，界面只有一个
+    // 读取器）：空数组**整个不写这个键** —— 界面按「有没有这个数组」决定要不要
+    // 给这一格挂「可点开」的交互，给一个空数组会点出一个空框。
+    let credits = credit_rows(&readout.packs, is_cn, unit);
 
     let mut raw = serde_json::Map::new();
     raw.insert("entUsage".to_string(), readout.raw_ent_usage.clone());
@@ -888,13 +1035,16 @@ pub fn document(readout: &Readout, is_cn: bool) -> Value {
         raw.insert("payStatus".to_string(), pay.clone());
     }
 
-    json!({
-        "available": available,
-        "unit": unit,
-        "wallets": wallets,
-        "subscription": Value::Object(subscription),
-        "raw": Value::Object(raw),
-    })
+    let mut document = serde_json::Map::new();
+    document.insert("available".to_string(), available);
+    document.insert("unit".to_string(), json!(unit));
+    document.insert("wallets".to_string(), Value::Array(wallets));
+    document.insert("subscription".to_string(), Value::Object(subscription));
+    if !credits.is_empty() {
+        document.insert("credits".to_string(), Value::Array(credits));
+    }
+    document.insert("raw".to_string(), Value::Object(raw));
+    Value::Object(document)
 }
 
 /// 去掉浮点尾零（`1468.20` → `1468.2`、`1550.00` → `1550`）。
@@ -1002,6 +1152,7 @@ async fn read_at(credential: &Credential, proxy: Option<&ResolvedProxy>, base: &
         solo_package,
         pay_plan_type,
         official: official_summary(&payload),
+        packs,
         pay_status,
         raw_ent_usage: payload,
     })
@@ -1255,6 +1406,7 @@ mod tests {
             solo_parallel: solo_parallel_limit(&json!({"quota":{"solo_agent_parallel_limit":5}})).or_else(|| solo_parallel_from_packs(&list)),
             solo_package: solo_package_from_packs(&list),
             pay_plan_type: String::new(),
+            packs: Vec::new(),
             official: None,
             pay_status: None,
             raw_ent_usage: json!({}),
@@ -1303,6 +1455,7 @@ mod tests {
             solo_parallel: None,
             solo_package: false,
             pay_plan_type: String::new(),
+            packs: Vec::new(),
             official: Some(official),
             pay_status: None,
             raw_ent_usage: json!({}),
@@ -1325,6 +1478,7 @@ mod tests {
             solo_parallel: None,
             solo_package: false,
             pay_plan_type: String::new(),
+            packs: Vec::new(),
             official: None,
             pay_status: None,
             raw_ent_usage: json!({"user_entitlement_pack_list": []}),
@@ -1349,6 +1503,7 @@ mod tests {
             solo_parallel: Some(3),
             solo_package: false,
             pay_plan_type: "CNExpress".to_string(),
+            packs: Vec::new(),
             official: None,
             pay_status: Some(json!({"code":0,"detail":{"fast_request_per":1000},"quota":{"solo_agent_parallel_limit":3}})),
             raw_ent_usage: json!({}),
@@ -1380,6 +1535,7 @@ mod tests {
             solo_parallel: None,
             solo_package: false,
             pay_plan_type: String::new(),
+            packs: Vec::new(),
             official: None,
             pay_status: None,
             raw_ent_usage: json!({}),

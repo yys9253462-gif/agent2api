@@ -109,7 +109,7 @@ import {
 } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import {
-  BOOLEAN_KEYS, capabilitiesOf, capabilityState, capabilityTip,
+  BOOLEAN_KEYS, CAPABILITY_LABELS, capabilitiesOf, capabilityState, capabilityTip, capSourceOf,
   exactTokens, formatTokens, normalizeOverrides,
   type CapabilityKey,
 } from './model-capability'
@@ -122,14 +122,14 @@ import type { ManageModel, ManageView } from './models-custom-source'
 // 内置家的图标映射（与添加账号弹窗、签到中心同一份，别处不要照抄这份映射）
 import { PROVIDER_ICONS } from './add-provider-pick'
 import {
-  GROUP_LIMIT, MODEL_STATE_OPTIONS, accept, bindingKeyOf, bindingsOf, builtinRailItems,
+  GROUP_LIMIT, MODEL_SORT_OPTIONS, MODEL_STATE_OPTIONS, accept, bindingKeyOf, bindingsOf, builtinRailItems,
   closeCapability, closeCustomModel, closeMapping, collapseGroup, currentProvider, customProviderOptions,
   directoryReady, esc, errorMessage, expandGroup, formatTime, getSnapshot, levelOf, load, models,
   openAddCustomProvider, openCapability, openCustomModel, openMapping, providerLabelOf, providerOptions,
   refreshAll,
   refreshModels, registerColumnSettings, removeCustomProvider, render, resolveProvider, restoreSavedFilters,
   pruneForeignTableNodes,
-  rowEnabled, rowKeyOf, runRowAction, same, selectProvider, setSearch, setStateFilter, setTableEl,
+  rowEnabled, rowKeyOf, runRowAction, same, selectProvider, setSearch, setSort, setStateFilter, setTableEl,
   shared, subscribe, syncHead, toast, upstreamOptions, viewData, visibleColumns, writeAddModel,
   writeBinding, writeRemoveMapping, writeRemoveModel,
   type Align, type Binding, type ColumnView, type CustomModelContext, type MappingContext,
@@ -143,6 +143,19 @@ import { t } from '../i18n'
 const cellClass = (base: string, align?: Align): string => (align ? `${base} ta-${align}` : base)
 
 /**
+ * 按 `(提供商, 上游 id)` 找表格里那一行。
+ *
+ * 用途只有一个：思考等级下拉要读**这个目标模型自己认识哪些档位**（见
+ * `models-reasoning.levels` 的三级回落）。找不到（孤儿映射指向的模型不在当前
+ * 表格里、或 provider 为空表示「全局」）就返回 undefined，调用方回落通用候选表。
+ */
+function modelRow(provider: string, id: string): ManageModel | undefined {
+  const wanted = (id || '').trim()
+  if (!wanted) return undefined
+  return models().find(model => same(model.provider, provider) && same(model.id, wanted))
+}
+
+/**
  * 自定义家条目悬浮时把右侧计数让给删除 ×（两者占同一块位置，不藏就会叠字）。
  * 这条行为原来由 page-gateway.css 的 `.pv-row:hover .pv .n` 提供；换成 NavItem 之后计数是
  * 组件内部按 `data-slot` 渲染的 span，按 `.n` 类名命中的那条规则不再匹配，于是用工具类补回。
@@ -154,6 +167,23 @@ const RAIL_HIDE_COUNT_ON_HOVER = '[.pv-row:hover_&_[data-slot=nav-item-count]]:i
 function formatCredits(credits: unknown): string {
   const match = /x\s*([\d.]+)/i.exec(String(credits || ''))
   return match ? `${match[1]}x` : String(credits || '')
+}
+
+/**
+ * 倍率的**数值**（排序用；解析不出返回 null）。
+ *
+ * 与 `formatCredits` 共用同一段正则：倍率是各家上游用同一套文本口径写进来的
+ * （`x0.7 credits`，见各家的 `attach_rates`），所以「取不出数值」与「显示成 —」
+ * 恰好是同一批行 —— 两处不会出现「显示的倍率和排序依据不是一个数」。
+ *
+ * `null` 不按 0 参与排序：0 是合法倍率（免费 / 限免档），而 null 是「上游没给」。
+ * 混在一起会把未知的排到最便宜那一端（排序说明见 models-panel-state 的 MODEL_SORTS）。
+ */
+function rateOf(credits: unknown): number | null {
+  const match = /x\s*([\d.]+)/i.exec(String(credits || ''))
+  if (!match) return null
+  const value = Number(match[1])
+  return Number.isFinite(value) ? value : null
 }
 
 /* ─── 提供商头像（左栏 + 面板头标题）───────────────────────
@@ -341,6 +371,8 @@ function ModelsPage() {
   const all = Array.isArray(view.models) ? view.models : []
   const keyword = state.search.trim().toLowerCase()
   const shown = all.filter(model => matches(model, keyword, provider, state.stateFilter))
+  /** 排序档位（'default' / 'rate-asc' / 'rate-desc'）；组内排序读它，见 rows() 里那一段 */
+  const sort = state.sort
   const columns = visibleColumns()
   const columnCount = columns.length
   /**
@@ -563,6 +595,12 @@ function ModelsPage() {
    * 展示的是**生效值**（清单原值 + 覆盖，归一后读）；被覆盖过的那一项挂一枚
    * 小点（`.cap-mark`，title 说明），未声明的显示 `—`。整格是一个按钮：
    * 点它打开能力弹窗（两列入口同一个 —— 能力是一个整体，没必要各开一个）。
+   *
+   * **来源也标出来**：这两个数正是 models.dev 补得最多的地方（上游普遍不给），
+   * 所以它补的那些值带一条虚线底边（`.filled`）—— 文字上加不了圆点那样的环，
+   * 虚线底边是同一套语义里唯一贴得上去的写法；悬停提示里还会逐项写明
+   * 「；其中 最大输出 Token 由 models.dev 补齐」。不标的话，用户没法知道这个数
+   * 是上游说的还是社区库说的 —— 两者的可信度不一样。
    */
   function budgetCell(model: ManageModel) {
     const caps = capabilitiesOf(model)
@@ -570,20 +608,33 @@ function ModelsPage() {
     const input = typeof caps.maxInputTokens === 'number' ? caps.maxInputTokens : null
     const output = typeof caps.maxOutputTokens === 'number' ? caps.maxOutputTokens : null
     const hint = t('上下文窗口 {input} / 最大输出 Token {output} —— 点击修改模型能力', { input: exactTokens(input), output: exactTokens(output) })
+      + tokenOriginSuffix(model)
     return (
       <button type='button' className='caps-open' title={hint}
         onClick={() => openCapability(model.provider || '', model.id)}>
-        <span className={cn('cap-num', input === null && 'unset')}>
+        <span className={cn('cap-num', input === null && 'unset', capSourceOf(model, 'maxInputTokens') === 'modelsdev' && 'filled')}>
           {formatTokens(input)}
           {overrides.includes('maxInputTokens') ? <i className='cap-mark' title={t('已覆盖上游值')} /> : null}
         </span>
         <span className='cap-sep'>/</span>
-        <span className={cn('cap-num', output === null && 'unset')}>
+        <span className={cn('cap-num', output === null && 'unset', capSourceOf(model, 'maxOutputTokens') === 'modelsdev' && 'filled')}>
           {formatTokens(output)}
           {overrides.includes('maxOutputTokens') ? <i className='cap-mark' title={t('已覆盖上游值')} /> : null}
         </span>
       </button>
     )
+  }
+
+  /**
+   * 悬停提示的**来源尾巴**（只写「不是上游给的」那两档；上游声明/未声明不必写）：
+   * 一格里两个数可能来自不同地方，所以逐项指名，而不是一句笼统的「部分来自
+   * models.dev」。
+   */
+  function tokenOriginSuffix(model: ManageModel): string {
+    const filled = (['maxInputTokens', 'maxOutputTokens'] as const)
+      .filter(key => capSourceOf(model, key) === 'modelsdev')
+      .map(key => CAPABILITY_LABELS[key])
+    return filled.length ? t('；其中 {keys} 由 models.dev 补齐', { keys: filled.join(t('、')) }) : ''
   }
 
   /**
@@ -603,9 +654,10 @@ function ModelsPage() {
           const value = caps[key] ?? null
           const state = capabilityState(value)
           const overridden = overrides.includes(key)
+          const source = capSourceOf(model, key)
           return (
-            <span key={key} className={cn('cap-dot', state, overridden && 'marked')}
-              title={capabilityTip(key, value, overridden)}>
+            <span key={key} className={cn('cap-dot', state, source === 'modelsdev' && 'filled', overridden && 'marked')}
+              title={capabilityTip(key, value, overridden, source)}>
               {CAP_ICON[key]}
               {overridden ? <i className='cap-mark' /> : null}
             </span>
@@ -756,7 +808,21 @@ function ModelsPage() {
     for (const [key, group] of groups) {
       // 组内排序：禁用的行沉到该组末尾，启用的排前面；Array#sort 稳定，组内仍按后端原序
       //（判定与「已启用 / 已禁用」筛选同一份，见 rowEnabled）
-      group.items.sort((a, b) => Number(!rowEnabled(a)) - Number(!rowEnabled(b)))
+      //
+      // 「按倍率」档位只在这之后**同一个启用态内部**再排一道：禁用行仍然全部沉底，
+      // 倍率排序不会把一条禁用行顶到前面去（那会让「哪些能用」先于「哪个便宜」失效）。
+      // 解析不出倍率的行恒排在同档末尾，方向也换不动它 —— 见 rateOf 的说明。
+      group.items.sort((a, b) => {
+        const byEnabled = Number(!rowEnabled(a)) - Number(!rowEnabled(b))
+        if (byEnabled !== 0 || sort === 'default') return byEnabled
+        const left = rateOf(a.credits)
+        const right = rateOf(b.credits)
+        if (left === null || right === null) {
+          if (left === right) return 0
+          return left === null ? 1 : -1
+        }
+        return sort === 'rate-asc' ? left - right : right - left
+      })
       const open = state.expanded.has(key) || !collapsible
       const items = open ? group.items : group.items.slice(0, GROUP_LIMIT)
       const rest = group.items.length - items.length
@@ -837,6 +903,10 @@ function ModelsPage() {
                 {/* 状态筛选：语义、键盘、滑块都在组件库里，取值仍以快照为准（完全受控） */}
                 <SegmentedControl options={MODEL_STATE_OPTIONS} value={state.stateFilter}
                   onValueChange={setStateFilter} aria-label={t('按状态筛选')} className='shrink-0' />
+                {/* 排序档位（issue #161）：默认 / 倍率升序 / 倍率降序。挑便宜模型时
+                    按倍率排比按名称排有用得多 —— 与状态筛选同一套（受控 + 落盘） */}
+                <SegmentedControl options={MODEL_SORT_OPTIONS} value={state.sort}
+                  onValueChange={setSort} aria-label={t('按倍率排序')} className='shrink-0' />
                 {/* 搜索框：InputGroup + addon 图标（与 input-control.tsx 的用法一致）。
                     刻意**不带** data-island-input：那是输入框岛（就地升级）的钩子，
                     两个岛同时挂一个输入框会打架。宽度沿用旧 CSS 的 #models-search 240px */}
@@ -883,8 +953,32 @@ function ModelsPage() {
                   <th data-col='model'>{t('上游模型')}</th>
                   <th data-col='rate'>{t('倍率')}</th>
                   <th data-col='source'>{t('来源')}</th>
-                  <th data-col='budget'>{t('上下文 / 输出')}</th>
-                  <th data-col='caps'>{t('能力')}</th>
+                  {/* 表头只留短标题，完整口径进问号提示（原括号长标题让表头喧宾夺主）。
+                      这是静态内容：重渲染时逐字不变，不会破坏「静态表头」的约定。
+                      这两枚问号讲的是**同一套视觉语言**（这个值到底是不是上游说的）：
+                      内侧描边 / 虚线底 = models.dev 补的，右上角小点 = 你改过 */}
+                  <th data-col='budget'>
+                    {t('上下文 / 输出')}
+                    <span className='th-help' aria-hidden='true'
+                      title={t('数字带虚线底 = 由 models.dev 补齐；右上角小点 = 你手动覆盖过；— = 未声明。点任意一格可改。')}>
+                      <svg viewBox='0 0 24 24'>
+                        <g fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round'>
+                          <circle cx='12' cy='12' r='9' /><path d='M12 16v-4' /><path d='M12 8h.01' />
+                        </g>
+                      </svg>
+                    </span>
+                  </th>
+                  <th data-col='caps'>
+                    {t('能力')}
+                    <span className='th-help' aria-hidden='true'
+                      title={t('圆点带内侧描边 = 由 models.dev 补齐；右上角小点 = 你手动覆盖过；虚线圈 = 未声明。悬停某一枚可看逐项出处。')}>
+                      <svg viewBox='0 0 24 24'>
+                        <g fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round'>
+                          <circle cx='12' cy='12' r='9' /><path d='M12 16v-4' /><path d='M12 8h.01' />
+                        </g>
+                      </svg>
+                    </span>
+                  </th>
                   {/* 表头只留短标题，完整口径进问号提示（原括号长标题让表头喧宾夺主）。
                       这是静态内容：重渲染时逐字不变，不会破坏「静态表头」的约定 */}
                   <th data-col='alias'>
@@ -904,7 +998,7 @@ function ModelsPage() {
               </table>
             </div>
             {/* 表尾：读数 / 每页条数 / 跳页 / 翻页器由通用表格外壳（table-shell.tsx）统一渲染。
-                左侧说明只剩「自定义家」那一条（内置家原先那句按用户要求移除）；其余四张表
+                左侧说明只剩「自定义家」那一条（内置家原先那句按用户要求移除）；其余几张表
                 的页脚说明也都去掉了，页脚现在是清一色的控制条 */}
             <TableFooter
               className='models-panel-foot'
@@ -980,15 +1074,18 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
    * 思考等级：`select` 是下拉的当前值（'' = 不覆盖 / 某个等级 / CUSTOM_LEVEL），`custom` 是
    * 自定义输入框里的字。keep 不在候选里（用户上次填的自定义值、或后端调整过候选表）时落到
    * 「自定义」那一项并把值填进输入框 —— 直接丢掉会让「改别的字段时顺手把等级抹掉」。
+   *
+   * 候选表按**当前选中的目标模型**取（三级回落见 `models-reasoning.levels`）：先把等级绑在
+   * A 模型上、再把上游改成 B，B 不认识这个档位时同样落到「自定义」，不静默改值。
    */
   const [reasoning, setReasoning] = React.useState(() => {
-    const candidates = reasoningLevels(getSnapshot().data)
+    const candidates = reasoningLevels(getSnapshot().data, modelRow(provider, upstream))
     const current = editing ? levelOf(context.alias, context.target, context.provider) : ''
     if (current && candidates.includes(current)) return { select: current, custom: '' }
     return { select: current ? CUSTOM_LEVEL : '', custom: current }
   })
 
-  const candidates = reasoningLevels(getSnapshot().data)
+  const candidates = reasoningLevels(getSnapshot().data, modelRow(provider, upstream))
   /** 提供商候选：表格里出现过的家，再补上上下文那一家（孤儿映射可能属于「整个没进表格」的家） */
   const providerChoices = (() => {
     const options = providerOptions()
@@ -1010,8 +1107,15 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
   })()
 
   const providerLabel = providerChoices.find(item => item.id === provider)?.label || provider || t('(全局)')
-  const level = reasoning.select === CUSTOM_LEVEL ? reasoning.custom.trim() : reasoning.select
-  const showCustomLevel = reasoning.select === CUSTOM_LEVEL
+  /**
+   * 显示用的等级：已选的档位不在当前候选里（换了上游 / 后端换了候选表）时按「自定义」呈现
+   * —— 与初始化同一条规则，值留在输入框里而不是被静默抹掉（派生态，不改 state）。
+   */
+  const active = reasoning.select && reasoning.select !== CUSTOM_LEVEL && !candidates.includes(reasoning.select)
+    ? { select: CUSTOM_LEVEL, custom: reasoning.custom || reasoning.select }
+    : reasoning
+  const level = active.select === CUSTOM_LEVEL ? active.custom.trim() : active.select
+  const showCustomLevel = active.select === CUSTOM_LEVEL
 
   /** 换了一家，上游候选整体换掉（保留同名项，切回来时不用重选） */
   function changeProvider(next: string): void {
@@ -1124,15 +1228,15 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
                 <TooltipContent>{REASONING_TIP}</TooltipContent>
               </Tooltip>
             </div>
-            <Select value={reasoning.select} onValueChange={next => {
+            <Select value={active.select} onValueChange={next => {
               const value = String(next)
               setReasoning(prev => ({ ...prev, select: value }))
             }}>
               {/* 改等级形态没别的可填，把焦点直接放在等级下拉上（旧实现是 setTimeout 里 focus） */}
               <SelectTrigger id='mapping-reasoning' className='w-full' autoFocus={editing}>
-                <SelectValue>{reasoning.select === CUSTOM_LEVEL
+                <SelectValue>{active.select === CUSTOM_LEVEL
                   ? t('自定义等级…')
-                  : (reasoning.select || t('不覆盖'))}</SelectValue>
+                  : (active.select || t('不覆盖'))}</SelectValue>
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value=''>{t('不覆盖')}</SelectItem>
@@ -1147,7 +1251,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
             {showCustomLevel ? (
               <Input id='mapping-reasoning-custom' maxLength={32} autoFocus
                 placeholder={t('自定义等级（例如 custom-high）')} autoComplete='off'
-                disabled={saving} value={reasoning.custom}
+                disabled={saving} value={active.custom}
                 onChange={event => setReasoning(prev => ({ ...prev, custom: event.currentTarget.value }))}
                 onKeyDown={onEnter} />
             ) : null}

@@ -53,7 +53,7 @@ export type CustomModelContext = { provider: string; locked: boolean }
  */
 export type CapabilityContext = { provider: string; id: string }
 
-type Filters = { provider: string; state: string; search: string }
+type Filters = { provider: string; state: string; search: string; sort: string }
 
 /** 表格现造的绑定（默认绑定 alias == target 由模型行合成，不在 mappings 里另占一格） */
 export type Binding = {
@@ -182,6 +182,23 @@ export const MODEL_STATE_OPTIONS: readonly SegmentedControlOption<string>[] = MO
 }))
 
 /**
+ * 排序档位（issue #161：按倍率排序，便于挑便宜的模型）。
+ *
+ * `default` 是「不做额外排序」—— 组内仍按后端清单原序（只把禁用的沉到组末尾，
+ * 见 models-page 的组内排序说明），与加这个档位之前**逐字一致**。
+ *
+ * 倍率取自清单上的 `credits` 文本（如 `x0.7 credits`），解析不出的一律排在最后：
+ * 「查不到倍率」与「倍率是 0」是两件事，按 0 参与排序会把未知的顶到最前面。
+ */
+const MODEL_SORTS: readonly string[] = ['default', 'rate-asc', 'rate-desc']
+const MODEL_SORT_LABEL: Record<string, string> = {
+  default: t('默认'), 'rate-asc': t('倍率升序'), 'rate-desc': t('倍率降序'),
+}
+export const MODEL_SORT_OPTIONS: readonly SegmentedControlOption<string>[] = MODEL_SORTS.map(value => ({
+  value, label: MODEL_SORT_LABEL[value],
+}))
+
+/**
  * 列的 key 用表格里既有的 `data-col`（index.html 的 `<col class="c-xxx" data-col="xxx">`、
  * 表头 th、table-columns.js 的列宽登记三处同名，键名只有一套）。顺序即默认渲染顺序。
  */
@@ -210,7 +227,7 @@ const CUSTOM_HIDDEN_COLUMNS: ReadonlySet<string> = new Set(['rate', 'source'])
 
 const EMPTY_VIEW: ManageView = { models: [], mappings: [] }
 
-const DEFAULT_FILTERS: Filters = { provider: 'all', state: 'all', search: '' }
+const DEFAULT_FILTERS: Filters = { provider: 'all', state: 'all', search: '', sort: 'default' }
 
 /* ─── 共享快照（外部 store）──────────────────── */
 
@@ -219,6 +236,8 @@ export type PanelState = {
   provider: string
   stateFilter: string
   search: string
+  /** 排序档位（默认 / 倍率升序 / 倍率降序），见 MODEL_SORTS */
+  sort: string
   /** 内置家的 manage 视图（null = 还没拉到） */
   data: ManageView | null
   /** 已展开全部行的提供商集合 */
@@ -248,6 +267,8 @@ function readSavedFilters(): Filters {
     // 存坏的状态档位回落「全部」（原生 select 赋一个不存在的值也是这个结果）
     state: MODEL_STATES.includes(saved.state) ? saved.state : 'all',
     search: String(saved.search || ''),
+    // 存坏的排序档位回落「默认」（与状态档位同一口径）
+    sort: MODEL_SORTS.includes(saved.sort) ? saved.sort : 'default',
   }
 }
 
@@ -261,6 +282,7 @@ let snapshot: PanelState = {
   provider: initialFilters.provider,
   stateFilter: initialFilters.state,
   search: initialFilters.search,
+  sort: initialFilters.sort,
   data: null,
   expanded: new Set<string>(),
   pending: new Set<string>(),
@@ -314,7 +336,8 @@ export function restoreSavedFilters(): void {
   if (filtersRestored || filtersTouched || !shared().wbFilterMemory) return
   filtersRestored = true
   const saved = readSavedFilters()
-  if (saved.provider !== snapshot.provider || saved.state !== snapshot.stateFilter || saved.search !== snapshot.search) {
+  if (saved.provider !== snapshot.provider || saved.state !== snapshot.stateFilter
+    || saved.search !== snapshot.search || saved.sort !== snapshot.sort) {
     patch(saved)
   }
 }
@@ -727,6 +750,15 @@ export function setStateFilter(next: string): void {
   filtersTouched = true
   patch({ stateFilter: value })
   saveFilters({ state: value })
+}
+
+/** 排序档位（与状态筛选同一套落盘口径：换档即写，重开面板原样恢复） */
+export function setSort(next: string): void {
+  const value = MODEL_SORTS.includes(next) ? next : 'default'
+  if (value === snapshot.sort) return
+  filtersTouched = true
+  patch({ sort: value })
+  saveFilters({ sort: value })
 }
 
 export function setSearch(next: string): void {

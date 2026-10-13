@@ -435,16 +435,25 @@ pub fn entries() -> Vec<ModelEntry> {
 }
 
 /// 某条目 → 聚合层认的原始形态（`core/models/shape.rs::list_item` 的输入）。
+///
+/// ── 两个键**故意不出**（由 models.dev 按模型回答，见 `core::model_meta`）──
+/// `maxOutputTokens` 与 `supportsImages` 此前是无出处的齐口价（一律 32K /
+/// 一律 true）：前者对不上任何一支真实模型（同池的 step-5-preview 输出上限是
+/// 100 万），后者只是一句「上游是 OpenAI 兼容的 agent 网关」的推断 ——
+/// 而 Cline 的池子里既有视觉模型也有纯文本模型。两者都不再声明；models.dev
+/// 覆盖不到的模型退回「未声明」，用户可在「模型能力」里覆盖。
+///
+/// 留下的三项各有出处：`maxInputTokens` 是上游字段 + 本文件那张逐条核对过的表
+/// （见 `context_window_for`：上游把 glm-5.3-flash 猜成 256K，实际 1.28M）；
+/// `supportsToolCall` 是 wire 协议级事实（这家就是 agent 网关）；`supportsReasoning`
+/// 是上游字段 + 实测注记（见 `reasoning_for`）。
 fn to_raw(entry: &ModelEntry) -> Value {
     json!({
         "id": entry.id,
         "name": entry.name,
         // 聚合层认这两个键名（见 shape.rs 的模块头）
         "maxInputTokens": entry.context_window,
-        "maxOutputTokens": 32_000,
-        // Cline 的上游是 OpenAI 兼容的 agent 网关，工具调用与视觉都支持
         "supportsToolCall": true,
-        "supportsImages": true,
         "supportsReasoning": entry.reasoning,
         "isDefault": false,
         "kind": "chat",

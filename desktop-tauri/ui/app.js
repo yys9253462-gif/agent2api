@@ -3,6 +3,12 @@
 
 const api = window.workbuddyDesktop;
 const $ = id => document.getElementById(id);
+/**
+ * 是不是「网页端」形态（headless / Docker：面板由网关自己托管）。
+ * 判定口径与 titlebar.js 一致 —— 桥接层注入的 platform 为 'web' 即网页端；
+ * 桥还没就绪时按桌面形态处理（保守：桌面才是自绘窗口按钮那一套）。
+ */
+const isWebPanel = () => api?.platform === 'web';
 let state = null;
 // 最近一次 `refresh()` 的失败原因（成功时清空）。
 // 它是给顶栏状态区挂 title 用的：后端不可达时页面上其余数字都只是「上一次的值」，
@@ -231,6 +237,10 @@ function renderTopbarStatus() {
   const session = state?.session || {};
   const accounts = state?.accounts?.accounts || [];
   const enabled = accounts.filter(a => a.enabled !== false).length;
+  // 「可用」= 启用且凭证完整。`available` 就是后端选路用的那个键
+  // （account_store 的 public_account 写的），所以徽章与「转发时会不会用这个账号」
+  // 同一判据；缺该键的老数据按可用处理（宁可不误报「不可用」）。
+  const available = accounts.filter(a => a.enabled !== false && a.available !== false).length;
   // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链。
   // 计数用 isLimited（含「余额不足已跳过」档，与账号页「已限流」分段同一口径）；
   // 契约上没有该成员时退回 isRateLimited（只数模型限流），宁少报不报错
@@ -259,7 +269,12 @@ function renderTopbarStatus() {
   const views = {
     accounts: () => chip(wbI18n.t('{n} 个启用', { n: enabled }), enabled ? 'ok' : '')
       + (limited ? chip(wbI18n.t('{n} 个已限流', { n: limited }), 'warn') : ''),
-    gateway: () => (gatewayUp ? chip(wbI18n.t('监听 127.0.0.1'), 'ok') : chip(wbI18n.t('未就绪'), 'bad')) + chip(port, '', true),
+    // 「监听 127.0.0.1」只在桌面模式成立：web 模式（Docker / 反代）下网关监听的是
+    // 容器内的 0.0.0.0，面板访问它走的是映射 / 代理后的地址 —— 那里照实说「网关运行中」
+    // 就好，后面的 port 徽标给的才是真正的地址。（文案复用已有的同一句话，不新增键）
+    gateway: () => (gatewayUp
+      ? chip(isWebPanel() ? wbI18n.t('网关运行中') : wbI18n.t('监听 127.0.0.1'), 'ok')
+      : chip(wbI18n.t('未就绪'), 'bad')) + chip(port, '', true),
     keys: () => mirror('keys-status'),
     // 文档页没有自己的徽标（它只有一组复制的地址），跟着网关的运行状态走 ——
     // 地址在页面上的意义就是「现在能不能连」，网关没起来时那个状态最要紧
@@ -272,8 +287,14 @@ function renderTopbarStatus() {
     checkin: () => mirror('checkin-badge'),
     settings: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok', true) : chip(wbI18n.t('未就绪'), 'bad', true))
       + (enabled ? chip(wbI18n.t('{n} 个账号启用', { n: enabled })) : ''),
+    // 「已登录 / 未登录」说的是**旧式单账号登录态**（WorkBuddy 的 auth.json），
+    // 它与「能不能转发」在库模式下是两件事：没有 WorkBuddy 账号的多账号部署会
+    // 恒显黄色「未登录」，而路由、转发、签到一切正常（issue #178）。有可用账号时
+    // 报账号数；一个可用账号都没有才回落登录态 —— 那时「未登录」是准确的说法。
     overview: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok') : chip(wbI18n.t('未就绪'), 'bad'))
-      + (session.loggedIn ? chip(wbI18n.t('已登录'), 'ok') : chip(wbI18n.t('未登录'), 'warn')),
+      + (available
+        ? chip(wbI18n.t('{n} 个账号可用', { n: available }), 'ok')
+        : (session.loggedIn ? chip(wbI18n.t('已登录'), 'ok') : chip(wbI18n.t('未登录'), 'warn'))),
   };
 
   box.innerHTML = views[currentPage]?.() ?? views.overview();

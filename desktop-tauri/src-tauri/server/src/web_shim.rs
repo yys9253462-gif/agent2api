@@ -729,6 +729,18 @@ pub fn shim_js() -> &'static str {
     refreshAccountToken: function (id) { return call('POST', '/api/accounts/refresh', id ? { id: id } : {}); },
     removeAccount: function (id) { return call('DELETE', '/api/accounts/' + encodeURIComponent(id)); },
     updateAccount: function (id, patch) { return call('PATCH', '/api/accounts/' + encodeURIComponent(id), patch); },
+    // 整队重排（账号页分组模式拖拽的落库通道；与桌面 bridge.rs 的同名方法成对）。
+    // ★ 这个方法曾整个漏在网页桥里：界面调用点是 `bridge?.reorderAccounts?.(ids)`
+    // —— 两层可选调用，缺了这一侧不报错、只是空操作，于是 Docker / 浏览器面板上
+    // 拖完顺位照样弹「✅ 已保存」，刷新又跳回旧顺序（库里的顺序从没被写过）。
+    // 队列是「全局一条按优先级升序尝试的队列」（见 account_store::priority），
+    // 组顺位 / 组内顺位由前端展开成整条 id 数组一次性交上来，后端编 0、1、2…，
+    // 所以这里原样透传，不做任何归一（空值整形与桌面桥一致）。
+    reorderAccounts: function (queue) {
+      return call('POST', '/api/accounts/reorder', {
+        queue: Array.isArray(queue) ? queue.map(function (item) { return String(item); }) : [],
+      });
+    },
     moveAccount: function (id, direction) {
       return call('POST', '/api/accounts/' + encodeURIComponent(id) + '/move', {
         direction: direction === 'down' ? 'down' : 'up',
@@ -745,6 +757,9 @@ pub fn shim_js() -> &'static str {
         ids: Array.isArray(payload.ids) ? payload.ids : [],
       };
       if (Object.prototype.hasOwnProperty.call(payload, 'proxy')) body.proxy = payload.proxy;
+      if (Object.prototype.hasOwnProperty.call(payload, 'maxConcurrent')) {
+        body.maxConcurrent = payload.maxConcurrent;
+      }
       return call('POST', '/api/accounts/batch', body);
     },
 
@@ -774,6 +789,18 @@ pub fn shim_js() -> &'static str {
     removeProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/remove', { id: String(id || '') }); },
     testProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/test', { id: String(id || '') }); },
     syncClashToProxyPool: function () { return call('POST', '/api/proxies/pool/sync-clash', {}); },
+    // 订阅（「网络代理」页的订阅区块；与桌面壳 bridge.rs 的同名方法成对存在，
+    // 契约见 api::subscriptions 的模块头 —— 写操作后端投一条内核命令（异步），
+    // 节点数与运行状态由轮询 kernel 看结果）
+    getSubscriptions: function () { return call('GET', '/api/subscriptions'); },
+    addSubscription: function (payload) { return call('POST', '/api/subscriptions/add', payload || {}); },
+    saveSubscription: function (payload) { return call('POST', '/api/subscriptions/save', payload || {}); },
+    refreshSubscription: function (id) { return call('POST', '/api/subscriptions/refresh', { id: String(id || '') }); },
+    removeSubscription: function (id) { return call('POST', '/api/subscriptions/remove', { id: String(id || '') }); },
+    decodeQrImage: function (payload) { return call('POST', '/api/subscriptions/decode-qr', payload || {}); },
+    getKernelStatus: function () { return call('GET', '/api/subscriptions/kernel'); },
+    downloadKernel: function () { return call('POST', '/api/subscriptions/kernel/download', {}); },
+    restartKernel: function () { return call('POST', '/api/subscriptions/kernel/restart', {}); },
 
     // ── 积分 / 签到 ──
     getUsage: function () { return call('GET', '/api/usage'); },
@@ -796,6 +823,24 @@ pub fn shim_js() -> &'static str {
     },
     claimOnboardingTasks: function (id) {
       return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding/claim', {});
+    },
+    // ── WorkBuddy 成长任务（国内版：盘点 / 单任务执行 / 开学季 / 猫猫旅行）──
+    // 与桌面 `bridge.rs` 的同名方法**必须成对存在**（理由上面 Loomy 那段已述：
+    // 只改一边时另一形态会静默失效）。端点在 server 的 `api::growth`。
+    // 执行拆成单任务端点（60 秒转发超时，见 api::growth 模块头）。
+    getGrowthStatus: function (id) {
+      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth');
+    },
+    runGrowthTask: function (id, code, mode) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth/task',
+        { code: code, mode: mode || 'full' });
+    },
+    runGrowthSchool: function (id, lottery) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth/school',
+        { lottery: lottery === true });
+    },
+    runGrowthTravel: function (id) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth/travel', {});
     },
 
     // ── 手机验证码登录（AutoClaw 国内版 / Loomy）──
@@ -997,6 +1042,15 @@ pub fn shim_js() -> &'static str {
       return call('PUT', '/api/captcha', { captchaEnabled: on === true });
     },
 
+    // ── models.dev 模型元数据（能力位与逐模型思考档位）──
+    // 与上面几个开关同形：GET 读（开关 + 索引状态）、PUT 写开关；
+    // refresh 那条会真打公网，返回里同时带一行结果与刷新后的状态。
+    getModelsDev: function () { return call('GET', '/api/models/metadata'); },
+    saveModelsDev: function (on) {
+      return call('PUT', '/api/models/metadata', { modelsDevEnabled: on === true });
+    },
+    refreshModelsDev: function () { return call('POST', '/api/models/metadata/refresh'); },
+
     // ── 数据存储概况 ──
     getStorage: function () { return call('GET', '/api/storage'); },
 
@@ -1038,10 +1092,10 @@ pub fn shim_js() -> &'static str {
     getPortOccupant: function () { return invokeShell('port_occupant'); },
     endPortOccupant: function () { return Promise.reject(new Error(SHELL_UNAVAILABLE)); },
     checkPort: function () {
-      return Promise.reject(new Error('网页端不探测端口：端口由 AGENT2API_PORT 环境变量决定'));
+      return Promise.reject(new Error('网页端不探测端口：端口由 AGENT2API_PROXY_PORT 环境变量决定'));
     },
     changePort: function () {
-      return Promise.reject(new Error('网页端不支持改端口：请设置环境变量 AGENT2API_PORT 后重启容器'));
+      return Promise.reject(new Error('网页端不支持改端口：请设置环境变量 AGENT2API_PROXY_PORT 后重启容器'));
     },
     restartApp: function () {
       return Promise.reject(new Error('网页端不支持重启：请重启容器（docker compose restart）'));

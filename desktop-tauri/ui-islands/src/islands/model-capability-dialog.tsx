@@ -35,8 +35,8 @@ import {
 
 import {
   BOOLEAN_KEYS, CAPABILITY_KEYS, CAPABILITY_LABELS, TOKEN_KEYS,
-  capabilitiesOf, capabilityState, exactTokens, normalizeCapability, normalizeOverrides,
-  patchFromDraft, reasoningLevelsOf, type CapabilityDraft, type CapabilityKey,
+  capabilitiesOf, capabilityState, capSourceOf, exactTokens, normalizeCapability, normalizeOverrides,
+  patchFromDraft, reasoningLevelsOf, type CapabilityDraft, type CapabilityKey, type CapabilitySource,
 } from './model-capability'
 import * as customSource from './models-custom-source'
 import {
@@ -64,12 +64,17 @@ function booleanText(value: number | boolean | null): string {
  * 字段下方的状态行：这一项**当前对下游**是什么、值从哪来。
  * 「未声明」要写明下游会怎么处理（布尔按不支持、数值按未知），否则用户会把
  * 「不知道」当成「明确不支持」照抄。
+ *
+ * `source` 是后端标的来源（`upstream` / `modelsdev` / `user`，见
+ * `core::model_meta`）：由 models.dev 补齐的那几项**不能**说成「继承上游」——
+ * 上游压根没声明过它，用户以为那是本通道的实测事实就错了。
  */
 function statusText(
   key: CapabilityKey,
   value: number | boolean | null,
   set: boolean,
   custom: boolean,
+  source: CapabilitySource | '' = '',
 ): string {
   const has = value !== null && value !== undefined
   const shown = TOKEN_KEYS.includes(key) ? exactTokens(value) : booleanText(value)
@@ -79,7 +84,10 @@ function statusText(
       : t('已覆盖：对下游声明 {value}', { value: shown })
   }
   if (custom) return t('未填写（下游按未声明处理）')
-  return has ? t('继承上游：{value}', { value: shown }) : t('上游未声明（下游会按不支持处理）')
+  if (!has) return t('上游未声明（下游会按不支持处理）')
+  return source === 'modelsdev'
+    ? t('models.dev 补齐：对下游声明 {value}', { value: shown })
+    : t('继承上游：{value}', { value: shown })
 }
 
 /**
@@ -230,7 +238,7 @@ export function CapabilityDialog({ context, onClose }: { context: CapabilityCont
                 onChange={event => setValue(key, event.currentTarget.value)}
                 onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void save() } }} />
               <p className='text-xs leading-[1.6] text-subtle'>
-                {statusText(key, capabilities[key] ?? null, isSet(key), custom)}
+                {statusText(key, capabilities[key] ?? null, isSet(key), custom, capSourceOf(row, key))}
               </p>
             </div>
           ))}
@@ -242,7 +250,7 @@ export function CapabilityDialog({ context, onClose }: { context: CapabilityCont
                 aria-label={CAPABILITY_LABELS[key]} className='self-start'
                 onValueChange={next => setValue(key, String(next))} />
               <p className='text-xs leading-[1.6] text-subtle'>
-                {statusText(key, capabilities[key] ?? null, isSet(key), custom)}
+                {statusText(key, capabilities[key] ?? null, isSet(key), custom, capSourceOf(row, key))}
               </p>
             </div>
           ))}

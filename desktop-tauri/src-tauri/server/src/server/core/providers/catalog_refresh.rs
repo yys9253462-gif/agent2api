@@ -163,5 +163,12 @@ pub fn reschedule(interval_ms: i64) -> Result<(), String> {
         } else { kind_id(kind) };
         task_state::reschedule(&format!("modelRefresh:{scope}"), interval_ms)?;
     }
+    // models.dev 元数据搭同一条任务、同一个间隔（见 `scheduled_tasks` 的
+    // TASK_MODEL_REFRESH 分支）：它的排期键与各家同一命名空间，改间隔时若不
+    // 一并重排，它会继续按旧节奏跑到下一轮自己领到新值为止。
+    task_state::reschedule(
+        &format!("modelRefresh:{}", crate::server::core::model_meta::SCHEDULE_SCOPE),
+        interval_ms,
+    )?;
     Ok(())
 }

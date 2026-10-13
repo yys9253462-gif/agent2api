@@ -6,7 +6,8 @@
 //!   GET    /api/accounts/export         导出全部账号（含 token，换机器后导入继续用）
 //!   POST   /api/accounts/import         导入账号（merge：按 uid 匹配，命中更新、未命中追加）
 //!   POST   /api/accounts/current        把账号置顶（仅调整全局优先级）{ id }
-//!   POST   /api/accounts/batch          批量操作 { action, ids, proxy? }
+//!   POST   /api/accounts/batch          批量操作 { action, ids, proxy?, maxConcurrent? }
+//!                                       action: enable / disable / proxy / concurrency / remove
 //!   POST   /api/accounts/reorder        整队重排（分组模式）{ queue: [id, …] }
 //!   POST   /api/accounts/refresh        刷新指定（或当前）账号的 token { id? }
 //!   POST   /api/accounts/refresh-expiring 刷新**全部**已过期/临期的账号凭证（批量）
@@ -309,6 +310,28 @@ pub async fn dispatch(
                 return super::onboarding::claim(&state, &id).await;
             }
         }
+        // WorkBuddy 成长任务（国内版）：单任务执行 / 开学季 / 猫猫旅行，见
+        // `api::growth`。三条后缀互不包含（各自以 /growth/xxx 结尾），先后不影响
+        // 命中；读的时候按界面上按钮的顺序排列（单任务执行 → 开学季 → 旅行巡检）。
+        // 执行拆成单任务端点的原因（60 秒转发超时）见 api::growth 的模块头。
+        if let Some(id) = rest.strip_suffix("/growth/task") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::growth::run_task(&state, &id, body).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/growth/school") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::growth::school_run(&state, &id, body).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/growth/travel") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::growth::travel_run(&state, &id).await;
+            }
+        }
     }
 
     // ③' GET + /onboarding 结尾 → 新手任务状态（只读，签到后弹窗的查询口）。
@@ -321,6 +344,15 @@ pub async fn dispatch(
             if !id.is_empty() {
                 let refresh = query_param(query, "refresh").as_deref() == Some("1");
                 return super::onboarding::status(&state, &id, refresh).await;
+            }
+        }
+        // WorkBuddy 成长任务盘点（只读，见 `api::growth` 的模块头）。
+        // 与上面的 onboarding 同一纪律：查询走 GET、动状态走 POST ——
+        // 页面展开只查，不给「看一眼就改状态」留机会。
+        if let Some(id) = rest.strip_suffix("/growth") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::growth::status(&state, &id).await;
             }
         }
     }
@@ -897,6 +929,16 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
                 return management_error(400, "批量修改代理时缺少 proxy 字段");
             };
             state.store().batch_update(&ids, &json!({ "proxy": target }))
+        }
+        "concurrency" => {
+            // 并发上限（0 = 不限）；缺字段是显式报错，值本身由 store 归一
+            // （非负整数、封顶 999，与单账号设置面板同一份校验）
+            let Some(target) = payload.get("maxConcurrent") else {
+                return management_error(400, "批量设置并发上限时缺少 maxConcurrent 字段");
+            };
+            state
+                .store()
+                .batch_update(&ids, &json!({ "maxConcurrent": target }))
         }
         other => {
             return management_error(

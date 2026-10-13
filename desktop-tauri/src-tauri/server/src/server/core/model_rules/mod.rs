@@ -904,6 +904,14 @@ pub fn apply_capability_overrides(provider: &str, items: &mut [Value]) {
             .find(|entry| entry.matches(provider, id))
         {
             crate::server::core::capability::apply_overrides(item, &entry.values);
+            // 来源标记：被覆盖的键从此是**用户指定**的值，既不是上游给的也不是
+            // models.dev 补的（管理页要把这三档分开显示，见 `core::model_meta`
+            // 的模块头）。覆盖在 models.dev 补齐**之后**执行，所以这里改的是
+            // 已经标好的那几项。
+            crate::server::core::model_meta::mark_user(
+                item,
+                &crate::server::core::capability::overridden_keys(&entry.values),
+            );
         }
     }
 }
