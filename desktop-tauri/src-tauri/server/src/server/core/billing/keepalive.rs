@@ -8,10 +8,12 @@
 //! `checkinKeepalive.models`。
 //!
 //! ── 读口径 ─────────────────────────────────────────────────
-//! 缺失 / 非数组 / 全是空串都回落缺省链 —— 与 `auto_checkin::normalize_providers`
-//! 同一条兜底哲学：旧 config.json 里没有这个字段，读出来必须是合法默认行为。
-//! 归一化逐项 trim、丢空串、去重（保序）：用户在输入框里写的多半是
-//! 「逗号/空格分隔的一行」，api 层拆好数组再进来，这里做最后一道净化。
+//! 两种落盘形态都认：对象 `{"models": […]}`（写入侧落的就是这一种）与裸数组
+//! `[…]`（旧形态 / 手改配置）。缺失 / 非上述形态 / 全是空串都回落缺省链 ——
+//! 与 `auto_checkin::normalize_providers` 同一条兜底哲学：旧 config.json 里没有
+//! 这个字段，读出来必须是合法默认行为。归一化逐项 trim、丢空串、去重（保序）：
+//! 用户在输入框里写的多半是「逗号/空格分隔的一行」，api 层拆好数组再进来，
+//! 这里做最后一道净化。
 
 use serde_json::{Value, json};
 
@@ -43,11 +45,27 @@ fn normalize(list: &[String]) -> Vec<String> {
 }
 
 /// 当前生效的保活模型链（配置缺失 / 非法时回落缺省链）。
+///
+/// ── 两种落盘形态都认（修复 #183）────────────────────────────
+/// 写入侧（[`set_models`]）落的是**对象** `{"models": […]}`，而这里早先只按
+/// **数组**解析 —— 存进去的是对象、读回来按数组匹配，`Value::Array` 永远不命中，
+/// 于是每次读都回落缺省链：界面表现为「保存成功、日志也打成功，但输入框和重启后
+/// 都还是原链路」，落库实际上是对的。现在对象优先取 `models` 键，数组（旧形态 /
+/// 手改配置）照收，两者之外一律回落缺省。
 pub fn models() -> Vec<String> {
     // 先绑定快照再取键：`config::current()` 返回的临时值必须活到借用结束
     let snapshot = config::current();
-    let Some(Value::Array(items)) = snapshot.raw().get(CONFIG_KEY) else {
+    let Some(raw) = snapshot.raw().get(CONFIG_KEY) else {
         return default_models();
+    };
+    let items = match raw {
+        Value::Array(items) => items.clone(),
+        Value::Object(_) => raw
+            .get("models")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => return default_models(),
     };
     let picked = normalize(
         &items

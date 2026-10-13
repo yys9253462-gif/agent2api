@@ -120,6 +120,40 @@ fn earned_of(record: &Value) -> i64 {
         .sum()
 }
 
+/// 未结算的任务数。
+fn unclaimed_of(rows: &[Value]) -> usize {
+    rows.iter()
+        .filter(|row| !row.get("done").and_then(Value::as_bool).unwrap_or(false))
+        .count()
+}
+
+/// 两条台账里较晚的结算时刻（两条都结算时才是有效值；未结算用 0）。
+fn settled_at_of(record: &Value) -> i64 {
+    TASKS
+        .iter()
+        .map(|task| settled_at(record, task.key))
+        .max()
+        .unwrap_or(0)
+}
+
+/// 签到时中心快照用：两条都结算过就给一份「已结清」的记忆（零上游），否则 None
+/// —— 与 Loomy / CodeArts 的 `onboardingSettled` 同形（见 `providers::onboarding_memory`），
+/// 快照消费方不必按 provider 分叉。本家没有单独的结算字段：两条台账都落下即结清，
+/// 结算时刻取两条里较晚的那个。
+pub fn settled_view(record: Option<&Value>) -> Option<Value> {
+    let record = record?;
+    let rows = task_rows(record);
+    if unclaimed_of(&rows) > 0 {
+        return None;
+    }
+    Some(json!({
+        "at": settled_at_of(record),
+        "tasks": rows,
+        "earned": earned_of(record),
+        "total": TOTAL_POINTS,
+    }))
+}
+
 /// 打一次 grant 探测（幂等），返回上游 `data` 对象。
 ///
 /// 请求失败在这里就是失败（返回 Err），不降级 —— 调用方据此向界面如实报错。
@@ -172,10 +206,18 @@ fn granted_outcome(data: &Value) -> (bool, i64) {
 /// 查询任务状态（`GET /api/accounts/{id}/onboarding` 的小浣熊执行体，只读：
 /// 不发任何上游请求）。
 ///
-/// 响应形状与 Loomy 对齐：`{tasks:[…], earned, total, unclaimed}`。`done` 来自
-/// 结算台账（见模块头）：结算过恒「已领取」，没结算过恒「待领取」—— 状态未知
+/// 响应形状与 Loomy 对齐：`{tasks:[…], earned, total, unclaimed, settled}`。`done`
+/// 来自结算台账（见模块头）：结算过恒「已领取」，没结算过恒「待领取」—— 状态未知
 /// 就说未知，不假装知道上游的真实发放状态。
-pub async fn get_tasks(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
+///
+/// `refresh` 在本家**没有实查可做**：上游没有「领没领过」的只读判定口（见模块头），
+/// 台账就是唯一真实性来源。参数只为接口形状与另外两家一致（`?refresh=1` 时结论
+/// 相同），调用方不必为本家单独分叉。
+pub async fn get_tasks(
+    store: &AccountStore,
+    account_id: &str,
+    _refresh: bool,
+) -> Result<Value, GatewayError> {
     if account_id.is_empty() {
         return Err(GatewayError::with_status(400, "缺少账号 id"));
     }
@@ -183,15 +225,19 @@ pub async fn get_tasks(store: &AccountStore, account_id: &str) -> Result<Value, 
         .raccoon_account_record(account_id)
         .ok_or_else(|| GatewayError::with_status(404, "未找到小浣熊账号"))?;
     let rows = task_rows(&record);
-    let unclaimed = rows
-        .iter()
-        .filter(|row| !row.get("done").and_then(Value::as_bool).unwrap_or(false))
-        .count();
+    let unclaimed = unclaimed_of(&rows);
     Ok(json!({
         "tasks": rows,
         "earned": earned_of(&record),
         "total": TOTAL_POINTS,
         "unclaimed": unclaimed,
+        // 两条都结算过 ⇒ 一次性福利到此为止（界面据此不再重复查询）。
+        // `settledAt` 与 Loomy / CodeArts 的记忆路径同义（结算时刻），界面展示
+        // 「结算于」时不必按 provider 分叉。
+        "settled": unclaimed == 0,
+        // 结算时刻：`settled` 为真时给两条台账里较晚的那个（与 Loomy / CodeArts
+        // 记忆路径的 `settledAt` 同义），否则 null
+        "settledAt": if unclaimed == 0 { json!(settled_at_of(&record)) } else { Value::Null },
     }))
 }
 
@@ -299,5 +345,7 @@ pub async fn claim_all(store: &AccountStore, account_id: &str) -> Result<Value, 
         "earned": earned_of(&merged),
         "total": TOTAL_POINTS,
         "unclaimed": unclaimed,
+        "settled": unclaimed == 0,
+        "settledAt": if unclaimed == 0 { json!(settled_at_of(&merged)) } else { Value::Null },
     }))
 }

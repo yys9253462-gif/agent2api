@@ -47,13 +47,14 @@ import { CUSTOM_LEVEL, levels as reasoningLevels } from './models-reasoning'
 import {
   accept, bindingsOf, errorMessage, getSnapshot, shared, toast, writeBinding, writeRemoveModel,
 } from './models-panel-state'
+import { t } from '../i18n'
 
 /** 批量动作（RadioGroup 的取值；文案与执行动词共用这里） */
 const ACTIONS = [
-  { value: 'enable', label: '启用' },
-  { value: 'disable', label: '禁用' },
-  { value: 'reasoning', label: '设置思考等级' },
-  { value: 'delete', label: '删除' },
+  { value: 'enable', label: t('启用') },
+  { value: 'disable', label: t('禁用') },
+  { value: 'reasoning', label: t('设置思考等级') },
+  { value: 'delete', label: t('删除') },
 ] as const
 
 type BatchAction = (typeof ACTIONS)[number]['value']
@@ -65,7 +66,7 @@ function isRemovable(model: ManageModel): boolean {
 
 /** 模型名（与账号页同一口径：有名字用名字，没有回退 id） */
 function modelName(model: ManageModel): string {
-  return (model.name && model.name !== model.id ? `${model.name}（${model.id}）` : model.id) || model.id
+  return (model.name && model.name !== model.id ? t('{name}（{id}）', { name: model.name, id: model.id }) : model.id) || model.id
 }
 
 export function ModelBatchDialog({ models, onClose, onDone }: {
@@ -84,30 +85,30 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
   const candidates = reasoningLevels(getSnapshot().data)
   const level = reasoning.select === CUSTOM_LEVEL ? reasoning.custom.trim() : reasoning.select
   const removableCount = models.filter(isRemovable).length
-  const label = ACTIONS.find(item => item.value === action)?.label || '操作'
+  const label = ACTIONS.find(item => item.value === action)?.label || t('操作')
 
   /** 批量删除不可逆，按数量做二次确认（与账号页批量删除同一口子，原生 confirm 在
    *  Tauri WebView 里直接放行，所以一律走 wbConfirm 的应用内确认框） */
   async function confirmRemove(count: number): Promise<boolean> {
     return Promise.resolve(shared().wbConfirm?.ask?.({
-      title: '删除选中的模型',
-      html: `确定删除选中的 <strong>${count}</strong> 个模型登记？删除后 <code>/v1/models</code> 不再广告它们、请求也会被拒。`
-        + (models.length > count ? `<br/>另有 ${models.length - count} 个非手动登记的模型将被跳过。` : ''),
-      okText: '删除',
+      title: t('删除选中的模型'),
+      html: t('确定删除选中的 <strong>{count}</strong> 个模型登记？删除后 <code>/v1/models</code> 不再广告它们、请求也会被拒。', { count })
+        + (models.length > count ? '<br/>' + t('另有 {n} 个非手动登记的模型将被跳过。', { n: models.length - count }) : ''),
+      okText: t('删除'),
       okClass: 'danger',
     }) ?? false)
   }
 
   async function run(): Promise<void> {
     if (busy) return
-    if (!models.length) { toast('没有选中的模型', 'err'); return }
+    if (!models.length) { toast(t('没有选中的模型'), 'err'); return }
     if (action === 'reasoning' && reasoning.select === CUSTOM_LEVEL && !level) {
-      setResult(<span className='text-destructive'>请填写自定义思考等级，或改选候选档 / 「清除」</span>)
+      setResult(<span className='text-destructive'>{t('请填写自定义思考等级，或改选候选档 / 「清除」')}</span>)
       return
     }
     if (action === 'delete') {
       if (removableCount === 0) {
-        setResult(<span className='text-destructive'>选中的模型都不是手动登记，无法删除（开关映射才是它们的手段）</span>)
+        setResult(<span className='text-destructive'>{t('选中的模型都不是手动登记，无法删除（开关映射才是它们的手段）')}</span>)
         return
       }
       if (!(await confirmRemove(removableCount))) return
@@ -140,18 +141,22 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
         failed += 1
         if (!firstError) firstError = errorMessage(error)
         setResult(<span className='text-destructive'>
-          失败 {failed} 个 · 首个失败：{firstError}
+          {t('失败 {n} 个 · 首个失败：{error}', { n: failed, error: firstError })}
         </span>)
       }
     }
     if (failed === 0) {
-      toast(`✅ 批量${label}完成：共 ${ok} 个模型${skipped ? `（跳过不可删除的 ${skipped} 个）` : ''}`)
+      toast(skipped
+        ? t('✅ 批量{action}完成：共 {n} 个模型（跳过不可删除的 {skipped} 个）',
+          { action: label, n: ok, skipped })
+        : t('✅ 批量{action}完成：共 {n} 个模型', { action: label, n: ok }))
       onDone()
     } else {
-      toast(`批量${label}完成：成功 ${ok} 个，失败 ${failed} 个`, 'err')
+      toast(t('批量{action}完成：成功 {ok} 个，失败 {failed} 个', { action: label, ok, failed }), 'err')
       setResult(<span className='text-destructive'>
-        成功 {ok} 个，失败 {failed} 个{skipped ? `，跳过 ${skipped} 个` : ''}
-        {firstError ? `；首个失败：${firstError}` : ''}
+        {t('成功 {ok} 个，失败 {failed} 个', { ok, failed })}
+        {skipped ? t('，跳过 {n} 个', { n: skipped }) : ''}
+        {firstError ? t('；首个失败：{error}', { error: firstError }) : ''}
       </span>)
     }
     setBusy(false)
@@ -160,16 +165,16 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
   return (
     <Dialog open onOpenChange={next => { if (next || busy) return; onClose() }}>
       <DialogContent>
-        <DialogHeader><DialogTitle>批量操作 · 已选 {models.length} 个模型</DialogTitle></DialogHeader>
+        <DialogHeader><DialogTitle>{t('批量操作 · 已选 {n} 个模型', { n: models.length })}</DialogTitle></DialogHeader>
         <DialogBody>
           <DialogSection>
-            <h3>将作用于以下模型</h3>
-            <p style={{ maxHeight: 84, overflowY: 'auto' }}>{models.map(modelName).join('、')}</p>
+            <h3>{t('将作用于以下模型')}</h3>
+            <p style={{ maxHeight: 84, overflowY: 'auto' }}>{models.map(modelName).join(t('、'))}</p>
           </DialogSection>
           <DialogSection>
-            <h3>操作</h3>
+            <h3>{t('操作')}</h3>
             <RadioGroup value={action} onValueChange={next => setAction(next as BatchAction)}
-              className='flex-row flex-wrap items-center gap-5' aria-label='批量动作'>
+              className='flex-row flex-wrap items-center gap-5' aria-label={t('批量动作')}>
               {ACTIONS.map(item => (
                 <Label key={item.value} className='inline-flex cursor-pointer items-center gap-2 font-normal'>
                   <RadioGroupItem value={item.value} />{item.label}
@@ -179,42 +184,43 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
             {action === 'reasoning' ? (
               <div className='mt-2.5'>
                 <div className='field-row'>
-                  <label htmlFor='batch-model-reasoning'>思考等级</label>
+                  <label htmlFor='batch-model-reasoning'>{t('思考等级')}</label>
                   <Select value={reasoning.select} onValueChange={next => setReasoning(prev => ({ ...prev, select: String(next) }))}>
                     <SelectTrigger id='batch-model-reasoning' className='min-w-[220px]'>
                       <SelectValue>
-                        {reasoning.select === CUSTOM_LEVEL ? '自定义等级…'
-                          : (reasoning.select || '清除（不覆盖）')}
+                        {reasoning.select === CUSTOM_LEVEL ? t('自定义等级…')
+                          : (reasoning.select || t('清除（不覆盖）'))}
                       </SelectValue>
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value=''>清除（不覆盖）</SelectItem>
+                      <SelectItem value=''>{t('清除（不覆盖）')}</SelectItem>
                       {candidates.map(levelName => (
                         <SelectItem key={levelName} value={levelName}>{levelName}</SelectItem>
                       ))}
-                      <SelectItem value={CUSTOM_LEVEL}>自定义等级…</SelectItem>
+                      <SelectItem value={CUSTOM_LEVEL}>{t('自定义等级…')}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 {reasoning.select === CUSTOM_LEVEL ? (
                   <div className='field-row mt-2'>
-                    <label htmlFor='batch-model-reasoning-custom'>自定义等级</label>
+                    <label htmlFor='batch-model-reasoning-custom'>{t('自定义等级')}</label>
                     <Input id='batch-model-reasoning-custom' maxLength={32} value={reasoning.custom}
                       onChange={event => setReasoning(prev => ({ ...prev, custom: event.currentTarget.value }))} />
                   </div>
                 ) : null}
                 <p className='detail mt-1.5'>
-                  设置 / 清除会应用到选中模型的<b>全部映射</b>（默认绑定与别名 chips）；
-                  「清除」= 不给这些映射指定等级（选「不覆盖」的口径与映射弹窗一致）
+                  {t('设置 / 清除会应用到选中模型的')}<b>{t('全部映射')}</b>{t('（默认绑定与别名 chips）；「清除」= 不给这些映射指定等级（选「不覆盖」的口径与映射弹窗一致）')}
                 </p>
               </div>
             ) : null}
             {action === 'delete' ? (
               <p className='detail mt-2'>
                 {removableCount === 0
-                  ? '选中的都不是手动登记的模型，删除不可用（上游目录带回来的行由清单决定存在性）'
-                  : `可删除 ${removableCount} 个（手动登记 / 自定义家）；`
-                    + (models.length > removableCount ? `其余 ${models.length - removableCount} 个会被跳过。` : '')}
+                  ? t('选中的都不是手动登记的模型，删除不可用（上游目录带回来的行由清单决定存在性）')
+                  : t('可删除 {n} 个（手动登记 / 自定义家）；', { n: removableCount })
+                    + (models.length > removableCount
+                      ? t('其余 {n} 个会被跳过。', { n: models.length - removableCount })
+                      : '')}
               </p>
             ) : null}
           </DialogSection>
@@ -222,9 +228,9 @@ export function ModelBatchDialog({ models, onClose, onDone }: {
         </DialogBody>
         <DialogFooter>
           <div className='mr-auto' />
-          <Button variant='outline' disabled={busy} onClick={onClose}>关闭</Button>
+          <Button variant='outline' disabled={busy} onClick={onClose}>{t('关闭')}</Button>
           <Button variant={action === 'delete' ? 'destructive' : 'default'} disabled={busy} onClick={() => void run()}>
-            {busy ? '执行中…' : `执行${label}`}
+            {busy ? t('执行中…') : t('执行{action}', { action: label })}
           </Button>
         </DialogFooter>
       </DialogContent>

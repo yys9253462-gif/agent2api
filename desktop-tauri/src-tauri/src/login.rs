@@ -646,8 +646,24 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // Trae 必须显式列在这里：落进默认分支会拿到 WorkBuddy 的白名单，
         // 那张表**既没有** `trae.cn`（授权页）**也没有** `127.0.0.1`（回调），
         // 症状正是本文件上面警告的那种 —— 窗口一片空白，日志什么也看不出。
-        "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl"
-        | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae" | "kuku" => None,
+        //
+        // Antigravity 同样不设限：授权页在 `accounts.google.com`，而 Google 账号
+        // 可能继续跳不可穷举的身份链路（二次验证 / 组织 SSO 等）；更要紧的是
+        // 回调落在**网关自己的** loopback 端口
+        // （`http://localhost:{网关端口}/oauth-callback`，见
+        // `providers::antigravity::oauth`）。那条 loopback 导航一旦被白名单拦下，
+        // 症状就是上面警告过的那种静默故障：用户明明授权成功，网关却永远等不到码
+        // —— 回调本身就是一次普通 HTTP 导航，没有可供回调识别兜底的协议特征。
+        //
+        // OfficeAce 同样不设限：授权页在 `auth.huaweicloud.com`，它会按用户选的
+        // 登录方式继续跳华为云账号 / 扫码等不可穷举的主机（与 CodeArts 同一情形）。
+        // **不用回本机** —— 授权码由网关**轮询云端**取回（`/v1/claw/auth/code`，
+        // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
+        // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
+        // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
+        "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
+        | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
+        | "kuku" | "antigravity" | "officeace" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -800,7 +816,10 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 少了它前端会收到「未知的 provider」而登录按钮直接失败。
         "workbuddy-intl" => Ok("workbuddy-intl"),
         "raccoon" => Ok("raccoon"),
+        // Qoder 两个地区（2026-10 拆家后是独立 provider）：设备授权两站同构，
+        // 壳侧只透传 provider id，地区由后端按 id 反查（与 ZCode 同款）。
         "qoder" => Ok("qoder"),
+        "qoder-intl" => Ok("qoder-intl"),
         "catpaw" => Ok("catpaw"),
         "cline-free" => Ok("cline-free"),
         "cline-pass" => Ok("cline-pass"),
@@ -833,6 +852,13 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 上游把这个地址按正则逐字校验），所以窗口**必须允许**导航到本机端口，
         // 否则用户点完授权、回调请求根本发不出去（见下面 allowed_hosts 的同一条）。
         "trae" => Ok("trae"),
+        // Antigravity：授权地址由**后端适配器**本地拼（Google OAuth 授权码，
+        // 见 `providers::antigravity::oauth::build_authorize_url`），壳侧只负责
+        // 开窗口与轮询 —— 与 CodeArts 同一条路。回调落在
+        // `http://localhost:{网关端口}/oauth-callback`（网关自己登记给 Google 的
+        // redirect_uri），所以窗口**必须允许**导航到本机端口（见下面
+        // allowed_hosts 的同一条），否则用户授权成功后网关永远等不到码。
+        "antigravity" => Ok("antigravity"),
         // KukuAI（百度通行证）：授权地址由**后端适配器**拼（客户端同款登录页
         // `passApi/html/loginMerge.html`，见 `providers::kuku::login::build_login_url`），
         // 壳侧负责开窗口（短信自动流程注入脚本；网页登录入口已移除）、并在
@@ -840,6 +866,11 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // （`POST /api/session/login/kuku/complete`，见 `run_embedded` 的
         // 等待循环与 `submit_kuku_login`）。
         "kuku" => Ok("kuku"),
+        // OfficeAce（华为云果办 / OfficeClaw）：授权地址由**后端适配器**现拼
+        // （先向云端要 state，见 `providers::officeace::oauth`），壳侧只负责开窗口
+        // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
+        // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
+        "officeace" => Ok("officeace"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1062,9 +1093,10 @@ pub async fn start(
     // （`cline-free` / `cline-pass`），池已经在 provider id 里，没有第二个旋钮 ——
     // 这里再算一遍 edition 就是多余的一处状态（还会与 provider 冲突时说不清谁算数）。
     let edition_id = match provider {
-        "qoder" => {
-            if edition == "intl" || edition == "global" { "intl" } else { "cn" }
-        }
+        // Qoder 两家 provider 各自固定地区（界面上是两张卡片，没有地区下拉），
+        // 归属已经在 provider id 里 —— 与 ZCode 同款，不再读 edition 形参。
+        "qoder" => "cn",
+        "qoder-intl" => "intl",
         // ZCode 的两个地区由 **provider 本身**决定（界面上是两张卡片，
         // 没有地区下拉，因此面板不会传 `edition`）。不看 `edition` 形参的
         // 后果只是标题里的「国内版/国际版」四个字，但既然信息已经在
@@ -1128,7 +1160,9 @@ pub async fn start(
     // 其余家各自点名 —— 少写一家只会让标题显示成「登录 WorkBuddy 国内版账号」
     // 而实际打开的是别家的页面，用户第一眼就会以为是点错了按钮。
     let provider_label = match provider {
-        "qoder" => "Qoder",
+        // Qoder 两家品牌名自带地区（两张卡片、无地区下拉），标题不拼后缀
+        "qoder" => "Qoder 中国版",
+        "qoder-intl" => "Qoder 国际版",
         "cline-free" => "Cline Free",
         "cline-pass" => "Cline Pass",
         "catpaw" => "CatPaw",
@@ -1144,14 +1178,21 @@ pub async fn start(
         // Trae 只有一家（国内 SOLO 通道；国际版是另一套协议、另立 provider id），
         // 品牌名里不需要地区
         "trae" => "Trae",
+        // Antigravity（Google 的 AI IDE）只有一家，没有地区之分
+        // （本仓 `providers::antigravity` 的模块头：端点全球统一）
+        "antigravity" => "Antigravity",
+        // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
+        // 不需要地区
+        "officeace" => "OfficeAce 果办",
         _ => "WorkBuddy",
     };
-    // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae 的单一家
-    // 都已经在品牌名里，不再拼 edition 后缀（否则会出现「登录 Cline Free 国内版
-    // 账号」「登录 ZCode 国内版 国内版账号」这种说不通的标题）
+    // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
+    // 的单一家都已经在品牌名里，不再拼 edition 后缀（否则会出现「登录 Cline Free
+    // 国内版账号」这种说不通的标题）
     let title = if matches!(
         provider,
-        "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae"
+        "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
+        | "qoder-intl" | "antigravity" | "officeace"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

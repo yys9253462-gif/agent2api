@@ -39,9 +39,7 @@ use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::live_desktop_credentials;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
-use crate::server::core::account_store::store_util::{
-    max_concurrent_public, pick_token, token_tail_of, truncate_chars,
-};
+use crate::server::core::account_store::store_util::{pick_token, token_tail_of, truncate_chars};
 use crate::server::core::account_store::{CredentialWrite, MAX_TOKEN_LENGTH};
 use crate::server::core::providers::raccoon::{credentials, jwt, models};
 use crate::server::core::providers::kind_id;
@@ -294,7 +292,7 @@ impl AccountStore {
                 "✅ 小浣熊账号已保存: {record_name}（{user_id}，优先级 {priority}）"
             ),
         );
-        Ok(self.to_raccoon_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// 导入/刷新「桌面端实时登录态」账号（`importDesktop: true` 与启动导入共用）。
@@ -394,7 +392,7 @@ impl AccountStore {
                 if is_new { "已导入" } else { "已刷新" },
             ),
         );
-        Ok(self.to_raccoon_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// 小浣熊账号刷新成功后回写新 token（`raccoon::credentials` 的刷新路径调用）。
@@ -623,12 +621,6 @@ impl AccountStore {
         );
         // 与 workbuddy 的公开形态同口径：本切片所有账号都视为可用
         public.insert("available".to_string(), Value::Bool(true));
-        // 单账号并发上限（所有家通用，兜底共用 `max_concurrent_public`）：
-        // 0 = 不限，缺键同样输出 0
-        public.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(record.get("maxConcurrent"))),
-        );
         Value::Object(public)
     }
 

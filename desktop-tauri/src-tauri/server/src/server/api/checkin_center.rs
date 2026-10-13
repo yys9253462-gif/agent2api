@@ -8,11 +8,13 @@
 //! 会抄一份判定逻辑 —— 那正是「两套行为」的开头。所以这里在服务端聚合成一份，
 //! 一次请求拉全，页面打开只打这一条。
 //!
-//! 惰性查询的**上游资格类状态**（Loomy / 小浣熊的新手任务、CodeArts 福利资格、
-//! ZCode 可领套餐）**不在**这份快照里：它们每查一个账号就要打一次上游，
-//! 聚合快照必须保持「打开页面零上游请求」。快照只给账号入口清单，前端拿到
-//! 清单后按需调既有的查询接口（/onboarding、/codearts-welfare/preview、
-//! /zcode-claim/preview）—— 那三条接口原样复用，一条不改。
+//! 惰性查询的**上游资格类状态**（Loomy / 小浣熊的新手任务、ZCode 可领套餐）
+//! **不在**这份快照里：它们每查一个账号就要打一次上游，聚合快照必须保持
+//! 「打开页面零上游请求」。快照只给账号入口清单，前端拿到清单后按需调既有的
+//! 查询接口（/onboarding、/zcode-claim/preview）—— 那两条接口原样复用，一条不改。
+//! （CodeArts 的 `/codearts-welfare/preview` 不再出现在本页：它的每日福利
+//! 2026-10 起已并入每日签到链，走 `/api/accounts/checkin` 那一套，见
+//! `core::billing::checkin` 的 codearts 分支。）
 //!
 //! ── 分组口径与批量签到完全一致 ─────────────────────────────
 //! 进「每日签到」分组的账号 = 提供商 ∈ `CHECKIN_PROVIDERS` **且**
@@ -33,8 +35,7 @@
 //!   },
 //!   "extras": {
 //!     "onboarding": [ { "id", "name", "provider" } ],
-//!     "welfare":    [ { "id", "name", "provider" } ],
-//!     "plans":      [ { "id", "name", "provider", "claimAt" } ]
+//!     "plans":      [ { "id", "name", "provider", "claimAt", "claimPlans" } ]
 //!   },
 //!   "auto": { …与 GET /api/auto-checkin 同形… },
 //!   "history": [ { "at", "date", "reason", "succeeded", "total", "skipped",
@@ -47,27 +48,24 @@ use std::collections::BTreeMap;
 
 use axum::extract::State;
 use axum::response::Response;
-use chrono::DateTime;
 use serde_json::{json, Value};
 
 use crate::server::core::auto_checkin::{self, CHECKIN_PROVIDERS};
+use crate::server::core::beijing;
 use crate::server::core::billing::checkin;
 use crate::server::core::checkin_history;
 use crate::server::http::ok_json;
 use crate::server::ServerState;
 
-/// `checkedInToday` 的判定：`checkinAt`（ms）落在今天（本地时区）。
+/// `checkedInToday` 的判定：`checkinAt`（ms）落在今天（**北京时间**，
+/// 上游自然日口径 —— 见 `core::beijing`；跟机器时区走会让海外部署下
+/// 的「今日已签到」错位，issue #138）。
 /// 时间戳缺失 / 非法都算「今天没签」—— 与账号页「checkinAt 落在今天即算签过」
 /// 的口径一致（见 store_admin::mark_checkin 的说明）。
 fn checked_in_today(checkin_at: Option<i64>) -> bool {
-    let Some(ms) = checkin_at else {
-        return false;
-    };
-    let Some(at) = DateTime::from_timestamp_millis(ms) else {
-        return false;
-    };
-    auto_checkin::local_date_key(at.with_timezone(&chrono::Local))
-        == auto_checkin::local_date_key(chrono::Local::now())
+    checkin_at
+        .and_then(beijing::date_key_of_ms)
+        .is_some_and(|key| key == beijing::today_key())
 }
 
 /// 账号快照里的字段（缺失按空值兜底，与 billing::checkin 的读取口径一致）
@@ -82,10 +80,12 @@ fn account_text(account: &Value, key: &str) -> String {
 /// outOfScope 的原因文案（按 `supports_checkin` 的排除分支逐一对应）：
 /// 判据改了这里要跟着改 —— 两处写的都是「这个账号为什么不能签到」。
 fn out_of_scope_reason(account: &Value) -> &'static str {
+    let provider = account_text(account, "provider");
+    // WorkBuddy / Qoder 两个地区的国际版都在 `supports_checkin` 里显式放行
+    //（前者走日活链、后者带风控领积分），还落在范围外的 intl 只可能是 Accio。
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return "国际版账号没有签到活动";
     }
-    let provider = account_text(account, "provider");
     if crate::server::core::account_store::is_accio_family(&provider) {
         return "未接入签到链路";
     }
@@ -172,38 +172,49 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         .collect();
 
     // ── 一次性 / 手动项的账号入口清单（资格状态由前端惰性查询）──
-    // 各家的账号行都是 {id, name, provider}；provider 供界面选图标与文案
-    // （新手任务分组里 Loomy 与小浣熊共用一张卡）。ZCode 额外带公开的
-    // `claimAt`（上次领取时间，与 checkinAt 同一处置：给原始时间戳，
-    // 不给布尔，见 zcode_accounts 的说明）。
-    let extra_rows = |provider: &str, with_claim_at: bool| -> Vec<Value> {
+    // 各家的账号行都是 {id, name, provider, settled}；provider 供界面选图标与文案
+    // （新手任务分组里 Loomy、小浣熊与 CodeArts 共用一张卡）。
+    //
+    // `settled` 是**一次性福利的结算记忆**（已结清才非空，形状三家一致，
+    // 见 `core::providers::onboarding_memory`）：与下面 CodeArts 行的 `welfare`
+    // 台账同一先例 —— 本地事实、零上游请求，界面据此直接渲染「已领取」并在
+    // 进页面 / 签到后跳过自动查询，不必为一条早就领完的福利反复问上游。
+    let onboarding_rows_of = |provider: &str| -> Vec<Value> {
         accounts
             .iter()
             .filter(|account| account_text(account, "provider") == provider)
             .map(|account| {
-                let mut row = json!({
-                    "id": account_text(account, "id"),
+                let id = account_text(account, "id");
+                json!({
+                    "id": id,
                     "name": Value::from(account_text(account, "name")),
                     "provider": provider,
-                });
-                if with_claim_at {
-                    if let Some(map) = row.as_object_mut() {
-                        map.insert(
-                            "claimAt".to_string(),
-                            account.get("claimAt").cloned().unwrap_or(Value::Null),
-                        );
-                    }
-                }
-                row
+                    "settled": super::onboarding::settled_view(state.store(), &id, provider)
+                        .unwrap_or(Value::Null),
+                })
             })
             .collect()
     };
-    // 新手任务分组：Loomy（任务表）+ 小浣熊（首次桌面登录奖励，见
-    // `providers::raccoon::onboarding`），执行体按 provider 分派
-    // （api::onboarding）。
-    let mut onboarding_rows = extra_rows("loomy", false);
-    onboarding_rows.extend(extra_rows("raccoon", false));
-    let welfare_rows = extra_rows("codearts", false);
+    // 新手任务分组：Loomy（任务表）+ 小浣熊（首次桌面登录奖励）+ CodeArts
+    // （运营活动里的新人注册礼那一条），执行体按 provider 分派（api::onboarding）。
+    // CodeArts 的账号在这里出现的是**一次性**那部分（新人注册礼）；它的**每日**
+    // 福利已并入每日签到链（上面 `daily` 段里就是一组普通分组）—— 同一家的两类
+    // 奖励分别归属「每日签到」与「新手福利」两块，互不重复。
+    // 签到中心「签到后自动补领」会替用户领这一条一次性新人礼 —— 领过之后上游
+    // 不再回 claimable，而结算记忆一落，这条自动路径连查询都不再发
+    // （见 codearts::onboarding）。
+    let mut onboarding_rows = onboarding_rows_of("loomy");
+    onboarding_rows.extend(onboarding_rows_of("raccoon"));
+    onboarding_rows.extend(onboarding_rows_of("codearts"));
+    // OfficeAce 的「新手任务」与每日签到是同一个上游动作（见 officeace::onboarding），
+    // 所以它也在这张分组表里 —— 前端按 server 给的 extras.onboarding 驱动，不硬编码家。
+    onboarding_rows.extend(onboarding_rows_of("officeace"));
+    // ZCode 的福利行带**本地领取台账**（`account.claimPlans`）—— 后端落盘的本地
+    // 事实，带出来零上游请求，不违反「快照零上游」；界面的「今天领过哪几份」按它
+    // 逐份比对（北京时间的日界判定在前端，不在后端再抄一份）。
+    // （CodeArts 曾也有一条同样的 welfare 行，2026-10 它的每日福利并入每日签到后
+    // 撤掉了：那一组在 `daily` 里已经是普通分组，「活动福利」再列一遍就是同一个
+    // 账号两处入口。一块 UI 只留一个入口，领与看都 unambiguous。）
     let plan_rows: Vec<Value> = accounts
         .iter()
         .filter(|account| {
@@ -232,7 +243,6 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         },
         "extras": {
             "onboarding": onboarding_rows,
-            "welfare": welfare_rows,
             "plans": plan_rows,
         },
         "auto": state.auto_checkin().state(),

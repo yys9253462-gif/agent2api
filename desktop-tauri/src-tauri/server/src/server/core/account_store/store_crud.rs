@@ -37,7 +37,8 @@
 use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::priority::{
-    next_free_priority, normalize_priority, renumber_consecutively, DEFAULT_PRIORITY,
+    grouped_queue_order, next_free_priority, normalize_priority, renumber_consecutively,
+    QueueEntry, DEFAULT_PRIORITY,
 };
 use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
@@ -48,6 +49,7 @@ use crate::server::core::account_store::store_util::{
 };
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
+use crate::server::core::limiter;
 use crate::server::core::providers::DEFAULT_PROVIDER_ID;
 use crate::server::core::proxies::describe_account_proxy;
 use crate::server::logging;
@@ -454,16 +456,63 @@ impl AccountStore {
             return Err(AccountStoreError::not_found("账号不存在"));
         }
 
-        let mut ordered = state.accounts.clone();
-        ordered.sort_by_key(StoredAccount::order_key);
+        // ── 「首选」在分组模式下的含义（2026-10 账号页分组化）──────────
+        // 组顺位是主键：别的家的组排在前头时，本家账号再怎么调号也当不上第一名。
+        // 所以置顶落成两步：**目标提到本组最前 + 本组整体提到最前** —— 这样它确实
+        // 是全局队列第一个被尝试的账号，界面上的「第 1 顺位」也与事实一致。
+        // 顺序从 `grouped_queue_order` 出发（而不是直接按优先级排），于是同家的
+        // 账号在队列里继续连续，这条不变量不会被一次「设为首选」打破。
+        let target_provider = state
+            .accounts
+            .iter()
+            .find(|item| item.id() == id)
+            .map(StoredAccount::provider)
+            .unwrap_or_default();
+        let providers: Vec<String> = state.accounts.iter().map(StoredAccount::provider).collect();
+        let entries: Vec<QueueEntry<'_>> = state
+            .accounts
+            .iter()
+            .enumerate()
+            .map(|(index, record)| QueueEntry {
+                id: record.id(),
+                provider: &providers[index],
+                priority: record.priority(),
+                added_at: record.added_at(),
+            })
+            .collect();
+        let current_order = grouped_queue_order(&entries);
+        let mut mine: Vec<String> = Vec::new();
+        let mut others: Vec<String> = Vec::new();
+        for item_id in current_order.iter() {
+            let same_provider = state
+                .accounts
+                .iter()
+                .find(|item| item.id() == item_id.as_str())
+                .map(|item| item.provider() == target_provider)
+                .unwrap_or(false);
+            if same_provider {
+                mine.push(item_id.clone());
+            } else {
+                others.push(item_id.clone());
+            }
+        }
+        mine.retain(|item_id| item_id != id);
+        mine.insert(0, id.to_string());
+        let next_order: Vec<String> = mine.into_iter().chain(others).collect();
         let mut changes: Vec<String> = Vec::new();
 
-        let position = ordered.iter().position(|item| item.id() == id).unwrap_or(0);
-        if position > 0 {
-            let record = ordered.remove(position);
-            ordered.insert(0, record);
-            // 整队重新连续编号（而非只改目标账号）：优先级唯一的前提下，
-            // 把目标插到队首后必须把其余账号整体让位，否则会撞号
+        if next_order != current_order {
+            // 按新顺序排记录再整队连续编号（组内第一 + 本组第一，见上）
+            let mut ordered: Vec<StoredAccount> = next_order
+                .iter()
+                .filter_map(|item_id| {
+                    state
+                        .accounts
+                        .iter()
+                        .find(|item| item.id() == item_id.as_str())
+                        .cloned()
+                })
+                .collect();
             let mut numbering: Vec<(String, String, i64)> = ordered
                 .iter()
                 .map(|item| (item.id().to_string(), item.name(), item.priority()))
@@ -476,15 +525,19 @@ impl AccountStore {
                 }
             }
             changes.push(format!(
-                "优先级 → {}（置顶）",
+                "优先级 → {}（本组置顶 + 本组排到最前）",
                 ordered.first().map(StoredAccount::priority).unwrap_or(DEFAULT_PRIORITY)
             ));
+            if let Some(record) = ordered.iter_mut().find(|item| item.id() == id) {
+                record.set_updated_at(logging::now_ms());
+            }
+            state.accounts = ordered;
         }
         if changes.is_empty() {
             return Ok(json!({
                 "id": id,
                 "changed": false,
-                "reason": "已在全局队列第一位",
+                "reason": "已在队列第一位",
                 "currentAccountId": Self::pick_current(&state.accounts)
                     .map(|record| Value::String(record.id().to_string()))
                     .unwrap_or(Value::Null),
@@ -492,19 +545,16 @@ impl AccountStore {
             }));
         }
 
-        let display_name = ordered
+        let display_name = state
+            .accounts
             .iter()
             .find(|item| item.id() == id)
             .map(StoredAccount::name)
             .unwrap_or_default();
-        // 按优先级序交给保存层：`save_state` 只对 data 真的变了的行发 UPDATE，
-        // 于是「不重写没变的账号」这条收益在这里同样成立。
-        // 物理行序（列表顺序）**不动** —— 界面与选路都自己按优先级排，
-        // 没有消费方观察数组顺序（推演见 `sql.rs` 模块头「顺序」一节）。
-        state.accounts = ordered;
-        if let Some(record) = state.accounts.iter_mut().find(|item| item.id() == id) {
-            record.set_updated_at(logging::now_ms());
-        }
+        // 数组已按新顺序排好、号码也已写进记录（见上面那一支），交给保存层：
+        // `save_state` 只对 data 真的变了的行发 UPDATE，于是「不重写没变的账号」
+        // 这条收益在这里同样成立。物理行序（列表顺序）**不动** —— 界面与选路都
+        // 自己按优先级排，没有消费方观察数组顺序（推演见 `sql.rs` 模块头「顺序」一节）。
         self.save(&state, &_guard)?;
         let current_id = Self::pick_current(&state.accounts).map(|record| record.id().to_string());
         logging::log(
@@ -727,6 +777,10 @@ impl AccountStore {
             // 缺省档按 provider 区分（Cline 免费池不处理，其余跳过阈值 1，
             // 见 usage_records::default_low_balance_mode），比较基准同源 ——
             // 对着缺省值保存不会凭空多一条变更日志、不会物化进记录。
+            //
+            // 限制器上线后这只是**兼容入口**（旧版前端 / 手工 API 调用还在用）：
+            // 新界面只发 `limiters`；同一请求里两个键都出现时，下面 limiters
+            // 块会按规则列表重写 lowBalance（限制器是源真值，见那里的说明）。
             let provider = record.provider();
             let next = Self::normalize_low_balance(value, &provider)?;
             let current = Self::normalize_low_balance_lenient(record.get("lowBalance"), &provider);
@@ -736,7 +790,44 @@ impl AccountStore {
             }
         }
 
+        if let Some(value) = patch.get("limiters") {
+            // 每账号的「限制器」（余额 / Token 规则列表，源真值）：界面每次保存
+            // 都整块发回，与 usageQuery 同一形态。写入侧归一化校验（校验即权威），
+            // 比较基准 = 有效规则（记录上没有 limiters 键时由旧 lowBalance /
+            // provider 缺省推导）—— 对着现状保存不会凭空多一条变更日志。
+            //
+            // ── 顺手同步 lowBalance（降级兼容）───────────────────
+            // 首条余额规则回写成旧的 {mode, threshold}，没有余额规则就写 off：
+            // 用户降级回旧版本时余额限制不丢（Token 规则旧版不认识，忽略即可，
+            // 多条余额规则只保首条 —— 旧形状本来就表达不了第二条）。
+            let next_rules = limiter::normalize_rules(value, record.fields())
+                .map_err(AccountStoreError::bad_request)?;
+            let next = limiter::rules_to_json(&next_rules);
+            let current = limiter::effective_rules_json_in(record.fields());
+            if next != current {
+                record.set("limiters", next);
+                changes.push(limiter::describe_rules(&next_rules));
+                record.set("lowBalance", Self::legacy_low_balance_of(&next_rules));
+            }
+        }
+
         Ok(changes)
+    }
+
+    /// 规则列表 → 旧 `lowBalance` 形状（降级兼容的同步目标）：首条余额规则的
+    /// (action, threshold)，没有余额规则 = off（阈值归零，与旧 off 形态一致）。
+    fn legacy_low_balance_of(rules: &[limiter::LimiterRule]) -> Value {
+        let Some(rule) = rules
+            .iter()
+            .find(|rule| rule.kind == limiter::LimiterKind::Balance)
+        else {
+            return json!({ "mode": "off", "threshold": 0.0 });
+        };
+        let mode = match rule.action {
+            limiter::LimiterAction::Skip => "skip",
+            limiter::LimiterAction::Disable => "disable",
+        };
+        json!({ "mode": mode, "threshold": rule.threshold })
     }
 
     /// `usageQuery` 的写入侧归一化（校验即权威：读侧只做容错展开，见 store_view）。

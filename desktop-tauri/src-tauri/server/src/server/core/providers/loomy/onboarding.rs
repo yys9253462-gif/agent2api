@@ -139,17 +139,59 @@ fn earned_of(done: &[bool]) -> i64 {
         .sum()
 }
 
-/// 查询任务状态（`GET /api/accounts/{id}/onboarding` 的执行体，只读）。
-pub async fn get_tasks(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
+/// 记忆里的结算快照（没有 / 读不懂 → None）。语义见
+/// `providers::onboarding_memory`。
+fn settled_snapshot(store: &AccountStore, account_id: &str) -> Option<Value> {
+    crate::server::core::providers::onboarding_memory::snapshot(
+        store.loomy_account_record(account_id).as_ref(),
+    )
+}
+
+/// 签到时中心快照用：已结算就给一份可渲染的记忆（零上游），否则 None。
+pub fn settled_view(record: Option<&Value>) -> Option<Value> {
+    crate::server::core::providers::onboarding_memory::snapshot(record)
+}
+
+/// 查询任务状态（`GET /api/accounts/{id}/onboarding` 的执行体）。
+///
+/// ── 一次性福利的记忆（`refresh = false` 时）───────────────────
+/// 这 8 条是**一次性**的：全部领完就永远是这个结论。记忆里已结算就直接回答，
+/// **零上游请求** —— 进签到中心、每次签到后的自动补领都不该为一笔早就结清的
+/// 福利反复查上游。手动「查询任务」按钮走 `?refresh=1` 强制实查（新事实会覆盖
+/// 或清除记忆）。详见 `providers::onboarding_memory`。
+pub async fn get_tasks(
+    store: &AccountStore,
+    account_id: &str,
+    refresh: bool,
+) -> Result<Value, GatewayError> {
+    let previous = settled_snapshot(store, account_id);
+    if !refresh {
+        if let Some(snapshot) = previous.as_ref() {
+            return Ok(crate::server::core::providers::onboarding_memory::serve(snapshot));
+        }
+    }
     let credentials = load_credentials(store, account_id)?;
     let done = fetch_done(&credentials).await?;
     let unclaimed = done.iter().filter(|done| !**done).count();
-    Ok(json!({
+    let mut payload = json!({
         "tasks": task_rows(&done),
         "earned": earned_of(&done),
         "total": TOTAL_POINTS,
         "unclaimed": unclaimed,
-    }))
+        // 8 条全完成 ⇒ 一次性福利到此为止（界面据此不再重复查询）。与 CodeArts /
+        // 小浣熊同名字段，记忆路径上恒为 true（见 `onboarding_memory::serve`）。
+        "settled": unclaimed == 0,
+    });
+    // 8 条全完成 ⇒ 结清，落记忆；没结清则清掉旧记忆（`remember` 自己按 settled
+    // 决定），并把结算时刻补回响应（与记忆路径的 `settledAt` 同义）。
+    crate::server::core::providers::onboarding_memory::remember(
+        store,
+        account_id,
+        "Loomy",
+        &mut payload,
+        previous.as_ref(),
+    );
+    Ok(payload)
 }
 
 /// 上报一个 key。成功返回「是否此前已完成」（上游幂等标记）。
@@ -176,7 +218,14 @@ async fn claim_one(credentials: &LoomyCredentials, key: &str) -> Result<bool, Ga
 /// 打同一个上游没有收益，还容易撞风控）；某 key 失败不中断其余（逐行带原因返回），
 /// 但**登录失效例外**：后面每个 key 都会以同样方式失败，立即整体 401。
 /// 已完成的 key 不发请求，所以这条命令天然幂等，重复点不会重复加分。
+///
+/// ── 结算过就直接回答（零上游）───────────────────────────────
+/// 一次性福利没有再领一次的可能，记忆里已结算 ⇒ 连「查完成表」那一次只读都省掉。
+/// 要实查请走状态查询的 `?refresh=1`（它会同步记忆）。
 pub async fn claim_all(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
+    if let Some(snapshot) = settled_snapshot(store, account_id) {
+        return Ok(settled_claim_response(&snapshot));
+    }
     let credentials = load_credentials(store, account_id)?;
     let before = fetch_done(&credentials).await?;
 
@@ -228,7 +277,8 @@ pub async fn claim_all(store: &AccountStore, account_id: &str) -> Result<Value, 
         }
     }
 
-    Ok(json!({
+    let unclaimed = after.iter().filter(|done| !**done).count();
+    let mut payload = json!({
         "results": rows,
         "claimed": claimed,
         "failed": failed,
@@ -236,6 +286,30 @@ pub async fn claim_all(store: &AccountStore, account_id: &str) -> Result<Value, 
         "tasks": task_rows(&after),
         "earned": earned_of(&after),
         "total": TOTAL_POINTS,
-        "unclaimed": after.iter().filter(|done| !**done).count(),
-    }))
+        "unclaimed": unclaimed,
+        "settled": unclaimed == 0,
+    });
+    // 这一轮把 8 条扫完了（领成功或上游报「早已完成」都算）⇒ 落记忆。没扫完
+    // 说明还有没领到的，`remember` 会按 settled 把旧记忆清掉。`previous` 传 None
+    // 是确定的：上面已有记忆就短路返回了，走到这里必然还没有快照。
+    crate::server::core::providers::onboarding_memory::remember(
+        store,
+        account_id,
+        "Loomy",
+        &mut payload,
+        None,
+    );
+    Ok(payload)
+}
+
+/// 记忆命中时领取接口的回答：这次**一次上游都没打**，因此没有一条 results。
+fn settled_claim_response(snapshot: &Value) -> Value {
+    let mut payload = crate::server::core::providers::onboarding_memory::serve(snapshot);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("results".to_string(), json!([]));
+        object.insert("claimed".to_string(), json!(0));
+        object.insert("failed".to_string(), json!(0));
+        object.insert("claimedPoints".to_string(), json!(0));
+    }
+    payload
 }

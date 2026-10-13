@@ -108,6 +108,10 @@ pub(super) struct ProviderContext<'a> {
     /// 读同一份，语义不会中途漂移。收窄的语义见
     /// [`super::ForwardRequest::pinned_account`] 与 `rotate::accounts_in_providers`。
     pub pinned_account: Option<&'a str>,
+    /// 跳过按模型路由的启停门禁（模型测试的「未启用也能测」；语义与取舍见
+    /// [`super::ForwardRequest::ignore_model_gate`]）。候选链改从 `key_scope`
+    /// 白名单取 —— 它是唯一的候选来源，两处读的是同一份事实。
+    pub ignore_model_gate: bool,
 }
 
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用），

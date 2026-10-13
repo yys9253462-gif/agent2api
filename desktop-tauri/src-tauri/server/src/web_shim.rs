@@ -650,6 +650,25 @@ pub fn shim_js() -> &'static str {
         captchaRegion: captchaRegion ? String(captchaRegion) : '',
       });
     },
+    // ── ZCode 活动套餐通道的验证码令牌池（见 api/zcode_captcha.rs）──────
+    // 与上面三条**不是一回事**：那三条服务「领套餐」（用户动作）；这两条服务
+    // **转发** —— 活动套餐的推理端点每条请求都要一个当次铸的令牌，令牌只能由
+    // 界面静默铸造后推进池子（唯一调用方 ui/zcode-captcha-pool.js）。
+    //
+    // ★ 这两条**必须**在这里给 web 端实现，理由就是本模块存在的理由：铸造器
+    // 只认 `window.workbuddyDesktop`，桌面端由 bridge.rs 注入、headless 由这里
+    // 注入。早先只给了桌面端，于是 headless（Docker / 浏览器面板）下铸造器
+    // 每轮都读到「没有这个方法」→ 安静退让 → 池子永远是空的，活动套餐通道
+    // 整条不可用（Issue #163）。铸造本身仍发生在**浏览器**里（阿里云 SDK 跑在
+    // 页面上），所以 headless 只要有人开着面板页就能维持池子 —— 与桌面端一致。
+    zcodeCaptchaStats: function () {
+      return call('GET', '/api/zcode/captcha');
+    },
+    pushZcodeCaptchaTokens: function (tokens) {
+      return call('POST', '/api/zcode/captcha', {
+        tokens: Array.isArray(tokens) ? tokens : [],
+      });
+    },
     onLoginState: function (callback) {
       loginListeners.add(callback);
       return function () { loginListeners.delete(callback); };
@@ -729,6 +748,13 @@ pub fn shim_js() -> &'static str {
       return call('POST', '/api/accounts/batch', body);
     },
 
+    // ── 账号路由（与 bridge.rs 的同名方法成对，缺一边会报「桥接方法缺失」）──
+    getRoutingConfig: function () { return call('GET', '/api/routing'); },
+    setRoutingConfig: function (patch) { return call('PUT', '/api/routing', patch || {}); },
+    getRoutingQueue: function (model) {
+      return call('GET', '/api/routing/queue' + (model ? '?model=' + encodeURIComponent(model) : ''));
+    },
+
     // ── 出网代理 ──
     getProxies: function () { return call('GET', '/api/proxies'); },
     testProxy: function (payload) {
@@ -762,8 +788,11 @@ pub fn shim_js() -> &'static str {
     // ── Loomy 新手任务（查询 / 一键领取）──
     // 与桌面 `bridge.rs` 的同名方法成对维护：签到后界面查询任务状态、有未领取才
     // 弹窗领取（accounts-dialog-onboarding）。
-    getOnboardingTasks: function (id) {
-      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding');
+    // `refresh` = 界面手点「查询任务」→ `?refresh=1` 强制实查上游；不带则吃后端
+    // 的结算记忆（一次性福利领完就不再问上游，见 api::onboarding 的模块说明）。
+    getOnboardingTasks: function (id, refresh) {
+      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding'
+        + (refresh ? '?refresh=1' : ''));
     },
     claimOnboardingTasks: function (id) {
       return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding/claim', {});
@@ -815,6 +844,15 @@ pub fn shim_js() -> &'static str {
     getAutoCheckin: function () { return call('GET', '/api/auto-checkin'); },
     saveAutoCheckin: function (patch) { return call('POST', '/api/auto-checkin', patch); },
     runAutoCheckinNow: function () { return call('POST', '/api/auto-checkin/run', {}); },
+    // 定时签到的**条目**（与 bridge.rs 的同名方法成对维护）
+    getCheckinSchedules: function () { return call('GET', '/api/checkin-schedules'); },
+    saveCheckinSchedule: function (patch) { return call('POST', '/api/checkin-schedules', patch); },
+    deleteCheckinSchedule: function (id) {
+      return call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/delete', {});
+    },
+    runCheckinSchedule: function (id) {
+      return call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/run', {});
+    },
     // WorkBuddy 国际版日活保活的模型链（与 bridge.rs 的同名方法成对维护）
     getCheckinKeepalive: function () { return call('GET', '/api/checkin-keepalive'); },
     saveCheckinKeepalive: function (models) { return call('POST', '/api/checkin-keepalive', { models: models }); },
@@ -822,6 +860,25 @@ pub fn shim_js() -> &'static str {
     runCheckinActivity: function (id, mode) { return call('POST', '/api/checkin-activity', { id: id, mode: mode }); },
     // 签到中心的聚合快照（与 bridge.rs 的同名方法同一路径）
     getCheckinCenter: function () { return call('GET', '/api/checkin-center'); },
+    // 签到记录明细台账（查询 / 清空；参数对象里空值不带，与 bridge.rs 成对）
+    getCheckinRecords: function (params) {
+      const query = new URLSearchParams();
+      for (const key of Object.keys(params || {})) {
+        const value = params[key];
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('GET', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
+    clearCheckinRecords: function (params) {
+      const query = new URLSearchParams();
+      for (const key of Object.keys(params || {})) {
+        const value = params[key];
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('DELETE', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
 
     // ── 间隔型定时任务 ──
     getScheduledTasks: function () { return call('GET', '/api/scheduled-tasks'); },
@@ -911,6 +968,13 @@ pub fn shim_js() -> &'static str {
     getStatsRequestRaw: function (id) {
       return call('GET', '/api/stats/requests/raw' + toQuery({ id: id }));
     },
+    // 掐掉一条在途请求（请求日志的「终止」与模型测试弹窗共用；桌面壳的
+    // invoke 没有 abort，这是前端唯一能中止在途请求的手段）。
+    // ★ 与上面两条 ZCode 令牌池同一类补齐：桌面端有这个桥接方法、web 端漏了，
+    // 而调用点是 `?.` 可选调用 —— 漏了不会报错，只会「点了没反应」。
+    terminateStatsRequest: function (id) {
+      return call('POST', '/api/stats/requests/terminate' + toQuery({ id: id }));
+    },
     // 清理弹窗的预览统计（与 DELETE 共用同一份筛选解析，预览与执行必须同源）
     getStatsClearPreview: function (query) {
       return call('GET', '/api/stats/requests/clear-preview' + toQuery(query));
@@ -949,6 +1013,9 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+    // ── 验证码令牌池（ZCode 活动套餐通道的补货节奏）──
+    getCaptchaPool: function () { return call('GET', '/api/zcode/captcha-pool'); },
+    saveCaptchaPool: function (patch) { return call('PUT', '/api/zcode/captcha-pool', patch); },
 
     // ── 调试模式 ──
     getDebug: function () { return call('GET', '/api/debug'); },

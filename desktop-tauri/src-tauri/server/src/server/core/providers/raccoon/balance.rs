@@ -40,6 +40,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth_http::send_raw;
+use crate::server::core::beijing;
 use crate::server::errors::GatewayError;
 
 use super::credentials;
@@ -371,8 +372,11 @@ pub async fn claim_daily_grant(
         Err(error) => json!({ "popups": Value::Null, "toast": Value::Null, "error": error.message }),
     };
 
-    // ② 账单核对今日入账（慢接口独立超时；失败降级为 grantsError）
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // ② 账单核对今日入账（慢接口独立超时；失败降级为 grantsError）。
+    // 「今天」按**北京时间**（上游自然日即 UTC+8 零点，见 `core::beijing`），
+    // 不跟机器时区：海外 / 容器部署下跟本地时区走会把 16 小时的账单认成昨天，
+    // 让「今日积分 +N」与「今天已领过」的判定整体错位（issue #138）。
+    let today = beijing::today_key();
     let bills_path = format!(
         "/api/web/points/v1/bills?paging.limit={GRANT_CHECK_LIMIT}&paging.offset=0"
     );

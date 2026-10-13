@@ -24,12 +24,21 @@
 //!     判定，低于阈值就把账号 `enabled` 置 false —— 不自动恢复，需手动启用；
 //!     自动查询**继续**跑（禁用只表示不参与转发，余额保持新鲜供用户判断）。
 //! 判定口径与余额列同一数字（`usage_records::extract_remaining`）。
+//!
+//! ── 限制器（余额 / Token 规则列表）与 Token 周期消耗 ─────────
+//! 「余额不足处理」已升级为每账号的**限制器规则列表**（`core::limiter`，
+//! 账号记录的 `limiters` 键）：余额规则沿用上面两档的语义与判定（判定函数
+//! 已改读有效规则），Token 规则另带重置周期。Token 侧的心跳职责在本循环：
+//! 每轮先**全量刷新窗口事实**（`limiter::refresh_token_facts`，窗口对齐自然
+//! 时间，翻页即归零），再做 **Token 自动禁用判定**（`enforce_token_disable`，
+//! disable 档命中即禁用、不自动恢复）；skip 档由选路过滤读同一份事实表拦截。
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::limiter;
 use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::usage_records;
 
@@ -350,6 +359,59 @@ fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Valu
     }
 }
 
+// ─── Token 限制器的自动禁用钩子 ──────────────────────────────
+
+/// 「Token 限额自动禁用」钩子：sweeper 每轮（10 秒）在窗口事实刷新后判定。
+///
+/// 命中条件（三条全要）：
+///   1. 账号启用中（幂等：已禁用的账号不再执行、不再重复打日志）；
+///   2. 配了启用的 Token **disable** 规则（skip 档不归它管 —— 选路过滤在拦）；
+///   3. 当前窗口消耗 ≥ 阈值（事实表由上一行 `refresh_token_facts` 刚刷新过，
+///      请求收尾还有增量记账兜着，读数最多旧 10 秒 —— 对硬动作足够）。
+///
+/// 禁用走 `update_account` 既有写路径（与手动禁用同一入口，「已禁用」的变更
+/// 日志照常出现），再补一条说明原因的日志。**不自动恢复**：窗口重置也保持
+/// 禁用，需手动启用 —— 与余额禁用档同一语义（原型评审定的口径）。
+fn enforce_token_disable(store: &AccountStore, accounts: &[Value], now: i64) {
+    let facts = limiter::token_facts();
+    for account in accounts {
+        if matches!(account.get("enabled"), Some(Value::Bool(false))) {
+            continue;
+        }
+        let Some(id) = account.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((rule, used)) = limiter::token_disable_hit(account, &facts, now) else {
+            continue;
+        };
+        let display = account
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(id);
+        match store.update_account(id, &json!({ "enabled": false })) {
+            Ok(_) => logging::log_with_level(
+                "[Usage]",
+                &format!(
+                    "账号「{display}」{}消耗 {} Token 达到上限 {}，已自动禁用（重置也不恢复，请手动启用）",
+                    if rule.reset == limiter::LimiterReset::Daily {
+                        "今日".to_string()
+                    } else {
+                        format!("{}内", limiter::describe_period(rule.period))
+                    },
+                    used,
+                    rule.threshold,
+                ),
+                "warn",
+            ),
+            Err(error) => logging::verbose(
+                "[Usage]",
+                &format!("账号 {id} Token 限额自动禁用失败：{}", error.message),
+            ),
+        }
+    }
+}
+
 // ─── 每账号自动查询的心跳调度 ────────────────────────────────
 
 /// 心跳判定间隔：10 秒（与 `scheduled_tasks` 的 tick 同一量级）。
@@ -376,9 +438,29 @@ pub fn spawn_sweeper(store: AccountStore) {
 /// 批量查询排除 `supports_usage == false` 的家（避免一整片 501，与手动批量
 /// 同口径）；没凭证的账号**不排除**：那是本地就能给出的失败结论，写进记录
 /// 让界面如实显示「没有可用凭证」，与手动批量同一行为。
+///
+/// ── Token 限制器的两件事也在这一轮做（先于「没有到期账号」的早退）──
+///   ① **全量刷新窗口事实**（`limiter::refresh_token_facts`）：按启用中的全部
+///      Token 周期把当前窗口的每账号消耗重算一遍 —— 窗口翻页后的旧读数由此
+///      归零，新配的规则由此进表；10 秒一轮，走 schema v9 的聚合索引。
+///   ② **Token 自动禁用判定**（`enforce_token_disable`）：disable 档命中
+///      （当前窗口消耗 ≥ 阈值）就把账号禁用 —— 与余额禁用同一条硬动作语义。
 async fn sweep_due(store: &AccountStore) {
     usage_records::prune_orphans();
     let now = logging::now_ms();
+    // 全量账号快照（不看启用 / 可用）：Token 事实表要覆盖所有配了规则的账号，
+    // 包括禁用的 —— 用户重新启用时读数已经在，不用等下一轮刷新才生效
+    let all_accounts: Vec<Value> = store
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let kinds = limiter::enabled_token_kinds(&all_accounts);
+    if !kinds.is_empty() {
+        limiter::refresh_token_facts(&kinds);
+        enforce_token_disable(store, &all_accounts, now);
+    }
     let due: Vec<(Value, i64)> = match resolve_batch_targets(store, None, None) {
         Ok((targets, _skipped)) => targets,
         Err(_) => return, // 目标集合解析失败（库不可用等）：这一轮什么都不做
@@ -422,6 +504,13 @@ async fn sweep_due(store: &AccountStore) {
 /// `at`（这一行的结论时刻）：按账号到期的写法下各行时刻天然不同，失败行的
 /// 时效判定必须按行算，不能再拿一个整轮的 `at` 盖所有人（前端 `applyBalances`
 /// 因此优先取行级 `at`）。
+///
+/// ── Token 限制器读数（`tokenAt` / `tokenUsage`）──────────────
+/// 余额读数只在查询到期时变化，`at` 不动就说明整份快照没新东西；Token 周期
+/// 消耗随每条请求变化，所以另带自己的时刻 `tokenAt`（恒为本次计算时刻，前端
+/// 按它判断要不要应用），与余额的 `at` 各走各的。`tokenUsage` 按账号给启用中
+/// 的每个 Token 周期一项 `{period, windowStart, used}`（内存事实表投影，零
+/// SQL；事实由心跳 10 秒刷新 + 请求收尾增量记账兜着）。
 ///
 /// 出口过滤的两条（与旧 kv 快照的 `prune_stale_failures` 同语义）：
 ///   - 账号已删除的行不端出（界面上没有那一行，留着只会对不上）；
@@ -471,6 +560,26 @@ pub fn snapshot(store: &AccountStore) -> Value {
             }
         }
     }
-    json!({ "at": at, "results": rows, "skipped": 0 })
+    // Token 限制器读数：按账号投影内存事实表（没有配 Token 规则的账号不出现，
+    // 前端按「没配规则」处理）。前端 20 秒轮询这份快照，读数的时效上限即轮询间隔
+    let now = logging::now_ms();
+    let facts = limiter::token_facts();
+    let mut token_usage = serde_json::Map::new();
+    for account in list.into_iter().flatten() {
+        let entries = limiter::token_usage_rows(account, &facts, now);
+        if entries.is_empty() {
+            continue;
+        }
+        if let Some(id) = account.get("id").and_then(Value::as_str) {
+            token_usage.insert(id.to_string(), Value::Array(entries));
+        }
+    }
+    json!({
+        "at": at,
+        "results": rows,
+        "skipped": 0,
+        "tokenAt": now,
+        "tokenUsage": token_usage,
+    })
 }
 
