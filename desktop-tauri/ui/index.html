@@ -116,11 +116,12 @@
         <button class="nav-item active" data-page="overview" data-icon="overview"><span class="ico"></span><span class="label" data-i18n="报表">报表</span></button>
         <button class="nav-item" data-page="accounts" data-icon="accounts"><span class="ico"></span><span class="label" data-i18n="账号">账号</span></button>
 
-        <!-- 签到中心：每日签到（7 家提供商）、新手任务（Loomy 一次性）、活动福利
-             （CodeArts / ZCode）与自动签到设置的统一入口。整页由 React 岛渲染
-             （desktop-tauri/ui-islands/src/islands/checkin-page.tsx，随 islands/ui.js
-             一起加载），岛直接挂在这个 section 上。自动签到的设置卡从「定时任务」页
-             移到这里 —— 签到的执行、范围与历史从此只有这一个出处。 -->
+        <!-- 签到中心：页内三个标签页 —— 签到中心（每日签到 / 新手福利 / 活动福利）、
+             定时签到（多条目 + 总开关 + 保活模型链）、签到记录（每账号明细台账）。
+             整页由 React 岛渲染（desktop-tauri/ui-islands/src/islands/checkin-page.tsx，
+             随 islands/ui.js 一起加载），岛直接挂在这个 section 上；
+             定时签到与签到记录两个标签页分别在 checkin-schedule-tab.tsx /
+             checkin-records-tab.tsx。 -->
         <button class="nav-item" data-page="checkin" data-icon="checkin"><span class="ico"></span><span class="label" data-i18n="签到中心">签到中心</span></button>
 
         <div class="nav-group-label" data-i18n="转发能力">转发能力</div>
@@ -202,9 +203,12 @@
         <!-- ─── 签到中心 ───
              整页由 React 岛渲染（desktop-tauri/ui-islands/src/islands/checkin-page.tsx，
              随 islands/ui.js 一起加载）。岛直接挂在这个 section 上、不套宿主 div。
+             页内三个标签页：签到中心（每日签到 / 新手福利 / 活动福利）、定时签到
+             （多条目 + 总开关 + 保活模型链，见 checkin-schedule-tab.tsx）、签到记录
+             （每账号明细台账，见 checkin-records-tab.tsx）。
              数据入口是聚合快照 GET /api/checkin-center（分组与「今日已签」的判定
-             在后端，与批量签到同一对判据）；新手任务 / 活动福利的资格状态是
-             上游查询，页面拿到账号清单后按需惰性查询，快照本身零上游请求。
+             在后端，与批量签到同一对判据）；新手福利的资格状态是上游查询，
+             页面拿到账号清单后按需惰性查询，快照本身零上游请求。
              对外契约 window.wbCheckinPanel = { load }（app.js 切页时调）。 -->
         <section class="page" data-page="checkin"></section>
 

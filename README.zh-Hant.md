@@ -24,6 +24,7 @@
 | MonkeyCode（長亭科技，中國版 / 國際版） | ✓ | ✗ 無續期介面 | ✓ 僅遠端 | — | — | — |
 | Command Code | ✓ | ✗ 靜態 API Key | ✓ 遠端 + 靜態備援 | — | — | — |
 | Antigravity（Google，Gemini） | ✓ | ✓ | ✓ 遠端 + 靜態備援 | — | — | — |
+| OfficeAce（華為雲果辦 / OfficeClaw） | ✓ | ✓ 控制面自動續期 | ✓ 僅遠端 | ✓ 積分餘額 | ✓ 每日獎勵（簽到 + 新人禮） | — |
 | 自訂供應商 | ✓ Chat 透傳 / Responses / Anthropic | — | ✓ 手動登記 + 伺服器端拉取 | — | — | — |
 
 三條對話協定入口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，另含 `/v1/messages/count_tokens`）與 `/v1/models` 對所有平台一視同仁，差異只在各家上游能不能做到表裡那些事；模型對應、全域優先順序佇列、429 降級、出口代理、出站指紋脫敏與請求報表同樣對全平台通用。
@@ -249,10 +250,15 @@ agent2api/
 │  │  │  │  │  ├─ commandcode/  Command Code：adapter / endpoints / credentials / login /
 │  │  │  │  │  │                fingerprint（決定性裝置指紋與 8h 回報）/ models /
 │  │  │  │  │  │                plan（8 鍵信封與 params 重寫、session id 派生）
-│  │  │  │  │  └─ antigravity/  Antigravity（Google，Gemini）：oauth（refresh token 續期 + 單飛）/
+│  │  │  │  │  ├─ antigravity/  Antigravity（Google，Gemini）：oauth（refresh token 續期 + 單飛）/
 │  │  │  │  │                   project（loadCodeAssist → onboardUser 探索）/ credentials /
 │  │  │  │  │                   endpoints（三環境基址與標頭集合）/ login /
 │  │  │  │  │                   models（fetchAvailableModels + 內建備援 + 上游真名對應）/ adapter
+│  │  │  │  │  └─ officeace/    OfficeAce（華為雲果辦 / OfficeClaw）：oauth（PKCE + P-256 DPoP 自助登入）/
+│  │  │  │  │                   signer（SDK-HMAC 與 V11-HMAC 兩套簽章 + 向量 fixtures）/ credentials（閘道器 Basic 與控制面臨時 AK/SK 兩層）/
+│  │  │  │  │                   chat（無狀態 OpenAI 相容轉發）/ models（遠端目錄 + 每模型倍率）/
+│  │  │  │  │                   probe（模型可用性探測，打不通的預設隱藏）/ subscription（訂閱 / 額度 / 獎勵）/
+│  │  │  │  │                   onboarding / checkin / balance
 │  │  │  │  ├─ protocol/        協定轉換層（各家 wire ↔ 標準 chat SSE 的請求/回應翻譯：
 │  │  │  │  │                    Anthropic Messages / Responses / NDJSON（Command Code）/
 │  │  │  │  │                    Gemini 信封（Antigravity），以及工具 plan 與歷史修復）
@@ -324,7 +330,7 @@ npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，
 
 ### 僅供學習與交流
 
-本專案是一個用於學習 HTTP 反向代理、SSE 串流透傳、多上游協定適配與桌面端打包（Tauri）等技術主題的實踐專案，**僅供個人學習與研究使用**。它不是官方產品，與騰訊公司及 WorkBuddy / CodeBuddy、美團及 CatPaw、商湯及小浣熊、智譜及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、華為雲及 CodeArts、字節跳動及 Trae、科大訊飛及 Loomy、百度文庫及 KukuAI、長亭科技及 MonkeyCode、Command Code、Google 及 Antigravity 均無任何關聯，未獲得其授權、認可或贊助。
+本專案是一個用於學習 HTTP 反向代理、SSE 串流透傳、多上游協定適配與桌面端打包（Tauri）等技術主題的實踐專案，**僅供個人學習與研究使用**。它不是官方產品，與騰訊公司及 WorkBuddy / CodeBuddy、美團及 CatPaw、商湯及小浣熊、智譜及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、華為雲及 CodeArts / OfficeAce、字節跳動及 Trae、科大訊飛及 Loomy、百度文庫及 KukuAI、長亭科技及 MonkeyCode、Command Code、Google 及 Antigravity 均無任何關聯，未獲得其授權、認可或贊助。
 
 ### 關於反向代理行為
 

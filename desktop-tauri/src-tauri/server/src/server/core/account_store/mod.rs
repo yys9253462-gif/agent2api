@@ -21,6 +21,11 @@
 //!   2. **优先级全局唯一**（所有提供商共用一条队列）：数值小的先用（主备式）。
 //!      写入侧冲突一律拒绝（409），启动时对既有数据做一次性迁移
 //!      （`migrate_startup`：旧版按家分队的号码按旧顺序合并成全局队列 + 去重）。
+//!      **分组模式（账号页按家分组）再加一条：同一家的账号在队列里连续** ——
+//!      组的顺位由「该家最靠前的账号」决定，界面上「第 N 顺位的家排在前面」这句
+//!      话才与真实尝试顺序一致。维护它只需两处：新增/导入一律落在本组末尾
+//!      （`sql::put` 里的那一跳），整队拖拽由 `store_order::reorder_accounts`
+//!      按用户拖出来的顺序重编号。规则本身在 `priority::grouped_queue_order`。
 //!      「当前账号」不是独立存储的手动选择，而是**由优先级派生** ——
 //!      全局队列里第一个「已启用且有可用凭证」的账号（`pick_current`），所以不存在
 //!      「手动选了 A、实际用 B」这种分叉。想换当前账号就把目标置顶。
@@ -60,6 +65,7 @@
 //!                按 id / provider 的按需读取
 //!   store_view.rs 公开形态（各家形状分派 + 跨家事实注入）、列表快照、provider 摘要
 //!   store_crud.rs 增删改查（add/remove/promote/update/move 与 apply_patch 内核）
+//!   store_order.rs 队列顺序（分组模式）：按给定顺序整队重编号（`reorder_accounts`）
 //!   store_batch.rs 批量操作（batch_update / batch_remove）
 //!   store_admin.rs token 回写、限额标记、启动迁移（provider 补齐 + 优先级去重）
 //!   raccoon_accounts.rs 小浣熊账号（W3-T4）：手动添加、桌面端实时账号、
@@ -104,6 +110,7 @@ pub mod custom_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
 pub mod monkeycode_accounts;
+pub mod officeace_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -114,6 +121,7 @@ pub mod store;
 pub mod store_admin;
 pub mod store_batch;
 pub mod store_crud;
+pub mod store_order;
 pub mod store_util;
 pub mod store_view;
 pub mod trae_accounts;
@@ -211,6 +219,12 @@ pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers:
 /// `sandbox`/`daily`/`prod` 是环境不是地区，规格 §6）。
 pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::Antigravity,
+);
+
+/// OfficeAce（华为云果办 / OfficeClaw）provider id（**从注册表推导**，同
+/// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `officeace_accounts.rs`。
+pub(crate) const OFFICEACE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::OfficeAce,
 );
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同

@@ -22,11 +22,14 @@ import {
 } from '@ui'
 import {
   CATEGORIES,
+  CAPTCHA_POOL_FIELDS,
   NOTES,
   PROMPT_MODES,
   QUEUE_FIELDS,
   RETENTION_FIELDS,
   RETRY_FIELDS,
+  ROUTE_STICKY_OPTIONS,
+  ROUTE_STRATEGIES,
   STATES,
   THEME_EVENT,
   THEME_MODES,
@@ -42,6 +45,8 @@ import {
   shared,
   type GatewayBlocks,
   type NumberField,
+  type RouteStickyValue,
+  type RouteStrategyValue,
   type ThemeMode,
 } from './settings-model'
 import {
@@ -50,18 +55,22 @@ import {
   applyUnits,
   cancelLanRegister,
   clearDegrade,
+  confirmDbRestore,
   dropLastRetryCode,
   exportAccounts,
+  exportDatabase,
   importAccounts,
   load,
   panelLogout,
   refreshDebug,
+  refreshCaptchaPool,
   refreshClineHeaders,
   refreshCors,
   refreshPrompt,
   refreshQueue,
   refreshRetention,
   refreshRetry,
+  refreshRouting,
   refreshSanitize,
   refreshStorage,
   refreshTimeouts,
@@ -75,10 +84,12 @@ import {
   renderSanitize,
   renderSettings,
   renderStorage,
+  resolveDbBackupConfirm,
   resolveLanConfirm,
   resolveRetentionConfirm,
   restoreCategory,
   saveCaptcha,
+  saveCaptchaPoolField,
   saveClineHeaders,
   saveCors,
   saveDebug,
@@ -90,12 +101,14 @@ import {
   saveQueueField,
   saveRetentionField,
   saveRetryField,
+  saveRoutingField,
   saveSanitize,
   saveTimeoutField,
   saveToggle,
   selectCategory,
   showCategory,
   submitLanRegister,
+  toggleDbIncludeLogs,
   toggleLan,
   toggleLanPanel,
   useSettings,
@@ -108,6 +121,7 @@ import {
   type PromptState,
   type ProviderPromptOption,
   type ProviderPromptState,
+  type RoutingState,
   type SettingsSnapshot,
   type StorageState,
 } from './settings-state'
@@ -1157,6 +1171,63 @@ function RetryPane({ snap }: { snap: SettingsSnapshot }) {
   )
 }
 
+/* ─── 路由分类（转发选路的策略 + 会话粘性）── */
+
+function RoutingPane({ snap }: { snap: SettingsSnapshot }) {
+  const routing: RoutingState = snap.routing
+  // 读不到（桥不在 / 后端不可用）或还在检测时锁住两档 —— 锁住比发出一次注定失败的保存强
+  const disabled = snap.busy === 'routing' || routing.status !== 'ready'
+  // 快照值只在档位表里取（老后端 / 异常值兜底回默认档），顺带把类型收窄到字面量联合
+  const strategy: RouteStrategyValue =
+    ROUTE_STRATEGIES.find(item => item.value === routing.strategy)?.value ?? 'order'
+  const sticky: RouteStickyValue =
+    ROUTE_STICKY_OPTIONS.find(item => item.value === routing.sticky)?.value ?? 'auto'
+  return (
+    <section className='panel'>
+      <PanelHead
+        title={t('账号路由')}
+        tip={TIPS.routing}
+        badge={routing.status === 'ready' ? undefined
+          : routing.status === 'unavailable'
+            ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+            : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
+        actions={<RefreshButton id='btn-routing-refresh' onClick={() => void refreshRouting()} />}
+      />
+      <div className='panel-body'>
+        <div className='retention-list'>
+          {/* 两行的说明都收进行内问号（[data-tip]，tooltip.js 统一服务），并且**跟随当前档位**
+              换内容 —— 每档干的事不一样，一段固定文案说不清 */}
+          <div className='retention-row'>
+            <label>{t('路由策略')}</label>
+            <div className='routing-row'>
+              <span className='tip-q' data-tip={ROUTE_STRATEGIES.find(item => item.value === strategy)?.tip}></span>
+              <SegmentedControl
+                options={ROUTE_STRATEGIES.map(item => ({ value: item.value, label: item.label }))}
+                value={strategy}
+                disabled={disabled}
+                aria-label={t('路由策略')}
+                onValueChange={value => void saveRoutingField({ routingStrategy: String(value) })} />
+            </div>
+          </div>
+          <div className='retention-row'>
+            <label>{t('会话粘性')}</label>
+            <div className='routing-row'>
+              <span className='tip-q' data-tip={ROUTE_STICKY_OPTIONS.find(item => item.value === sticky)?.tip}></span>
+              <SegmentedControl
+                options={ROUTE_STICKY_OPTIONS.map(item => ({ value: item.value, label: item.label }))}
+                value={sticky}
+                disabled={disabled}
+                aria-label={t('会话粘性')}
+                onValueChange={value => void saveRoutingField({ routingSticky: String(value) })} />
+            </div>
+          </div>
+        </div>
+        <div className='hint retention-note'>{NOTES.routing}</div>
+      </div>
+    </section>
+  )
+}
+
 /* ─── 网关分类 ─────────────────────────────── */
 
 function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
@@ -1182,6 +1253,31 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
             ))}
           </div>
           <div className='hint retention-note'>{NOTES.queue}</div>
+        </div>
+      </section>
+
+      <section className='panel'>
+        <PanelHead
+          title={t('验证码令牌池')}
+          tip={TIPS.captchaPool}
+          badge={numericBadge(snap.captchaPool)}
+          actions={
+            <RefreshButton id='btn-captcha-pool-refresh' onClick={() => void refreshCaptchaPool()} />
+          }
+        />
+        <div className='panel-body'>
+          <div className='retention-list'>
+            {CAPTCHA_POOL_FIELDS.map(field => (
+              <NumberRow
+                key={field.key}
+                field={field}
+                value={snap.captchaPool.values?.[field.key] ?? null}
+                disabled={snap.busy === 'captchaPool'}
+                onCommit={raw => saveCaptchaPoolField(field, raw)}
+              />
+            ))}
+          </div>
+          <div className='hint retention-note'>{NOTES.captchaPool}</div>
         </div>
       </section>
 
@@ -1517,6 +1613,8 @@ function storageBadge(state: StorageState): React.ReactNode {
 function DataPane({ snap }: { snap: SettingsSnapshot }) {
   const io = snap.busy
   const storage = snap.storage
+  // 端别取自桥（platform）：整库备份 / 恢复的文件对话框只有桌面壳有
+  const isWebBridge = shared().workbuddyDesktop?.platform === 'web'
   // 库打不开时各计数都是后端回落出来的 0，与「真的没有数据」在数字上无法区分 ——
   // 整排显示「—」，不误导用户以为数据丢了；路径仍然照显（文件位置是已知的）
   const ready = storage.status === 'ready'
@@ -1526,6 +1624,54 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
+      {/* 整库备份 / 恢复：仅桌面端渲染（web shim 没有这两个桥方法）。
+          排在「账号导入 / 导出」之前 —— 恢复是整库替换，两种语义别让用户混着看 */}
+      {!isWebBridge && (
+        <section className='panel'>
+          <PanelHead
+            title={t('整库备份 / 恢复')}
+            tip={TIPS.backup}
+            actions={
+              <>
+                <Button
+                  id='btn-settings-db-export'
+                  variant='outline'
+                  disabled={io === 'dbExport' || io === 'dbImport'}
+                  onClick={() => void exportDatabase()}
+                >
+                  {io === 'dbExport' ? t('备份中…') : t('备份整库')}
+                </Button>
+                <Button
+                  id='btn-settings-db-restore'
+                  variant='destructive'
+                  disabled={io === 'dbExport' || io === 'dbImport'}
+                  onClick={() => confirmDbRestore()}
+                >
+                  {io === 'dbImport' ? t('恢复中…') : t('恢复整库')}
+                </Button>
+              </>
+            }
+          />
+          <div className='panel-body'>
+            <div className='retention-row'>
+              <label htmlFor='settings-db-include-logs'>{t('包含日志与调试报文')}</label>
+              <Switch
+                id='settings-db-include-logs'
+                checked={snap.dbIncludeLogs}
+                disabled={io !== null}
+                onCheckedChange={toggleDbIncludeLogs}
+              />
+              <div className='hint'>
+                {t('取消勾选后只备份业务数据（账号、配置与余额记录），文件显著变小；事件日志、请求统计与调试报文不会进备份文件。')}
+              </div>
+            </div>
+            <div className='danger-zone'>
+              <strong>{NOTES.backupDanger}</strong>
+            </div>
+          </div>
+        </section>
+      )}
+
       <section className='panel'>
         <PanelHead
           title={t('账号导入 / 导出')}
@@ -1731,8 +1877,45 @@ function RetentionConfirmDialog({ confirm }: { confirm: { head: string } | null 
   )
 }
 
-/* ─── 局域网访问的确认 / 注册弹窗 ─────────────── */
+/**
+ * 整库恢复的二次确认（骨架照 RetentionConfirmDialog）。
+ *
+ * 恢复是**替换**语义：本机的账号、配置、日志、面板登录态会整体换成备份文件
+ * 的状态。焦点落在「取消」—— 危险操作敲回车不该等于同意（与保留期确认同一
+ * 取向）；确认后才弹系统文件框（壳侧 import_database）。
+ */
+function DbBackupConfirmDialog({ confirm }: { confirm: { includeLogs: boolean } | null }) {
+  const cancelRef = React.useRef<HTMLButtonElement | null>(null)
 
+  return (
+    <Dialog open={confirm !== null} onOpenChange={next => { if (!next) resolveDbBackupConfirm(false) }}>
+      <DialogContent className='w-[min(440px,calc(100vw-48px))]' initialFocus={cancelRef}>
+        <DialogHeader>
+          <DialogTitle>{t('恢复整库备份')}</DialogTitle>
+        </DialogHeader>
+        <DialogBody>
+          <div className='danger-zone'>
+            {t('本机的全部数据（账号、网关配置、日志统计与桌面设置）将被所选备份文件')}
+            <strong>{t('整体替换')}</strong>{t('，包括恢复后需要重新登录管理面板。')}
+            <br />
+            <strong>{t('替换前会自动把当前数据备份到配置目录的 backups/ 文件夹。')}</strong>{t('确定继续？')}
+          </div>
+        </DialogBody>
+        <DialogFooter>
+          <div className='mr-auto' />
+          <Button ref={cancelRef} variant='outline' onClick={() => resolveDbBackupConfirm(false)}>
+            {t('取消')}
+          </Button>
+          <Button variant='destructive' onClick={() => resolveDbBackupConfirm(true)}>
+            {t('选择备份文件并恢复')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/* ─── 局域网访问的确认 / 注册弹窗 ─────────────── */
 /** 三种确认（开启 / 关闭 / 面板子开关）各自的标题、正文与确认键文案 */
 const LAN_CONFIRM_COPY: Record<
   NonNullable<LanConfirm>['mode'],
@@ -1917,6 +2100,9 @@ function SettingsPage() {
         <div className={paneClass('gateway')} data-cat='gateway'>
           <GatewayPane snap={snap} />
         </div>
+        <div className={paneClass('routing')} data-cat='routing'>
+          <RoutingPane snap={snap} />
+        </div>
         <div className={paneClass('retry')} data-cat='retry'>
           <RetryPane snap={snap} />
         </div>
@@ -1943,6 +2129,7 @@ function SettingsPage() {
       </div>
 
       <RetentionConfirmDialog confirm={snap.retentionConfirm} />
+      <DbBackupConfirmDialog confirm={snap.dbBackupConfirm} />
       <LanDialog confirm={snap.lanConfirm} register={snap.lanRegister} />
     </div>
   )

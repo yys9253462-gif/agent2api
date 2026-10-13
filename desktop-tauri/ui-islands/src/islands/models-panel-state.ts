@@ -905,3 +905,37 @@ export function levelOf(alias: unknown, target: unknown, provider: unknown): str
 export function setTableEl(el: HTMLTableElement | null): void {
   tableEl = el
 }
+
+/**
+ * 摘掉表格里**不属于 React 树**的节点（修复 #195，由视图层每次提交后调用）。
+ *
+ * `<table>` 的直接子级只该有 colgroup / thead / tbody#models 三样，行全部由
+ * React 渲染。但 React **不会**清理外部插进表格的节点：注入实验确认，手工塞进
+ * tbody 的行、或塞进 table 的独立 tbody，之后 render() / load() 都不会把它们
+ * 摘掉，会一直留在表里。issue #195 的现场正是这样一行：不属于当前数据、不计入
+ * 标题统计，且它所在的那个 tbody 让它下面少了一条分隔线（tbody 最后一行没有
+ * 下边框）。
+ *
+ * 判据是 React 给每个渲染元素挂的 fiber 标记（`__reactFiber$…` / 旧版
+ * `__reactInternalInstance$…`）：外部插入的节点没有这两个键。摘的全是「不属于
+ * React」的节点，所以清理本身不会与 React 的 diff 打架，正常渲染一个都不会碰。
+ */
+export function pruneForeignTableNodes(): void {
+  const table = tableEl
+  if (!table) return
+  const owned = (el: Element): boolean => Object.keys(el).some(
+    key => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'))
+  for (const child of [...table.children]) {
+    if (child.tagName === 'TBODY') {
+      if (child.id !== 'models') child.remove()
+    } else if (child.tagName === 'TR' && !owned(child)) {
+      // 直接落在 table 下的 tr 会被浏览器按「匿名 tbody」渲染成一行，同样要清
+      child.remove()
+    }
+  }
+  const tbody = table.querySelector('tbody#models')
+  if (!tbody) return
+  for (const row of [...tbody.children]) {
+    if (!owned(row)) row.remove()
+  }
+}

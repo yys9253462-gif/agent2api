@@ -210,7 +210,7 @@ impl AccountStore {
                 credentials::masked(&api_key)
             ),
         );
-        Ok(self.to_commandcode_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// Command Code 账号的**公开形态**（进 HTTP 响应）：去掉 key 本体，只留尾几位。

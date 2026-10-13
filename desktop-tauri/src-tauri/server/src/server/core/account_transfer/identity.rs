@@ -163,6 +163,19 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 uid 与 loginName（无法标识 CatPaw 账号）".to_string());
     }
+    // Kuku：账号标识是 `uid`（= userreport 的 uk，本家 id 也从它派生），缺则
+    // loginName —— 与 CatPaw 同一套字段口径。没有这一支会落进兜底按 `userId`
+    // 取，而本家记录没有该字段：账号导得出去、导不回来（报「缺少 userId」整条
+    // 失败）。
+    if provider == kind_id(ProviderKind::Kuku) {
+        if !uid.is_empty() {
+            return Ok(uid);
+        }
+        if !login_name.is_empty() {
+            return Ok(login_name);
+        }
+        return Err("缺少 uid 与 loginName（无法标识 Kuku 账号）".to_string());
+    }
     // Cline 的账号标识落在 `account`（邮箱或 `usr-…` id）而不是 `userId`
     // —— 见 `account_store::cline_accounts` 的公开形态。少了这一支，
     // Cline 账号导出后再导入会因「缺少 userId」整条失败。
@@ -236,6 +249,22 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 apiKey 与 id（无法标识自定义提供商账号）".to_string());
     }
+    // Command Code：凭证就是身份 —— API Key 落盘在 `accessToken`（添加路径的
+    // 账号 id 就是 key 的 SHA-256 前缀，与自定义家同构），记录上没有
+    // userId / uid / apiKey 键。没有这一支会落进兜底按 `userId` 取 → 报
+    // 「缺少 userId」整条失败；空 token 的记录退到账号 id（与自定义家
+    // 「缺 apiKey 用 id」同口径）。
+    if provider == kind_id(ProviderKind::CommandCode) {
+        let access_token = text("accessToken");
+        if !access_token.is_empty() {
+            return Ok(access_token);
+        }
+        let id = text("id");
+        if !id.is_empty() {
+            return Ok(id);
+        }
+        return Err("缺少 accessToken 与 id（无法标识 Command Code 账号）".to_string());
+    }
     if user_id.is_empty() {
         return Err(format!("缺少 userId（无法标识 {provider} 账号）"));
     }
@@ -255,6 +284,14 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
         return (!uid.is_empty()).then_some(uid);
     }
     if provider == kind_id(ProviderKind::CatPaw) {
+        let uid = record.uid().trim().to_string();
+        if !uid.is_empty() {
+            return Some(uid);
+        }
+        return (!login_name.is_empty()).then_some(login_name);
+    }
+    // Kuku：uid（缺则 loginName）—— 与 `identity_of_item` 同口径
+    if provider == kind_id(ProviderKind::Kuku) {
         let uid = record.uid().trim().to_string();
         if !uid.is_empty() {
             return Some(uid);
@@ -314,6 +351,16 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
             .to_string();
         if !api_key.is_empty() {
             return Some(api_key);
+        }
+        let id = record.id().trim().to_string();
+        return (!id.is_empty()).then_some(id);
+    }
+    // Command Code：accessToken（= API Key）即身份，缺则账号 id ——
+    // 与 `identity_of_item` 同口径
+    if provider == kind_id(ProviderKind::CommandCode) {
+        let access_token = record.access_token().trim().to_string();
+        if !access_token.is_empty() {
+            return Some(access_token);
         }
         let id = record.id().trim().to_string();
         return (!id.is_empty()).then_some(id);

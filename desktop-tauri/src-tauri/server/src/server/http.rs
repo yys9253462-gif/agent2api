@@ -271,6 +271,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/queue",
             get(api::queue_api::get_queue).put(api::queue_api::put_queue),
         )
+        // 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断）：GET 读、PUT（部分字段）
+        // 更新，保存后对下一个请求立即生效；queue 是候选队列的可见化端点
+        // （账号页「路由」面板的数据源，排序实现与转发选路同一个函数）。
+        .route(
+            "/api/routing",
+            get(api::routing_api::get_routing).put(api::routing_api::put_routing),
+        )
+        .route("/api/routing/queue", get(api::routing_api::get_routing_queue))
         // ── 调试模式（设置页「通用 → 调试模式」）──
         // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回
         // 报文，见 debug_api 的模块头）。挂 protected：报文含上游 URL 与请求体。
@@ -291,6 +299,12 @@ pub fn panel_router(state: ServerState) -> Router {
         // 全部业务表（账号、日志、统计、配置），与 /api/config 同级敏感。
         .route("/api/upgrade", get(api::upgrade_api::get_upgrade))
         .route("/api/upgrade/run", post(api::upgrade_api::run_upgrade))
+        // ── 整库备份 / 恢复（设置页，SQL 文本形态）──
+        // 挂 protected：导出把全部凭证写进指定路径，导入整体替换数据库，
+        // 都是 /api/config 级别敏感；文件由后端按壳选的路径直读直写
+        // （大文件不过 HTTP，见 api::backup_api 的模块头）。
+        .route("/api/backup/export", post(api::backup_api::export_backup))
+        .route("/api/backup/import", post(api::backup_api::import_backup))
         // ── 账号管理（对照 workbuddy-account-routes.mjs）──
         // 用 any(...) 注册两条入口（无尾段 + 通配尾段），方法/路径的判定交给
         // api::accounts::dispatch —— 这是为了复刻 Node 版 tryHandle 的判定顺序
@@ -491,6 +505,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/zcode/captcha",
             get(api::zcode_captcha::get_captcha).post(api::zcode_captcha::push_captcha),
         )
+        // 令牌池的补货节奏设置（目标 / 轮询间隔 / 单轮上限）：与上面那条的
+        // 分工见 `api::zcode_captcha_pool` 的模块头。stats 响应会把这三项
+        // 带给铸造器，保存后下一轮轮询就生效。同样挂 protected。
+        .route(
+            "/api/zcode/captcha-pool",
+            get(api::zcode_captcha_pool::get_captcha_pool)
+                .put(api::zcode_captcha_pool::put_captcha_pool),
+        )
         // ── 系统提示词与内容拦截降级 ──
         // 与 /api/sanitize 同为「出站内容处理」的开关，但形状不同（枚举 + 文件
         // 路径 + 一个运行期状态要一起返回），所以单独一条端点，见 api::prompt
@@ -510,6 +532,27 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::auto_checkin::get_state).post(api::auto_checkin::configure),
         )
         .route("/api/auto-checkin/run", post(api::auto_checkin::run_now))
+        // ── 定时签到的条目 ──
+        // 总开关走上面的老接口；条目 CRUD / 立即执行在这里（分组理由见
+        // api::checkin_schedules 的模块头）。挂 protected：写配置 + 触发真签到，
+        // 敏感度与 /api/auto-checkin 同级。三条入口 any(...) 手工分发，
+        // 与 /api/scheduled-tasks 同一取舍（统一 404，不落到 405 兜底）。
+        .route("/api/checkin-schedules", any(api::checkin_schedules::entry))
+        .route("/api/checkin-schedules/", any(api::checkin_schedules::entry))
+        .route(
+            "/api/checkin-schedules/{*rest}",
+            any(api::checkin_schedules::entry),
+        )
+        // ── 签到记录明细台账 ──
+        // GET 查询 / DELETE 清空（全清护栏 all=1，照 logs 的规则；筛选删除与
+        // 查询共用同一份过滤链）。挂 protected：明细里有账号名与收益文案，
+        // 敏感度与 /api/logs 一致。
+        .route(
+            "/api/checkin-records",
+            get(api::checkin_records::query_records).delete(api::checkin_records::clear_records),
+        )
+        .route("/api/checkin-records/", any(api::logs_api::not_found))
+        .route("/api/checkin-records/{*rest}", any(api::logs_api::not_found))
         // ── 签到中心的聚合快照 ──
         // 只读一条：分组与「今日已签」的判定复用批量签到同一对判据
         // （CHECKIN_PROVIDERS ∩ supports_checkin），见 api::checkin_center 的模块头。

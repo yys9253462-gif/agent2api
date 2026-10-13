@@ -652,6 +652,67 @@ fn unwrap_envelope_file(parsed: Value) -> Value {
     }
 }
 
+/// 整库备份：弹系统保存框，后端把整库导出为 SQL 文本直接写到该路径。
+///
+/// 与账号导出（`export_accounts`）不同：**没有「空库不导」分支** —— 整库
+/// 语义下 kv 表至少有配置项，空库同样值得备份。文件内容不经壳中转，
+/// 后端按路径直写（几十 MB 的导出不占两份内存，见 `api/backup_api`）。
+#[tauri::command]
+pub async fn export_database(
+    app: AppHandle,
+    #[allow(non_snake_case)] includeLogs: Option<bool>,
+) -> Result<Value, String> {
+    let stamp = timestamp_for_filename();
+    let default_name = format!("agent2api-backup-{stamp}.sql");
+    let file = app
+        .dialog()
+        .file()
+        .set_title("整库备份")
+        .set_file_name(&default_name)
+        .add_filter("SQL", &["sql"])
+        .add_filter("全部文件", &["*"])
+        .blocking_save_file();
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("保存路径无效: {error}"))?;
+    let payload = json!({
+        "filePath": path.to_string_lossy(),
+        // 前端不传（旧壳直调）时按完整导出
+        "includeLogs": includeLogs.unwrap_or(true),
+    });
+    let mut data = gateway::call("POST", "/api/backup/export", Some(&payload)).await?;
+    if let Value::Object(map) = &mut data {
+        map.insert("file".to_string(), Value::String(path.to_string_lossy().to_string()));
+    }
+    Ok(data)
+}
+
+/// 整库恢复：弹系统打开框，后端校验该 SQL 文件后整体替换数据库。
+///
+/// 覆盖前的确认弹窗由前端负责（文案里说明「本机数据会先自动备份到
+/// backups/ 目录」「恢复后需重新登录面板」）；这里只做选文件与转发。
+#[tauri::command]
+pub async fn import_database(app: AppHandle) -> Result<Value, String> {
+    let file = app
+        .dialog()
+        .file()
+        .set_title("整库恢复")
+        .add_filter("SQL", &["sql"])
+        .add_filter("全部文件", &["*"])
+        .blocking_pick_file();
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("文件路径无效: {error}"))?;
+    let payload = json!({ "filePath": path.to_string_lossy() });
+    gateway::call("POST", "/api/backup/import", Some(&payload)).await
+}
+
 /// 检查新版本：把本应用版本作为 query 参数交给后端比较。
 ///
 /// 版本号必须由壳提供 —— 后端以独立进程运行，不知道自己被哪个壳打包，

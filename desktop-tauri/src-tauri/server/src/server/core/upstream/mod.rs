@@ -48,10 +48,12 @@
 pub mod aggregate;
 pub mod cancellation;
 pub mod connections;
+pub mod refusal;
 pub mod request;
 mod payload;
 mod provider_loop;
 mod rotate;
+mod route_state;
 pub mod sse;
 pub mod stall;
 pub mod translate;
@@ -168,6 +170,13 @@ pub struct UpstreamService {
     in_flight: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
     /// 账号级活跃连接计数（账号页「连接数」列的数据源，见 `connections.rs`）
     connections: Connections,
+    /// 账号路由的运行期状态（轮转游标 / 粘性 / 退避 / 垫底 / 熔断，
+    /// 见 `route_state.rs`）。转发选路读它的快照、请求收尾写它。
+    /// 字段刻意保持**私有**：子孙模块（rotate / provider_loop）本就看得到，
+    /// 模块外一律走 `route_queue_facts` 的只读快照 —— 状态只该被两条钩子
+    /// 路径改写。Arc 是给 `#[derive(Clone)]` 的：克隆服务句柄（入请求上下文）
+    /// 时状态必须仍是同一份 —— 游标与粘性表分叉就失去意义了。
+    route: std::sync::Arc<route_state::RouteState>,
 }
 
 /// 一次转发的入参
@@ -263,6 +272,12 @@ pub(super) struct RouteTarget {
     /// 又看不到「这条请求其实是直连出去的」。带到这里之后，转发层把它记进
     /// **本轮尝试明细**的 `notice`，请求日志一次悬停就能看到，运行日志不再写。
     pub proxy_notice: Option<String>,
+    /// 本次选路的**决策快照**（候选怎么排的、谁被跳过、为什么选中它 ——
+    /// `routing::plan_route` 的输出；请求详情页的「路由回放」读它）。
+    ///
+    /// `None` = 没走到账号选路（候选集合为空、用默认登录态直发）。
+    /// 由转发层挂进 telemetry 落进请求日志；这里只是**捎带**，不参与转发。
+    pub decision: Option<Value>,
 }
 
 impl UpstreamService {
@@ -272,7 +287,24 @@ impl UpstreamService {
             auth,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             connections: Connections::new(),
+            route: std::sync::Arc::new(route_state::RouteState::new()),
         }
+    }
+
+    /// 路由运行期状态的**只读快照**（`api::routing` 的队列端点用）。
+    ///
+    /// 返回纯 std 容器（沉底表 / 休息表 / 熔断集合），不把本模块的私有类型
+    /// 漏出去；面板只看不写，粘性查找不在此做（预演不该刷新会话计时）。
+    pub fn route_queue_facts(
+        &self,
+        now: i64,
+    ) -> (
+        HashMap<String, i64>,
+        HashMap<String, i64>,
+        std::collections::HashSet<String>,
+    ) {
+        let snapshot = self.route.snapshot("", now, 0);
+        (snapshot.sunk, snapshot.resting, snapshot.open)
     }
 
     /// 账号级活跃连接计数句柄（`api::accounts` 的 `/api/accounts/connections` 读它）。

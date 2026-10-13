@@ -232,7 +232,7 @@ impl AccountStore {
             "[Accounts]",
             &format!("✅ MonkeyCode {} 账号已保存: {record_name}（优先级 {priority}）", region.label()),
         );
-        Ok(self.to_monkeycode_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// MonkeyCode 账号的**公开形态**（进 HTTP 响应）：去掉 session 本体，只留

@@ -597,6 +597,8 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // 两处各写一遍迟早会让进行中行与收尾行显示成两种样子。
     entry.attempt_details = stored_attempt_details(&snapshot.attempts_detail);
     entry.sensitive_hits = stored_sensitive_hits(&snapshot.sensitive_hits);
+    // 选路决策快照：有采集才落（没走到选路的请求是 Null，前端不渲染那一段）
+    entry.route = context.telemetry.route_decision().unwrap_or(Value::Null);
     // 来源标记：入口带进来的事实，存储层据此排除报表聚合（见该字段的说明）
     entry.is_test = context.is_test;
     entry.error = error;

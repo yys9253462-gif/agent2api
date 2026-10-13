@@ -64,6 +64,11 @@
     // 网关：双向箭头（进出的流量）
     traffic: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
       + '<path d="M8 3 4 7l4 4M4 7h16"/><path d="m16 21 4-4-4-4M20 17H4"/></g>',
+    // 路由：一条线分出两条支路（请求分流到不同账号）
+    route: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M4 12h5"/><circle cx="3.5" cy="12" r="1.5"/>'
+      + '<path d="M9 12c3 0 3-6 6-6h4"/><path d="m17 3 3 3-3 3"/>'
+      + '<path d="M9 12c3 0 3 6 6 6h4"/><path d="m17 15 3 3-3 3"/></g>',
     // 重试：环形箭头
     refresh: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
       + '<path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></g>',
@@ -114,6 +119,19 @@
       + '<path d="M12 5v14"/><path d="m6 13 6 6 6-6"/></g>',
     arrowUp: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
       + '<path d="M12 19V5"/><path d="m6 11 6-6 6 6"/></g>',
+
+    /**
+     * 拖动把手（账号页分组模式：分组的组顺位、组内的行顺序都靠它）。
+     * 六个圆点两列排布，是「这一处可以拖」的通用意象。光标态交给 CSS
+     * （默认 grab、拖动中 grabbing），图标本身不带状态。
+     */
+    gripVertical: '<g fill="currentColor">'
+      + '<circle cx="9" cy="6" r="1.4"/><circle cx="15" cy="6" r="1.4"/>'
+      + '<circle cx="9" cy="12" r="1.4"/><circle cx="15" cy="12" r="1.4"/>'
+      + '<circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="18" r="1.4"/></g>',
+    /** 折叠箭头（分组带的展开 / 收起）：向下 = 已展开；收起态由 CSS 旋转 -90° */
+    chevronDown: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="m6 9 6 6 6-6"/></g>',
 
     /**
      * 账号名隐私开关的两枚眼睛（账号表「账号」表头的显隐按钮）。

@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
 use crate::server::core::account_store::store::{forwards_requests, AccountStore};
-use crate::server::core::account_store::store_util::{js_truthy, max_concurrent_public, value_or, value_or_nullish};
+use crate::server::core::account_store::store_util::{js_truthy, max_concurrent_public_for, value_or, value_or_nullish};
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
 
@@ -122,13 +122,6 @@ impl AccountStore {
         );
         // 本切片所有账号都视为可用（限额/可用性判定属切片 3 的转发层）
         public.insert("available".to_string(), Value::Bool(true));
-        // 单账号并发上限（所有家通用的账号属性）：0 = 不限，记录里没有该键
-        // （旧数据 / 从未设置过）同样输出 0 —— 兜底在 `max_concurrent_public`
-        // 一处实现，其余各家的公开形态同用它（选路消费方按 0 解释为不限）
-        public.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
-        );
         Value::Object(public)
     }
 
@@ -236,6 +229,15 @@ impl AccountStore {
     /// 事实，否则会出现「界面标 ★ 的账号其实转发时会因无凭证被跳过」的分歧。
     /// 放在分派点让各家形状**同字段名、同语义**，前端不必按 provider 查表。
     ///
+    /// `nameCustom` / `checkinAt` / `usageQuery` / `lowBalance` / `limiters` /
+    /// `maxConcurrent` 走同一条路子。`maxConcurrent` 尤其不能下放到各家：
+    /// 它是**恒有的数字键**，而各家公开形态只要漏写一次，选路读到的缺键就等于
+    /// 0 = 不限（上限静默失效），现场看不出任何异常。
+    ///
+    /// 两条出口（本函数与各家的「添加 / 更新响应」）必须形状一致，所以那些响应
+    /// 也一律回 [`Self::public_account`] 的结果，而不是各自调 `to_*_public_account`
+    /// —— 后者会绕过这里注入的全部字段。
+    ///
     /// 纯新增字段：各家的既有字段一个不动，旧客户端忽略它即可。
     pub(crate) fn public_account(&self, record: &StoredAccount) -> Value {
         let shaped = if record.provider() == super::RACCOON_PROVIDER_ID {
@@ -294,6 +296,13 @@ impl AccountStore {
             // 公开形态去掉 token 本体、只留 refresh token 尾号与
             // 「有没有 refreshToken / accessToken」（见 `antigravity_accounts.rs`）
             self.to_antigravity_public_account(record)
+        } else if record.provider() == super::OFFICEACE_PROVIDER_ID {
+            // OfficeAce（华为云果办）：只透出标识与到期时刻，网关 Basic 那一对
+            // 与控制面临时凭据都不出这个函数（见 `to_officeace_public_account`）。
+            // 漏这一支时它会掉进下面的 workbuddy 兜底形状：界面多出一批 uid/edition
+            // 之类与它无关的空字段，而「刷新 Token」按钮靠的 hasRefreshToken
+            // 只是**恰好**在兜底形状里也算得出来 —— 那不是设计，是巧合。
+            self.to_officeace_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -334,6 +343,20 @@ impl AccountStore {
                 // 恒为数字（无记录时 0）而不是缺键：界面按 `Number(...) || 0` 读，
                 // 两种形态都能吃，但恒定的形状让「字段缺失」与「值为 0」不再需要分开判。
                 fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
+                // 单账号并发上限（所有家通用的账号属性）：跨家统一注入的理由与上面
+                // 三条相同 —— 选路（`routing::max_concurrent_of`）与前端账号菜单读的
+                // 是**同一份事实**。恒为数字键（0 = 不限），且**只在这里写一次**：
+                // 从前它是各家公开形态里各自的 `insert`，于是逐字段白名单那几家
+                // （monkeycode / antigravity / officeace）漏了它 —— 缺键被选路当成
+                // 0 = 不限，上限**静默失效**。CodeArts 的「0 = 按本家默认并发」口径
+                // 由 `max_concurrent_public_for` 一处承载，别家 0 就是不限。
+                fields.insert(
+                    "maxConcurrent".to_string(),
+                    Value::from(max_concurrent_public_for(
+                        &record.provider(),
+                        record.get("maxConcurrent"),
+                    )),
+                );
                 // 用户显式设置过备注名（update_account 真正改到 name 时打的标，
                 // 见 apply_patch）。恒为布尔而不是缺键：界面据此决定「备注名赢过
                 // 邮箱 / 昵称等默认口径」还是「维持原展示行为」，两种形态都不必
@@ -485,12 +508,6 @@ impl AccountStore {
         public.insert(
             "available".to_string(),
             Value::Bool(record.enabled() && record.has_credentials()),
-        );
-        // 单账号并发上限（与 to_public_account 同口径，兜底共用
-        // `max_concurrent_public`）：0 = 不限，缺键同样输出 0
-        public.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
         );
         Value::Object(public)
     }

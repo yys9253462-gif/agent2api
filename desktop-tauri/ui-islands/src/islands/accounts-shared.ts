@@ -227,8 +227,23 @@ type ConfirmOptions = {
 export type AccountsBridge = {
   getAccountConnections(): Promise<{ counts?: Record<string, unknown> } | null | undefined>
   updateAccount(id: string, patch: Record<string, unknown>): Promise<{ changes?: string[] } | null | undefined>
+  /** 整队重排（分组模式）：把新队列整条交上去（从队首到队尾的 id 数组） */
+  reorderAccounts(queue: string[]): Promise<unknown>
   moveAccount(id: string, direction: 'up' | 'down'): Promise<unknown>
   clearRateLimits(id: string, model?: string | null): Promise<unknown>
+  /**
+   * 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断）与候选队列可见化。
+   * `setRoutingConfig` 收**部分**补丁、返回生效后的全量值（与 /api/timeouts
+   * 同一模式）；`getRoutingQueue` 的 model 缺省 = 不限模型的全局队列。
+   */
+  /** 全量会话态（/api/session，app.js 的首屏数据源）；路由面板读 models / lastRequestModel */
+  getState?(): Promise<{
+    models?: Array<{ id?: string; providerLabel?: string }>
+    lastRequestModel?: string | null
+  } | null | undefined>
+  getRoutingConfig(): Promise<Record<string, unknown> | null | undefined>
+  setRoutingConfig(patch: Record<string, unknown>): Promise<Record<string, unknown> | null | undefined>
+  getRoutingQueue(model?: string): Promise<Record<string, unknown> | null | undefined>
   batchAccounts(payload: { action: string; ids: string[]; proxy?: unknown }): Promise<{
     ok?: Array<{ id?: string; changes?: string[] }>
     removed?: unknown[]

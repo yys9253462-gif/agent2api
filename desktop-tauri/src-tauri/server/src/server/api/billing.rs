@@ -163,13 +163,23 @@ pub async fn run_activity(State(state): State<ServerState>, body: Bytes) -> Resp
         .billing()
         .workbuddy_daily_activity(&entry.session, mode)
         .await;
-    ok_json(json!({
+    let row = json!({
         "id": id,
         "name": name,
         "mode": mode.as_str(),
         "claim": activity.get("claim").cloned().unwrap_or(Value::Null),
         "activity": activity.get("activity").cloned().unwrap_or(Value::Null),
-    }))
+    });
+    // 签到记录台账：这条路径不走 run_checkin（没有唯一记账点可借），单独补
+    // 一条（source=activity）—— 判定在 checkin_records::record_activity
+    // （keepalive 只看保活读数，见那里的说明）。写失败在台账侧只打日志，
+    // 不影响本响应。
+    crate::server::core::checkin_records::record_activity(
+        &row,
+        account.get("provider").and_then(Value::as_str).unwrap_or(""),
+        mode.as_str(),
+    );
+    ok_json(row)
 }
 
 /// POST /api/checkin-keepalive —— 保存保活模型链。

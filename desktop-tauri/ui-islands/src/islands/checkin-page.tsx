@@ -1,19 +1,17 @@
 import { createRoot } from 'react-dom/client'
 import * as React from 'react'
-import {
-  Badge, Button, Checkbox, Input, Progress, Spinner, Switch,
-} from '@ui'
+import { Badge, Button, Progress, SegmentedControl, Spinner } from '@ui'
 import { PROVIDER_ICONS } from './add-provider-pick'
 import { formatTime, shared, type OnboardingTask } from './accounts-shared'
-import { claimedPlanIdsToday, welfareDoneTitle, welfareStateOf, welfareTodoTitle } from './accounts-domain'
+import { claimedPlanIdsToday } from './accounts-domain'
 import {
-  claimOnboarding, getCheckinStore, groupTone, historyLine, loadCheckinCenter,
-  nextRunText, onboardingExpanded, queryOnboarding, runAllCheckin, saveAutoCheckin,
-  setAutoTimeDraft, setKeepaliveDraft, signSingleAccount, submitAutoTime,
-  submitKeepaliveModels, subscribeCheckinStore, toggleAutoProvider,
-  toggleOnboardingExpand, toggleProviderExpand,
-  type AutoCheckinState, type CheckinProviderGroup, type CheckinStore,
+  claimOnboarding, getCheckinStore, groupTone, loadCheckinCenter, nextScheduleRun,
+  onboardingExpanded, queryOnboarding, runAllCheckin, setCheckinTab, showCheckinTab,
+  signSingleAccount, subscribeCheckinStore, toggleOnboardingExpand, toggleProviderExpand,
+  type CheckinProviderGroup, type CheckinStore, type CheckinTab,
 } from './checkin-state'
+import { ScheduleTab } from './checkin-schedule-tab'
+import { RecordsTab } from './checkin-records-tab'
 import { openZcodePlans } from './accounts-data'
 import { t } from '../i18n'
 
@@ -21,15 +19,14 @@ import { t } from '../i18n'
  * 签到中心（React 岛）。
  *
  * ── 这页管什么 ──────────────────────────────────────────────
- * 全部签到类动作的统一入口：每日签到（提供商清单与「能不能签」的判定都在后端，
- * 见 `core::auto_checkin::CHECKIN_PROVIDERS`）、自动签到设置（含 WorkBuddy
- * 国际版日活保活的模型链）、签到历史时间线、新手任务（Loomy / 小浣熊，
- * 惰性查询）与活动福利（CodeArts / ZCode，沿用既有领取流程）。
- * 原型见 prototype/checkin-center.html。
- *
- * ── 数据从哪来 ──────────────────────────────────────────────
- * 快照走 `GET /api/checkin-center` 一次拉全（load）；新手任务的任务状态是上游
- * 查询，拿到账号清单后按需逐账号查询（queryOnboarding）并缓存（checkin-state）。
+ * 全部签到类动作的统一入口，页内分三个标签页（SegmentedControl 切换，
+ * 状态与持久化在 checkin-state）：
+ *   · **签到中心**（本文件 CenterTab）：总览卡 + 每日签到 + 新手福利（Loomy /
+ *     小浣熊 / CodeArts，惰性查询）+ 活动福利（ZCode）；
+ *   · **定时签到**（checkin-schedule-tab）：总开关 + 多条定时条目 + 保活模型链；
+ *   · **签到记录**（checkin-records-tab）：每账号一行的明细台账（schema v11）。
+ * 数据从哪来：快照走 `GET /api/checkin-center` 一次拉全（load）；后端快照的
+ * `auto` 段与 GET /api/auto-checkin 同形（含条目数组 schedules），总览卡直接读。
  * 页面零轮询：签到动作完成后由动作层重拉快照，主状态刷新交给 wbApp.refresh。
  *
  * ── 挂载：面板岛模式，root 直接建在既有的页面区块上 ──────────────
@@ -54,69 +51,27 @@ const PROVIDER_DESC: Record<string, string> = {
   trae: t('SOLO 的 checkin_credits 领取 · 按自然日 0 点刷新'),
   loomy: t('无独立签到接口 · 每天替账号打一次首次登录积分'),
   kuku: t('「免费领积分」的每日任务 · 逐个领取'),
+  officeace: t('一次领当天全部奖励（每日签到 + 新人礼） · 幂等由上游保证'),
+  // CodeArts 的每日福利 2026-10 起并入本链（此前是「活动福利」里那颗手动「去领取」）：
+  // 它执行的是 ops 活动交付（三个接口），一句话说明里点出这一点，用户才不会
+  // 拿它跟别家「一次请求」的签到比快慢。
+  codearts: t('每日福利 · 领取 → 确认 → 回读核实 · 按北京时间自然日重置'),
 }
 
-/**
- * Qoder 国际版的 UMID 组件提示（展开后的分组详情顶部）。
- *
- * 国际版签到依赖本机的设备风控身份（`Cosy-MachineToken` 三件套），组件来源
- * 三种：本机 Qoder 客户端、qodercli 解压、网关数据目录安装（Linux 一键装）。
- * 这里只读一次状态：装了就说明来源，没装且平台支持安装就给按钮（Linux/Docker
- * 用户唯一能自助的路径）；不支持安装的平台只说明怎么补 —— Windows/macOS 装
- * 客户端或 qodercli 后无需重启网关（组件发现按次执行）。
- */
-function UmidHint(): React.ReactElement | null {
-  const [state, setState] = React.useState<{ available?: boolean; source?: string | null; installSupported?: boolean; installing?: boolean } | null>(null)
-  const load = React.useCallback(async (): Promise<void> => {
-    try {
-      const response = await fetch('/api/qoder-umid')
-      if (response.ok) setState(await response.json())
-    } catch { /* 状态是锦上添花，拉不到不挡签到 */ }
-  }, [])
-  React.useEffect(() => { void load() }, [load])
-  if (!state || state.available) return null
-  const install = async (): Promise<void> => {
-    try {
-      setState(prev => prev ? { ...prev, installing: true } : prev)
-      const response = await fetch('/api/qoder-umid/install', { method: 'POST' })
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null)
-        shared().wbApp?.toast?.(t('UMID 组件安装失败：{error}', { error: String(payload?.error ?? response.status) }), 'err')
-      } else {
-        shared().wbApp?.toast?.(t('✅ UMID 组件已安装，下轮签到即可领取国际版积分'))
-      }
-    } catch (error) {
-      shared().wbApp?.toast?.(t('UMID 组件安装失败：{error}', { error: error instanceof Error ? error.message : String(error) }), 'err')
-    } finally {
-      void load()
-    }
-  }
-  return (
-    <div className='flex flex-wrap items-center gap-2 px-[2px] pb-1 text-[12px] text-muted-foreground'>
-      <span>{t('国际版签到需要 UMID 组件生成设备风控身份（本机未检测到）。')}</span>
-      {state.installSupported
-        ? <Button variant='outline' size='sm' disabled={state.installing === true} onClick={() => { void install() }}>
-            {state.installing ? t('安装中…') : t('一键安装组件')}
-          </Button>
-        : <span>{t('安装 Qoder 客户端或 qodercli 后即可（无需重启网关）。')}</span>}
-    </div>
-  )
-}
-
-/**
- * 问号提示全文（沿用 tasks-panel 的 CHECKIN_DESC，签到口径没变）。
- * 整段是一个键：扫描器只认字符串字面量（拼接串 / 模板串提不到键），所以不拆行。
- */
-const AUTO_CHECKIN_DESC = t(
-  '到点后自动签到勾选提供商的可用账号（WorkBuddy 国内版走每日签到接口，国际版走每日活跃任务：探测活动、领日活奖励、再用免费模型保活；小浣熊走桌面端每日积分链路；AutoClaw 走官方客户端的每日签到任务；Qoder 中国版走活动领取，没被下发活动的账号会得到中性提示；Qoder 国际版要先带设备风控身份（本机 Qoder 客户端 / qodercli 的 UMID 组件生成）才能看到「每日 100 Credits」活动，缺组件时会得到明确的说明而不是报错；Trae 领 SOLO 的每日签到积分（按自然日 0 点重置），上游没对该账号开活动、或凭据里没有设备号时得到的是「未领取 + 具体原因」而不是报错；Loomy 每天替账号打一次首次登录积分；KukuAI 领「免费领积分」的每日任务）。错过时点开机后会自动补签，不会因为当时没开机而漏掉。各家签到接口都是幂等的，重复执行不会重复领取。',
-)
+/** 页内标签页的档位（值与 checkin-state 的 CheckinTab 一致） */
+const CHECKIN_TAB_OPTIONS = [
+  { value: 'center', label: t('签到中心') },
+  { value: 'schedule', label: t('定时签到') },
+  { value: 'records', label: t('签到记录') },
+] as const
 
 /* ─── 小组件 ───────────────────────────────── */
 
-/** 新手任务分组的提供商展示名（缺省回落 provider id 本身） */
+/** 新手福利分组的提供商展示名（缺省回落 provider id 本身） */
 function onboardingProviderLabel(provider: string): string {
   return provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy'
-    : provider === 'codearts' ? 'CodeArts' : provider
+    : provider === 'codearts' ? 'CodeArts'
+    : provider === 'officeace' ? 'OfficeAce 果办' : provider
 }
 
 function useCheckinStore(): CheckinStore {
@@ -269,7 +224,54 @@ function ProviderRow({ group, expanded }: { group: CheckinProviderGroup; expande
   )
 }
 
-/** 新手任务一行（含惰性查询 / 一键领取 / 可展开收起的行级任务清单） */
+/**
+ * Qoder 国际版的 UMID 组件提示（展开后的分组详情顶部）。
+ *
+ * 国际版签到依赖本机的设备风控身份（`Cosy-MachineToken` 三件套），组件来源
+ * 三种：本机 Qoder 客户端、qodercli 解压、网关数据目录安装（Linux 一键装）。
+ * 这里只读一次状态：装了就说明来源，没装且平台支持安装就给按钮（Linux/Docker
+ * 用户唯一能自助的路径）；不支持安装的平台只说明怎么补 —— Windows/macOS 装
+ * 客户端或 qodercli 后无需重启网关（组件发现按次执行）。
+ */
+function UmidHint(): React.ReactElement | null {
+  const [state, setState] = React.useState<{ available?: boolean; source?: string | null; installSupported?: boolean; installing?: boolean } | null>(null)
+  const load = React.useCallback(async (): Promise<void> => {
+    try {
+      const response = await fetch('/api/qoder-umid')
+      if (response.ok) setState(await response.json())
+    } catch { /* 状态是锦上添花，拉不到不挡签到 */ }
+  }, [])
+  React.useEffect(() => { void load() }, [load])
+  if (!state || state.available) return null
+  const install = async (): Promise<void> => {
+    try {
+      setState(prev => prev ? { ...prev, installing: true } : prev)
+      const response = await fetch('/api/qoder-umid/install', { method: 'POST' })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null)
+        shared().wbApp?.toast?.(t('UMID 组件安装失败：{error}', { error: String(payload?.error ?? response.status) }), 'err')
+      } else {
+        shared().wbApp?.toast?.(t('✅ UMID 组件已安装，下轮签到即可领取国际版积分'))
+      }
+    } catch (error) {
+      shared().wbApp?.toast?.(t('UMID 组件安装失败：{error}', { error: error instanceof Error ? error.message : String(error) }), 'err')
+    } finally {
+      void load()
+    }
+  }
+  return (
+    <div className='flex flex-wrap items-center gap-2 px-[2px] pb-1 text-[12px] text-muted-foreground'>
+      <span>{t('国际版签到需要 UMID 组件生成设备风控身份（本机未检测到）。')}</span>
+      {state.installSupported
+        ? <Button variant='outline' size='sm' disabled={state.installing === true} onClick={() => { void install() }}>
+            {state.installing ? t('安装中…') : t('一键安装组件')}
+          </Button>
+        : <span>{t('安装 Qoder 客户端或 qodercli 后即可（无需重启网关）。')}</span>}
+    </div>
+  )
+}
+
+/** 新手福利一行（含惰性查询 / 一键领取 / 可展开收起的行级任务清单） */
 function OnboardingRow({ row }: { row: { id: string; name: string; provider?: string } }) {
   const provider = row.provider ?? 'loomy'
   const cache = getCheckinStore().onboarding.get(row.id)
@@ -372,241 +374,54 @@ function OnboardingRow({ row }: { row: { id: string; name: string; provider?: st
 }
 
 /**
- * 活动福利一行（CodeArts / ZCode；领取沿用既有流程，本页只提供入口）。
+ * 活动福利一行（ZCode 的限时套餐领取；本页只提供入口，领取由弹窗内的逐份按钮发起）。
  *
- * ── 「已领取」标记（CodeArts）───────────────────────────────
- * 快照的福利行带着本地领取台账（`row.welfare`，后端 checkin_center 落盘事实），
- * 用账号页同款的 `welfareStateOf` 判「今天已领取且已受理」—— 判据只有一处，
- * 两页不会一个说领了一个说没领。已领时按钮置灰、行上加绿徽章：再点也只是
- * 让后端回一句「已领取并确认」，留着可点会让人以为还能再领一次。
- * **试过但没到账不置灰**：手动点击在后端是绕过限流闸的，重试不会变成第二笔领取。
- *
- * ── ZCode 那行的状态也是逐份的（`claimPlans`）───────────────
+ * ── 为什么是按份判、不按「今天领过没」───────────────────────
  * 「已领取过」在上游是按**套餐**判的（领了 A 之后 B 照样能领），所以这一行不按
  * 「今天领过没」把入口堵死，而是：行上标出**今天已领几份 / 今天未领**（台账判据
  * 复用账号页域层的 `claimedPlanIdsToday`，北京时间的日界只在那一处），按钮始终
  * 开着 —— 点开套餐明细弹窗（`wbZcodePlans`）逐份看：可领取的、名下的（含未生效
  * 与已过期）都在那里，领取也在那里。旧版点这里直接进原生确认框，既看不出逐份
  * 状态、也显示不了刚领到还没生效的套餐。
+ *
+ * ── CodeArts 那一行去哪了 ───────────────────────────────────
+ * 它的**每日福利** 2026-10 起并入了每日签到（`core::billing::checkin` 的
+ * codearts 分支，后端也把 `extras.welfare` 撤了），不再有这颗手动「去领取」：
+ * 同一个账号在这两处各挂一个「领」的入口只会让人不确定该点哪个。
+ * （一次性新人礼仍在「新手福利」，那是另一条链。）
  */
-function WelfareRow({ row, kind }: {
-  row: { id: string; name: string; welfare?: unknown; claimAt?: number | null; claimPlans?: Record<string, number> | null }
-  kind: 'welfare' | 'plan'
+function PlanRow({ row }: {
+  row: { id: string; name: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }
 }) {
-  const state = kind === 'welfare'
-    ? welfareStateOf({ welfare: row.welfare } as never)
-    : null
-  const taken = state !== null && state.today && state.accepted
   // ZCode 的逐份领取台账（只算今天、按北京时间判；`row.claimPlans` 是后端落盘事实）
-  const claimedIds = kind === 'plan'
-    ? claimedPlanIdsToday({ claimPlans: row.claimPlans } as never)
-    : []
+  const claimedIds = claimedPlanIdsToday({ claimPlans: row.claimPlans } as never)
   const claimed = claimedIds.length > 0
-  /** 领取完成后刷新快照与主状态（账号页的余额读数也在那一轮里跟上） */
-  const start = async () => {
-    const account = { id: row.id, name: row.name }
-    if (kind === 'welfare') {
-      await shared().wbCodeArtsWelfare?.start?.(account as never)
-      await loadCheckinCenter()
-      void shared().wbApp?.refresh?.()
-      return
-    }
-    // ZCode：打开套餐明细弹窗，领取由弹窗内的逐份按钮发起
-    // （账台与余额读数弹窗自己从账号页状态里读，见 zcode-plans-modal.tsx）
-    openZcodePlans(row.id, row.name)
-  }
   return (
     <div className='ck-welfare-row'>
-      <ProviderLogo id={kind === 'welfare' ? 'codearts' : 'zcode'} label={kind === 'welfare' ? 'CodeArts' : 'ZCode'} />
+      <ProviderLogo id='zcode' label='ZCode' />
       <div className='ck-prov-info'>
         <div className='ck-prov-name'>
           {row.name || row.id}
-          {taken ? <Badge variant='success' shape='tag' title={welfareDoneTitle(state!)}>{t('已领取')}</Badge> : null}
-          {kind === 'plan' ? (
-            claimed
-              ? <Badge variant='success' shape='tag' title={t('本地台账里今天（北京时间）领过的套餐：{plans}', { plans: claimedIds.join(t('、')) })}>
-                {t('今天已领 {n} 份', { n: claimedIds.length })}
-              </Badge>
-              : <Badge variant='outline' shape='tag' title={t('本地台账里今天还没领过；活动期内每天发一份新套餐')}>{t('今天未领')}</Badge>
-          ) : null}
+          {claimed
+            ? <Badge variant='success' shape='tag' title={t('本地台账里今天（北京时间）领过的套餐：{plans}', { plans: claimedIds.join(t('、')) })}>
+              {t('今天已领 {n} 份', { n: claimedIds.length })}
+            </Badge>
+            : <Badge variant='outline' shape='tag' title={t('本地台账里今天还没领过；活动期内每天发一份新套餐')}>{t('今天未领')}</Badge>}
         </div>
         <div className='ck-prov-desc'>
-          {kind === 'welfare'
-            ? taken
-              ? t('今天（北京时间 {day}）已领取 · 官方确认到账 {n} 项 · 明天可再领', { day: state!.day, n: state!.confirmed })
-              : t('运营活动交付（领取 → 确认 → 回读核实）· 领的是套餐赠送积分')
-            : claimed
-              ? t('点「套餐明细」看领到了哪几份、什么时候生效；活动期内每天可再领')
-              : row.claimAt
-                ? t('上次领取 {time} · 领取需通过滑块验证码', { time: formatTime(row.claimAt) })
-                : t('限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码')}
+          {claimed
+            ? t('点「套餐明细」看领到了哪几份、什么时候生效；活动期内每天可再领')
+            : row.claimAt
+              ? t('上次领取 {time} · 领取需通过滑块验证码', { time: formatTime(row.claimAt) })
+              : t('限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码')}
         </div>
       </div>
       <div className='ck-prov-right'>
-        {kind === 'welfare' && taken ? (
-          <Button size='sm' variant='outline' disabled title={welfareDoneTitle(state!)}>{t('已领取')}</Button>
-        ) : (
-          <Button size='sm' variant='outline'
-            title={state && !taken ? welfareTodoTitle(state) : undefined}
-            onClick={() => void start()}>
-            {kind === 'welfare' ? t('去领取') : claimed ? t('套餐明细') : t('去领取')}
-          </Button>
-        )}
+        <Button size='sm' variant='outline' onClick={() => openZcodePlans(row.id, row.name)}>
+          {claimed ? t('套餐明细') : t('去领取')}
+        </Button>
       </div>
     </div>
-  )
-}
-
-/** 时间线一条 */
-function HistoryItem({ entry }: {
-  entry: {
-    at?: number | null
-    reason?: string | null
-    succeeded?: number | null
-    active?: number | null
-    total?: number | null
-    failedCount?: number | null
-    failed?: string[] | null
-  }
-}) {
-  const failed = Number(entry.failedCount) || 0
-  return (
-    <div className={failed > 0 ? 'ck-tl-item err' : Number(entry.succeeded) > 0 ? 'ck-tl-item ok' : 'ck-tl-item'}>
-      <div className='ck-tl-head'>
-        <span>{entry.at ? formatTime(entry.at) : '—'}</span>
-        {entry.reason ? <span className='ck-tl-why'>{entry.reason}</span> : null}
-      </div>
-      <div className='ck-tl-sub'>
-        {historyLine(entry)}
-        {failed > 0 && Array.isArray(entry.failed) && entry.failed.length > 0
-          ? <><br /><span className='fail'>{entry.failed.join(t('；'))}</span></>
-          : null}
-      </div>
-    </div>
-  )
-}
-
-/** 自动签到设置卡（自 tasks-panel 迁入：开关 / 时刻 / 范围 / 保活链 / 上次执行） */
-function AutoCheckinCard({ store }: { store: CheckinStore }) {
-  const auto: AutoCheckinState | null = store.snapshot?.auto ?? null
-  const enabled = auto?.enabled === true
-  const options = Array.isArray(auto?.providerOptions) ? auto!.providerOptions! : []
-  const picked = Array.isArray(auto?.providers) ? auto!.providers! : []
-  const locked = !auto || store.autoSaving
-  const checkinTime = store.autoTimeDraft ?? auto?.time ?? ''
-  const last = auto?.lastResult
-  // 保活模型链：WorkBuddy 国际版日活任务用的免费模型，按顺序回退；
-  // 清空提交 = 恢复缺省链（提示里写明，别让用户以为清空是关掉保活）
-  const keepalive = store.snapshot?.keepalive
-  const keepaliveModels = Array.isArray(keepalive?.models) ? keepalive!.models : []
-  const defaultModels = Array.isArray(keepalive?.defaultModels) ? keepalive!.defaultModels : []
-  const keepaliveText = store.keepaliveDraft ?? keepaliveModels.join(t('、'))
-  return (
-    <section className='panel'>
-      <div className='panel-head'>
-        <h2>{t('自动签到')}</h2>
-        <span className='tip-q' data-tip={AUTO_CHECKIN_DESC}></span>
-        {/* id 保留：app.js 的 renderTopbarStatus 会按 id 镜像这枚徽标（data-tone 传语义色） */}
-        <Badge
-          id='checkin-badge'
-          className='ml-auto'
-          variant={!auto ? 'destructive' : enabled ? 'success' : 'outline'}
-          data-tone={!auto ? 'bad' : enabled ? 'ok' : ''}
-        >
-          {!auto ? t('不可用') : enabled ? (auto?.lastFiredToday ? t('今日已执行') : t('已开启')) : t('已关闭')}
-        </Badge>
-      </div>
-      <div className='p-4'>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('开关')}</span>
-          <span className='ck-set-v'>
-            <Switch
-              checked={enabled}
-              disabled={locked}
-              // 开关一起提交当前时刻（带上未提交的编辑草稿，与旧实现同款）
-              onCheckedChange={next => void saveAutoCheckin({ enabled: next, time: checkinTime }, t('自动签到开关'))}
-            />
-          </span>
-        </div>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('每天时刻')}</span>
-          <span className='ck-set-v flex items-center gap-2'>
-            <Input
-              type='time'
-              className='w-[96px] max-w-[96px] font-mono tabular-nums'
-              value={checkinTime}
-              disabled={locked}
-              onChange={event => setAutoTimeDraft(event.currentTarget.value)}
-              onBlur={event => void submitAutoTime(event.currentTarget.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter') event.currentTarget.blur()
-              }}
-            />
-            <span className='text-subtle text-xs'>{t('错过时点开机后会自动补签')}</span>
-          </span>
-        </div>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('签到范围')}</span>
-          <span className='ck-set-v ck-range'>
-            {options.map(option => (
-              <label className='inline-flex items-center gap-1.5 text-[12.5px]' key={option.id}>
-                <Checkbox
-                  checked={picked.includes(option.id)}
-                  disabled={locked}
-                  // 提交完整勾选清单（后端校验至少一家），顺序取 providerOptions
-                  onCheckedChange={next => void toggleAutoProvider(option.id, next === true)}
-                />
-                <span>{option.label}</span>
-              </label>
-            ))}
-          </span>
-        </div>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('下次执行')}</span>
-          <span className='ck-set-v'>{nextRunText(auto)}</span>
-        </div>
-        <div className='ck-set-line'>
-          <span className='ck-set-k'>{t('保活模型链')}</span>
-          <span className='ck-set-v flex items-center gap-2'>
-            <Input
-              type='text'
-              className='max-w-[300px] font-mono text-xs'
-              placeholder={t('WorkBuddy 国际版保活模型，按顺序回退')}
-              value={keepaliveText}
-              disabled={store.keepaliveSaving}
-              onChange={event => setKeepaliveDraft(event.currentTarget.value)}
-              onBlur={event => void submitKeepaliveModels(event.currentTarget.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter') event.currentTarget.blur()
-              }}
-            />
-          </span>
-        </div>
-        <div className='ck-note'>
-          {t('「保活模型链」是 WorkBuddy 国际版领日活时用来保活的免费模型，按顺序逐个尝试、 第一个成功即止；清空提交恢复缺省（{defaults}）。 当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。 自动签到的设置以这里为准，「定时任务」页只保留间隔型任务。', {
-            defaults: defaultModels.join(t('、')),
-          })}
-        </div>
-        {last ? (
-          <div className='ck-set-line'>
-            <span className='ck-set-k'>{t('上次执行')}</span>
-            <span className='ck-set-v text-xs leading-6'>
-              {last.at ? formatTime(last.at) : '—'}
-              {last.reason ? ` · ${last.reason}` : ''}
-              {` —— ${t('成功 {n}', { n: Number(last.succeeded) || 0 })}`}
-              {(Number(last.active) || 0) > 0 ? ` · ${t('保活 {n}', { n: Number(last.active) })}` : ''}
-              {(Number(last.skipped) || 0) > 0 ? ` · ${t('跳过 {n}', { n: Number(last.skipped) || 0 })}` : ''}
-              {(Number(last.failedCount) || 0) > 0
-                ? <span className='text-destructive'> · {t('失败 {n}', { n: Number(last.failedCount) || 0 })}</span>
-                : ''}
-            </span>
-          </div>
-        ) : null}
-        <div className='ck-note'>
-          {t('当天去重 + 幂等领取：重复执行只会拿到「已领取」，不会重复加分。 自动签到的设置以这里为准，「定时任务」页只保留间隔型任务。')}
-        </div>
-      </div>
-    </section>
   )
 }
 
@@ -628,7 +443,192 @@ function EmptyProviderRow({ group }: { group: CheckinProviderGroup }) {
   )
 }
 
-/* ─── 页面 ─────────────────────────────────── */
+/* ─── 签到中心标签页 ───────────────────────── */
+
+/**
+ * 总览卡 + 三块任务面板。原「自动签到设置卡」与「最近签到记录」时间线已迁出：
+ * 设置长成了多条目（「定时签到」页），记录长成了明细（「签到记录」页），
+ * 两张总览卡改成入口（点击切页）。
+ */
+function CenterTab({ store }: { store: CheckinStore }) {
+  const snapshot = store.snapshot
+  // 「累计签到记录」卡的读数：签到动作后随快照一起重取（只取 1 行拿 total）
+  const [recordTotal, setRecordTotal] = React.useState<number | null>(null)
+  React.useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const api = shared().workbuddyDesktop as {
+          getCheckinRecords?: (params: Record<string, unknown>) => Promise<{ total?: number } | null | undefined>
+        } | undefined
+        const data = await api?.getCheckinRecords?.({ limit: 1 })
+        if (alive) setRecordTotal(Number(data?.total) || 0)
+      } catch { /* 总览卡是锦上添花：拉不到显示 —，不挡签到 */ }
+    })()
+    return () => { alive = false }
+  }, [store.version])
+
+  const daily = snapshot?.daily
+  const auto = snapshot?.auto
+  const outCount = (daily?.outOfScope ?? []).reduce((sum, item) => sum + (Number(item.count) || 0), 0)
+  const onboardingRows = snapshot?.extras.onboarding ?? []
+  const onboardingChecked = onboardingRows.filter(row => store.onboarding.get(row.id)?.status === 'loaded')
+  const onboardingUnclaimed = onboardingRows.reduce((sum, row) => sum + (store.onboarding.get(row.id)?.unclaimed ?? 0), 0)
+  const welfarePlanRows = snapshot?.extras.plans ?? []
+  // 定时签到总览：条目数（启用 / 总数）与聚合「下次执行」（多条目里最近的一次）
+  const scheduleEntries = Array.isArray(auto?.schedules) ? auto!.schedules! : []
+  const scheduleEnabled = scheduleEntries.filter(entry => entry.enabled === true).length
+  const scheduleNext = nextScheduleRun(auto)
+
+  return (
+    <div>
+      {/* ── 总览卡条 ── */}
+      <div className='ck-stats'>
+        <div className='ck-stat'>
+          <div className='ck-stat-label'>{t('今日签到进度')}</div>
+          <div className='ck-stat-value'>
+            {daily ? <> {daily.todayDone}<small> / {daily.todayEligible}</small></> : <span className='ck-pending'>—</span>}
+          </div>
+          <Progress className='ck-stat-bar' value={daily && daily.todayEligible > 0 ? (daily.todayDone / daily.todayEligible) * 100 : 0} />
+          <div className='ck-stat-foot'>{outCount > 0 ? t('另有 {n} 个账号不参与每日签到', { n: outCount }) : t('全部账号均可签到')}</div>
+        </div>
+        <div
+          className='ck-stat ck-stat-link'
+          onClick={() => void showCheckinTab('schedule')}
+          role='button'
+          tabIndex={0}
+          onKeyDown={event => { if (event.key === 'Enter') void showCheckinTab('schedule') }}
+        >
+          <div className='ck-stat-label'>{t('定时签到')}</div>
+          <div className='ck-stat-value'>
+            {auto
+              ? <>{scheduleEnabled}<small> / {scheduleEntries.length} {t('条启用')}</small></>
+              : <span className='ck-pending'>—</span>}
+          </div>
+          <div className='ck-stat-foot'>
+            {auto?.enabled !== true
+              ? t('总开关已关闭 · 在「定时签到」页打开')
+              : scheduleNext
+                ? t('下次 {date} · 点此管理条目', { date: formatTime(scheduleNext) })
+                : t('暂无启用的条目 · 点此添加')}
+          </div>
+        </div>
+        <div className='ck-stat'>
+          <div className='ck-stat-label'>{t('待领新手福利')}</div>
+          <div className='ck-stat-value'>
+            {onboardingRows.length
+              ? <>{onboardingUnclaimed}<small> {t('项')}</small></>
+              : <span className='ck-pending'>{t('无')}</span>}
+          </div>
+          <div className='ck-stat-foot'>
+            {onboardingRows.length
+              ? t('已有结果 {checked} / 共 {total} 个账号', { checked: onboardingChecked.length, total: onboardingRows.length })
+              : t('没有支持新手福利的账号')}
+          </div>
+        </div>
+        <div
+          className='ck-stat ck-stat-link'
+          onClick={() => void showCheckinTab('records')}
+          role='button'
+          tabIndex={0}
+          onKeyDown={event => { if (event.key === 'Enter') void showCheckinTab('records') }}
+        >
+          <div className='ck-stat-label'>{t('累计签到记录')}</div>
+          <div className='ck-stat-value'>
+            {recordTotal === null ? <span className='ck-pending'>—</span> : recordTotal}
+          </div>
+          <div className='ck-stat-foot'>{t('每账号一条明细 · 点此查看「签到记录」')}</div>
+        </div>
+      </div>
+
+      {/* ── 任务面板（单列；设置与记录各自成页）── */}
+      <div className='ck-main'>
+        <section className='panel'>
+          <div className='panel-head'>
+            <h2>{t('每日签到')}</h2>
+            <span className='panel-sub'>{t('点击行展开账号明细 · 单账号签到不受范围限制')}</span>
+            <Button
+              size='sm'
+              variant='default'
+              className='ml-auto'
+              disabled={store.runningAll || (auto?.running === true)}
+              onClick={() => void runAllCheckin()}
+            >
+              {store.runningAll || auto?.running === true ? t('签到中…') : t('立即全部签到')}
+            </Button>
+          </div>
+          <div>
+            {(daily?.providers ?? []).map(group =>
+              group.totalCount > 0
+                ? <ProviderRow key={group.id} group={group} expanded={store.expanded.has(group.id)} />
+                : <EmptyProviderRow key={group.id} group={group} />,
+            )}
+            {(daily?.outOfScope ?? []).length > 0 ? (
+              <div className='ck-fold-note'>
+                {t('不参与每日签到：{list}。CodeArts 的一次性奖励在下方「新手福利」，它的每日福利就在上方「每日签到」里；ZCode 的套餐领取见「活动福利」。', {
+                  // 列表项里的 provider 名与原因都是后端数据（snapshot 的 outOfScope），原样透出
+                  list: daily!.outOfScope
+                    .map(item => t('{label} ×{count}（{reason}）', { label: item.label, count: item.count, reason: item.reason }))
+                    .join(t('；')),
+                })}
+              </div>
+            ) : null}
+          </div>
+        </section>
+
+        <section className='panel'>
+          <div className='panel-head'>
+            <h2>{t('新手福利')}</h2>
+            <span className='panel-sub'>
+              {t('一次性福利 · 签到后自动查询并领取，领完记在本机不再查上游 · 点击行展开任务清单')}
+            </span>
+            {onboardingRows.length > 0 ? (
+              <Button
+                size='sm'
+                variant='outline'
+                className='ml-auto'
+                onClick={() => {
+                  for (const row of onboardingRows) {
+                    // 已结算的账号（快照带回了记忆）不进这一轮：它们的结论不会变，
+                    // 「全部查询」的语义是「把还没查的查一遍」。真要重问上游，
+                    // 逐行那颗「查询任务」才是强制实查的入口（refresh）。
+                    if (row.settled && typeof row.settled === 'object') continue
+                    void queryOnboarding(row.id)
+                  }
+                }}
+              >
+                {t('全部查询')}
+              </Button>
+            ) : null}
+          </div>
+          {onboardingRows.length ? (
+            <div>
+              {onboardingRows.map(row => <OnboardingRow key={row.id} row={row} />)}
+            </div>
+          ) : (
+            <div className='ck-empty'>{t('没有支持新手福利的账号 —— 目前有 Loomy、小浣熊、CodeArts 三家。')}</div>
+          )}
+        </section>
+
+        <section className='panel'>
+          <div className='panel-head'>
+            <h2>{t('活动福利')}</h2>
+            <span className='panel-sub'>{t('限时体验套餐 · 领取需滑块验证码 · 逐份查看与领取')}</span>
+          </div>
+          {welfarePlanRows.length > 0 ? (
+            <div>
+              {welfarePlanRows.map(row => <PlanRow key={row.id} row={row} />)}
+            </div>
+          ) : (
+            <div className='ck-empty'>{t('没有可领套餐的账号（ZCode 未添加）。')}</div>
+          )}
+        </section>
+      </div>
+    </div>
+  )
+}
+
+/* ─── 页面（Tab 壳）─────────────────────────── */
 
 function CheckinPage() {
   const store = useCheckinStore()
@@ -640,7 +640,7 @@ function CheckinPage() {
   // 顶栏那块是本页徽标的镜像（app.js 的 renderTopbarStatus 读 #checkin-badge）：
   // 数据一更新就让它跟上，否则要等下一次主状态轮询（20 秒）才同步 —— 与 tasks-panel 同款
   React.useEffect(() => {
-    // renderTopbarStatus 不在 accounts-shared 的 SharedWindow.wbApp 声明里，窄读
+    // renderTopbarStatus 不在 accounts-shared 的 SharedWindow 声明里，窄读
     const app = window as unknown as { wbApp?: { renderTopbarStatus?: () => void } }
     app.wbApp?.renderTopbarStatus?.()
   }, [store.version])
@@ -654,17 +654,8 @@ function CheckinPage() {
     )
   }
 
-  const daily = snapshot?.daily
   const auto = snapshot?.auto
-  const history = snapshot?.history ?? []
-  const outCount = (daily?.outOfScope ?? []).reduce((sum, item) => sum + (Number(item.count) || 0), 0)
-  const picked = auto?.providers ?? []
-  const options = auto?.providerOptions ?? []
-  const onboardingRows = snapshot?.extras.onboarding ?? []
-  const onboardingChecked = onboardingRows.filter(row => store.onboarding.get(row.id)?.status === 'loaded')
-  const onboardingUnclaimed = onboardingChecked.reduce((sum, row) => sum + (store.onboarding.get(row.id)?.unclaimed ?? 0), 0)
-  const welfareRows = snapshot?.extras.welfare ?? []
-  const planRows = snapshot?.extras.plans ?? []
+  const enabled = auto?.enabled === true
 
   return (
     <div>
@@ -675,173 +666,29 @@ function CheckinPage() {
         </div>
       ) : null}
 
-      {/* ── 总览卡条 ── */}
-      <div className='ck-stats'>
-        <div className='ck-stat'>
-          <div className='ck-stat-label'>{t('今日签到进度')}</div>
-          <div className='ck-stat-value'>
-            {daily ? <> {daily.todayDone}<small> / {daily.todayEligible}</small></> : <span className='ck-pending'>—</span>}
-          </div>
-          <Progress className='ck-stat-bar' value={daily && daily.todayEligible > 0 ? (daily.todayDone / daily.todayEligible) * 100 : 0} />
-          <div className='ck-stat-foot'>{outCount > 0 ? t('另有 {n} 个账号不参与每日签到', { n: outCount }) : t('全部账号均可签到')}</div>
-        </div>
-        <div className='ck-stat'>
-          <div className='ck-stat-label'>{t('签到范围')}</div>
-          <div className='ck-stat-value'>
-            {auto ? <>{picked.length}<small> / {t('{n} 家', { n: options.length })}</small></> : <span className='ck-pending'>—</span>}
-          </div>
-          <div className='ck-stat-foot'>
-            {picked.length
-              ? options.filter(option => picked.includes(option.id)).map(option => option.label).join(t('、'))
-              : t('未勾选任何提供商')}
-          </div>
-        </div>
-        <div className='ck-stat'>
-          <div className='ck-stat-label'>{t('下次自动签到')}</div>
-          <div className='ck-stat-value'>
-            {auto?.enabled === true
-              ? <>{auto.time}</>
-              : <span className='ck-pending'>{t('未开启')}</span>}
-          </div>
-          <div className='ck-stat-foot'>
-            {auto?.enabled === true
-              ? (auto.lastFiredToday ? t('今天已执行') : t('到点自动执行 · 错过会补签'))
-              : t('账号需要手动签到')}
-          </div>
-        </div>
-        <div className='ck-stat'>
-          <div className='ck-stat-label'>{t('待领新手任务')}</div>
-          <div className='ck-stat-value'>
-            {onboardingRows.length
-              ? <>{onboardingUnclaimed}<small> {t('项')}</small></>
-              : <span className='ck-pending'>{t('无')}</span>}
-          </div>
-          <div className='ck-stat-foot'>
-            {onboardingRows.length
-              ? t('已有结果 {checked} / 共 {total} 个账号', { checked: onboardingChecked.length, total: onboardingRows.length })
-              : t('没有支持新手任务的账号')}
-          </div>
-        </div>
+      {/* ── Tab 条：左档位 + 右总开关徽标 ──
+          徽标必须三个标签页都在（app.js 的 renderTopbarStatus 按 id 镜像它，
+          放进某个标签页里就会在另外两页丢失镜像），放 Tab 条右端全局可见 */}
+      <div className='ck-tabs'>
+        <SegmentedControl
+          options={CHECKIN_TAB_OPTIONS}
+          value={store.tab}
+          onValueChange={next => setCheckinTab(next as CheckinTab)}
+          aria-label={t('签到中心分区')}
+        />
+        <Badge
+          id='checkin-badge'
+          className='ml-auto'
+          variant={!auto ? 'destructive' : enabled ? 'success' : 'outline'}
+          data-tone={!auto ? 'bad' : enabled ? 'ok' : ''}
+        >
+          {!auto ? t('不可用') : enabled ? (auto?.lastFiredToday ? t('今日已执行') : t('已开启')) : t('已关闭')}
+        </Badge>
       </div>
 
-      <div className='ck-layout'>
-        {/* ── 左列：三类签到任务 ── */}
-        <div className='ck-main'>
-          <section className='panel'>
-            <div className='panel-head'>
-              <h2>{t('每日签到')}</h2>
-              <span className='panel-sub'>{t('点击行展开账号明细 · 单账号签到不受范围限制')}</span>
-              <Button
-                size='sm'
-                variant='default'
-                className='ml-auto'
-                disabled={store.runningAll || (auto?.running === true)}
-                onClick={() => void runAllCheckin()}
-              >
-                {store.runningAll || auto?.running === true ? t('签到中…') : t('立即全部签到')}
-              </Button>
-            </div>
-            <div>
-              {(daily?.providers ?? []).map(group =>
-                group.totalCount > 0
-                  ? <ProviderRow key={group.id} group={group} expanded={store.expanded.has(group.id)} />
-                  : <EmptyProviderRow key={group.id} group={group} />,
-              )}
-              {(daily?.outOfScope ?? []).length > 0 ? (
-                <div className='ck-fold-note'>
-                  {t('不参与每日签到：{list}。CodeArts 的一次性奖励在上方「新手任务」，它与 ZCode 的每日/套餐福利领取见下方「活动福利」。', {
-                    // 列表项里的 provider 名与原因都是后端数据（snapshot 的 outOfScope），原样透出
-                    list: daily!.outOfScope
-                      .map(item => t('{label} ×{count}（{reason}）', { label: item.label, count: item.count, reason: item.reason }))
-                      .join(t('；')),
-                  })}
-                </div>
-              ) : null}
-            </div>
-          </section>
-
-          <section className='panel'>
-            <div className='panel-head'>
-              <h2>{t('新手任务')}</h2>
-              <span className='panel-sub'>
-                {t('一次性福利 · 签到后自动查询并领取，领完记在本机不再查上游 · 点击行展开任务清单')}
-              </span>
-              {onboardingRows.length > 0 ? (
-                <Button
-                  size='sm'
-                  variant='outline'
-                  className='ml-auto'
-                  onClick={() => {
-                    for (const row of onboardingRows) {
-                      // 已结算的账号（快照带回了记忆）不进这一轮：它们的结论不会变，
-                      // 「全部查询」的语义是「把还没查的查一遍」。真要重问上游，
-                      // 逐行那颗「查询任务」才是强制实查的入口（refresh）。
-                      if (row.settled && typeof row.settled === 'object') continue
-                      void queryOnboarding(row.id)
-                    }
-                  }}
-                >
-                  {t('全部查询')}
-                </Button>
-              ) : null}
-            </div>
-            {onboardingRows.length ? (
-              <div>
-                {onboardingRows.map(row => <OnboardingRow key={row.id} row={row} />)}
-              </div>
-            ) : (
-              <div className='ck-tl-empty'>{t('没有支持新手任务的账号 —— 目前有 Loomy、小浣熊、CodeArts 三家。')}</div>
-            )}
-          </section>
-
-          <section className='panel'>
-            <div className='panel-head'>
-              <h2>{t('活动福利')}</h2>
-              <span className='panel-sub'>{t('独立链路 · 只提供手动入口 · 不进自动签到')}</span>
-            </div>
-            {welfareRows.length + planRows.length > 0 ? (
-              <div>
-                {welfareRows.map(row => <WelfareRow key={row.id} row={row} kind='welfare' />)}
-                {planRows.map(row => <WelfareRow key={row.id} row={row} kind='plan' />)}
-              </div>
-            ) : (
-              <div className='ck-tl-empty'>{t('没有可领福利的账号（CodeArts / ZCode 未添加）。')}</div>
-            )}
-          </section>
-        </div>
-
-        {/* ── 右列：自动签到设置 + 最近记录 ── */}
-        <div className='ck-side'>
-          <AutoCheckinCard store={store} />
-          <section className='panel'>
-            <div className='panel-head'>
-              <h2>{t('最近签到记录')}</h2>
-              <Button
-                size='sm'
-                variant='ghost'
-                className='ml-auto'
-                onClick={() => {
-                  // 预设「自动签到」分类再切页（wbLogsPanel 未进 accounts-shared 的
-                  // SharedWindow，这里窄读；与旧定时任务卡的「查看签到日志」同款）
-                  const logs = window as unknown as {
-                    wbLogsPanel?: { showCategory?: (category: string) => unknown }
-                  }
-                  void logs.wbLogsPanel?.showCategory?.('checkin')
-                }}
-              >
-                {t('查看日志')}
-              </Button>
-            </div>
-            {history.length ? (
-              <div className='ck-tl'>
-                {history.map((entry, index) => <HistoryItem key={entry.at ?? index} entry={entry} />)}
-              </div>
-            ) : (
-              <div className='ck-tl-empty'>{t('还没有批量签到记录 —— 点右上角「立即全部签到」，或等自动签到到点执行。')}</div>
-            )}
-          </section>
-        </div>
-      </div>
+      {store.tab === 'center' ? <CenterTab store={store} /> : null}
+      {store.tab === 'schedule' ? <ScheduleTab /> : null}
+      {store.tab === 'records' ? <RecordsTab /> : null}
     </div>
   )
 }

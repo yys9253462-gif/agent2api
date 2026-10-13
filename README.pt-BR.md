@@ -24,6 +24,7 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 | MonkeyCode (长亭科技, China / global) | ✓ | ✗ sem API de renovação | ✓ somente remota | — | — | — |
 | Command Code | ✓ | ✗ API key estática | ✓ remota + fallback estático | — | — | — |
 | Antigravity (Google, Gemini) | ✓ | ✓ | ✓ remota + fallback estático | — | — | — |
+| OfficeAce (Huawei Cloud, OfficeClaw) | ✓ | ✓ renovação automática do plano de controle | ✓ somente remota | ✓ saldo de pontos | ✓ bônus diário (check-in + presente de boas-vindas) | — |
 | Provedores personalizados | ✓ passthrough de chat / Responses / Anthropic | — | ✓ registro manual + busca no servidor | — | — | — |
 
 Os três pontos de entrada de conversa (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, além de `/v1/messages/count_tokens`) e `/v1/models` funcionam igual para todas as plataformas; as diferenças acima dizem respeito apenas ao que cada upstream consegue fazer. Mapeamento de modelos, fila global de prioridade, fallback em 429, proxy de saída, mascaramento de impressão digital e relatórios de requisições valem para todas as plataformas.
@@ -249,10 +250,16 @@ agent2api/
 │  │  │  │  │  ├─ commandcode/  Command Code: adapter / endpoints / credentials / login /
 │  │  │  │  │  │                fingerprint (impressão digital determinística do dispositivo + relatório a cada 8h) / models /
 │  │  │  │  │  │                plan (envelope de 8 chaves e reescrita de params, derivação do session id)
-│  │  │  │  │  └─ antigravity/  Antigravity (Google, Gemini): oauth (renovação por refresh token + single-flight) /
+│  │  │  │  │  ├─ antigravity/  Antigravity (Google, Gemini): oauth (renovação por refresh token + single-flight) /
 │  │  │  │  │                   project (descoberta loadCodeAssist → onboardUser) / credentials /
 │  │  │  │  │                   endpoints (bases dos três ambientes e conjunto de cabeçalhos) / login /
 │  │  │  │  │                   models (fetchAvailableModels + fallback interno + mapeamento do nome real no upstream) / adapter
+│  │  │  │  │  └─ officeace/    OfficeAce (Huawei Cloud, OfficeClaw): oauth (login self-service PKCE + P-256 DPoP) /
+│  │  │  │  │                   signer (assinaturas SDK-HMAC e V11-HMAC + fixtures de vetores) /
+│  │  │  │  │                   credentials (Basic do gateway + AK/SK temporárias do plano de controle) /
+│  │  │  │  │                   chat (OpenAI compatível sem estado) / models (catálogo remoto + multiplicadores por modelo) /
+│  │  │  │  │                   probe (sondagem de disponibilidade; modelos inacessíveis ficam ocultos por padrão) /
+│  │  │  │  │                   subscription (assinatura / cota / recompensas) / onboarding / checkin / balance
 │  │  │  │  ├─ protocol/        Camada de conversão de protocolo (wire de cada fornecedor ↔ chat SSE padrão:
 │  │  │  │  │                    Anthropic Messages / Responses / NDJSON (Command Code) /
 │  │  │  │  │                    envelope Gemini (Antigravity), além de planos de ferramentas e reparo de histórico)
@@ -324,7 +331,7 @@ O projeto raiz não tem dependências de runtime; o `package.json` apenas fornec
 
 ### Apenas para aprendizado e discussão
 
-Este projeto é um exercício prático de proxy reverso HTTP, passthrough de streaming SSE, adaptação de protocolos de múltiplos upstreams e empacotamento desktop (Tauri), e destina-se **apenas a aprendizado e pesquisa pessoal**. Não é um produto oficial e não tem qualquer vínculo, endosso ou patrocínio de Tencent e WorkBuddy / CodeBuddy, Meituan e CatPaw, SenseTime e 小浣熊, Zhipu e AutoClaw / autoglm, Alibaba e Qoder / Accio, Huawei Cloud e CodeArts, ByteDance e Trae, iFlytek e Loomy, Baidu Wenku e KukuAI, 长亭科技 e MonkeyCode, Command Code, ou Google e Antigravity.
+Este projeto é um exercício prático de proxy reverso HTTP, passthrough de streaming SSE, adaptação de protocolos de múltiplos upstreams e empacotamento desktop (Tauri), e destina-se **apenas a aprendizado e pesquisa pessoal**. Não é um produto oficial e não tem qualquer vínculo, endosso ou patrocínio de Tencent e WorkBuddy / CodeBuddy, Meituan e CatPaw, SenseTime e 小浣熊, Zhipu e AutoClaw / autoglm, Alibaba e Qoder / Accio, Huawei Cloud e CodeArts / OfficeAce, ByteDance e Trae, iFlytek e Loomy, Baidu Wenku e KukuAI, 长亭科技 e MonkeyCode, Command Code, ou Google e Antigravity.
 
 ### Sobre o comportamento de proxy reverso
 

@@ -526,3 +526,4 @@ fn reload_facts() {
         *slot = facts;
     }
 }
+

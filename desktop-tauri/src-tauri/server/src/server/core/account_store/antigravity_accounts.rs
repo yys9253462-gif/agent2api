@@ -288,7 +288,7 @@ impl AccountStore {
                 credentials::tail_chars(&refresh_token, 4)
             ),
         );
-        Ok(self.to_antigravity_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// 刷新成功后回写新令牌（`oauth::refresh_and_save` 调用）。

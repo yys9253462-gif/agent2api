@@ -686,6 +686,42 @@ const ANTIGRAVITY: ProviderConfig = {
   ],
 }
 
+/**
+ * OfficeAce（华为云果办 / OfficeClaw）：一家一个 provider，没有地区之分。
+ *
+ * ── 两条来源（都落在后端 `add_officeace_account`）──────────────
+ * ① **浏览器登录（自助 OAuth）**：网关向云端要 state、拼授权地址，用户在浏览器里
+ *    登华为云，网关**轮询云端**取授权码并换到网关凭据 —— **不需要装 OfficeAce
+ *    桌面端**（云端回调页不往本机跳，所以壳侧也不用开回调监听）。
+ * ② **粘贴凭据**：从别的机器（或桌面端 `models.json`）拿 `baseUrl` 与
+ *    `modelAppKey`/`modelAppSecret` 贴进来。只给这三个也能转发（网关凭据不过期）；
+ *    控制面临时凭据（`accessKeyId` 等）可选。
+ *
+ * ── 没有「导入桌面端登录态」这条后端路径 ──────────────────────
+ * 与 CodeArts 同：凭据只能靠网页登录或粘贴，所以显式 `desktop: false`
+ * （不写的话桌面壳里会多出一个选了之后什么都没有的分段）。
+ */
+const OFFICEACE: ProviderConfig = {
+  provider: 'officeace',
+  label: t('OfficeAce 果办'),
+  desktop: false,
+  webLogin: {
+    // 整段是一个 t() 键：扫描器只认字符串字面量（拼接串提不到键），所以不拆行
+    noteHtml: t('打开华为云授权页登录：登录完成后网关会自动<b>轮询云端</b>取回授权码并加入账号列表（不需要装 OfficeAce 桌面端，也无需手工回填回调地址）。'),
+    button: t('打开授权页'),
+    busyText: t('等待 OfficeAce 登录完成…'),
+  },
+  manualTitle: t('粘贴网关凭据'),
+  manualNoteHtml: t('从别的机器（或 OfficeAce 桌面端 <code>models.json</code>）取三项贴进来：模型网关基址（<code>baseUrl</code>，形如 <code>https://modelgw-…/v2</code>）与 <code>modelAppKey</code> / <code>modelAppSecret</code>。这三项就能转发（网关凭据不过期）；控制面临时凭据（<code>accessKeyId</code> 等）可选，留空则额度/自动续期不可用，但不影响转发。'),
+  fields: [
+    // 字段名与 URL 示例不包 t()（各语言相同，与 CodeArts 的 JSON 示例同一处置）
+    { key: 'baseUrl', label: t('模型网关基址'), placeholder: 'https://modelgw-…huaweicloud-agentarts.com/v2' },
+    { key: 'modelAppKey', label: t('网关 Key'), placeholder: 'model_app_key' },
+    { key: 'modelAppSecret', label: t('网关 Secret'), placeholder: 'model_app_secret' },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空用「OfficeAce 果办」') },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -724,6 +760,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // PROVIDERS 的追加顺序排在表尾（后到居后，新增的家加在末尾）。
   COMMANDCODE,
   ANTIGRAVITY,
+  // OfficeAce（华为云果办 / OfficeClaw）：浏览器登录（自助 OAuth）或粘贴网关
+  //凭据，排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
+  OFFICEACE,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

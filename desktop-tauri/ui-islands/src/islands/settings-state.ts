@@ -33,6 +33,7 @@
 import * as React from 'react'
 import {
   CATEGORIES,
+  CAPTCHA_POOL_FIELDS,
   NO_RETRY_CODES_KEY,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -41,9 +42,12 @@ import {
   RETRY_CODE_MIN,
   RETRY_FIELDS,
   RETRY_MAX_CODES,
+  ROUTE_STICKY_OPTIONS,
+  ROUTE_STRATEGIES,
   SETTINGS_CAT_KEY,
   TIMEOUT_FIELDS,
   errorMessage,
+  formatBytes,
   normalizeApp,
   normalizeNumbers,
   parseInteger,
@@ -74,6 +78,8 @@ export type BusyScope =
   | 'codes'
   | 'timeouts'
   | 'queue'
+  | 'captchaPool'
+  | 'routing'
   | 'debug'
   | 'sanitize'
   | 'clineHeaders'
@@ -82,6 +88,8 @@ export type BusyScope =
   | 'captcha'
   | 'export'
   | 'import'
+  | 'dbExport'
+  | 'dbImport'
   | null
 
 /**
@@ -112,6 +120,12 @@ export type AppState = {
 
 /** 数值面板：values 为 null 时（loading / unavailable）各输入框保持禁用 */
 export type NumericState = { status: LoadStatus; values: Record<string, number> | null }
+
+/**
+ * 账号路由（策略 + 会话粘性）：两档都是受控枚举，读不到时档位回落后端默认
+ * （order / auto，由视图侧按合法值表兜底）。
+ */
+export type RoutingState = { status: LoadStatus; strategy: string; sticky: string }
 
 export type DebugState = {
   status: LoadStatus
@@ -222,6 +236,9 @@ export type SettingsSnapshot = {
   retryCodes: number[] | null
   timeouts: NumericState
   queue: NumericState
+  captchaPool: NumericState
+  /** 账号路由：策略 + 会话粘性（「路由」分类） */
+  routing: RoutingState
   debug: DebugState
   sanitize: SanitizeState
   clineHeaders: ClineHeadersState
@@ -232,6 +249,12 @@ export type SettingsSnapshot = {
   ioFailure: IoFailure
   /** 保留期改小的确认框正文（非空即开着）；确认 / 取消都收口到 resolveRetentionConfirm */
   retentionConfirm: { head: string } | null
+  /**
+   * 整库备份 / 恢复（「数据」分类）：`dbIncludeLogs` 是导出复选框的当前值；
+   * `dbBackupConfirm` 非空 = 恢复确认弹窗开着（记录的是确认时要执行的参数集）。
+   */
+  dbIncludeLogs: boolean
+  dbBackupConfirm: { includeLogs: boolean } | null
   /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
   lanConfirm: LanConfirm
   /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
@@ -277,6 +300,8 @@ const INITIAL: SettingsSnapshot = {
   retryCodes: null,
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
+  captchaPool: { status: 'loading', values: null },
+  routing: { status: 'loading', strategy: 'order', sticky: 'auto' },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
@@ -310,6 +335,9 @@ const INITIAL: SettingsSnapshot = {
   captcha: { available: true, enabled: false },
   ioFailure: null,
   retentionConfirm: null,
+  // 整库备份：默认包含日志与调试报文（完整备份）；恢复确认弹窗默认关闭
+  dbIncludeLogs: true,
+  dbBackupConfirm: null,
   lanConfirm: null,
   lanRegister: null,
   panelLogin: false,
@@ -728,6 +756,85 @@ export async function importAccounts(): Promise<void> {
   }
 }
 
+/* ─── 整库备份 / 恢复（替换语义，见 db::backup 的模块头） ──────────────── */
+
+/** 拨动「包含日志与调试报文」复选框（默认勾上；取消后只备业务数据） */
+export function toggleDbIncludeLogs(on: boolean): void {
+  publish({ dbIncludeLogs: on })
+}
+
+/**
+ * 整库备份：后端把整库导出为 SQL 文件直写到壳选的路径（文件不过壳中转）。
+ * 桌面端专属（web shim 没有这个方法），导出没有「空库不导」分支。
+ */
+export async function exportDatabase(): Promise<void> {
+  if (busyScope) return
+  beginBusy('dbExport')
+  try {
+    const api = shared().workbuddyDesktop
+    if (!api?.exportDatabase) {
+      toast(t('当前环境不支持整库备份（仅桌面端可用）'), 'err')
+      return
+    }
+    const result = await api.exportDatabase(snapshot.dbIncludeLogs)
+    if (result?.canceled) { toast(t('已取消导出')); return }
+    const size = Number(result?.bytes) || 0
+    const tables = Array.isArray(result?.tables) ? result.tables.length : 0
+    toast(t('✅ 已备份 {n} 张表（{size}）到 {file}', {
+      n: tables,
+      size: formatBytes(size),
+      file: result?.file || '',
+    }))
+  } catch (error) {
+    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
+  } finally {
+    endBusy()
+  }
+}
+
+/** 点「恢复」：先弹确认框（整库恢复是替换语义，二次确认后才开始） */
+export function confirmDbRestore(): void {
+  if (busyScope) return
+  publish({ dbBackupConfirm: { includeLogs: snapshot.dbIncludeLogs } })
+}
+
+/** 确认框出口（与 resolveRetentionConfirm 同形）：确认后才执行恢复 */
+export function resolveDbBackupConfirm(accepted: boolean): void {
+  publish({ dbBackupConfirm: null })
+  if (accepted) void proceedDbRestore()
+}
+
+/**
+ * 整库恢复本体。成功后**重拉整页设置与存储概况** —— 配置、桌面设置、账号、
+ * 日志全被替换成备份的状态，任何一块旧快照都不能再用；主界面同样刷新
+ * （账号列表、分组与模型清单都会变）。面板短效令牌由后端在恢复后清空，
+ * 浏览器下一次请求会自然落到重新登录。
+ */
+async function proceedDbRestore(): Promise<void> {
+  if (busyScope) return
+  const api = shared().workbuddyDesktop
+  if (!api?.importDatabase) {
+    toast(t('当前环境不支持整库恢复（仅桌面端可用）'), 'err')
+    return
+  }
+  beginBusy('dbImport')
+  try {
+    const result = await api.importDatabase()
+    const tables = Array.isArray(result?.tables) ? result.tables.length : 0
+    const note = result?.safetyBackup
+      ? t('，替换前的数据已备份为 {name}', { name: result.safetyBackup })
+      : ''
+    toast(t('✅ 已恢复 {n} 张表{note}', { n: tables, note }))
+    // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）
+    await load()
+    await shared().wbApp?.refresh?.()
+  } catch (error) {
+    toast(t('恢复失败：{message}', { message: errorMessage(error) }), 'err')
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── 数据保留（三项保留天数） ─────────────── */
 
 export function renderRetention(data?: unknown): void {
@@ -857,7 +964,7 @@ async function commitRetention(field: NumberField, days: number, shrinking: bool
  * 直接换号」名单）由各自的代码实现，在数据到达 / 不可用时被回调一次。
  */
 type NumericPanel = {
-  scope: 'retry' | 'timeouts' | 'queue'
+  scope: 'retry' | 'timeouts' | 'queue' | 'captchaPool'
   fields: NumberField[]
   consoleLabel: string
   /** 取数 / 写回：桥不在时给 undefined（各调用点按「读不到」处理） */
@@ -939,6 +1046,92 @@ export async function loadQueue(): Promise<void> {
 
 export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
   await saveNumericField(queuePanel, field, raw)
+}
+
+/* ─── 验证码令牌池 ─────────────────────────── */
+
+const captchaPoolPanel: NumericPanel = {
+  scope: 'captchaPool',
+  fields: CAPTCHA_POOL_FIELDS,
+  consoleLabel: '读取验证码令牌池设置',
+  get: () => shared().workbuddyDesktop?.getCaptchaPool(),
+  save: patch => shared().workbuddyDesktop?.saveCaptchaPool(patch),
+  read: () => snapshot.captchaPool,
+  write: state => publish({ captchaPool: state }),
+}
+
+export function renderCaptchaPool(data?: unknown): void {
+  renderNumericPanel(captchaPoolPanel, data)
+}
+
+export async function loadCaptchaPool(): Promise<void> {
+  await loadNumericPanel(captchaPoolPanel)
+}
+
+export async function saveCaptchaPoolField(field: NumberField, raw: string): Promise<void> {
+  await saveNumericField(captchaPoolPanel, field, raw)
+}
+
+/* ─── 账号路由（策略 + 会话粘性）───────────── */
+
+/** 后端给的路由配置里我们关心的两个键（与 /api/routing 的长键名逐字对应） */
+const ROUTING_STRATEGY_KEY = 'routingStrategy'
+const ROUTING_STICKY_KEY = 'routingSticky'
+
+/** 路由配置的合法取值表（逐字来自 settings-model 的档位表，校验与兜底共用） */
+const ROUTING_VALID: Record<string, ReadonlySet<string>> = {
+  [ROUTING_STRATEGY_KEY]: new Set(ROUTE_STRATEGIES.map(item => item.value)),
+  [ROUTING_STICKY_KEY]: new Set(ROUTE_STICKY_OPTIONS.map(item => item.value)),
+}
+
+/** 路由响应 → 快照值：只认合法档位，读不到 / 非法时按该键的默认档兜底 */
+function routingValuesFrom(data: unknown): { strategy: string; sticky: string } {
+  const record = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>
+  const pick = (key: string, fallback: string): string => {
+    const raw = record[key]
+    return typeof raw === 'string' && ROUTING_VALID[key].has(raw) ? raw : fallback
+  }
+  return { strategy: pick(ROUTING_STRATEGY_KEY, 'order'), sticky: pick(ROUTING_STICKY_KEY, 'auto') }
+}
+
+export async function loadRouting(): Promise<void> {
+  try {
+    const data = await shared().workbuddyDesktop?.getRoutingConfig()
+    if (data === undefined) { publish({ routing: { ...snapshot.routing, status: 'unavailable' } }); return }
+    publish({ routing: { status: 'ready', ...routingValuesFrom(data) } })
+  } catch (error) {
+    console.warn('读取路由设置失败:', errorMessage(error))
+    publish({ routing: { ...snapshot.routing, status: 'unavailable' } })
+  }
+}
+
+/**
+ * 保存两档之一：PUT 契约返回生效后的全量值（与超时 / 重试同一模式），直接按响应刷新。
+ * 后端只认长键名；未知档位在界面上就发不出来（SegmentedControl 的取值来自档位表）。
+ */
+export async function saveRoutingField(patch: { routingStrategy?: string; routingSticky?: string }): Promise<void> {
+  if (busyScope) return
+  const bridge = shared().workbuddyDesktop
+  if (!bridge?.setRoutingConfig) {
+    toast(t('桌面运行时不可用，暂时无法保存'), 'err')
+    return
+  }
+  beginBusy('routing')
+  try {
+    const saved = await bridge.setRoutingConfig(patch)
+    if (saved !== undefined) {
+      publish({ routing: { status: 'ready', ...routingValuesFrom(saved) } })
+    } else {
+      // 老壳不回响应体：回读一次拿真实生效值（loadRouting 会给出 ready / unavailable）
+      await loadRouting()
+    }
+    toast(t('✅ 路由设置已保存'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadRouting() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
 }
 
 /* ─── 请求重试 ─────────────────────────────── */
@@ -1764,6 +1957,8 @@ export async function load(): Promise<void> {
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
+    loadCaptchaPool(),
+    loadRouting(),
     loadDebug(),
     loadSanitize(),
     loadClineHeaders(),
@@ -1796,6 +1991,16 @@ export async function refreshTimeouts(): Promise<void> {
 export async function refreshQueue(): Promise<void> {
   await loadQueue()
   toast(t('排队等待设置已刷新'))
+}
+
+export async function refreshCaptchaPool(): Promise<void> {
+  await loadCaptchaPool()
+  toast(t('验证码令牌池设置已刷新'))
+}
+
+export async function refreshRouting(): Promise<void> {
+  await loadRouting()
+  toast(t('路由设置已刷新'))
 }
 
 export async function refreshDebug(): Promise<void> {

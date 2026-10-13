@@ -16,10 +16,15 @@
  * `wbAccountsFilters` / `wbAccountsGroups` 四个对象在页外无任何引用，已随本页合并
  * 进岛里不再挂 window —— 见最终报告）。
  *
- * ── 全局一条队列（优先级不再按 provider 分段）────────────────────
- * 优先级在后端是**全局唯一**的一条队列：四家账号混排，转发时按优先级从小到大逐个
- * 尝试，跳过禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与 rotate.rs）。
- * 所以筛选与计数都按这一条队列算，positionMap 的序号就是整张表的行序。
+ * ── 全局一条队列 + 按家分组（2026-10 账号页分组化）───────────────
+ * 优先级在后端仍是**全局唯一**的一条队列：转发时按优先级从小到大逐个尝试，跳过
+ * 禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与 rotate.rs）。
+ * 界面上按家分组显示（`accountGroups`），组顺位 = 各家最靠前的账号的先后 ——
+ * 两者能对上，靠的是队列不变量「同一家的账号连续」（后端新增/导入落在本组末尾、
+ * 拖拽由 `POST /api/accounts/reorder` 整队重编号，见 store_order.rs）。
+ * 于是旧的「全局第 N 位」（`positionMap`）不再直接显示在行上：行上是**组内序号**，
+ * 队列的先后由「组顺位 + 组内序号」共同表达。positionMap 保留给需要绝对位置的地方
+ * （模型测试的候选清单、⋯ 菜单的「已在第一位」判定）。
  */
 
 import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
@@ -167,6 +172,19 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `expiry: ''` —— BDUSS 没有过期时间字段（无刷新接口，过期只能重登，
   //   这一列对它是空，界面不渲染「有效期」）。
   kuku: { usage: true, edition: false, identifier: 'uid', expiry: '' },
+  // OfficeAce（华为云果办 / OfficeClaw）。各位各有出处：
+  // `usage: true` —— 额度/积分要**控制面签名**（V11-HMAC-SHA256 打 `/v1/subscription`），
+  //   那条链已经实现（`officeace/balance.rs` + 适配器 `query_usage`），所以余额按钮与
+  //   积分列都开。⚠️ 只导入网关 Basic 那一对、没有控制面凭据的账号查不到余额，
+  //   服务端回 400 `usage_not_configured`，界面按「未配置查询」如实显示（不是报错）。
+  // `edition: false` —— 单一入口（自助 OAuth 浏览器登录 / 粘贴网关 Basic 凭据），
+  //   没有国际版。
+  // `expiry: 'expiresAt'` —— 控制面临时凭据约 2 小时到期；只导入网关 Basic
+  //   凭据时没有这个字段，界面不渲染「有效期」（那一半本来也不过期）。
+  // `identifier: 'id'` —— 账号标识渲染的是**账号 id**（`officeace-<hash>`，
+  //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
+  //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
+  officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
 }
 
 /**
@@ -820,9 +838,12 @@ export function welfareTodoTitle(state: WelfareState): string {
   return t('{tried}探测并领取官方每日登录赠送的套餐积分（到账进套餐积分，不增加福利模型 token 池）', { tried })
 }
 
-/* ─── 筛选维度（provider / enabled / limit 三维各自独立）───── */
+/* ─── 筛选维度（enabled / limit / q 三维各自独立）─────────────
+   分组模式（账号页按家分组）去掉了「提供商」这一维：家的维度已经由页面结构本身
+   表达（一家一段），再挂一个下拉筛同一件事，只会让「现在看的是哪几家」有两个说法。
+   `q` 是搜索框（账号名 / 备注 / 邮箱 / 标识），与另外两维共用同一条可见性口径。 */
 
-export type AccountFilter = { provider: string; enabled: string; limit: string }
+export type AccountFilter = { enabled: string; limit: string; q: string }
 
 /** 余额读数的查找口（账号 → `usageEntryOf` 的结果）；不传视作「都没有读数」 */
 export type UsageLookup = (account: AccountRecord) => UsageEntry | undefined
@@ -851,8 +872,20 @@ export function isLimitedNow(
     || tokenBlockedOf(account, tokenReadings)
 }
 
-export function matchProvider(account: AccountRecord, filter: AccountFilter): boolean {
-  return filter.provider === 'all' || providerOf(account) === filter.provider
+/** 搜索词是否命中这条账号：账号名 / 备注名 / 邮箱 / 厂商标识 / id 任一含它就留下。
+ *  大小写不敏感（英文邮箱与 id 常见大小写混写）。空词命中一切。 */
+export function matchQuery(account: AccountRecord, filter: AccountFilter): boolean {
+  const q = String(filter.q || '').trim().toLowerCase()
+  if (!q) return true
+  const haystack = [
+    displayNameOf(account),
+    account?.name,
+    account?.nickname,
+    account?.email,
+    identifierOf(account),
+    account?.id,
+  ]
+  return haystack.some(value => String(value || '').toLowerCase().includes(q))
 }
 
 export function matchEnabled(account: AccountRecord, filter: AccountFilter): boolean {
@@ -873,6 +906,18 @@ export function matchLimit(
   return filter.limit === 'limited' ? limited : !limited
 }
 
+/** 单条账号是否通过当前筛选（三个维度的合取）。`visibleAccounts` 就是它在列表上的 filter */
+export function matchesFilter(
+  account: AccountRecord,
+  filter: AccountFilter,
+  usageOf?: UsageLookup,
+  tokenUsageOf?: TokenUsageLookup,
+): boolean {
+  return matchEnabled(account, filter)
+    && matchLimit(account, filter, usageOf, tokenUsageOf)
+    && matchQuery(account, filter)
+}
+
 /** 当前筛选条件下的可见账号（三个维度同时生效） */
 export function visibleAccounts(
   all: AccountRecord[] | null | undefined,
@@ -880,9 +925,7 @@ export function visibleAccounts(
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
 ): AccountRecord[] {
-  return (all || []).filter(account => matchProvider(account, filter)
-    && matchEnabled(account, filter)
-    && matchLimit(account, filter, usageOf, tokenUsageOf))
+  return (all || []).filter(account => matchesFilter(account, filter, usageOf, tokenUsageOf))
 }
 
 /**
@@ -892,35 +935,25 @@ export function visibleAccounts(
 export function filterCounts(
   all: AccountRecord[] | null | undefined,
   filter: AccountFilter,
-  summaries: Array<{ id: string }> | null | undefined,
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
 ): Record<string, number> {
   const list = all || []
-  const scope = (except: 'provider' | 'enabled' | 'limit') => list.filter(account =>
-    (except === 'provider' || matchProvider(account, filter))
-    && (except === 'enabled' || matchEnabled(account, filter))
-    && (except === 'limit' || matchLimit(account, filter, usageOf, tokenUsageOf)))
+  const scope = (except: 'enabled' | 'limit') => list.filter(account =>
+    (except === 'enabled' || matchEnabled(account, filter))
+    && (except === 'limit' || matchLimit(account, filter, usageOf, tokenUsageOf))
+    && matchQuery(account, filter))
 
   const forEnabled = scope('enabled')
   const forLimit = scope('limit')
-  const forProvider = scope('provider')
-  const counts: Record<string, number> = {
+  return {
     enabledAll: forEnabled.length,
     enabled: forEnabled.filter(isEnabled).length,
     disabled: forEnabled.filter(a => !isEnabled(a)).length,
     limitAll: forLimit.length,
     normal: forLimit.filter(a => isEnabled(a) && !isLimitedNow(a, usageOf?.(a), tokenUsageOf?.(a))).length,
     limited: forLimit.filter(a => isEnabled(a) && isLimitedNow(a, usageOf?.(a), tokenUsageOf?.(a))).length,
-    providerAll: forProvider.length,
   }
-  // 摘要里每一家都要有键（没有账号的家显示 0 并置灰），否则它的徽标会停在旧数字上
-  ;(summaries || []).forEach(item => { counts[`p-${item.id}`] = 0 })
-  forProvider.forEach(account => {
-    const key = `p-${providerOf(account)}`
-    counts[key] = (counts[key] || 0) + 1
-  })
-  return counts
 }
 
 /**
@@ -950,6 +983,69 @@ export function positionMap(all: AccountRecord[] | null | undefined): Map<string
   const map = new Map<string, { position: number; total: number }>()
   ordered.forEach((account, index) => map.set(account.id, { position: index + 1, total: ordered.length }))
   return map
+}
+
+/* ─── 分组（账号页的显示口径）────────────────── */
+
+export type AccountGroup = {
+  /** 这一组的家（provider id） */
+  provider: string
+  /** 家名（后端注册表的 label，取不到回落 id） */
+  label: string
+  /** 组顺位（1 起）：拖动整组改变的就是它 */
+  rank: number
+  /** 组内**全部**账号（按组内优先级升序，不受筛选影响）：组内序号、统计、以及
+   *  「整队重排」时拼队列都用它 —— 折叠起来的组在 DOM 里没有行，只有这里留着全量 */
+  members: AccountRecord[]
+  /** 组内**可见**的账号（members 里通过筛选的那些，顺序同上）：渲染用它 */
+  accounts: AccountRecord[]
+  enabled: number
+  disabled: number
+  limited: number
+}
+
+/**
+ * 按家分组：组序 = 各家**最靠前**那个账号的先后（组内按优先级升序，并列按加入时间）。
+ *
+ * 与后端 `priority::grouped_queue_order` 是同一份规则的同构实现（渲染层拿不到 Rust，
+ * 只能两处各写一遍 —— 改一处必须同步另一处）。两边的顺序之所以总是一致，靠的是
+ * 队列不变量「同一家的账号连续」：组序因此就等于真实队列里的先后。
+ * 拖完一次由后端按拖出来的顺序整队重编号，不变量继续成立。
+ *
+ * `keep` 是可见性谓词（筛选 / 搜索），**只过滤组内的行、不参与定组序**：筛选时
+ * 组序不跳动，被筛掉的行也不会让整组消失（组头还在，只是组内空了）。
+ */
+export function accountGroups(
+  all: AccountRecord[] | null | undefined,
+  keep?: ((account: AccountRecord) => boolean) | null,
+  usageOf?: UsageLookup,
+  tokenUsageOf?: TokenUsageLookup,
+): AccountGroup[] {
+  const ordered = (all || []).slice().sort(byPriorityOrder)
+  const providers: string[] = []
+  const members = new Map<string, AccountRecord[]>()
+  for (const account of ordered) {
+    const provider = providerOf(account)
+    if (!members.has(provider)) {
+      members.set(provider, [])
+      providers.push(provider)
+    }
+    members.get(provider)!.push(account)
+  }
+  return providers.map((provider, index) => {
+    const list = members.get(provider) || []
+    return {
+      provider,
+      label: shared().wbProviders?.labelOf?.(provider) || provider,
+      rank: index + 1,
+      members: list,
+      accounts: keep ? list.filter(keep) : list,
+      enabled: list.filter(isEnabled).length,
+      disabled: list.filter(account => !isEnabled(account)).length,
+      limited: list.filter(account =>
+        isEnabled(account) && isLimitedNow(account, usageOf?.(account), tokenUsageOf?.(account))).length,
+    }
+  })
 }
 
 /* ─── 展示派生 ─────────────────────────────── */

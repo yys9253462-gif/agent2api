@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.0.1"
+version = "3.0.2"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -107,7 +107,9 @@ md-5 = "0.10"
 # Qoder COSY 签名的 RSA-PKCS#1 v1.5 加密（手写模幂，见 cosy.rs）
 num-bigint = "0.4"
 # 本地存储唯一真相：单文件 SQLite（bundled 静态链接，运行时零系统依赖）
-rusqlite = { version = "0.40", features = ["bundled"] }
+# backup：整库在线备份/恢复（设置页「整库备份/恢复」）；hooks：导入 SQL 时的
+# authorizer 沙箱（拒绝越界语句，见 db::backup 的模块头）
+rusqlite = { version = "0.40", features = ["bundled", "backup", "hooks"] }
 # 管理面板登录的密码哈希（AGENT2API_ADMIN_PASSWORD_HASH）：
 # bcrypt 与 htpasswd -nBC 的输出格式互通，生成命令无需额外工具
 bcrypt = "0.15"

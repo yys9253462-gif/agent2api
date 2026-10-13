@@ -321,6 +321,13 @@ const BRIDGE_JS: &str = r#"
     refreshAccountToken: id => call('POST', '/api/accounts/refresh', id ? { id } : {}),
     removeAccount: id => call('DELETE', '/api/accounts/' + encodeURIComponent(id)),
     updateAccount: (id, patch) => call('PATCH', '/api/accounts/' + encodeURIComponent(id), patch),
+    // 整队重排（账号页分组模式）：账号拖完组 / 拖完行之后，把**新队列整条**交上来
+    // （从队首到队尾的 id 数组）。后端按顺序把全局 priority 编成 0、1、2…，所以
+    // 「组顺位 + 组内顺位」一次落库，不存在逐条 PATCH 的中间态。
+    reorderAccounts: queue =>
+      call('POST', '/api/accounts/reorder', {
+        queue: Array.isArray(queue) ? queue.map(item => String(item)) : [],
+      }),
     moveAccount: (id, direction) =>
       call('POST', '/api/accounts/' + encodeURIComponent(id) + '/move', {
         direction: direction === 'down' ? 'down' : 'up',
@@ -329,6 +336,12 @@ const BRIDGE_JS: &str = r#"
     clearRateLimits: (id, model) =>
       call('POST', '/api/accounts/' + encodeURIComponent(id) + '/rate-limits/clear',
         model ? { model } : {}),
+    // ── 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断 + 队列可见化）──
+    getRoutingConfig: () => call('GET', '/api/routing'),
+    setRoutingConfig: patch => call('PUT', '/api/routing', patch || {}),
+    // 候选队列可见化（账号页「路由」面板的数据源）：model 缺省 = 不限模型的全局队列
+    getRoutingQueue: model =>
+      call('GET', '/api/routing/queue' + (model ? '?model=' + encodeURIComponent(model) : '')),
     batchAccounts: payload =>
       call('POST', '/api/accounts/batch', {
         action: String((payload && payload.action) || ''),
@@ -475,6 +488,13 @@ const BRIDGE_JS: &str = r#"
     getAutoCheckin: () => call('GET', '/api/auto-checkin'),
     saveAutoCheckin: patch => call('POST', '/api/auto-checkin', patch),
     runAutoCheckinNow: () => call('POST', '/api/auto-checkin/run', {}),
+    // 定时签到的**条目**（签到中心「定时签到」页）：列表 / 保存一条 / 删除 / 立即执行
+    getCheckinSchedules: () => call('GET', '/api/checkin-schedules'),
+    saveCheckinSchedule: patch => call('POST', '/api/checkin-schedules', patch),
+    deleteCheckinSchedule: id =>
+      call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/delete', {}),
+    runCheckinSchedule: id =>
+      call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/run', {}),
     // WorkBuddy 国际版日活保活的模型链（读 / 存；与 web_shim.rs 的同名方法成对）
     getCheckinKeepalive: () => call('GET', '/api/checkin-keepalive'),
     saveCheckinKeepalive: models => call('POST', '/api/checkin-keepalive', { models }),
@@ -483,6 +503,24 @@ const BRIDGE_JS: &str = r#"
     // 签到中心的聚合快照（每日签到分组 / 自动签到设置 / 签到历史 / 一次性项入口），
     // 见 api::checkin_center 的模块头 —— 页面打开只打这一条
     getCheckinCenter: () => call('GET', '/api/checkin-center'),
+    // 签到记录明细台账（签到记录页）：查询（limit/offset/outcome/provider/keyword/start/end）
+    // 与清空（全清必须显式 all=1，护栏见 api::checkin_records 的模块头）
+    getCheckinRecords: params => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(params || {})) {
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('GET', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
+    clearCheckinRecords: params => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(params || {})) {
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('DELETE', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
 
     // ── 间隔型定时任务（凭证自动维护 / 定时查询积分 / 模型刷新 / 两个前端自动刷新）──
     // 改一条任务用 PATCH（后端同时受理 POST 作别名：CORS 允许方法里没有 PATCH，
@@ -631,6 +669,12 @@ const BRIDGE_JS: &str = r#"
     getQueue: () => call('GET', '/api/queue'),
     saveQueue: patch => call('PUT', '/api/queue', patch),
 
+    // ── 验证码令牌池（设置页「网关 → 验证码令牌池」）──
+    // ZCode 活动套餐通道令牌池的补货节奏（目标 / 轮询间隔 / 单轮上限），
+    // 存配置（/api/zcode/captcha-pool）。契约同 saveTimeouts。
+    getCaptchaPool: () => call('GET', '/api/zcode/captcha-pool'),
+    saveCaptchaPool: patch => call('PUT', '/api/zcode/captcha-pool', patch),
+
     // ── 调试模式（设置页「通用 → 调试模式」）──
     // 开关存配置（debugMode）：开启后转发层把上游原始报文（凭据类头已脱敏）
     // 落到统一库的 debug_traffic 表，请求日志页的「详情」列据此展示。
@@ -730,6 +774,11 @@ const BRIDGE_JS: &str = r#"
     saveAppSettings: patch => invoke('save_app_settings', { patch }),
     exportAccounts: () => invoke('export_accounts'),
     importAccounts: () => invoke('import_accounts'),
+    // ── 整库备份 / 恢复（设置页「整库备份 / 恢复」）──
+    // 文件由后端按壳选的路径直读直写（见 api/backup_api.rs），壳只负责
+    // 系统对话框；参数名 includeLogs 必须与 Rust 侧 export_database 的形参一致
+    exportDatabase: includeLogs => invoke('export_database', { includeLogs }),
+    importDatabase: () => invoke('import_database'),
   };
 })();
 "#;

@@ -45,7 +45,6 @@ import {
   errorMessage, esc, poolItemLabel, shared, toast,
   type AccountRecord, type ClashSnapshot, type LimiterRule, type PoolItem,
 } from './accounts-shared'
-import { clampPriority, priorityOf, PRIORITY_MAX, PRIORITY_MIN } from './accounts-columns'
 import {
   displayNameOf, providerFeatures, providerOf, supportsPlanChannel, supportsUsage,
   zcodePlanLabel, zcodePlanOf, ZCODE_PLAN_CODING, ZCODE_PLAN_START,
@@ -63,17 +62,17 @@ const MAX_PROVIDER_NAME_CHARS = 64
 
 type AccountLike = AccountRecord
 
+/** 同一家的其它账号：自定义提供商那一段的「名下 N 个账号」按它算（级联删除会一起删） */
+function peersOf(account: AccountLike, all: AccountLike[]): AccountLike[] {
+  const provider = providerOf(account)
+  return all.filter(item => item.id !== account.id && providerOf(item) === provider)
+}
+
 /** 账号设置弹窗的分组（左侧导航）。 */
 type PaneId = 'basic' | 'credential' | 'query' | 'limiter' | 'network'
 
 /** 并发上限的封顶值（与后端 apply_patch 的 MAX_CONCURRENT_LIMIT 一致） */
 const CONC_MAX = 999
-
-/** 同 provider 的其它账号：优先级唯一性的作用域就是这一组 */
-function peersOf(account: AccountLike, all: AccountLike[]): AccountLike[] {
-  const provider = providerOf(account)
-  return all.filter(item => item.id !== account.id && providerOf(item) === provider)
-}
 
 function labelOf(account: AccountLike | null | undefined): string {
   // 与账号列同一取名口径（displayNameOf 内含 nameCustom / emailAsName 分流）
@@ -635,7 +634,6 @@ function ProviderSection({
 
 export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: () => void }) {
   const account = findAccount(id)
-  const [priority, setPriority] = React.useState(String(account ? priorityOf(account) : 100))
   const [enabled, setEnabled] = React.useState(account?.enabled !== false)
   const [name, setName] = React.useState(account?.name || '')
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(account?.proxy))
@@ -700,11 +698,6 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   // 下面几个 async 函数声明会被提升，TS 不会把「早退之后的窄化」带进它们体内
   const target: AccountRecord = account
   const peers = peersOf(target, allAccounts())
-  const numeric = Number(priority)
-  const holder = Number.isFinite(numeric)
-    ? peers.find(item => Number(item.priority) === clampPriority(numeric))
-    : undefined
-  const used = [...new Set(peers.map(item => Number(item.priority)))].sort((a, b) => a - b)
   const isCatpaw = providerOf(target) === 'catpaw'
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
@@ -792,12 +785,6 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       toast(errorMessage(error), 'err')
       return
     }
-    if (!Number.isFinite(numeric)) { toast(t('优先级必须是数字'), 'err'); return }
-    const clamped = clampPriority(numeric)
-    if (holder) {
-      setStatus(<span className='text-destructive'>{t('优先级 {priority} 已被同一提供商的「{name}」占用，请换一个数值', { priority: clamped, name: labelOf(holder) })}</span>)
-      return
-    }
     const providerPatch = readProviderPatch()
     if (providerPatch && 'error' in providerPatch) {
       setStatus(<span className='text-destructive'>{providerPatch.error}</span>)
@@ -841,9 +828,11 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       const planPatch = supportsPlanChannel(target) && planChannel !== zcodePlanOf(target)
         ? { zcodePlan: planChannel }
         : {}
+      // 顺序（priority）**不在这张表单里**：分组模式下它由拖拽整队写（见
+      // accounts-data 的 reorderQueue）。设置弹窗只改「账号自身」的属性，
+      // 一次「改备注名」不该顺手把顺序也提交一遍
       await shared().workbuddyDesktop?.updateAccount?.(id, {
         name: name.trim() || target.name,
-        priority: clamped,
         enabled,
         proxy,
         ...balancePatch,
@@ -884,10 +873,6 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       setBusy(false)
     }
   }
-
-  const hint = holder
-    ? <span className='text-destructive'>{t('已被「{name}」占用', { name: labelOf(holder) })}</span>
-    : (used.length ? t('同提供商已占用：{names}', { names: used.join(t('、')) }) : t('同提供商内暂无其他账号占用优先级'))
 
   // 「凭证与套餐」按家出现：有什么配什么（CatPaw 余额凭证 / 自定义账号凭证与
   // 提供商 / ZCode 套餐通道）。内置家什么都没有时整组不出现。
@@ -935,13 +920,10 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
                       value={name} onChange={event => setName(event.currentTarget.value)} />
                   </div>
                   <div className='field-row'>
-                    <label htmlFor='account-priority-input'>{t('转发优先级')}</label>
-                    <Input id='account-priority-input' type='number' min={PRIORITY_MIN} max={PRIORITY_MAX} step={1}
-                      className='max-w-[110px]' value={priority}
-                      onChange={event => setPriority(event.currentTarget.value)} />
-                    <span className='detail'>{holder
-                      ? <>{t('数值越小越先用；')}{hint}</>
-                      : t('数值越小越先用；{hint}', { hint: String(hint) })}</span>
+                    <label>{t('转发顺序')}</label>
+                    <span className='detail'>
+                      {t('在列表里拖：拖分组带调整整组顺位，拖行首把手调整组内先后（顺序由拖拽表达，不再填数字）')}
+                    </span>
                   </div>
                   <div className='field-row'>
                     <label htmlFor='account-conc-input'>{t('并发上限')}</label>

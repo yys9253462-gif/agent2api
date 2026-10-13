@@ -343,6 +343,21 @@ impl ServerState {
         // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
         // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
         core::usage_records::install(db.clone());
+        // 签到记录的明细台账（签到中心「签到记录」页）：装句柄即可，记账点在
+        // `core::billing::checkin::run_checkin`（唯一），保留期裁剪随每次记账
+        // 与「立即清理」进行（见 checkin_records 模块头）。
+        core::checkin_records::install(db.clone());
+        // 定时签到的「签到范围」一次性补齐：把加入版本晚于配置里那一版的家补进
+        // 每条条目的范围（用户的期望是 OfficeAce 果办 / CodeArts 默认开启）。
+        // 放在这里是因为它要读写配置快照（`config::init` 已在上方就位），且必须早于
+        // 第一次 `/api/checkin-schedules` —— 界面读到的就该是补过的清单。
+        // 只补一次：版本写上去之后，用户取消勾选就真的生效了。
+        if core::checkin_schedules::extend_providers_once() {
+            logging::console_line(
+                "[Checkin]",
+                "已把新加入的签到提供商补进定时条目的签到范围（OfficeAce 果办 / CodeArts）",
+            );
+        }
         // 每账号的「限制器」（余额 / Token 规则列表）：Token 周期消耗的窗口
         // 聚合读同一个库（schema v9 的聚合索引），装句柄即可 —— 事实表的刷新
         // 由 usage_query 的心跳循环驱动（见 limiter 模块头）。
@@ -357,6 +372,11 @@ impl ServerState {
         // 位置必须在这里：它得早于下面那次 `restore_cached_catalogs` 预热 ——
         // 各家的目录句柄首次初始化时才读缓存，句柄先被碰到就再也读不回来了。
         core::providers::catalog_cache::install(db.clone());
+        // OfficeAce 模型可用性探测的结论也落同一个库（kv 的 `officeaceModelProbe`
+        // 键）：目录刷新后探一轮、把「这个号打不通」的模型从对外清单里收窄掉。
+        // 与 catalog_cache 同一形态（kv 固定键 + 整份读写），位置只需早于
+        // 第一次 `advertise_models`（那是纯读，未 install 时给空结论 = 不藏）。
+        core::providers::officeace::probe::install(db.clone());
         // ── 旧文件一次性迁移：**本切片起不再自动跑** ────────────────
         // 它现在由用户在升级弹窗里点「升级」触发（`POST /api/upgrade/run`）。
         // 为什么改成手动：需求是「弹窗告诉用户换了 SQLite，点升级才开始导」——

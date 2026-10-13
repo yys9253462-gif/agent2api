@@ -97,6 +97,43 @@
 
 .batch-hidden { color: var(--warn); font-size: 11px; }
 
+/* 批量栏里的分组摘要（「N 家 · 显示 M 行」）：分组带逐段给了各家的账号数，
+   这里只说「当前看到几家几行」，不再重复各家的明细 */
+.batch-summary { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
+
+/* 「清除筛选」是一条轻动作（就在批量栏里，与批量操作同一行）：
+   它改的是「怎么看」，不该与右侧那两颗操作按钮同权重 */
+.batch-bar .link-btn {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.batch-bar .link-btn:hover { background: var(--nav-hover); color: var(--text); }
+
+/* 搜索框（工具条第一段）：宽度跟着工具条走，最窄 150px、最宽 220px ——
+   账号名 / 邮箱长度不可控，再宽就把两个分段挤到下一行了 */
+.acct-search { width: clamp(150px, 22vw, 220px); }
+
+/* 空态里那颗「清除筛选」：与 .empty 的正文同一行，做成下划线链接的样子
+   （空态本身已经在说「没有账号」，这里只补一个出口，不该再给一颗按钮的分量） */
+.empty .link-btn {
+  margin-left: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--primary-fg);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .batch-actions { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 
 .batch-actions button {

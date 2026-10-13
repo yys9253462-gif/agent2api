@@ -17,7 +17,7 @@ use super::priority::next_free_priority;
 use super::sql;
 use super::state::{mark_name_custom, StoredAccount};
 use super::store::{AccountStore, AccountStoreError};
-use super::store_util::{max_concurrent_public, token_tail_of, truncate_chars};
+use super::store_util::{token_tail_of, truncate_chars};
 use super::CredentialWrite;
 
 impl AccountStore {
@@ -193,17 +193,12 @@ impl AccountStore {
         public.insert("rateLimits".to_string(), record.get("rateLimits").cloned().unwrap_or_else(|| json!({})));
         public.insert("desktop".to_string(), Value::Bool(false));
         public.insert("available".to_string(), Value::Bool(available));
-        // 单账号并发上限（所有家通用，兜底共用 `max_concurrent_public`）：
-        // 0 = 不限，缺键同样输出 0
-        public.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(record.get("maxConcurrent"))),
-        );
-        // `chatSupported` **刻意不在这里写**：它是跨家的统一事实，由
-        // `store.rs::public_account` 在分派点按适配器的 `supports_chat()` 注入。
-        // 本函数早先硬编码过 `false`（Qoder 只有账号管理能力那会儿），
-        // 而那个值会被分派点的注入覆盖 —— 留着它只会在下一次读这段代码时
-        // 误导「这家不能转发」，且一旦注入被挪走就会静默失真。
+        // `chatSupported` / `maxConcurrent` **刻意不在这里写**：它们是跨家的统一
+        // 事实，由 `store_view::public_account` 在分派点注入（前者按适配器的
+        // `supports_chat()`，后者按 `store_util::max_concurrent_public_for`）。
+        // 本函数早先硬编码过 `chatSupported: false`（Qoder 只有账号管理能力
+        // 那会儿），而那个值会被分派点的注入覆盖 —— 留着它只会在下一次读这段
+        // 代码时误导「这家不能转发」，且一旦注入被挪走就会静默失真。
         Value::Object(public)
     }
 }

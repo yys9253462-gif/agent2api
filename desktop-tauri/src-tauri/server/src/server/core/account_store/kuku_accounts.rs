@@ -27,7 +27,7 @@ use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
-use crate::server::core::account_store::store_util::{max_concurrent_public, token_tail_of, truncate_chars};
+use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::providers::kuku::credentials::KukuCredentials;
 use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::logging;
@@ -167,7 +167,7 @@ impl AccountStore {
             "[Accounts]",
             &format!("✅ KukuAI 账号已保存: {record_name}（{id}，优先级 {priority}）"),
         );
-        Ok(self.to_kuku_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// 账号的公开形态（前端账号列表 / 会话摘要用；**不含凭证**）。
@@ -201,10 +201,6 @@ impl AccountStore {
             record.get("rateLimits").cloned().unwrap_or_else(|| Value::Object(Map::new())),
         );
         public.insert("available".to_string(), Value::Bool(true));
-        public.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(record.get("maxConcurrent"))),
-        );
         Value::Object(public)
     }
 }

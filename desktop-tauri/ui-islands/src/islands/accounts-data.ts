@@ -38,7 +38,6 @@ import {
   supportsUsage,
 } from './accounts-domain'
 import * as domain from './accounts-domain'
-import { clampPriority, priorityOf } from './accounts-columns'
 import { t } from '../i18n'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, openPanelsFor, panelOpen, patch,
@@ -671,37 +670,10 @@ export async function refreshUsageAfterCheckin(id?: string): Promise<void> {
   }
 }
 
-/* ─── 行内动作（优先级 / 启用 / 顺序 / 限流 / 代理）───── */
-
-/**
- * 提交一个优先级。失败（409 冲突）时**必须还原显示值**：留着用户输的数字会让人以为
- * 存进去了，而实际的转发顺序没变 —— 下一次刷新时它会悄悄跳回去，那比当场报错更让人
- * 困惑。后端的 409 文案已经带上了占位者的姓名，直接透出即可（前端不知道谁是占位者，
- * 除非再算一遍，而两套算法迟早会分叉）。
- */
-export async function commitPriority(id: string, raw: string): Promise<number | null> {
-  const account = findAccount(id)
-  if (!account) return null
-  const current = priorityOf(account)
-  const text = String(raw ?? '').trim()
-  const parsed = text ? Number(text) : NaN
-  // 非法值 / 未改动：只把显示复原，不发请求（改成同一个值后端也会返回空 changes）
-  if (!Number.isFinite(parsed)) return current
-  const next = clampPriority(parsed)
-  if (next === current) return current
-  try {
-    await shared().workbuddyDesktop?.updateAccount?.(id, { priority: next })
-    toast(t('✅ 优先级已改为 {n}', { n: next }))
-    // 改完顺序会变，必须重拉：只改本地状态的话行不会重排，看起来「没生效」
-    await shared().wbApp?.refresh?.()
-    return next
-  } catch (error) {
-    toast(t('优先级未保存：{message}', { message: errorMessage(error) }), 'err')
-    // 冲突可能来自别处已经改过的数据（比如另一端刚占了号），补一次刷新让列表回到事实
-    void shared().wbApp?.refresh?.()
-    return current
-  }
-}
+/* ─── 行内动作（启用 / 顺序 / 限流 / 代理）─────
+ * 「优先级」那一组动作随分组化下线：顺序不再由数字表达，改由拖拽整队
+ * （`reorderQueue`）。后端 `PATCH priority` / `move` 端点仍在（别的客户端在用），
+ * 只是账号页不再调它们。 */
 
 /**
  * 启用 / 禁用单个账号（状态列的开关与 ⋯ 菜单的第一项走同一条链）。
@@ -723,19 +695,44 @@ export async function setAccountEnabled(id: string, enabled: boolean): Promise<v
 }
 
 /**
- * 与全局相邻账号交换优先级。
+ * **整队重排**（分组模式唯一的顺序写入通道）：把新队列整条交给后端。
  *
- * 方向与语义的对应（**极易搞反**）：优先级数值越小越先用，所以
- *   · up   = 与队列里的**上一个**账号交换 = 排得更靠前 = 数值变小
- *   · down = 与队列里的**下一个**账号交换 = 排得更靠后 = 数值变大
- * 来自后端 `move_account(id, "up" | "down")` 的语义（down 找 index + 1，up 找 index - 1）。
+ * 调用方给的是「组顺位 → 组内顺位」展开后的账号 id 列表（从队首到队尾），后端按
+ * 顺序把全局 priority 编成 0、1、2… —— 一次请求落地一条队列，不存在逐条 PATCH
+ * 的中间态（中途失败会留下重号，那会破坏「优先级唯一」这条不变量）。
+ *
+ * 失败必须刷新：界面此时显示的是**用户拖出来的顺序**，而库里还是旧顺序，
+ * 不拉回事实的话，下一次刷新会看到顺序「自己跳回去」。
  */
-export async function moveAccount(id: string, direction: 'up' | 'down'): Promise<void> {
+export async function reorderQueue(ids: string[], note?: string): Promise<boolean> {
+  if (!ids.length) return false
   try {
-    await shared().workbuddyDesktop?.moveAccount?.(id, direction)
+    await shared().workbuddyDesktop?.reorderAccounts?.(ids)
+    toast(note ? t('✅ 已保存：{note}', { note }) : t('✅ 顺序已保存'))
+    await shared().wbApp?.refresh?.()
+    return true
+  } catch (error) {
+    toast(t('顺序未保存：{message}', { message: errorMessage(error) }), 'err')
+    void shared().wbApp?.refresh?.()
+    return false
+  }
+}
+
+/**
+ * 整组启用 / 禁用（分组带的 ⋯ 菜单）：走既有的批量端点，一次改一组。
+ * 与单行开关同一口径（`PATCH enabled`），只是把 ids 换成一组的成员。
+ */
+export async function setGroupEnabled(ids: string[], enabled: boolean): Promise<void> {
+  if (!ids.length) return
+  try {
+    await shared().workbuddyDesktop?.batchAccounts?.({ action: enabled ? 'enable' : 'disable', ids })
+    toast(enabled
+      ? t('✅ 已启用 {n} 个账号', { n: ids.length })
+      : t('✅ 已禁用 {n} 个账号', { n: ids.length }))
     await shared().wbApp?.refresh?.()
   } catch (error) {
-    toast(t('调整顺序失败：{message}', { message: errorMessage(error) }), 'err')
+    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
+    void shared().wbApp?.refresh?.()
   }
 }
 
@@ -836,16 +833,25 @@ export function openZcodePlans(id: string, name?: string): void {
 
 /** 一行账号的渲染上下文（视图层按它取位置、勾选、余额与连接数） */
 export type RowContext = {
+  /** 全局队列位置（1 起）：⋯ 菜单的「已在第一位」判定、模型测试候选清单用它。
+   *  分组模式下**不再直接显示**（行上是组内序号），见 accounts-domain 模块头 */
   seat: { position: number; total: number }
+  /** 组内序号（1 起）：顺序列的 `#N` 就是它 */
+  rank: number
   picked: boolean
   usageEntry: UsageEntry
   limitsOpen: boolean
   connections: number
 }
 
-export function rowContext(account: AccountRecord, seatMap: Map<string, { position: number; total: number }>): RowContext {
+export function rowContext(
+  account: AccountRecord,
+  seatMap: Map<string, { position: number; total: number }>,
+  rank = 1,
+): RowContext {
   return {
     seat: seatMap.get(account.id) || { position: 1, total: 1 },
+    rank,
     picked: isPicked(account.id),
     usageEntry: usageMap.get(account.id),
     limitsOpen: panelOpen(account.id, 'limits'),
@@ -907,7 +913,6 @@ type AccountsModelApi = {
   isLimited: (account: AccountRecord | null | undefined) => boolean
   accountEdition: typeof domain.accountEdition
   supportsClaim: typeof domain.supportsClaim
-  matchProvider: typeof domain.matchProvider
   matchEnabled: typeof domain.matchEnabled
   matchLimit: typeof domain.matchLimit
   visibleAccounts: typeof domain.visibleAccounts
@@ -952,7 +957,6 @@ const ACCOUNTS_MODEL_API: AccountsModelApi = {
   ),
   accountEdition: domain.accountEdition,
   supportsClaim: domain.supportsClaim,
-  matchProvider: domain.matchProvider,
   matchEnabled: domain.matchEnabled,
   matchLimit: domain.matchLimit,
   visibleAccounts: domain.visibleAccounts,

@@ -111,6 +111,8 @@ type RequestRow = {
   accountName?: unknown
   attemptDetails?: AttemptDetail[]
   sensitiveHits?: SensitiveHit[]
+  /** 选路决策快照（后端 `route` 列；旧行 / 没走到选路的行是 null） */
+  route?: unknown
   /** 模型测试发起的请求（后端 `is_test` 透传到列表行；老行没有这个键） */
   isTest?: boolean
 } & ProviderFields
@@ -467,6 +469,61 @@ function AttemptsTable({ row }: { row: RequestRow }) {
     </Table>
   )
 }
+/**
+ * 路由回放：这条请求转发时，候选账号按当时的策略怎么排、为什么是它先上。
+ * 数据是选路层落库的决策快照（`route` 列），与「尝试明细」互补 —— 那边回答
+ * 「试了谁、成没成」，这边回答「当时为什么这么排」。旧行 / 转发前就失败的
+ * 请求没有快照（null），不渲染这一段。
+ */
+function RouteReplay({ row }: { row: RequestRow }) {
+  const route = row.route && typeof row.route === 'object' && !Array.isArray(row.route)
+    ? row.route as Record<string, unknown>
+    : null
+  if (!route) return null
+  const strategy = String(route.strategy || '')
+  const sticky = String(route.sticky || '')
+  // 只有两档（顺序优先 / 负载均衡）；历史记录里可能留着已下线的 'usage'，
+  // 按它的替代者「负载均衡」显示（后端 RouteStrategy::from_id 也是这么归的）
+  const strategyLabel = strategy === 'rotate' || strategy === 'usage' ? t('负载均衡')
+    : strategy === 'order' ? t('顺序优先') : strategy
+  const stickyLabel = sticky === 'auto' ? t('自动') : sticky === 'session' ? t('会话内')
+    : sticky === 'turn' ? t('每轮') : sticky === 'off' ? t('关闭') : sticky
+  const ordered = Array.isArray(route.ordered) ? route.ordered as Array<Record<string, unknown>> : []
+  const blocked = Array.isArray(route.blocked) ? route.blocked as Array<Record<string, unknown>> : []
+  const picked = String(route.picked || '')
+  return (
+    <div className='text-[11.5px] leading-relaxed'>
+      <div className='mb-1 text-muted-foreground'>
+        {t('策略 {strategy} · 会话粘性 {sticky}{hit}', {
+          strategy: strategyLabel, sticky: stickyLabel,
+          hit: route.stickyHit === true ? t(' · 会话粘住') : '',
+        })}
+      </div>
+      {ordered.length ? (
+        <ol className='m-0 list-none p-0'>
+          {ordered.map((entry, index) => (
+            <li key={String(entry.id ?? index)} className='py-0.5'>
+              <b>{index + 1}. {String(entry.name || entry.id || '—')}</b>
+              <span className='text-muted-foreground'>　{String(entry.reason || '')}</span>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      {blocked.length ? (
+        <div className='mt-1 text-muted-foreground'>
+          {t('被跳过：')}
+          {blocked.map(entry => String(entry.name || entry.id || '')).join('、')}
+        </div>
+      ) : null}
+      {picked ? (
+        <div className='mt-1'>
+          {t('最终承载：{picked}', { picked: picked })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 /* ─── 标签 ①：请求详情（数据全部来自 row）────── */
 
 function DetailPane({ row }: { row: RequestRow | null }) {
@@ -521,6 +578,7 @@ function DetailPane({ row }: { row: RequestRow | null }) {
           {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}
         </Field>
         <Field label={t('尝试明细')}><AttemptsTable row={row} /></Field>
+        {row.route ? <Field label={t('路由回放')}><RouteReplay row={row} /></Field> : null}
         <Field label={t('敏感词')}>
           {/* 命中标签（与列表「敏」标签同一套紫，这里展开写词与次数） */}
           {Array.isArray(row.sensitiveHits) && row.sensitiveHits.length ? (

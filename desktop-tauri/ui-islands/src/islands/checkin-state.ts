@@ -74,6 +74,52 @@ export type AutoCheckinState = {
   running?: boolean
 }
 
+/**
+ * 一条定时签到**条目**的视图（/api/auto-checkin 与 /api/checkin-schedules 的
+ * `schedules[]` 元素；字段可能缺，读的时候逐个兜底）。
+ * `displayLabel` 是后端给好的展示名（label 为空退到 time），界面不必再兜。
+ */
+export type ScheduleEntry = {
+  id: string
+  label?: string
+  displayLabel?: string
+  enabled?: boolean
+  time?: string
+  providers?: string[]
+  lastFiredDate?: string | null
+  lastFiredToday?: boolean
+  nextRunAt?: number | null
+  lastResult?: CheckinHistoryEntry | null
+}
+
+/** GET /api/checkin-schedules 的响应：聚合状态 + 条目数组（同一份 state() 形状） */
+export type SchedulesSnapshot = AutoCheckinState & {
+  schedules?: ScheduleEntry[]
+}
+
+/** 一条签到记录（/api/checkin-records 的行；字段可能缺） */
+export type CheckinRecordRow = {
+  rowId?: number
+  ts?: number
+  /** 北京时间的自然日（上游的「哪天的签到」） */
+  date?: string
+  /** schedule / startup / manual / single / activity */
+  source?: string
+  reason?: string
+  accountId?: string
+  accountName?: string
+  provider?: string
+  /** success / already / pending / failed */
+  outcome?: string
+  /** 「今日已完成」投影（success|already） */
+  ok?: boolean
+  /** 收益 / 上游文案（「今日积分 +100」在这里） */
+  message?: string | null
+  error?: string | null
+  /** 国际版保活成功 */
+  keptActive?: boolean
+}
+
 export type CheckinCenterSnapshot = {
   daily: {
     providers: CheckinProviderGroup[]
@@ -84,12 +130,12 @@ export type CheckinCenterSnapshot = {
   extras: {
     /** 新手任务行；`settled` 是后端的一次性福利结算记忆（已结清才非空） */
     onboarding: Array<{ id: string; name: string; provider?: string; settled?: OnboardingSettledRaw }>
-    /** CodeArts 福利行：`welfare` 是后端落盘的本地领取台账（day/accepted/…，原样透传），
-     *  「已领取」标记按它判（见 accounts-domain 的 welfareStateOf） */
-    welfare: Array<{ id: string; name: string; provider?: string; welfare?: unknown }>
+    /** ZCode 的限时套餐行（后端落盘的本地领取台账原样透传）。
+     *  曾还有一条 CodeArts 福利行（带 `welfare` 台账），2026-10 它的每日福利并入
+     *  每日签到后后端把那条撤了 —— 见 `api::checkin_center` 的说明。 */
     plans: Array<{ id: string; name: string; provider?: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
   }
-  auto: AutoCheckinState
+  auto: SchedulesSnapshot
   /** WorkBuddy 国际版日活保活的模型链（后端快照直接给当前生效值 + 缺省值） */
   keepalive?: KeepaliveState
   history: CheckinHistoryEntry[]
@@ -134,6 +180,14 @@ type CheckinBridge = {
   getAutoCheckin?(): Promise<AutoCheckinState>
   saveAutoCheckin?(patch: Record<string, unknown>): Promise<AutoCheckinState>
   runAutoCheckinNow?(): Promise<(CheckinHistoryEntry & AutoCheckinState) | null | undefined>
+  /** 定时签到的**条目**（列表 / 保存 / 删除 / 立即执行；与 bridge.rs 成对） */
+  getCheckinSchedules?(): Promise<SchedulesSnapshot | null | undefined>
+  saveCheckinSchedule?(patch: Record<string, unknown>): Promise<SchedulesSnapshot | null | undefined>
+  deleteCheckinSchedule?(id: string): Promise<{ success?: boolean } | null | undefined>
+  runCheckinSchedule?(id: string): Promise<(CheckinHistoryEntry & SchedulesSnapshot) | null | undefined>
+  /** 签到记录明细台账（查询 / 清空；参数对象里空值桥层自动不带） */
+  getCheckinRecords?(params: Record<string, unknown>): Promise<{ records?: CheckinRecordRow[]; total?: number } | null | undefined>
+  clearCheckinRecords?(params: Record<string, unknown>): Promise<{ success?: boolean; removed?: number } | null | undefined>
   /** WorkBuddy 国际版日活保活的模型链（读 / 存；与 bridge.rs、web_shim.rs 三处成对） */
   getCheckinKeepalive?(): Promise<KeepaliveState>
   saveCheckinKeepalive?(models: string[]): Promise<KeepaliveState>
@@ -176,11 +230,51 @@ function accountsView(): { wbAccountsView?: { refreshUsageAfterCheckin?: (id?: s
   return window as unknown as { wbAccountsView?: { refreshUsageAfterCheckin?: (id?: string | null) => unknown } }
 }
 
+/* ─── 页内标签页（签到中心 / 定时签到 / 签到记录）────────── */
+
+export type CheckinTab = 'center' | 'schedule' | 'records'
+
+/** 持久化键（命名仿 settings 页的 workbuddy-desktop-settings-cat） */
+const TAB_STORAGE_KEY = 'workbuddy-desktop-checkin-tab'
+
+const CHECKIN_TABS: readonly CheckinTab[] = ['center', 'schedule', 'records']
+
+/** 上次停留的标签页（没存过 / 值不认 → 签到中心）。localStorage 挂了给缺省。 */
+function readStoredTab(): CheckinTab {
+  try {
+    const value = localStorage.getItem(TAB_STORAGE_KEY)
+    return CHECKIN_TABS.includes(value as CheckinTab) ? (value as CheckinTab) : 'center'
+  } catch {
+    return 'center'
+  }
+}
+
+/** 切换标签页（持久化；数据加载交给各标签页自己挂载时的 effect） */
+export function setCheckinTab(tab: CheckinTab): void {
+  if (tab === store.tab) return
+  try {
+    localStorage.setItem(TAB_STORAGE_KEY, tab)
+  } catch { /* 隐私模式等存不进就算了：会话内仍然生效 */ }
+  patch({ tab })
+}
+
+/**
+ * 切换并确保签到数据就位（对外深链契约：顶栏徽标、总览卡的跳转都走它 ——
+ * 与 settings 页 showCategory 同一款）。定时签到 / 签到记录两页的数据由各自的
+ * 挂载 effect 拉，这里只兜签到中心的快照。
+ */
+export async function showCheckinTab(tab: CheckinTab): Promise<void> {
+  setCheckinTab(tab)
+  if (!store.loaded) await loadCheckinCenter()
+}
+
 /* ─── store ─────────────────────────────────── */
 
 export type CheckinStore = {
   /** 每次变更 +1；React 靠它判断「该重画了」（快照对象同时被换掉） */
   version: number
+  /** 当前标签页（页内导航；localStorage 持久化） */
+  tab: CheckinTab
   /** 聚合快照（null = 还没读到 / 读失败） */
   snapshot: CheckinCenterSnapshot | null
   /** 快照至少成功拉过一次（失败后的重试交给用户手点刷新，不自动轮询） */
@@ -194,10 +288,10 @@ export type CheckinStore = {
   autoSaving: boolean
   /** 签到时刻的编辑草稿：null = 跟随后端值 */
   autoTimeDraft: string | null
-  /** 保活模型链保存中（输入框临时禁用） */
+  /** 保活模型链保存中（清单的增删 / 拖动 / 保存按钮临时禁用） */
   keepaliveSaving: boolean
-  /** 保活模型链的编辑草稿：null = 跟随后端值（逗号分隔的一行文本） */
-  keepaliveDraft: string | null
+  /** 保活模型链的编辑草稿：null = 跟随后端值；数组 = 用户正在编辑的清单 */
+  keepaliveDraft: string[] | null
   /** 单账号签到在途（行内按钮的去重闸） */
   signing: ReadonlySet<string>
   /** 新手任务的按账号缓存（Loomy / 小浣熊） */
@@ -206,6 +300,7 @@ export type CheckinStore = {
 
 let store: CheckinStore = {
   version: 0,
+  tab: readStoredTab(),
   snapshot: null,
   loaded: false,
   loadError: '',
@@ -513,24 +608,28 @@ function mergeAuto(next: AutoCheckinState): CheckinCenterSnapshot | null {
 
 /* ─── WorkBuddy 国际版日活保活的模型链 ─── */
 
-/** 保活模型链的编辑草稿（输入过程；提交在 blur / 回车时走 submitKeepaliveModels） */
-export function setKeepaliveDraft(value: string): void {
-  patch({ keepaliveDraft: value })
+/**
+ * 保活模型链的编辑草稿：把整份清单换掉（增 / 删 / 拖动都是「换一份新数组」）。
+ *
+ * 草稿放在 store 而不是组件里，是为了**切标签页不丢**：签到中心一次只渲染一个
+ * 标签页，组件内的 useState 在切走时会连同编辑到一半的清单一起消失。
+ */
+export function setKeepaliveDraft(models: string[]): void {
+  patch({ keepaliveDraft: models.map(item => item.trim()).filter(Boolean) })
 }
 
 /**
- * 提交保活模型链（失焦 / 回车）：按逗号 / 顿号 / 空白拆成数组交给后端
- * （后端对字符串入参也会再拆一遍，这里先拆是为了在界面上先归一成干净的一行）。
- * 空清单 = 恢复缺省链（语义在后端，界面只管把草稿原样交上去）。
+ * 保存保活模型链（「保存」按钮）。**空清单也会提交** —— 空 = 恢复缺省链，这是
+ * 后端 `billing::keepalive::set_models` 的既定语义，界面据此提供「恢复缺省」。
+ * （旧实现是输入框失焦提交，那时空串直接 return，「清空恢复缺省」实际做不到。）
+ * 成功后快照换成后端返回的完整状态、草稿清空（回到「跟随后端值」）。
  */
-export async function submitKeepaliveModels(value: string): Promise<void> {
-  const draft = value.trim()
-  if (!draft) return
-  const models = draft.split(/[，、,]/).map(item => item.trim()).filter(Boolean)
+export async function submitKeepaliveModels(models: string[]): Promise<void> {
+  const clean = models.map(item => item.trim()).filter(Boolean)
   if (getCheckinStore().keepaliveSaving) return
   patch({ keepaliveSaving: true })
   try {
-    const next = await bridge().saveCheckinKeepalive?.(models)
+    const next = await bridge().saveCheckinKeepalive?.(clean)
     if (next) {
       const current = getCheckinStore().snapshot
       patch({ snapshot: current ? { ...current, keepalive: next } : current, keepaliveDraft: null })
@@ -691,9 +790,9 @@ export async function claimOnboarding(id: string): Promise<void> {
     })
     const failed = merged.filter(task => task.error && !task.done).length
     if (failed) {
-      toast(t('新手任务有 {n} 项领取失败，可重试', { n: failed }), 'err')
+      toast(t('新手福利有 {n} 项领取失败，可重试', { n: failed }), 'err')
     } else if (claimedCount) {
-      toast(t('✅ 新手任务领取完成，累计 {n} 积分', { n: numberOf(data?.earned) }))
+      toast(t('✅ 新手福利领取完成，累计 {n} 积分', { n: numberOf(data?.earned) }))
     }
   } catch (error) {
     const message = errorMessage(error)
@@ -742,4 +841,17 @@ export function nextRunText(auto: AutoCheckinState | null | undefined): string {
   const time = auto.time ?? ''
   if (!Number.isFinite(at) || at <= 0) return formatTime(at) || t('每天 {time}', { time })
   return t('{date}（每天 {time}）', { date: formatTime(at), time })
+}
+
+/**
+ * 条目视图里的聚合「下次执行」（多条目里最近的一次；总开关关着 / 都没排上 → null）。
+ * 签到中心总览卡与顶栏徽标用聚合值，不必关心是哪一条给的。
+ */
+export function nextScheduleRun(snapshot: SchedulesSnapshot | null | undefined): number | null {
+  const entries = Array.isArray(snapshot?.schedules) ? snapshot!.schedules! : []
+  const times = entries
+    .filter(entry => entry.enabled === true)
+    .map(entry => Number(entry.nextRunAt))
+    .filter(value => Number.isFinite(value) && value > 0)
+  return times.length ? Math.min(...times) : null
 }

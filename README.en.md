@@ -24,6 +24,7 @@ Reverse-proxy capabilities at a glance (✓ supported · ✗ not supported · �
 | MonkeyCode (Chaitin, domestic / international) | ✓ | ✗ no refresh flow | ✓ remote only | — | — | — |
 | Command Code | ✓ | ✗ static API key | ✓ remote + static fallback | — | — | — |
 | Antigravity (Google, Gemini) | ✓ | ✓ | ✓ remote + static fallback | — | — | — |
+| OfficeAce (Huawei Cloud, OfficeClaw) | ✓ | ✓ control-plane auto-refresh | ✓ remote only | ✓ points balance | ✓ daily bonus (check-in + newcomer gift) | — |
 | Custom providers | ✓ chat passthrough / Responses / Anthropic | — | ✓ manual + server-side fetch | — | — | — |
 
 The three chat entry points (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, plus `/v1/messages/count_tokens`) and `/v1/models` behave identically for every platform — the differences above are only about what each upstream can do. Model mapping, the global priority queue, 429 fallback, egress proxying, content redaction and request reporting apply to all platforms alike.
@@ -255,10 +256,16 @@ agent2api/
 │  │  │  │  │  ├─ commandcode/  Command Code: adapter / endpoints / credentials / login /
 │  │  │  │  │  │                fingerprint (deterministic device fingerprint + 8h reporting) / models /
 │  │  │  │  │  │                plan (8-key envelope, params rewrite, session id derivation)
-│  │  │  │  │  └─ antigravity/  Antigravity (Google, Gemini): oauth (refresh token + single-flight) /
+│  │  │  │  │  ├─ antigravity/  Antigravity (Google, Gemini): oauth (refresh token + single-flight) /
 │  │  │  │  │                   project (loadCodeAssist -> onboardUser discovery) / credentials /
 │  │  │  │  │                   endpoints (three environment bases and header set) / login /
 │  │  │  │  │                   models (fetchAvailableModels + built-in fallback + real-name mapping) / adapter
+│  │  │  │  │  └─ officeace/    OfficeAce (Huawei Cloud, OfficeClaw): oauth (PKCE + P-256 DPoP self-service login) /
+│  │  │  │  │                   signer (both SDK-HMAC and V11-HMAC signatures + vector fixtures) /
+│  │  │  │  │                   credentials (gateway Basic + control-plane temporary AK/SK) /
+│  │  │  │  │                   chat (stateless OpenAI-compatible) / models (remote catalog + per-model multipliers) /
+│  │  │  │  │                   probe (availability probe; unreachable models hidden by default) /
+│  │  │  │  │                   subscription (subscription / quota / rewards) / onboarding / checkin / balance
 │  │  │  │  ├─ protocol/        Protocol translation layer (per-vendor wire <-> standard chat SSE request/response
 │  │  │  │  │                   translation: Anthropic Messages / Responses / NDJSON (Command Code) /
 │  │  │  │  │                   Gemini envelope (Antigravity), plus tool plans and history repair)
@@ -330,7 +337,7 @@ The root project has no runtime dependencies; `package.json` only provides the s
 
 ### For learning and discussion only
 
-This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, Alibaba and Qoder / Accio, Huawei Cloud and CodeArts, ByteDance and Trae, iFlytek and Loomy, Baidu Wenku and KukuAI, Chaitin and MonkeyCode, Command Code, or Google and Antigravity.
+This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, Alibaba and Qoder / Accio, Huawei Cloud and CodeArts / OfficeAce, ByteDance and Trae, iFlytek and Loomy, Baidu Wenku and KukuAI, Chaitin and MonkeyCode, Command Code, or Google and Antigravity.
 
 ### About the reverse-proxy behaviour
 

@@ -748,6 +748,13 @@ pub fn shim_js() -> &'static str {
       return call('POST', '/api/accounts/batch', body);
     },
 
+    // ── 账号路由（与 bridge.rs 的同名方法成对，缺一边会报「桥接方法缺失」）──
+    getRoutingConfig: function () { return call('GET', '/api/routing'); },
+    setRoutingConfig: function (patch) { return call('PUT', '/api/routing', patch || {}); },
+    getRoutingQueue: function (model) {
+      return call('GET', '/api/routing/queue' + (model ? '?model=' + encodeURIComponent(model) : ''));
+    },
+
     // ── 出网代理 ──
     getProxies: function () { return call('GET', '/api/proxies'); },
     testProxy: function (payload) {
@@ -837,6 +844,15 @@ pub fn shim_js() -> &'static str {
     getAutoCheckin: function () { return call('GET', '/api/auto-checkin'); },
     saveAutoCheckin: function (patch) { return call('POST', '/api/auto-checkin', patch); },
     runAutoCheckinNow: function () { return call('POST', '/api/auto-checkin/run', {}); },
+    // 定时签到的**条目**（与 bridge.rs 的同名方法成对维护）
+    getCheckinSchedules: function () { return call('GET', '/api/checkin-schedules'); },
+    saveCheckinSchedule: function (patch) { return call('POST', '/api/checkin-schedules', patch); },
+    deleteCheckinSchedule: function (id) {
+      return call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/delete', {});
+    },
+    runCheckinSchedule: function (id) {
+      return call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/run', {});
+    },
     // WorkBuddy 国际版日活保活的模型链（与 bridge.rs 的同名方法成对维护）
     getCheckinKeepalive: function () { return call('GET', '/api/checkin-keepalive'); },
     saveCheckinKeepalive: function (models) { return call('POST', '/api/checkin-keepalive', { models: models }); },
@@ -844,6 +860,25 @@ pub fn shim_js() -> &'static str {
     runCheckinActivity: function (id, mode) { return call('POST', '/api/checkin-activity', { id: id, mode: mode }); },
     // 签到中心的聚合快照（与 bridge.rs 的同名方法同一路径）
     getCheckinCenter: function () { return call('GET', '/api/checkin-center'); },
+    // 签到记录明细台账（查询 / 清空；参数对象里空值不带，与 bridge.rs 成对）
+    getCheckinRecords: function (params) {
+      const query = new URLSearchParams();
+      for (const key of Object.keys(params || {})) {
+        const value = params[key];
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('GET', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
+    clearCheckinRecords: function (params) {
+      const query = new URLSearchParams();
+      for (const key of Object.keys(params || {})) {
+        const value = params[key];
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('DELETE', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
 
     // ── 间隔型定时任务 ──
     getScheduledTasks: function () { return call('GET', '/api/scheduled-tasks'); },
@@ -978,6 +1013,9 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+    // ── 验证码令牌池（ZCode 活动套餐通道的补货节奏）──
+    getCaptchaPool: function () { return call('GET', '/api/zcode/captcha-pool'); },
+    saveCaptchaPool: function (patch) { return call('PUT', '/api/zcode/captcha-pool', patch); },
 
     // ── 调试模式 ──
     getDebug: function () { return call('GET', '/api/debug'); },

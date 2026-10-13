@@ -3,19 +3,19 @@
  * 的 ⋯ 菜单 / 行内面板 HTML + ui/accounts-view.js 的菜单交互）。
  *
  * ── 为什么还留着 legacy 类名 ─────────────────────────────────
- * 表格的每一格都有 page-accounts-table.css 里量出来的尺寸与排版（列宽预算、`.prio` 的
- * 22+84 算式、`.acct-actions` 的四颗按钮预算…）。迁移只换**控件**，布局类名原样保留：
+ * 表格的每一格都有 page-accounts-table.css 里量出来的尺寸与排版（列宽预算、
+ * `.acct-actions` 的四颗按钮预算…）。迁移只换**控件**，布局类名原样保留：
  * 换掉的控件走组件库（Button / Badge / Switch / Checkbox / Select / Popover），
- * 而 `.prio-stepper`（数字框 + 两枚箭头的合并控件）、`.pbadge`（按 provider 上色的
- * 徽章）、`.usage-sum`（读数，不可点）这三处组件库没有对应件，保持原标记形态 ——
- * 见最终报告的「组件库缺口」。
+ * 而 `.usage-sum`（读数，不可点）与 `.order-cell`（分组模式的拖动把手 + 组内序号）
+ * 这两处组件库没有对应件，保持原标记形态 —— 见最终报告的「组件库缺口」。
  *
- * ── 优先级控件的方向语义（**极易搞反，改动时先读这里**）──────────
- * 优先级数值越小越先用（全局一条队列），所以：
- *   · 上箭头（↑）= 与队列里的**上一个**账号交换 = 排得更靠前 = **数值变小**
- *   · 下箭头（↓）= 与队列里的**下一个**账号交换 = 排得更靠后 = **数值变大**
- * 来自后端 `move_account(id, "up" | "down")` 的语义。视觉上「↓ 在左、↑ 在右」与
- * 「左降右升」的横排直觉一致。
+ * ── 分组化（2026-10）删掉的两块 ────────────────────────────────
+ *   · `PriorityStepper`（数字框 + 两枚箭头的优先级控件）：顺序改由拖拽表达，
+ *     连它承载的「↑ = 数值变小」那套方向语义一起下线 —— 现在只有「拖到哪一行」
+ *     一种表达（落在目标行上方 / 下方，由 accounts-queue-drag 判定）。
+ *   · `ProviderCell`（按 provider 上色的徽章）：家名与图标搬到了分组带
+ *     （`GroupBandRow`），行里不再重复。`.pbadge` 这一族样式留在 CSS 里 ——
+ *     报表页的账号行还在用（report-page.tsx 自己的那一枚）。
  */
 
 import * as React from 'react'
@@ -44,20 +44,20 @@ import {
 import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
 import {
   accountTags, activeLimits, balanceBlockedOf, claimDoneTitle, claimedToday,
-  displayNameOf, editionSuffix, expiryMillis, formatIntervalSeconds, formatResetText,
+  displayNameOf, expiryMillis, formatIntervalSeconds, formatResetText,
   formatTokenCount, identifierOf, isDesktopAccount, isEnabled, isFreePlan, planBadgeLabel,
   providerFeatures,
   providerOf, RESET_UNKNOWN, supportsClaim, supportsUsage, supportsUsageDetail,
   tokenBlockedOf, tokenCountdownText, tokenDisableTriggeredOf, tokenReadingForRule,
   tokenRulesOf, tokenWindowInfo, zcodePlanStateLabel,
 } from './accounts-domain'
-import { PRIORITY_MAX, PRIORITY_MIN, priorityOf } from './accounts-columns'
 import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
-  commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, openZcodePlans,
-  poolError, proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen, tokenUsageOf,
-  toggleNamesHidden, usageEntryOf, usageFailureOf,
+  connectionsOf, maskName, openBatchDialog, openSettingsDialog, openZcodePlans,
+  poolError, proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setGroupEnabled, setPanelOpen,
+  tokenUsageOf, toggleGroupCollapsed, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
+import type { AccountGroup } from './accounts-domain'
 import { PROVIDER_ICONS } from './add-provider-pick'
 import { t } from '../i18n'
 
@@ -66,87 +66,124 @@ function iconHtml(name: string, size: number): string {
   return shared().wbIcons?.icon?.(name, size) || ''
 }
 
-/* ─── 优先级列 ──────────────────────────────── */
+/* ─── 顺序列（组内）──────────────────────────── */
 
 /**
- * 优先级：全局序号 + 「↓ 数字 ↑」合并控件。
+ * 顺序格：`⠿ #N` —— 左边是拖动把手，右边是**组内序号**。
  *
- * 序号（#N）回答「第几位」，控件里的数字回答「队列值」—— 两者是同一个事实的两种读法。
- * 数字一直可编辑（不是双击才变输入框）：这一列的主用途就是改顺序，双击先要用户发现
- * 「这里能双击」；而两枚箭头已经覆盖了最常用的「挪一位」。保存时机是**失焦 / 回车**
- * 而不是 input 事件 —— 每敲一位就发一次请求会让「改成 250」变成三次 PATCH。
+ * ── 为什么不再有数字输入与 ↑↓ ────────────────────────────────
+ * 顺序改由拖拽表达（组序拖分组带、组内拖这一格），数字本身不再是用户要维护的东西：
+ * 全局 `priority` 由「组顺位 → 组内顺位」编译出来（后端 `reorder_accounts` 整队重编号），
+ * 界面上留一个可编辑的号码栏，等于给同一件事留了两个口径。旧的优先级列（数字 + 两枚
+ * 箭头）因此整体下线，`commitPriority` / `moveAccount` 两个动作也随之不再被调用。
  *
- * 草稿态住在这个组件里（而不是像旧实现那样「重绘前 captureEditing / 重绘后
- * restoreEditing」）：React 不会重建同一个 key 的输入框，用户的输入与光标天然保住；
- * 只有「不在编辑中」时才把服务端的最新值同步进草稿。
+ * 把手是**唯一**的拖动起点（不是整行都能拖）：行里还有开关、下拉、按钮，整行可拖会
+ * 让「点一下开关」变成「拖走了一行」。序号显示的是它在**本组内**的位次，组与组之间的
+ * 先后由分组带的顺位表达 —— 两者合起来才是真实的尝试顺序。
  */
-export function PriorityStepper({ account, seat }: {
-  account: AccountRecord
-  seat: { position: number; total: number }
-}) {
-  const serverValue = priorityOf(account)
-  const [draft, setDraft] = React.useState(String(serverValue))
-  const [editing, setEditing] = React.useState(false)
-  /** 交换在途：连点两下会发出两次交换（后端按相邻位置找，第二次会换到别人身上） */
-  const [moving, setMoving] = React.useState(false)
-
-  React.useEffect(() => {
-    if (!editing) setDraft(String(serverValue))
-  }, [serverValue, editing])
-
-  async function commit(): Promise<void> {
-    setEditing(false)
-    const next = await commitPriority(account.id, draft)
-    // commitPriority 在「非法 / 未改动 / 失败」时返回账号的**真实当前值** ——
-    // 留着用户输的数字会让人以为存进去了，而下一次刷新它又会悄悄跳回去
-    if (next !== null) setDraft(String(next))
-  }
-
-  async function move(direction: 'up' | 'down'): Promise<void> {
-    if (moving) return
-    setMoving(true)
-    try {
-      await moveAccount(account.id, direction)
-    } finally {
-      setMoving(false)
-    }
-  }
-
-  const atFront = seat.position <= 1
-  const atEnd = seat.position >= seat.total
-
+export function OrderCell({ account, rank }: { account: AccountRecord; rank: number }) {
+  const label = t('组内第 {rank} 位', { rank })
   return (
-    <div className='prio'>
-      <span className='seat' title={t('全局队列第 {position} 位，共 {total} 位', { position: seat.position, total: seat.total })}>#{seat.position}</span>
-      <span className='prio-stepper'>
-        <button type='button' className='prio-arrow' disabled={atEnd || moving}
-          title={t('与队列里的下一个账号交换优先级（可能是另一家的账号）')}
-          onClick={() => void move('down')}
-          dangerouslySetInnerHTML={{ __html: iconHtml('arrowDown', 14) }} />
-        <input className='prio-input' type='number' min={PRIORITY_MIN} max={PRIORITY_MAX} step={1}
-          aria-label={t('优先级')} title={t('全局唯一：所有提供商的账号都不能重号，数值越小越先用')}
-          value={draft}
-          onChange={event => setDraft(event.currentTarget.value)}
-          onFocus={() => setEditing(true)}
-          onBlur={() => { void commit() }}
-          onKeyDown={event => {
-            if (event.key === 'Enter') {
-              event.preventDefault()
-              // 回车 = 提交（失焦即走上面那条路）
-              event.currentTarget.blur()
-            } else if (event.key === 'Escape') {
-              // 放弃这次输入、还原成当前值
-              setDraft(String(serverValue))
-              setEditing(false)
-              event.currentTarget.blur()
-            }
-          }} />
-        <button type='button' className='prio-arrow' disabled={atFront || moving}
-          title={t('与队列里的上一个账号交换优先级（可能是另一家的账号）')}
-          onClick={() => void move('up')}
-          dangerouslySetInnerHTML={{ __html: iconHtml('arrowUp', 14) }} />
-      </span>
+    <div className='order-cell'>
+      <span className='order-grip' role='button' tabIndex={-1} aria-label={t('拖动调整组内顺序')}
+        title={t('按住拖动，调整这个账号在本组内的顺序')}
+        dangerouslySetInnerHTML={{ __html: iconHtml('gripVertical', 14) }} />
+      <span className='order-rank' title={label}>{`#${rank}`}</span>
     </div>
+  )
+}
+
+/* ─── 分组带 ────────────────────────────────── */
+
+/**
+ * 分组带的 ⋯ 菜单：整组启用 / 禁用、批量操作本组、折叠本组。
+ *
+ * 「整组启用 / 禁用」直接落批量端点（一次改一组，与单行开关同一口径）；
+ * 「批量操作本组…」打开既有的批量弹窗并**预选本组**（改代理这类要挑参数的动作用它，
+ * 不必再新造一套界面）；折叠那一项与组头那颗箭头同一个状态 —— **它是个开关**，
+ * 所以文案必须跟着当前状态变：已经收起的那一组，这一项写「展开这一组」才是它真做的事。
+ */
+function GroupMenu({ group, ids, collapsed }: { group: AccountGroup; ids: string[]; collapsed: boolean }) {
+  const [open, setOpen] = React.useState(false)
+  const itemClass = 'w-full justify-start px-2 font-normal'
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger render={<button type='button' className='grp-iconbtn' title={t('本组操作')} />}>⋯</PopoverTrigger>
+      <PopoverContent align='end' sideOffset={4} className='w-[196px] p-1.5'>
+        <div className='flex flex-col gap-0.5'>
+          <Button variant='ghost' size='sm' className={itemClass}
+            title={t('启用这一组里的全部账号（含被筛选隐藏的）')}
+            onClick={() => { setOpen(false); void setGroupEnabled(ids, true) }}>
+            {t('全部启用（{n}）', { n: ids.length })}
+          </Button>
+          <Button variant='ghost' size='sm' className={itemClass}
+            title={t('禁用这一组里的全部账号（含被筛选隐藏的）')}
+            onClick={() => { setOpen(false); void setGroupEnabled(ids, false) }}>
+            {t('全部禁用（{n}）', { n: ids.length })}
+          </Button>
+          <Button variant='ghost' size='sm' className={itemClass}
+            title={t('打开批量操作弹窗，并预选这一组的账号（改代理等动作在弹窗里挑参数）')}
+            onClick={() => { setOpen(false); openBatchDialog(ids, 'proxy') }}>
+            {t('批量操作本组…')}
+          </Button>
+          <div className='my-1 h-px bg-hairline' />
+          <Button variant='ghost' size='sm' className={itemClass}
+            onClick={() => { setOpen(false); toggleGroupCollapsed(group.provider) }}>
+            {collapsed ? t('展开这一组') : t('折叠这一组')}
+          </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+/**
+ * 分组带：一家的分隔横幅（`<tbody>` 的第一行，通栏一格）。
+ *
+ * 从左到右：拖动把手（整组顺位的唯一拖动起点）→ 顺位 → 家图标 + 家名 → 统计
+ * （N 个账号 · 启用 x · 禁用 y · 限流 z）→ 右侧折叠箭头与 ⋯ 菜单。
+ * 统计读的是**整组**（不受筛选影响）：它回答「这一家有多少账号」，不是「当前显示几行」。
+ *
+ * 样式刻意保持中性（surface 底 + 一条 hairline）：一家一色会让整页像调色板，
+ * 而「哪一段是哪一家」由家名与图标已经说清楚了。
+ */
+export function GroupBandRow({ group, collapsed, colSpan }: {
+  group: AccountGroup
+  collapsed: boolean
+  colSpan: number
+}) {
+  const icon = PROVIDER_ICONS[group.provider]
+  return (
+    <tr className='grp-band' data-provider={group.provider}>
+      <td colSpan={colSpan}>
+        <div className='grp-band-inner'>
+          <span className='queue-grip' role='button' tabIndex={-1} aria-label={t('拖动调整整组顺序')}
+            title={t('按住拖动，调整这一家的组顺位（整组一起动）')}
+            dangerouslySetInnerHTML={{ __html: iconHtml('gripVertical', 14) }} />
+          <span className='grp-rank' title={t('组顺位：越小越先用（拖动分组带调整）')}>
+            {t('第 {rank} 顺位', { rank: group.rank })}
+          </span>
+          <span className='grp-logo'>
+            {icon
+              ? <img src={icon} alt='' loading='lazy' />
+              : <span className='grp-logo-txt'>{String(group.label || '?').trim().slice(0, 1).toUpperCase()}</span>}
+          </span>
+          <span className='grp-name'>{group.label}</span>
+          <span className='grp-stat'>{t('{total} 个账号 · 启用 {enabled} · 禁用 {disabled}{limited}', {
+            total: group.members.length,
+            enabled: group.enabled,
+            disabled: group.disabled,
+            limited: group.limited > 0 ? t(' · 限流 {n}', { n: group.limited }) : '',
+          })}</span>
+          <span className='grp-spacer' />
+          <button type='button' className='grp-iconbtn grp-fold' aria-expanded={!collapsed}
+            title={collapsed ? t('展开这一组') : t('折叠这一组')}
+            onClick={() => toggleGroupCollapsed(group.provider)}
+            dangerouslySetInnerHTML={{ __html: iconHtml('chevronDown', 14) }} />
+          <GroupMenu group={group} ids={group.accounts.map(account => account.id)} collapsed={collapsed} />
+        </div>
+      </td>
+    </tr>
   )
 }
 
@@ -328,7 +365,7 @@ function subscriptionText(subscription: unknown): string {
  * 「待生效 今天 23:00 · 过期时间 10月12日 09:00」），刚领到的那笔额度还没开始算。
  * 余额列上什么都不显示，用户会以为没领上；一条徽章回答「领到了、还没到生效时间」。
  */
-function pendingPlans(entry: UsageEntry): Array<Record<string, unknown>> {
+export function pendingPlans(entry: UsageEntry): Array<Record<string, unknown>> {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
   const plans = (entry as Record<string, unknown>).plans
   if (!Array.isArray(plans)) return []
@@ -343,7 +380,7 @@ function pendingPlans(entry: UsageEntry): Array<Record<string, unknown>> {
  * `plan_effective_times`）；它缺失时才退回 `startsAt`（那是领取时间，只在没有
  * 权益的套餐上才等于生效时间）。
  */
-function pendingPlansTitle(plans: Array<Record<string, unknown>>): string {
+export function pendingPlansTitle(plans: Array<Record<string, unknown>>): string {
   const lines = plans.map(plan => {
     const name = String(plan.name || plan.planId || t('套餐'))
     const starts = Number(plan.pendingUntil ?? plan.startsAt)
@@ -363,7 +400,7 @@ function pendingPlansTitle(plans: Array<Record<string, unknown>>): string {
  * 摘要文案刻意压到「数字 + 单位」，完整句（各钱包 / 套餐 / 到期）放进 title ——
  * 余额列是这张表里最窄的几列之一。
  */
-function usageSummary(entry: UsageEntry): { text: string; kind: string; title: string } {
+export function usageSummary(entry: UsageEntry): { text: string; kind: string; title: string } {
   if (entry === undefined) return { text: t('未查询'), kind: 'muted', title: t('尚未查询该账号的余额') }
   if (entry === null) return { text: t('查询中…'), kind: 'muted', title: t('正在查询') }
   const failure = usageFailureOf(entry)
@@ -525,7 +562,7 @@ function grantUsage(plan: Record<string, unknown>): { used: number; total: numbe
  * 不拿 0 或 100 冒充 —— 一条满格的进度条与一条空进度条读起来是相反的意思，
  * 而它们都可能是错的。
  */
-function usagePool(entry: UsageEntry): { planName: string; text: string; percent: number | null } | null {
+export function usagePool(entry: UsageEntry): { planName: string; text: string; percent: number | null } | null {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
   const data = entry as Record<string, unknown>
   const wallets = Array.isArray(data.wallets) ? data.wallets as Array<Record<string, unknown>> : []
@@ -1116,31 +1153,6 @@ export function AccountCell({ account, namesHidden }: { account: AccountRecord; 
 }
 
 /**
- * 提供商：一枚徽章，带版本后缀（「WorkBuddy 国际版」）—— 与 AutoClaw 那种「名字自带
- * 版本」的家同一种形态，不再提供商、版本两枚并排。
- * 收录过图标的家（PROVIDER_ICONS，与模型管理页 / 签到中心同一份）在名字前挂
- * 13px 小图标，没有的仍是纯文字 —— 与卡片图标的兜底口径一致。
- * 配色按 provider id 生成（`p-<id>` 类），未登记的家落到 CSS 里的中性兜底 ——
- * 加一家时不必改样式表，也不会显示成空白（所以这里不换组件库的 Badge：它没有按
- * provider 上色的档位，见最终报告的组件库缺口）。
- */
-export function ProviderCell({ account }: { account: AccountRecord }) {
-  const provider = providerOf(account)
-  const label = shared().wbProviders?.labelOf?.(provider) || provider
-  const edition = providerFeatures(provider).edition ? editionSuffix(account) : ''
-  const text = edition ? `${label} ${edition}` : label
-  const icon = PROVIDER_ICONS[provider]
-  return (
-    <div className='pv'>
-      <span className={`pbadge p-${provider}`} title={t('提供商：{name}', { name: text })}>
-        {icon ? <img className='pbadge-ico' src={icon} alt='' loading='lazy' /> : null}
-        <span className='pbadge-txt'>{text}</span>
-      </span>
-    </div>
-  )
-}
-
-/**
  * 代理：这个账号出网走哪条线路。一格一个下拉，**选中即保存**。
  *
  * 选项**只有**直连 + 「网络代理」页的代理池条目（值是 `pool:<proxyId>`）——
@@ -1436,14 +1448,11 @@ export function TableHead({ namesHidden, allPicked, somePicked, disabled, onTogg
             title={t('全选 / 取消全选当前筛选结果（与批量栏同一个选择）')}
             onCheckedChange={next => onToggleAll(next)} />
         </th>
-        <th className='cell-priority' data-col='priority'>
-          <span className='th-label' title={t('全局一条队列：数值越小越先用，不分提供商')}>
-            {t('优先级')}<span className='th-hint'>{t('全局队列')}</span>
+        <th className='cell-order' data-col='order'>
+          <span className='th-label' title={t('组内先后：按住左边的把手上下拖动即可调整；整组的先后拖分组带的把手')}>
+            {t('顺序')}
           </span>
           {grip}
-        </th>
-        <th className='cell-provider' data-col='provider'>
-          <span className='th-label'>{t('提供商')}</span>{grip}
         </th>
         <th className='cell-account' data-col='account'>
           <span className='th-label'>
@@ -1465,7 +1474,7 @@ export function TableHead({ namesHidden, allPicked, somePicked, disabled, onTogg
         </th>
         <th className='cell-limits' data-col='limits'>
           <span className='th-label' title={t('该账号当前限流中的模型；点徽章看明细')}>
-            {t('限流')}<span className='th-hint'>{t('按模型')}</span>
+            {t('限流')}
           </span>
           {grip}
         </th>

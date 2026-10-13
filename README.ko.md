@@ -24,6 +24,7 @@
 | MonkeyCode(长亭科技, 중국판 / 국제판) | ✓ | ✗ 갱신 API 없음 | ✓ 원격만 | — | — | — |
 | Command Code | ✓ | ✗ 정적 API 키 | ✓ 원격 + 정적 폴백 | — | — | — |
 | Antigravity(Google, Gemini) | ✓ | ✓ | ✓ 원격 + 정적 폴백 | — | — | — |
+| OfficeAce(Huawei Cloud, OfficeClaw) | ✓ | ✓ 제어 영역 자동 갱신 | ✓ 원격만 | ✓ 포인트 잔액 | ✓ 일일 보너스(출석 + 신규 혜택) | — |
 | 사용자 지정 프로바이더 | ✓ Chat 패스스루 / Responses / Anthropic | — | ✓ 수동 등록 + 서버 측 가져오기 | — | — | — |
 
 세 가지 대화 프로토콜 진입점(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, 그리고 `/v1/messages/count_tokens`)과 `/v1/models`는 모든 플랫폼에 동일하게 적용되며, 차이는 각 업스트림이 표의 항목을 할 수 있는지에만 있습니다. 모델 매핑, 전역 우선순위 큐, 429 폴백, 이그레스 프록시, 아웃바운드 핑거프린트 마스킹, 요청 리포트 역시 전 플랫폼 공통입니다.
@@ -249,10 +250,16 @@ agent2api/
 │  │  │  │  │  ├─ commandcode/  Command Code: adapter / endpoints / credentials / login /
 │  │  │  │  │  │                fingerprint(결정적 기기 핑거프린트와 8h 보고) / models /
 │  │  │  │  │  │                plan(8키 엔벨로프와 params 재작성, session id 파생)
-│  │  │  │  │  └─ antigravity/  Antigravity(Google, Gemini): oauth(refresh token 갱신 + 싱글플라이트) /
+│  │  │  │  │  ├─ antigravity/  Antigravity(Google, Gemini): oauth(refresh token 갱신 + 싱글플라이트) /
 │  │  │  │  │                   project(loadCodeAssist → onboardUser 탐색) / credentials /
 │  │  │  │  │                   endpoints(3개 환경 베이스와 헤더 집합) / login /
 │  │  │  │  │                   models(fetchAvailableModels + 내장 폴백 + 업스트림 실제 이름 매핑) / adapter
+│  │  │  │  │  └─ officeace/    OfficeAce(Huawei Cloud, OfficeClaw): oauth(PKCE + P-256 DPoP 셀프 서비스 로그인)/
+│  │  │  │  │                   signer(SDK-HMAC 과 V11-HMAC 두 가지 서명 + 벡터 픽스처)/
+│  │  │  │  │                   credentials(게이트웨이 Basic + 제어 영역 임시 AK/SK)/
+│  │  │  │  │                   chat(무상태 OpenAI 호환)/ models(원격 목록 + 모델별 배율)/
+│  │  │  │  │                   probe(사용 가능성 프로브. 연결되지 않는 모델은 기본 숨김)/
+│  │  │  │  │                   subscription(구독 / 할당량 / 보상)/ onboarding / checkin / balance
 │  │  │  │  ├─ protocol/        프로토콜 변환 계층(각 사 wire ↔ 표준 chat SSE 요청/응답 번역:
 │  │  │  │  │                    Anthropic Messages / Responses / NDJSON(Command Code) /
 │  │  │  │  │                    Gemini 엔벨로프(Antigravity), 그리고 도구 plan 과 기록 복구)
@@ -324,7 +331,7 @@ npm run build:icon         # 아이콘 소스 이미지 생성(아이콘 디자�
 
 ### 학습과 교류 목적에 한정
 
-이 프로젝트는 HTTP 리버스 프록시, SSE 스트리밍 패스스루, 다중 업스트림 프로토콜 적응, 데스크톱 패키징(Tauri) 같은 기술 주제를 익히기 위한 실습 프로젝트이며, **개인 학습과 연구 목적으로만** 제공됩니다. 공식 제품이 아니며 Tencent 및 WorkBuddy / CodeBuddy, Meituan 및 CatPaw, SenseTime 및 小浣熊, Zhipu 및 AutoClaw / autoglm, Alibaba 및 Qoder / Accio, Huawei Cloud 및 CodeArts, ByteDance 및 Trae, iFlytek 및 Loomy, Baidu Wenku 및 KukuAI, 长亭科技 및 MonkeyCode, Command Code, Google 및 Antigravity 와 아무런 관련이 없고, 그 승인이나 후원도 받지 않았습니다.
+이 프로젝트는 HTTP 리버스 프록시, SSE 스트리밍 패스스루, 다중 업스트림 프로토콜 적응, 데스크톱 패키징(Tauri) 같은 기술 주제를 익히기 위한 실습 프로젝트이며, **개인 학습과 연구 목적으로만** 제공됩니다. 공식 제품이 아니며 Tencent 및 WorkBuddy / CodeBuddy, Meituan 및 CatPaw, SenseTime 및 小浣熊, Zhipu 및 AutoClaw / autoglm, Alibaba 및 Qoder / Accio, Huawei Cloud 및 CodeArts / OfficeAce, ByteDance 및 Trae, iFlytek 및 Loomy, Baidu Wenku 및 KukuAI, 长亭科技 및 MonkeyCode, Command Code, Google 및 Antigravity 와 아무런 관련이 없고, 그 승인이나 후원도 받지 않았습니다.
 
 ### 리버스 프록시 동작에 대하여
 

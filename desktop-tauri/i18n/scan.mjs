@@ -61,7 +61,7 @@ const DOMAIN_ORDER = [
 const DOMAIN_RULES = [
   { domain: 'common', files: ['index.html', 'titlebar.js', 'tooltip.js', 'clipboard.js', 'filter-memory.js', 'app.js', 'confirm-dialog.tsx', 'input.tsx', 'input-control.tsx', 'segmented.tsx', 'index.tsx', 'markdown.js', 'icons.js'] },
   { domain: 'login', files: ['login.html', 'login-page.tsx', 'panel-captcha.js'] },
-  { domain: 'accounts', files: ['accounts-page.tsx', 'accounts-shared.ts', 'accounts-columns.ts', 'accounts-store.ts', 'accounts-panels.tsx', 'accounts-dialogs.tsx', 'accounts-dialog-limiter.tsx', 'accounts-dialog-usage.tsx', 'accounts-data.ts', 'accounts-domain.ts', 'zcode-plans-modal.tsx'] },
+  { domain: 'accounts', files: ['accounts-page.tsx', 'accounts-shared.ts', 'accounts-columns.ts', 'accounts-store.ts', 'accounts-panels.tsx', 'accounts-queue-drag.ts', 'accounts-dialogs.tsx', 'accounts-dialog-limiter.tsx', 'accounts-dialog-usage.tsx', 'accounts-data.ts', 'accounts-domain.ts', 'zcode-plans-modal.tsx'] },
   { domain: 'add-account', files: ['add-custom-provider.tsx', 'custom-provider-ui.js', 'providers.js', 'preset-providers.js', 'web-login.js', 'sms-login.js', 'autoclaw-oauth.js', 'aliyun-captcha.js', 'zcode-claim.js', 'zcode-captcha-pool.js', 'codearts-welfare.js'], prefixes: ['add-account-', 'add-provider-'] },
   { domain: 'models', files: ['model-capability.ts', 'model-capability-dialog.tsx', 'model-test-dialog.tsx'], prefixes: ['models-'] },
   { domain: 'settings', files: ['units.js'], prefixes: ['settings-'] },
@@ -70,7 +70,7 @@ const DOMAIN_RULES = [
   { domain: 'proxies', files: ['proxies-page.tsx', 'proxies-state.ts'] },
   { domain: 'docs', files: ['docs-page.tsx'] },
   { domain: 'report', files: ['report-page.tsx', 'report-charts.ts'] },
-  { domain: 'checkin', files: ['checkin-page.tsx', 'checkin-state.ts'] },
+  { domain: 'checkin', files: ['checkin-page.tsx', 'checkin-state.ts', 'checkin-schedule-tab.tsx', 'checkin-records-tab.tsx', 'checkin-schedules-state.ts'] },
   { domain: 'tasks', files: ['tasks-panel.tsx'] },
   { domain: 'logs', files: ['logs-panel.tsx'] },
   { domain: 'requests', files: ['requests-page.tsx', 'request-detail.tsx', 'request-hover.tsx', 'request-clear-modal.tsx', 'conversation-preview.js'] },

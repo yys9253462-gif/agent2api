@@ -194,6 +194,33 @@ export async function openExternal(url: string): Promise<void> {
   }
 }
 
+/**
+ * 官方 QQ 群号。两处用：面板页脚那颗「加入 QQ 群」的悬停提示，以及加群弹窗里
+ * 显示的「群号」（可复制，给人搜不到码时手打）。
+ */
+export const QQ_GROUP = '1127656296'
+
+/**
+ * 加群二维码：**随界面一起打包**的一张小图（`ui/assets/qq-group/<群号>.jpg`，
+ * 与 provider 图标同在 `ui/assets/` 下，同样按相对路径引用）。
+ *
+ * ── 为什么落在这里，而不是外链 ──────────────────────────────
+ * 先后试过两条远程路子，都不成立：
+ *   · `mqqapi://card/show_pslcard?…&card_type=group`（社区里流传最广的「一键加群」）：
+ *     协议确实注册了、能拉起 QQ 主程序，但桌面版 QQ NT 9.9.36 打开那张群名片后自己
+ *     弹「当前QQ暂不支持该内容」；这个拒绝**发生在 QQ 里面**，壳只看得到 ShellExecuteW
+ *     成功，判断不了、也就接不了「失败再换一条路」的兜底。
+ *   · 群里「分享 → 复制加群链接」给出的 `https://qm.qq.com/q/xxxx`：它是给 QQ 内置
+ *     浏览器 / 手机 QQ 用的加群页（靠 `qqapi.wk.js` 那套 App 内 SDK 完成加群），
+ *     系统浏览器里走不通。
+ * 外链托管（GitHub raw、自建 Worker）也都不如内置：图是死的、就那么一张，放进安装包
+ * 不用联网、不受网络环境影响，扫码这条路也不依赖对方 QQ 的版本。
+ *
+ * 代价说清楚：图在包里，**换群 / 换码必须跟着发一次版**（改文件名 + 这一个常量），
+ * 不像外链那样能只换服务端。文件名就用群号，两处对得上即可。
+ */
+export const QQ_GROUP_QR = `assets/qq-group/${QQ_GROUP}.jpg`
+
 /** 更新日志正文：渲染交给 wbMarkdown（不重写它），只做缺失兜底 */
 export function markdownHtml(notes: string): string {
   return shared().wbMarkdown?.render?.(notes) || ''

@@ -98,17 +98,12 @@ pub fn supports_checkin(account: &Value) -> bool {
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return false;
     }
-    // CodeArts 没有「签到」链路，必须先排除：`checkin_for` 的分派 match 把
-    // 「不在范围里的家」报成「未接入」，签到中心那边则按 `CHECKIN_PROVIDERS`
-    // 分桶（本家不在清单里，落到「没有签到链路」那组）—— 这一层是批量路径
-    // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
-    // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
-    // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
+    // CodeArts **参与**本链（2026-10 按用户要求纳入，见 `auto_checkin::CHECKIN_PROVIDERS`
+    // 里那一条的说明）：它的每日福利是 ops 活动交付（三个接口、两套状态），形态与
+    // 别家差别最大，所以在「今天还能不能再领」「要不要重试」这两件事上与签到同构 ——
+    // 上面那条按 `edition` 的 intl 一刀切与本家无关（它没有版本概念，恒 cn）。
     // Trae 曾与 CodeArts 同列排除表；SOLO 转积分制后模型调用花的就是签到钱包
     // 那份钱，它已在 `providers::trae::checkin` 接入本链，不要再加回来。
-    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID {
-        return false;
-    }
     !crate::server::core::account_store::is_accio_family(provider)
 }
 
@@ -211,7 +206,16 @@ pub fn resolve_checkin_targets(
 ///   - **Qoder**：活动（campaign）领取链路，中国版直领；国际版要先带设备
 ///     风控身份重新拉活动列表（`providers::qoder::checkin` + `qoder::risk`）；
 ///     （`providers::qoder::checkin::claim_daily_checkin`）；
-///   - **Trae**：SOLO 的 `checkin_credits` 领取（`providers::trae::checkin`）。
+///   - **Trae**：SOLO 的 `checkin_credits` 领取（`providers::trae::checkin`）；
+///   - **CodeArts**：当日 ops 福利（`providers::codearts::welfare` 的
+///     delivery → claim → confirm → 回读核实）。它的「签到」是**写请求**，
+///     受本家自己的限流闸约束，所以这一支要吃 `manual` 参数（见下）。
+///
+/// `manual` 只对 CodeArts 有意义（别家的签到接口幂等且无本地闸）：真值表示这次
+/// 执行是**用户在面板上点出来的**（单账号 `single` / 批量 `manual`），假值表示
+/// 无人值守的定时或启动补签。它决定 welfare 那两道闸（每天 ≤6 次写、间隔
+/// ≥10 分钟）要不要生效 —— 闸保护的是无人值守的重试，不是用户的点击
+/// （见 `providers::codearts::welfare` 的模块头）。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
@@ -221,6 +225,7 @@ pub async fn checkin_for(
     store: &AccountStore,
     billing: &BillingService,
     account: &Value,
+    manual: bool,
 ) -> Value {
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
@@ -332,6 +337,32 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "officeace" => {
+            // OfficeAce：`POST /v1/subscription/bonus/claim`（V11 签名）一次把当天
+            // 所有可领的奖励（每日签到 + 一次性新人礼）发下来；一天一个活动只能领
+            // 一次、重复领不报错，幂等由上游保证（见 `officeace::checkin` 模块头）。
+            let claim =
+                crate::server::core::providers::officeace::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "codearts" => {
+            // CodeArts：当日 ops 福利（每日登录送积分那一组，`Rewards::DailyLogin`
+            // ——一次性注册礼归新手福利，不在这里领，见 welfare 的模块头）。
+            // 四步流程与限流闸都在实现里，这里只把结论翻成签到结果行。
+            let claim = crate::server::core::providers::codearts::welfare::claim_account(
+                store,
+                &id,
+                crate::server::core::providers::codearts::models::DEFAULT_BASE_URL,
+                logging::now_ms(),
+                manual,
+            )
+            .await
+            .map_err(|error| error.message)
+            .map(welfare_claim_of);
+            claim_result(id, name, &display, true, claim)
+        }
         // 兜底只服务默认那家（WorkBuddy 国内版）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
@@ -364,6 +395,27 @@ pub async fn checkin_for(
                 crate::server::core::providers::label_of(other)
             ),
         }),
+    }
+}
+
+/// CodeArts 的福利结论 → 签到结果行的 claim 形状。
+///
+/// 四档结论在「今天还能不能再领」这件事上分三类，映射必须与
+/// [`checkin_completed_today`] / [`claim_pending`] 的口径对齐 —— 那两处是调度
+/// （`auto_checkin::tick` 要不要稍后重试）、落账（要不要写 `checkinAt`）与
+/// 台账（outcome 档位）共用的唯一判据：
+///   · `Confirmed`（官方已确认到账）→ `success`：今天真领到了；
+///   · `Already`（已领取并确认）→ `alreadyCompleted`：上游说今天已经领过 ——
+///     两者都算「今天签到完成」，于是落 `checkinAt`、计入 succeeded、进签到记录；
+///   · `NotEligible`（暂无可领取活动）/ `Skipped`（被本地限流闸挡住，只可能出现在
+///     自动路径）→ **中性未领取**：不落账，定时链稍后重试（文案由 `claim_pending` 认）。
+fn welfare_claim_of(outcome: crate::server::core::providers::codearts::welfare::Outcome) -> Value {
+    use crate::server::core::providers::codearts::welfare::Outcome;
+    let label = outcome.label();
+    match outcome {
+        Outcome::Confirmed => json!({ "success": true, "msg": label }),
+        Outcome::Already => json!({ "success": false, "alreadyCompleted": true, "msg": label }),
+        Outcome::NotEligible | Outcome::Skipped => json!({ "success": false, "msg": label }),
     }
 }
 
@@ -409,6 +461,8 @@ fn claim_result(
 }
 
 /// 这次签到是否意味着「今天已经签过了」—— 决定要不要落 `checkinAt`。
+/// `pub`：签到记录台账（`core::checkin_records`）的 outcome 判定复用它 ——
+/// 「今天已完成」的口径在调度、落账与台账三处必须是同一份（判据只此一份）。
 ///
 /// 三种情况都算，因为它们在「今天不能再领」这件事上没有区别：
 ///   1. `success === true`：本次真的领到了；
@@ -425,7 +479,7 @@ fn claim_result(
 /// 可能一次都没签上，把它当作已签到去置灰按钮会白丢一天。这不是假想 ——
 /// 实测见过自动签到 4 个账号全部未领取、17 秒后手动逐个重试全部成功
 /// （批次撞上上游风控），所以判据必须收紧到「上游说签过了」。
-fn checkin_completed_today(claim: &Value) -> bool {
+pub fn checkin_completed_today(claim: &Value) -> bool {
     if claim.get("success").and_then(Value::as_bool) == Some(true) {
         return true;
     }
@@ -455,7 +509,14 @@ pub fn claim_pending(claim: &Value) -> bool {
     // 两个地区的「无活动」文案都含这一句；实现改措辞时这里要跟着对齐
     //（`providers::qoder::checkin::no_claim` 与 trae 的「未领取 + 原因」不同形，
     // trae 不走这条 pending 逻辑 —— 它没有窗口概念）。
-    message.contains("没有可领取的签到活动") || message.contains("未下发每日积分活动")
+    // CodeArts 的两条（`providers::codearts::welfare::Outcome::label`）同理：
+    // 「暂无可领取活动」是运营活动还没下发（再过一阵可能就有），「等待重试」是
+    // 被本地那两道写闸挡住（今天还有额度、只是间隔没到）—— 两者都该让定时链
+    // 稍后重试，而不是记成失败。改那边的文案时这两条也要跟着改。
+    message.contains("没有可领取的签到活动")
+        || message.contains("未下发每日积分活动")
+        || message.contains("暂无可领取活动")
+        || message.contains("等待重试")
 }
 
 /// 执行一次签到并汇总（Node 版 `runCheckin(id)`）。
@@ -464,6 +525,8 @@ pub fn claim_pending(claim: &Value) -> bool {
 /// 决定（配置里勾选的提供商，缺省全选；**指定 id 单签时不受范围限制**）。
 /// `reason` 只在批量轮次（id=None）进签到历史台账（`checkin_history`，签到中心
 /// 时间线的来源）；单账号签到不进台账，只更新账号的 `checkinAt`。
+/// `source` 是签到记录台账（`core::checkin_records`，schema v11）的触发来源，
+/// 每个账号行落一条明细时原样带上 —— 批量与单账号共用这一处记账点。
 /// **串行**：避免多账号同时打上游触发 11-128 风控。
 pub async fn run_checkin(
     store: &AccountStore,
@@ -471,11 +534,16 @@ pub async fn run_checkin(
     providers: &[String],
     id: Option<&str>,
     reason: &str,
+    source: &str,
 ) -> Result<Value, CheckinError> {
     let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
+    // 「这次是用户在面板上点的吗」——只有 CodeArts 用得上（它的福利是写请求，
+    // 有两道本地限流闸）。单账号 single 与批量 manual 都是点击触发；
+    // schedule / startup 是无人值守，必须受闸。见 `checkin_for` 的说明。
+    let manual = matches!(source, "single" | "manual");
     let mut results = Vec::with_capacity(targets.len());
     for account in &targets {
-        let row = checkin_for(store, billing, account).await;
+        let row = checkin_for(store, billing, account, manual).await;
         // 落签到时间：手动单签与定时签到走的是**这一段**（两条链都调本函数），
         // 所以账号页的「已签到」在两种路径下都会亮起来，不需要各自记一次。
         // 写盘失败只记日志、不改签到结果 —— 上游那边积分已经领到了，
@@ -492,6 +560,16 @@ pub async fn run_checkin(
                 );
             }
         }
+        // 签到记录台账（schema v11）：每个账号行落一条明细（成败 / 错误原文 /
+        // 收益文案都在结果行里）。写盘失败只记日志：台账缺一条不该让这次
+        // 签到的响应报错 —— 与上面 mark_checkin 的取舍同构。provider 由账号
+        // 记录带上（结果行里没有这个字段，记录页的提供商筛选列要用）。
+        crate::server::core::checkin_records::record_row(
+            &row,
+            account.get("provider").and_then(Value::as_str).unwrap_or(""),
+            source,
+            reason,
+        );
         results.push(row);
     }
     // 「真实领取」与「今日已领取」都表示本日签到已完成；只有活跃保活不计入

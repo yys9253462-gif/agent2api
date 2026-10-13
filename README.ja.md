@@ -24,6 +24,7 @@
 | MonkeyCode（長亭科技、中国版 / 国際版） | ✓ | ✗ 更新 API なし | ✓ リモートのみ | — | — | — |
 | Command Code | ✓ | ✗ 静的な API キー | ✓ リモート + 静的フォールバック | — | — | — |
 | Antigravity（Google、Gemini） | ✓ | ✓ | ✓ リモート + 静的フォールバック | — | — | — |
+| OfficeAce（Huawei Cloud、OfficeClaw） | ✓ | ✓ コントロールプレーンの自動更新 | ✓ リモートのみ | ✓ ポイント残高 | ✓ デイリーボーナス（チェックイン + 新規特典） | — |
 | カスタムプロバイダー | ✓ Chat パススルー / Responses / Anthropic | — | ✓ 手動登録 + サーバー側取得 | — | — | — |
 
 3 つの対話プロトコルの入口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、および `/v1/messages/count_tokens`）と `/v1/models` はすべてのプラットフォームで同じように扱われ、違いは各アップストリームが表の項目を実現できるかどうかだけです。モデルマッピング、グローバル優先度キュー、429 フォールバック、外向きプロキシ、送信フィンガープリントの秘匿化、リクエストレポートも全プラットフォーム共通です。
@@ -249,10 +250,16 @@ agent2api/
 │  │  │  │  │  ├─ commandcode/  Command Code: adapter / endpoints / credentials / login /
 │  │  │  │  │  │                fingerprint（決定論的デバイスフィンガープリントと 8h レポート）/ models /
 │  │  │  │  │  │                plan（8 キーのエンベロープと params 書き換え、session id の派生）
-│  │  │  │  │  └─ antigravity/  Antigravity（Google、Gemini）: oauth（refresh token 更新 + シングルフライト）/
+│  │  │  │  │  ├─ antigravity/  Antigravity（Google、Gemini）: oauth（refresh token 更新 + シングルフライト）/
 │  │  │  │  │                   project（loadCodeAssist → onboardUser の検出）/ credentials /
 │  │  │  │  │                   endpoints（3 環境のベース URL とヘッダー集合）/ login /
 │  │  │  │  │                   models（fetchAvailableModels + 内蔵フォールバック + 上流の実名マッピング）/ adapter
+│  │  │  │  │  └─ officeace/    OfficeAce（Huawei Cloud、OfficeClaw）: oauth（PKCE + P-256 DPoP セルフサービスログイン）/
+│  │  │  │  │                   signer（SDK-HMAC と V11-HMAC の 2 種類の署名 + ベクター fixtures）/
+│  │  │  │  │                   credentials（ゲートウェイ Basic + コントロールプレーンの一時 AK/SK）/
+│  │  │  │  │                   chat（ステートレスな OpenAI 互換）/ models（リモート目録 + モデル別倍率）/
+│  │  │  │  │                   probe（可用性プローブ。疎通できないモデルは既定で非表示）/
+│  │  │  │  │                   subscription（サブスクリプション / クォータ / 報酬）/ onboarding / checkin / balance
 │  │  │  │  ├─ protocol/        プロトコル変換層（各社 wire ↔ 標準 chat SSE のリクエスト / レスポンス翻訳:
 │  │  │  │  │                    Anthropic Messages / Responses / NDJSON（Command Code）/
 │  │  │  │  │                    Gemini エンベロープ（Antigravity）、およびツール plan と履歴修復）
@@ -324,7 +331,7 @@ npm run build:icon         # アイコンのソース画像を生成（アイコ
 
 ### 学習・交流目的に限る
 
-本プロジェクトは、HTTP リバースプロキシ、SSE ストリーミングのパススルー、複数アップストリームのプロトコル適応、デスクトップパッケージング（Tauri）といった技術テーマを学ぶための実践プロジェクトであり、**個人の学習・研究目的のみ**を対象としています。公式製品ではなく、Tencent および WorkBuddy / CodeBuddy、Meituan および CatPaw、SenseTime および小浣熊、Zhipu および AutoClaw / autoglm、Alibaba および Qoder / Accio、Huawei Cloud および CodeArts、ByteDance および Trae、iFlytek および Loomy、Baidu Wenku および KukuAI、長亭科技 および MonkeyCode、Command Code、Google および Antigravity のいずれとも一切の関係がなく、その承認やスポンサーシップも受けていません。
+本プロジェクトは、HTTP リバースプロキシ、SSE ストリーミングのパススルー、複数アップストリームのプロトコル適応、デスクトップパッケージング（Tauri）といった技術テーマを学ぶための実践プロジェクトであり、**個人の学習・研究目的のみ**を対象としています。公式製品ではなく、Tencent および WorkBuddy / CodeBuddy、Meituan および CatPaw、SenseTime および小浣熊、Zhipu および AutoClaw / autoglm、Alibaba および Qoder / Accio、Huawei Cloud および CodeArts / OfficeAce、ByteDance および Trae、iFlytek および Loomy、Baidu Wenku および KukuAI、長亭科技 および MonkeyCode、Command Code、Google および Antigravity のいずれとも一切の関係がなく、その承認やスポンサーシップも受けていません。
 
 ### リバースプロキシの挙動について
 

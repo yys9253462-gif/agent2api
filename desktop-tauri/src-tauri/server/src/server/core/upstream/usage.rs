@@ -535,6 +535,10 @@ pub struct RequestTelemetry {
     /// 轮询）手上只有 telemetry，令牌放这里它们才够得着；接线在入口 handler
     /// （`api::chat` / `api::protocol` 在 `record_started` 之后装入）。
     cancel: Mutex<Option<Arc<super::cancellation::CancelToken>>>,
+    /// 本次请求的**选路决策快照**（`rotate::select_target_account` 产出，
+    /// 转发层每次选路后覆盖 —— 最后一次为准）。请求日志「路由回放」的数据源；
+    /// None = 没走到账号选路（转发前就失败、候选集合为空）。
+    route: Mutex<Option<Value>>,
 }
 
 impl Default for RequestTelemetry {
@@ -550,7 +554,25 @@ impl RequestTelemetry {
             capture: Mutex::new(None),
             live: Mutex::new(LiveWrite::default()),
             cancel: Mutex::new(None),
+            route: Mutex::new(None),
         }
+    }
+
+    /// 挂本次请求的选路决策快照（选路层每次覆盖，最后一次 = 最终承载那次）。
+    pub fn set_route_decision(&self, decision: Value) {
+        let mut guard = self
+            .route
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(decision);
+    }
+
+    /// 取选路决策快照（记账点在请求收尾时取走落库；没走到选路时为 None）。
+    pub fn route_decision(&self) -> Option<Value> {
+        self.route
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// 建一个已带关联 id 的槽位（三个对话入口都走这条：转发开始前生成一次）。
