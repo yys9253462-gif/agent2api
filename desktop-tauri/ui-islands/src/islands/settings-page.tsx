@@ -23,11 +23,13 @@ import {
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
+  modelsDevStateText,
   NOTES,
   PROMPT_MODES,
   QUEUE_FIELDS,
   RETENTION_FIELDS,
   RETRY_FIELDS,
+  ROUTE_PROTECTION_SWITCHES,
   ROUTE_STICKY_OPTIONS,
   ROUTE_STRATEGIES,
   STATES,
@@ -39,7 +41,6 @@ import {
   ZOOM_PERCENTS,
   formatBytes,
   formatCount,
-  modelsDevStateText,
   openExternal,
   readThemeMode,
   readZoomPercent,
@@ -64,9 +65,10 @@ import {
   load,
   panelLogout,
   refreshDebug,
-  refreshCaptchaPool,
+  refreshDeveloperRoleCompat,
   refreshClineHeaders,
   refreshCors,
+  refreshCaptchaPool,
   refreshModelsDev,
   refreshPrompt,
   refreshQueue,
@@ -91,9 +93,9 @@ import {
   resolveRetentionConfirm,
   restoreCategory,
   saveCaptcha,
-  saveCaptchaPoolField,
   saveClineHeaders,
   saveCors,
+  saveCaptchaPoolField,
   saveDebug,
   saveModelsDev,
   savePromptFile,
@@ -106,6 +108,7 @@ import {
   saveRetryField,
   saveRoutingField,
   saveSanitize,
+  saveDeveloperRoleCompat,
   saveTimeoutField,
   saveToggle,
   selectCategory,
@@ -134,6 +137,9 @@ import {
   PromptTextButton,
   gatewayEditedText,
 } from './settings-prompt-editor'
+// AI 助手分类的面板（对话模型 / 系统提示词 / 工具勾选）。独立成文件、自带一份
+// 数据流（/api/assistant/config），见该文件的模块头
+import { AssistantSettingsPane } from './assistant-settings-pane'
 import { t } from '../i18n'
 
 /**
@@ -218,6 +224,37 @@ function PanelHead({ title, tip, badge, actions }: PanelHeadProps) {
       {badge}
       {actions ? <div className='head-actions'>{actions}</div> : null}
     </div>
+  )
+}
+
+/**
+ * 可折叠面板：标题栏就是 `<details>` 的 summary，正文平时收起 —— 给「行数多、
+ * 但多数时候不用动」的面板用（目前是 Cline 伪装头）。开合状态不持久化，跟
+ * 用户上次的选择，不需要额外持久化。
+ */
+function CollapsiblePanel({ title, tip, badge, actions, children }: PanelHeadProps & { children: React.ReactNode }) {
+  // `summary` 里的一切点击都会切换开合（原生行为），而标题栏里有两类**独立
+  // 动作**的控件：问号提示（点开 tooltip）与右侧操作按钮（如「刷新」）。
+  // 点它们不该顺手把面板折起来 —— 尤其是「展开 → 点问号看说明」这个动作，
+  // 正文会在眼前消失。
+  //
+  // 用 `preventDefault` 而不是 `stopPropagation`：开合是 click 的**默认动作**
+  // （由 `<details>` 在事件传播结束后执行），`stopPropagation` 拦不住它。
+  function keepOpen(event: React.MouseEvent<HTMLElement>): void {
+    const target = event.target as HTMLElement
+    if (target.closest('.tip-q, .head-actions')) event.preventDefault()
+  }
+  return (
+    <details className='panel panel-fold'>
+      <summary className='panel-head' onClick={keepOpen}>
+        <span className='fold-caret' aria-hidden dangerouslySetInnerHTML={{ __html: iconHtml('caretRight', 14) }} />
+        <h2>{title}</h2>
+        {tip ? <span className='tip-q' data-tip={tip}></span> : null}
+        {badge}
+        {actions ? <div className='head-actions'>{actions}</div> : null}
+      </summary>
+      {children}
+    </details>
   )
 }
 
@@ -322,58 +359,6 @@ function lanStateText(snap: SettingsSnapshot): string {
   return t('已开启：其他设备把 API 地址指向 {url}{panel}。', { url: `${base}/v1`, panel })
 }
 
-/**
- * 「界面语言」一行：下拉选 auto 或某个具体语言，选中即整页刷新。
- *
- * ── 为什么不进 settings-state 的后端模型 ──────────────────────
- * 语言只改本机界面文案：不碰转发、不碰账号，跟「主题 / 缩放 / 计量单位」同属纯前端
- * 偏好。所以它只读写 localStorage（键 workbuddy-desktop-locale，见 ui/i18n.js），
- * 与后端 desktop-settings.json 无关，也正因如此这里不需要受控 state —— 切换会
- * location.reload()，重载后本行自然按新值重新渲染。
- *
- * ── 选项为什么是双语的 ──────────────────────────────────────
- * 'auto' 的标签是中文键（跟随系统），走 t()；其余语言名称分两半：label 是**各语言
- * 自己的写法**（English / 日本語 / 한국어 …）—— 选之前就该看得懂，不翻译；nameKey
- * 是这门外语的中文名，用 t() 译成当前界面语言，拼成「English（英语）」式双语选项
- * （两者相同则只给一次）。触发器（收起态）只显示 label，避免长名字在窄控件里截断。
- */
-function LanguageRow() {
-  const api = window.wbI18n
-  const value = api?.rawLocale?.() ?? 'auto'
-  const locales = api?.LOCALES ?? []
-  /** 选项的双语名：本地写法 + 当前界面语言的写法（相同时只给一次） */
-  const nameOf = (item: { label: string; nameKey: string }): string => {
-    const translated = t(item.nameKey)
-    return translated && translated !== item.label ? `${item.label}（${translated}）` : item.label
-  }
-  const labelOf = (code: string): string => (
-    code === 'auto' ? t('跟随系统') : (locales.find(item => item.code === code)?.label ?? code)
-  )
-
-  return (
-    <div className='retention-list'>
-      <div className='retention-row'>
-        <label htmlFor='settings-language'>{t('界面语言')}</label>
-        <span className='prompt-input'>
-          {/* 与「界面缩放」同一个 Select 形态：展示文案显式给 SelectValue，不依赖 value 自动显示。
-              组件的 onValueChange 可能给 null（被清空），这里只在拿到非空值时切换 */}
-          <Select value={value} onValueChange={next => { if (next) api?.setLocale(next) }}>
-            <SelectTrigger id='settings-language' className='w-[200px]' aria-label={t('界面语言')}>
-              <SelectValue>{labelOf(value)}</SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value='auto'>{t('跟随系统')}</SelectItem>
-              {locales.map(item => (
-                <SelectItem key={item.code} value={item.code}>{nameOf(item)}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </span>
-      </div>
-    </div>
-  )
-}
-
 function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
   const app = snap.app
   // 轻量模式只挂在「关闭到托盘」上（关闭即退出时没有窗口可轻量），
@@ -388,14 +373,6 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
-      <section className='panel'>
-        <PanelHead title={t('语言设置')} tip={TIPS.displayLanguage} />
-        <div className='panel-body'>
-          <LanguageRow />
-          <div className='settings-state'>{STATES.languageHint}</div>
-        </div>
-      </section>
-
       <section className='panel'>
         <PanelHead
           title={t('启动与托盘')}
@@ -466,14 +443,12 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
       )}
 
       <section className='panel'>
-        <PanelHead title={t('Token 读数量级')} tip={TIPS.units} />
+        <PanelHead title={t('计量单位')} tip={TIPS.units} />
         <div className='panel-body'>
           <div className='settings-switches'>
-            {/* 标签不再写死「中文」：开启是「万 / 亿」式本地量级词，繁体 / 日文 / 韩文各自
-                有对应的量级词（萬 / 億、만 / 억），译文里这句话描述的正是那些语言用户看到的东西 */}
             <SwitchRow
               id='settings-chinese-units'
-              label={t('使用本地量级词（万 / 亿式）')}
+              label={t('使用中文单位（亿 / 万）')}
               checked={snap.unitsChinese}
               onCheckedChange={applyUnits}
             />
@@ -497,9 +472,9 @@ function themeStateText(mode: ThemeMode): string {
 }
 
 /**
- * 显示分类：显示模式 / 界面缩放。
+ * 显示分类：显示模式 / 界面缩放 / 语言。
  *
- * 两项都是**纯前端偏好** —— 与后端配置无关，所以不参与 settings-state 的 load
+ * 三项都是**纯前端偏好** —— 与后端配置无关，所以不参与 settings-state 的 load
  * （那边一次并行取全部后端设置），这里自己持两个受控值就够了。
  *
  * 主题与缩放的**唯一应用入口都在 app.js**（见 settings-model 的显示偏好一节）：
@@ -589,7 +564,60 @@ function DisplayPane() {
           </div>
         </div>
       </section>
+
+      <section className='panel'>
+        <PanelHead title={t('语言设置')} tip={TIPS.displayLanguage} />
+        <div className='panel-body'>
+          <LanguageRow />
+          <div className='settings-state'>{STATES.languageHint}</div>
+        </div>
+      </section>
     </>
+  )
+}
+
+/**
+ * 「界面语言」一行：下拉选 auto 或某个具体语言，选中即整页刷新。
+ *
+ * ── 为什么不进 settings-state 的后端模型 ──────────────────────
+ * 语言只改本机界面文案：不碰转发、不碰账号，跟「主题 / 缩放 / 计量单位」同属纯前端
+ * 偏好。所以它只读写 localStorage（键 workbuddy-desktop-locale，见 ui/i18n.js），
+ * 与后端 desktop-settings.json 无关，也正因如此这里不需要受控 state —— 切换会
+ * location.reload()，重载后本行自然按新值重新渲染。
+ *
+ * ── 选项文案为什么不都走 t() ─────────────────────────────────
+ * 'auto' 的标签是中文键（跟随系统），要翻译；其余语言的 label 是**各语言自己的写法**
+ * （English / 日本語 / 한국어 …），选之前就该看得懂，所以照搬 wbI18n.LOCALES，不翻译。
+ */
+function LanguageRow() {
+  const api = window.wbI18n
+  const value = api?.rawLocale?.() ?? 'auto'
+  const locales = api?.LOCALES ?? []
+  const labelOf = (code: string): string => (
+    code === 'auto' ? t('跟随系统') : (locales.find(item => item.code === code)?.label ?? code)
+  )
+
+  return (
+    <div className='retention-list'>
+      <div className='retention-row'>
+        <label htmlFor='settings-language'>{t('界面语言')}</label>
+        <span className='prompt-input'>
+          {/* 与「界面缩放」同一个 Select 形态：展示文案显式给 SelectValue，不依赖 value 自动显示。
+              组件的 onValueChange 可能给 null（被清空），这里只在拿到非空值时切换 */}
+          <Select value={value} onValueChange={next => { if (next) api?.setLocale(next) }}>
+            <SelectTrigger id='settings-language' className='w-[200px]' aria-label={t('界面语言')}>
+              <SelectValue>{labelOf(value)}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value='auto'>{t('跟随系统')}</SelectItem>
+              {locales.map(item => (
+                <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </span>
+      </div>
+    </div>
   )
 }
 
@@ -730,9 +758,10 @@ function promptSourceText(source: string): string {
 
 /** 降级行的说明：只在真的处于降级期时出现（平时它是一行与用户无关的状态噪音） */
 function degradeHint(prompt: PromptState): string {
-  return t('已自动切换到最小中性提示词（撞了上游内容拦截，多半是 system 指纹误报），到 {until} 自动解除。期间本模式自己的提示词不会发出；把提示词改好后可以立即解除。', {
+  return t('已自动切换到最小中性提示词（撞了上游内容拦截，多半是 system 指纹误报），到 {until} 自动解除。', {
     until: prompt.degradeUntilText || STATES.degradeUntilFallback,
   })
+    + t('期间本模式自己的提示词不会发出；把提示词改好后可以立即解除。')
 }
 
 /**
@@ -778,10 +807,9 @@ function ProviderFileRow({ item, label, locked, busy }: {
 function providerStateText(item: ProviderPromptState, configured: boolean): string {
   // 没单独配过的家（只在「有网关自带提示词」时才会被列出来）走全局那份 ——
   // 不说这一句的话，用户会以为这一行显示的就是「这家的设置」
-  if (!configured) {
-    const mode = PROMPT_MODES.find(option => option.value === item.mode)?.toastLabel ?? item.mode
-    return t('未单独配置：模式、提示词文件与正文都跟随上面的全局配置（当前「{mode}」）。', { mode })
-  }
+  if (!configured) return t('未单独配置：模式、提示词文件与正文都跟随上面的全局配置（当前「{mode}」）。', {
+    mode: PROMPT_MODES.find(option => option.value === item.mode)?.toastLabel ?? item.mode,
+  })
   if (item.mode === 'passthrough') return t('客户端 system 原样出站。')
   const head = t('{mode}生效：上游收到的 system 来自{source}{lines}。', {
     mode: item.mode === 'custom' ? t('替换') : t('追加'),
@@ -1176,6 +1204,19 @@ function RetryPane({ snap }: { snap: SettingsSnapshot }) {
 
 /* ─── 路由分类（转发选路的策略 + 会话粘性）── */
 
+/**
+ * 自愈开关的后端键 → 前端状态字段。
+ *
+ * 两边命名不同（后端是 `routingSink` 这类带前缀的长键，前端状态是 `sink` 这类短字段），
+ * 这里显式列一张表而不是拼字符串 —— 拼出来的名字一旦对不上，表现是「开关点了没反应」，
+ * 那种静默失败最难查。
+ */
+const PROTECTION_STATE_FIELD = {
+  routingFailoverBackoff: 'failoverBackoff',
+  routingSink: 'sink',
+  routingBreakerEnabled: 'breakerEnabled',
+} as const
+
 function RoutingPane({ snap }: { snap: SettingsSnapshot }) {
   const routing: RoutingState = snap.routing
   // 读不到（桥不在 / 后端不可用）或还在检测时锁住两档 —— 锁住比发出一次注定失败的保存强
@@ -1200,6 +1241,7 @@ function RoutingPane({ snap }: { snap: SettingsSnapshot }) {
         <div className='retention-list'>
           {/* 两行的说明都收进行内问号（[data-tip]，tooltip.js 统一服务），并且**跟随当前档位**
               换内容 —— 每档干的事不一样，一段固定文案说不清 */}
+          <div className='prompt-group'>{t('选路规则')}</div>
           <div className='retention-row'>
             <label>{t('路由策略')}</label>
             <div className='routing-row'>
@@ -1224,6 +1266,29 @@ function RoutingPane({ snap }: { snap: SettingsSnapshot }) {
                 onValueChange={value => void saveRoutingField({ routingSticky: String(value) })} />
             </div>
           </div>
+          {/* 三个自愈开关：分组条把「怎么排队」与「出了事怎么自愈」分开 —— 不分开时它们是
+              一串同构的行，读不出哪几行管选路、哪几行管失败处置 */}
+          <div className='prompt-group'>
+            {t('自愈保护')}<span className='note'>{t('默认值通常够用，出问题时才需要调')}</span>
+          </div>
+          {ROUTE_PROTECTION_SWITCHES.map(item => {
+            // label 与 Switch 靠 htmlFor/id 配对（同页既有写法，见 SwitchRow 与
+            // DB 面板）：点文字也能拨动，读屏才念得出这一项叫什么
+            const switchId = `route-protection-${item.key}`
+            return (
+              <div key={item.key} className='retention-row'>
+                <label htmlFor={switchId}>{item.label}</label>
+                <div className='routing-row'>
+                  <span className='tip-q' data-tip={item.tip}></span>
+                  <Switch
+                    id={switchId}
+                    checked={routing[PROTECTION_STATE_FIELD[item.key]]}
+                    disabled={disabled}
+                    onCheckedChange={next => void saveRoutingField({ [item.key]: next })} />
+                </div>
+              </div>
+            )
+          })}
         </div>
         <div className='hint retention-note'>{NOTES.routing}</div>
       </div>
@@ -1343,6 +1408,41 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
         </div>
       </section>
 
+      <section className='panel'>
+        <PanelHead
+          title={t('开发者角色兼容')}
+          tip={TIPS.developerRoleCompat}
+          badge={snap.developerRoleCompat.status === 'ready'
+            ? <StatusBadge tone='ok'>{t('已生效')}</StatusBadge>
+            : snap.developerRoleCompat.status === 'unavailable'
+              ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+              : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
+          actions={
+            <RefreshButton id='btn-role-compat-refresh' onClick={() => void refreshDeveloperRoleCompat()} />
+          }
+        />
+        <div className='panel-body'>
+          <div className='settings-switches'>
+            <SwitchRow
+              id='settings-developer-role-compat'
+              label={t('转发前将 developer 角色消息转换为 system，兼容不支持 developer 角色的 OpenAI 兼容上游')}
+              checked={snap.developerRoleCompat.on}
+              // 读到后端值之前不许切（否则会出现「切了但不知道后端原本是什么」，回滚也没依据）
+              disabled={snap.developerRoleCompat.status !== 'ready' || snap.busy === 'developerRoleCompat'}
+              onCheckedChange={next => void saveDeveloperRoleCompat(next)}
+            />
+          </div>
+          <div className='settings-state'>
+            {snap.developerRoleCompat.status === 'loading'
+              ? STATES.appLoading
+              : snap.developerRoleCompat.status === 'unavailable'
+                ? STATES.roleCompatUnavailable
+                : snap.developerRoleCompat.on ? STATES.roleCompatOn : STATES.roleCompatOff}
+          </div>
+          <div className='hint retention-note'>{NOTES.developerRoleCompat}</div>
+        </div>
+      </section>
+
       <ClineHeadersPanel snap={snap} />
 
       <PromptPanel snap={snap} />
@@ -1446,17 +1546,16 @@ function ClineHeadersPanel({ snap }: { snap: SettingsSnapshot }) {
   const dirty = ready && !sameOverrides(buildOverrides(), state.overrides)
 
   return (
-    <section className='panel'>
-      <PanelHead
-        title={t('Cline 伪装头')}
-        tip={TIPS.clineHeaders}
-        badge={state.status === 'ready'
-          ? <StatusBadge tone='ok'>{t('已生效')}</StatusBadge>
-          : state.status === 'unavailable'
-            ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
-            : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
-        actions={<RefreshButton id='btn-cline-headers-refresh' onClick={() => void refreshClineHeaders()} />}
-      />
+    <CollapsiblePanel
+      title={t('Cline 伪装头')}
+      tip={TIPS.clineHeaders}
+      badge={state.status === 'ready'
+        ? <StatusBadge tone='ok'>{t('已生效')}</StatusBadge>
+        : state.status === 'unavailable'
+          ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+          : <StatusBadge tone='idle'>{t('检测中…')}</StatusBadge>}
+      actions={<RefreshButton id='btn-cline-headers-refresh' onClick={() => void refreshClineHeaders()} />}
+    >
       <div className='panel-body'>
         <div className='retention-list'>
           {ready
@@ -1528,7 +1627,7 @@ function ClineHeadersPanel({ snap }: { snap: SettingsSnapshot }) {
         </div>
         <div className='hint retention-note'>{NOTES.clineHeaders}</div>
       </div>
-    </section>
+    </CollapsiblePanel>
   )
 }
 
@@ -1682,6 +1781,18 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
             }
           />
           <div className='panel-body'>
+            {/* 恢复后的密钥警告（后端 warning 原文，密钥对不上时导入后账号解不开）：
+                排在面板最前 —— 用户刚点完标题栏的「恢复整库」，视线就在这片区域，
+                这条警告必须第一眼看到；而且它**常驻**，不像 toast 那样几秒后消失。
+                呈现沿用本页既有的 .danger-zone 警示框（与下面那条备份说明同款），
+                不自造组件；文案是服务端生成的数据，原样显示、不翻译 */}
+            {snap.dbWarning ? (
+              <div className='danger-zone' id='settings-db-warning'>
+                <strong>{t('⚠️ 密钥警告')}</strong>
+                <br />
+                {snap.dbWarning}
+              </div>
+            ) : null}
             <div className='retention-row'>
               <label htmlFor='settings-db-include-logs'>{t('包含日志与调试报文')}</label>
               <Switch
@@ -1889,8 +2000,7 @@ function RetentionConfirmDialog({ confirm }: { confirm: { head: string } | null 
           <div className='danger-zone'>
             {confirm?.head}
             <br />
-            <strong>{t('超出的历史数据会被立即删除，且不可恢复。')}</strong>{t('确定继续？')}
-          </div>
+            <strong>{t('超出的历史数据会被立即删除，且不可恢复。')}</strong>{t('确定继续？')}</div>
         </DialogBody>
         <DialogFooter>
           <div className='mr-auto' />
@@ -1906,8 +2016,54 @@ function RetentionConfirmDialog({ confirm }: { confirm: { head: string } | null 
   )
 }
 
+/* ─── 局域网访问的确认 / 注册弹窗 ─────────────── */
+
+/** 三种确认（开启 / 关闭 / 面板子开关）各自的标题、正文与确认键文案 */
+const LAN_CONFIRM_COPY: Record<
+  NonNullable<LanConfirm>['mode'],
+  { title: string; body: (panel: boolean) => React.ReactNode; label: string }
+> = {
+  enable: {
+    title: t('开启局域网访问'),
+    body: () => (
+      <>
+        {t('为了安全，开启前需要先注册一个')}<b>{t('面板管理员账号')}</b>{t('（已注册过会跳过这一步，直接生效）。')}<br />
+        {t('开启后网关将监听所有网卡，同一局域网内的设备即可把 API 地址指向本机 IP 一起使用；管理接口从此要求管理员会话或网关 Key，转发接口在没有一把启用的 Key 时也会拒绝服务（届时会自动创建一把名为「默认」的 Key）。')}<br />
+        <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
+      </>
+    ),
+    label: t('继续'),
+  },
+  disable: {
+    title: t('关闭局域网访问'),
+    body: () => (
+      <>
+        {t('关闭后网关回到只监听 127.0.0.1，局域网内的设备将无法继续访问；已配置的网关 Key 与账号都不受影响。')}<br />
+        <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
+      </>
+    ),
+    label: t('关闭并重启'),
+  },
+  panel: {
+    title: t('变更网页管理面板'),
+    body: panel =>
+      panel ? (
+        <>
+          {t('开放后，局域网内其他设备的浏览器打开本机 IP 即可进入管理面板（需管理员账号登录）。')}<br />
+          <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
+        </>
+      ) : (
+        <>
+          {t('关闭后，管理界面不再从局域网提供，只有本机的桌面程序可以管理；已开启的 API 转发不受影响。')}<br />
+          <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
+        </>
+      ),
+    label: t('保存并重启'),
+  },
+}
+
 /**
- * 整库恢复的二次确认（骨架照 RetentionConfirmDialog）。
+ * 「恢复整库备份」的确认弹窗（骨架照 RetentionConfirmDialog）。
  *
  * 恢复是**替换**语义：本机的账号、配置、日志、面板登录态会整体换成备份文件
  * 的状态。焦点落在「取消」—— 危险操作敲回车不该等于同意（与保留期确认同一
@@ -1942,56 +2098,6 @@ function DbBackupConfirmDialog({ confirm }: { confirm: { includeLogs: boolean } 
       </DialogContent>
     </Dialog>
   )
-}
-
-/* ─── 局域网访问的确认 / 注册弹窗 ─────────────── */
-/** 三种确认（开启 / 关闭 / 面板子开关）各自的标题、正文与确认键文案 */
-const LAN_CONFIRM_COPY: Record<
-  NonNullable<LanConfirm>['mode'],
-  { title: string; body: (panel: boolean) => React.ReactNode; label: string }
-> = {
-  enable: {
-    title: t('开启局域网访问'),
-    body: () => (
-      <>
-        {t('为了安全，开启前需要先注册一个')}<b>{t('面板管理员账号')}</b>{t('（已注册过会跳过这一步，直接生效）。')}
-        <br />
-        {t('开启后网关将监听所有网卡，同一局域网内的设备即可把 API 地址指向本机 IP 一起使用；管理接口从此要求管理员会话或网关 Key，转发接口在没有一把启用的 Key 时也会拒绝服务（届时会自动创建一把名为「默认」的 Key）。')}
-        <br />
-        <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
-      </>
-    ),
-    label: t('继续'),
-  },
-  disable: {
-    title: t('关闭局域网访问'),
-    body: () => (
-      <>
-        {t('关闭后网关回到只监听 127.0.0.1，局域网内的设备将无法继续访问；已配置的网关 Key 与账号都不受影响。')}
-        <br />
-        <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
-      </>
-    ),
-    label: t('关闭并重启'),
-  },
-  panel: {
-    title: t('变更网页管理面板'),
-    body: panel =>
-      panel ? (
-        <>
-          {t('开放后，局域网内其他设备的浏览器打开本机 IP 即可进入管理面板（需管理员账号登录）。')}
-          <br />
-          <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
-        </>
-      ) : (
-        <>
-          {t('关闭后，管理界面不再从局域网提供，只有本机的桌面程序可以管理；已开启的 API 转发不受影响。')}
-          <br />
-          <strong>{t('保存后应用将重启以生效。')}</strong>{t('确定继续？')}
-        </>
-      ),
-    label: t('保存并重启'),
-  },
 }
 
 /**
@@ -2122,6 +2228,12 @@ function SettingsPage() {
       <div className='settings-panes' ref={panesRef}>
         <div className={paneClass('general')} data-cat='general'>
           <GeneralPane snap={snap} />
+        </div>
+        {/* AI 助手：三块面板（对话模型 / 系统提示词 / 工具勾选）。它自带一份独立的
+            加载与保存（/api/assistant/config），不经过 settings-state 的快照 —— 见
+            assistant-settings-pane.tsx 的模块头 */}
+        <div className={paneClass('assistant')} data-cat='assistant'>
+          <AssistantSettingsPane />
         </div>
         <div className={paneClass('display')} data-cat='display'>
           <DisplayPane />

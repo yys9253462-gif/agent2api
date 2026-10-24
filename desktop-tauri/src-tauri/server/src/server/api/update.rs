@@ -8,6 +8,16 @@
 //!   POST /api/update/proxy                 换更新出网线路 { proxy: null | {…} }
 //!   GET  /api/update/token                 GitHub 令牌状态 { filled, origin }（不回显本体）
 //!   POST /api/update/token                 保存 / 清除 GitHub 令牌 { token: string | null }
+//!   GET  /api/update/beta                  「加入 beta 版」开关 { enabled }
+//!   POST /api/update/beta                  写「加入 beta 版」{ enabled: bool }
+//!
+//! ── 容器内更新的三条（Linux headless / Docker 专有）──────────
+//!   POST /api/update/install               校验并应用已下载的更新包（替换二进制与 ui）
+//!   POST /api/update/rollback              回滚到上一版本（用 install 留下的备份）
+//!   POST /api/update/restart               重启进程（容器由 restart 策略拉起）
+//! 三条都要求 `AGENT2API_SELF_UPDATE=1`，否则 400；机制见 `core::update::selfupdate`。
+//! `check` 的 `current` 缺省（网页端不传）时用服务端自己的版本号 —— 桌面壳一定
+//! 会传（后端不知道自己被哪个壳打包，那个口径不能变），所以只有网页端走缺省。
 //!
 //! ── 路由挂法 ────────────────────────────────────────────────
 //! Node 是 `path.startsWith('/api/update/')` 的前缀判定：命中前缀后逐条判
@@ -74,6 +84,13 @@ async fn dispatch(
             .find(|(key, _)| *key == "current")
             .map(|(_, value)| percent_decode(value))
             .unwrap_or_default();
+        // 网页端（web_shim 注入的面板）不传版本号：它没有「壳打包的版本」这个
+        // 概念，以服务端自己的编译期版本为准。桌面壳始终显式传值，行为不变。
+        let current = if current.trim().is_empty() {
+            crate::server::core::update::CURRENT_VERSION.to_string()
+        } else {
+            current
+        };
         return match state.update().check(&current).await {
             Ok(data) => ok_json(data),
             Err(error) => update_error(error),
@@ -108,6 +125,16 @@ async fn dispatch(
         };
         let raw = payload.get("proxy").cloned().unwrap_or(Value::Null);
         return match normalize_account_proxy(&raw) {
+            // 轮询档只属于**账号级**出网（逐请求换出口，见 `core::proxy_rotate`）：
+            // 软件更新是一条检查 / 下载动作，没有这个语义。归一放行它（那份归一
+            // 与账号共用）之后必须在这里挡下 —— 否则会存进一条解析不出地址的
+            // 配置，检查更新静默回退直连（界面上却显示「已换线路」）。
+            Ok(Some(value)) if crate::server::core::proxies::is_rotate_config(&value) => {
+                GatewayError::bad_request(
+                    "更新出网线路不支持「轮询」档（轮询用于 OpenCode Zen 账号的出网）",
+                )
+                .into_response()
+            }
             Ok(normalized) => {
                 // 「换」才算数：重复选中当前线路不该被当成换线路（否则就成了
                 // 绕开失败冷却的口子，见下面 clear_check_cooldown 的说明）
@@ -172,6 +199,34 @@ async fn dispatch(
         };
     }
 
+    if method == Method::GET && full_path == "/api/update/beta" {
+        // 「加入 beta 版」开关（设置页「更新设置」弹窗里那一枚的读数）。
+        // 只报当前值：开关的效果体现在**下一次检查**上（后端每次检查现读这个键），
+        // 这里不做任何事，也不动缓存里那份上次检查结果。
+        return ok_json(json!({ "enabled": config::update_beta() }));
+    }
+
+    if method == Method::POST && full_path == "/api/update/beta" {
+        // 写：`{enabled: true|false}`。缺字段 / 非布尔一律 400 —— 与 token 那条
+        // 同一纪律（开关就该显式给值，免得某个调用方手滑发个 `{}` 把它关掉）。
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::new(error.message).into_response(),
+        };
+        let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
+            return GatewayError::bad_request("请求体缺少 enabled 字段（须为 true / false）")
+                .into_response();
+        };
+        let saved = config::set_update_beta(enabled);
+        // 不做 clear_check_cooldown：那条冷却记的是 GitHub **配额桶**的恢复时刻，
+        // 换通道既没换出口也没换身份，桶还是同一个（与换线路 / 换令牌不同）。
+        // 落库失败仍返回新值（内存已生效，本次运行照走新通道），saved 如实带上。
+        return ok_json(json!({
+            "enabled": config::update_beta(),
+            "saved": saved,
+        }));
+    }
+
     if method == Method::POST && full_path == "/api/update/download" {
         // 非法 JSON 在 Node 里是 JSON.parse 抛错 → errorPayload 500 proxy_error
         // （与 /api/auto-checkin 同一条路径），这里保持一致
@@ -198,6 +253,35 @@ async fn dispatch(
 
     if method == Method::POST && full_path == "/api/update/cancel" {
         return ok_json(state.update().cancel_download());
+    }
+
+    // ── 容器内更新（Linux headless / Docker）────────────────────
+    // 三条都不接受请求体：装什么、回滚到哪儿、重启谁，全部由服务端自己决定
+    // （更新包按固定名从下载目录取，路径不从请求里进 —— 见 core::update::mod）。
+    // 界面目录取自 ServerState（headless 入口 set_ui_dir 装进去的），
+    // 桌面包没有它（None）—— 桌面形态本来也不会走到这三条。
+
+    if method == Method::POST && full_path == "/api/update/install" {
+        let ui_dir = state.ui_dir().map(|path| path.as_path());
+        return match state.update().install_downloaded(ui_dir).await {
+            Ok(data) => ok_json(data),
+            Err(error) => update_error(error),
+        };
+    }
+
+    if method == Method::POST && full_path == "/api/update/rollback" {
+        let ui_dir = state.ui_dir().map(|path| path.as_path());
+        return match state.update().rollback(ui_dir) {
+            Ok(data) => ok_json(data),
+            Err(error) => update_error(error),
+        };
+    }
+
+    if method == Method::POST && full_path == "/api/update/restart" {
+        return match state.update().request_restart() {
+            Ok(data) => ok_json(data),
+            Err(error) => update_error(error),
+        };
     }
 
     // 未命中任何一条 → 全局 404 的文案（Node 落到最外层 `sendJson(res, 404, …)`），

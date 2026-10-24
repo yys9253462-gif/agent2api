@@ -15,20 +15,52 @@
 //! 版本**：`db::schema` 的模块头把「表只增不改」的成本讲得很清楚，这里没有
 //! 需要索引/约束的字段，不值得为它推一个版本。
 //!
-//! ── 两种来源（对标 OmniProxy 的 proxies 表）────────────────────
+//! ── 三种来源（对标 OmniProxy 的 proxies 表）────────────────────
 //!   manual  手填 `{protocol, host, port, username, password}`；
 //!   clash   **从 Clash Verge 同步进来**的镜像记录 `{listenerUid}`：名称 / 端口 /
 //!           启用状态全部跟随 Clash（端口实时读取，见 `core::clash` 的「严格镜像」
-//!           说明），因此**本地不可改不可删** —— 想改去 Clash Verge 改，想删去
-//!           Clash Verge 删（下一次同步会把它从池里摘掉）。这条只读语义照
+//!           说明），因此名称与端口**本地不可改不可删** —— 想改去 Clash Verge 改，
+//!           想删去 Clash Verge 删（下一次同步会把它从池里摘掉）。这条只读语义照
 //!           OmniProxy 的 `imported_clash_listeners` 分支实现（它的 PUT/DELETE
 //!           对同步来的记录一律 400「请在 Clash Verge 中修改」）；
 //!   subscription  **订阅节点镜像**（内核拉到订阅后同步进来，见 `core::sub_kernel`）：
 //!           条目存 `{providerId, node, port}`，地址是内核起的本地监听器
 //!           （http://127.0.0.1:端口），端口注册表持久在内核目录里、重启不漂移。
-//!           与 clash 同为**只读镜像** —— 名称 / 端口 / 启用跟随订阅与内核，
-//!           本地不可改不可删（要改去「订阅」区块操作，下一次同步会镜像回来）。
+//!           与 clash 同为**只读镜像** —— 名称 / 端口跟随订阅与内核，本地不可改
+//!           不可删（要改去「订阅管理」操作，下一次同步会镜像回来）。
 //!
+//! ── `localDisabled`：镜像条目的本地开关（启用列不再只读）────────
+//! 名称与端口必须跟随来源侧，但**「这条本端用不用」是用户自己的事**：某条节点
+//! 常年不通、或只是暂时不想用它，用户要能在「网络代理」页把它关掉 —— 不必去
+//! Clash Verge 关监听器、也不必改订阅里的节点。所以镜像条目多一个可选字段：
+//!   · `localDisabled: true` = 本页禁用。它**只在本端生效**：有效启用为
+//!     「来源侧启用 ∧ 非本地禁用」（`is_enabled`），引用解析、监听器分配、
+//!     展示都按它算；
+//!   · 为什么不直接改写 `enabled`：那个字段是来源侧的镜像值，下一次同步就会
+//!     被写回来（`sync_clash` 按 uid 更新名称与启用），开关会自己弹回去；
+//!   · 禁用一条**订阅节点**会连带收掉它的本地监听端口（关闭流程，见
+//!     `api::proxies::pool_enable` 与 `reconcile_listeners`）：内核不再为被
+//!     禁用的节点开监听器 —— 禁用的语义就是「这个端口不再听着」，只留一个
+//!     标记会让端口继续开着、地址看着能用而实际没人用它。
+//!     manual / clash 没有本机端口（clash 的端口在 Clash Verge 手里），
+//!     禁用只影响本端的取用。
+//!
+//! ── 端口跟随引用（双向对账，`api::proxies::reconcile_listeners`）────
+//! 专用端口只为账号转发而存在（测试走统一测试口，见下节），于是「引用 ⇄
+//! 端口」两个方向都自动收敛：新增引用补监听器，**失去引用（删账号 / 改走
+//! 别的代理）回收端口**。账号每次写操作后对账一次，缺口非空就投一次内核
+//! 重建（重建按最新引用全量重算，一次同时补缺与回收）。「无引用却还挂着
+//! 端口」因此只是两次重建之间的瞬时态，不是需要用户手动清理的状态。
+//!
+//! ── 测试走统一测试口（不占节点端口）────────────────────────
+//! 内核里有一个固定的「测试口」监听器，背后是 select 策略组（成员 = 全部
+//! 节点）：「测试」= 把组切到目标节点 → 从测试口发请求（见
+//! `sub_kernel::runtime::select_test_node`），**不为被测节点开专用端口**。
+//! 于是「先测一个节点、测通了再决定给哪个账号用」这条最自然的用法零成本 ——
+//! 曾经为此存在的 `pinned`（测试前把条目钉住、请内核补建、等端口写回）
+//! 整套机制随之退役。专用端口只服务真正在用的节点（账号引用，lazy listeners）；
+//! 未引用的节点条目端口为 null（「未分配端口」），这是正常状态而不是待补建的缺口。
+
 //! ── 同步（`sync_clash`，对标 OmniProxy 的 syncClashVergeListeners）──
 //! 把 Clash 当前的出口集合**整体镜像**进池：新出口插入、已有出口按 uid 更新
 //! （名称 / 启用）、Clash 侧已消失的摘掉。手动条目不受影响。触发点两处：
@@ -110,6 +142,16 @@ fn read_items() -> Vec<Value> {
     .and_then(|text| serde_json::from_str::<Value>(&text).ok())
     .and_then(|value| value.get("items").and_then(Value::as_array).cloned())
     .unwrap_or_default()
+}
+
+/// 全部条目的**原始形态**（`core::proxy_rotate` 的读入口）。
+///
+/// 轮询档要按池的实时状态算候选（新增 / 删除 / 禁用都要立刻反映到下一次取用），
+/// 而那份计算只需要条目本身；公开形态（`describe_item`）要解析出口、成本高一个
+/// 量级，不适合逐请求调用。给原始形态而不是包一层轮询专用访问器，是为了让
+/// 「哪些条目能轮询」这条判据只留在 `proxy_rotate` 一处。
+pub(crate) fn raw_items() -> Vec<Value> {
+    read_items()
 }
 
 /// 整份写回（增删改都走它；条目数量小，整份重写的开销可忽略）
@@ -250,6 +292,25 @@ fn new_id() -> String {
     format!("px_{}_{suffix:08x}", logging::now_ms())
 }
 
+// ─── 条目状态判定（本地禁用位 / 有效启用）────────────────────
+
+/// 本地禁用位（`localDisabled: true`；缺键 / false 一律按未禁用）。
+///
+/// 只对**镜像条目**（clash / subscription）有意义 —— manual 条目的 `enabled`
+/// 就是用户自己的开关，不需要第二个字段（见模块头 localDisabled 一节）。
+pub fn is_locally_disabled(item: &Value) -> bool {
+    matches!(item.get("localDisabled"), Some(Value::Bool(true)))
+}
+
+/// 条目的**有效**启用状态：来源侧启用 ∧ 非本地禁用。
+///
+/// 「这条代理现在能不能用」全项目都按它算（引用解析、监听器分配、列表展示）——
+/// 少一处就会冒出「界面显示已禁用、转发却还在用它」这类谁也解释不清的状态。
+/// manual 条目没有本地禁用位，退化成 `enabled` 本身。
+pub fn is_enabled(item: &Value) -> bool {
+    !is_locally_disabled(item) && !matches!(item.get("enabled"), Some(Value::Bool(false)))
+}
+
 // ─── 解析（给 core::proxies 的 pool 分支与 describe 共用）──────
 
 /// 把条目解析成可用的出口（复用账号代理那条链，见模块头）。
@@ -268,9 +329,20 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
         json!({ "source": "clash", "listenerUid": text_of(item, "listenerUid") })
     } else if source == "subscription" {
         let Some(port) = valid_port(item.get("port")) else {
-            return Some(ProxyResolution::Failed(
-                "订阅节点已不存在（订阅更新后节点被移除，等下一次同步或重新订阅）".to_string(),
-            ));
+            // 两种「没有端口」要分开说：节点还在但还没有账号引用它（lazy
+            // listeners 只给引用中的节点开监听器；刚保存引用的话，内核可能
+            // 还在重建），与节点已被订阅移除 —— 处置动作完全不同。
+            //
+            // 「没有端口」是未引用节点的**正常状态**而不是待补建的缺口：
+            // 测试走统一测试口（见模块头），不再需要端口；地址只在「真在用」
+            // 时存在。
+            let node_alive = crate::server::core::subscriptions::ids()
+                .contains(&text_of(item, "providerId"));
+            return Some(ProxyResolution::Failed(if node_alive {
+                "该节点还没有监听端口（还没有账号引用它 —— 在账号里选它并保存后，内核会自动开端口）".to_string()
+            } else {
+                "订阅节点已不存在（订阅更新后节点被移除，等下一次同步或重新订阅）".to_string()
+            }));
         };
         return Some(ProxyResolution::Resolved(crate::server::core::proxies::ResolvedProxy {
             source: "pool".to_string(),
@@ -305,7 +377,7 @@ pub fn resolve_reference(proxy_id: &str) -> Result<crate::server::core::proxies:
     let Some(item) = find_raw(proxy_id) else {
         return Err(format!("代理「{proxy_id}」不存在或已被删除"));
     };
-    if matches!(item.get("enabled"), Some(Value::Bool(false))) {
+    if !is_enabled(&item) {
         return Err(format!(
             "代理「{}」已禁用（在「网络代理」页启用它）",
             display_name(&item, proxy_id)
@@ -368,7 +440,12 @@ fn describe_item(item: &Value) -> Value {
         "id": text_of(item, "id"),
         "name": text_of(item, "name"),
         "source": source,
-        "enabled": !matches!(item.get("enabled"), Some(Value::Bool(false))),
+        // 有效启用（来源侧启用 ∧ 非本地禁用）：前端拿它当开关的值
+        "enabled": is_enabled(item),
+        // 本地禁用位（只对镜像条目有意义）：前端据此区分「来源侧关着」与
+        // 「本页关着」两种 off —— 前者点不动（改它要去 Clash Verge），后者
+        // 是本页的开关，点一下就恢复
+        "localDisabled": is_locally_disabled(item),
         // manual 的字段原样带出（编辑弹窗要回显，含密码 —— 与账号代理表单同一口径：
         // 那是本机自己的配置，账号记录里的代理密码同样是明文存的）
         "protocol": text_of(item, "protocol"),
@@ -438,9 +515,9 @@ fn is_readonly(item: &Value) -> bool {
 const CLASH_READONLY_HINT: &str =
     "该代理来自 Clash Verge 同步（名称 / 端口 / 启用都跟随 Clash），请到 Clash Verge 中修改";
 
-/// 订阅节点的只读提示（与 Clash 那条同一形态；改去「订阅」区块）
+/// 订阅节点的只读提示（与 Clash 那条同一形态；改去「订阅管理」）
 const SUBSCRIPTION_READONLY_HINT: &str =
-    "该节点来自订阅（名称 / 端口 / 启用跟随订阅与内核），请在「订阅」区块修改";
+    "该节点来自订阅（名称 / 端口 / 启用跟随订阅与内核），请在「订阅管理」修改";
 
 fn readonly_hint(item: &Value) -> String {
     if is_subscription_item(item) {
@@ -473,6 +550,62 @@ pub fn update(input: &Value) -> Result<Vec<Value>, String> {
         &format!("✅ 更新代理「{}」", text_of(&next, "name")),
     );
     Ok(list())
+}
+
+/// 启用 / 禁用的结果（`api::proxies::pool_enable` 读它决定要不要联动内核）
+pub struct EnabledChange {
+    /// 条目的展示名（提示文案用）
+    pub name: String,
+    /// manual | clash | subscription（只有 subscription 需要内核联动）
+    pub source: String,
+    /// 变更前端口是否在监听（订阅节点的关闭流程判据；其它来源恒 false）
+    pub had_port: bool,
+    /// 变更后的有效启用状态
+    pub enabled: bool,
+}
+
+/// 行内启用 / 禁用一条池条目（三种来源都放行，写法各不相同）。
+///
+///   · manual：直接改写它自己的 `enabled` —— 与过去经 `update` 整份覆盖的效果
+///     相同（禁用后引用它的账号回退直连），但少一份「表单少带一个键就丢字段」
+///     的风险：这里只碰 `enabled` 与 `updatedAt`；
+///   · clash / subscription：改写**本地禁用位** `localDisabled`（理由见模块头）
+///     —— `enabled` 是来源侧的镜像值，留给同步写。
+///
+/// 返回值带上「改动前端口是否开着」与来源：订阅节点禁用时调用方要接着走关闭
+/// 流程（内核不给它开监听器，端口要真的收掉），启用时走补建流程。
+pub fn set_enabled(id: &str, enabled: bool) -> Result<(Vec<Value>, EnabledChange), String> {
+    let mut items = read_items();
+    let Some(index) = items
+        .iter()
+        .position(|item| item.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return Err(format!("代理「{id}」不存在"));
+    };
+    // 先读完需要的信息再拿可变借用（同一元素不能同时借两次）
+    let source = text_of(&items[index], "source");
+    let name = display_name(&items[index], id);
+    // 关闭流程的判据：这条现在是不是真开着**本机**监听端口（只有订阅节点有）
+    let had_port = is_subscription_item(&items[index]) && valid_port(items[index].get("port")).is_some();
+    let now = logging::now_ms();
+    let Some(object) = items[index].as_object_mut() else {
+        return Err("代理条目形状异常".to_string());
+    };
+    if source == "manual" {
+        object.insert("enabled".to_string(), Value::Bool(enabled));
+    } else if enabled {
+        // 开 = 撤掉本地禁用位（键直接删掉：缺键本来就按未禁用算，记录形态也干净）
+        object.remove("localDisabled");
+    } else {
+        object.insert("localDisabled".to_string(), Value::Bool(true));
+    }
+    object.insert("updatedAt".to_string(), Value::from(now));
+    write_items(&items)?;
+    logging::log(
+        "[Proxies]",
+        &format!("{}代理「{name}」", if enabled { "✅ 启用" } else { "⏸️ 禁用" }),
+    );
+    Ok((list(), EnabledChange { name, source, had_port, enabled }))
 }
 
 /// 删除条目；返回（最新列表, 被删条目的名称 —— 调用方拼日志/提示用）。
@@ -715,8 +848,10 @@ pub struct SubscriptionNodeTarget {
     pub sub_name: String,
     /// 节点名（条目名的后半段；同时是内核配置里监听器绑定的出口名）
     pub node: String,
-    /// 内核监听端口（http://127.0.0.1:端口）
-    pub port: u16,
+    /// 内核监听端口；**None = 未分配**（lazy listeners：内核只为被账号引用的
+    /// 节点开监听器，未引用的节点仍镜像进池供浏览选择，端口为空 —— 引用后
+    /// 由对账链路触发内核重启补上，见 `api::proxies::reconcile_listeners`）
+    pub port: Option<u16>,
 }
 
 /// 把订阅节点集合整体镜像进池（与 `sync_clash` 同一套只读镜像语义）：
@@ -748,13 +883,18 @@ pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usi
         });
         match existing {
             Some(index) => {
-                let port_changed = items[index].get("port").and_then(Value::as_u64)
-                    != Some(target.port as u64);
+                let current_port = items[index].get("port").and_then(Value::as_u64).map(|v| v as u16);
+                let port_changed = current_port != target.port;
                 let name_changed = text_of(&items[index], "name") != name;
                 if port_changed || name_changed {
                     if let Some(object) = items[index].as_object_mut() {
                         object.insert("name".to_string(), Value::String(name));
-                        object.insert("port".to_string(), Value::from(target.port));
+                        // None = 未分配端口（lazy listeners）：写 null 而不是删键，
+                        // 前端按 null 显示「未分配」
+                        object.insert(
+                            "port".to_string(),
+                            target.port.map(|port| Value::from(port)).unwrap_or(Value::Null),
+                        );
                         object.insert("updatedAt".to_string(), Value::from(now));
                     }
                     changes += 1;
@@ -770,7 +910,8 @@ pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usi
                         "providerId": target.provider_id,
                         "node": target.node,
                         "enabled": true,
-                        "port": target.port,
+                        // None = 未分配（lazy listeners，见 SubscriptionNodeTarget.port）
+                        "port": target.port.map(|port| Value::from(port)).unwrap_or(Value::Null),
                         "createdAt": now,
                         "updatedAt": now,
                         "lastTest": Value::Null,
@@ -807,4 +948,140 @@ pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usi
         write_items(&items)?;
     }
     Ok(changes)
+}
+
+/// 把**全部订阅镜像条目**的端口清空（删内核时调用，见
+/// `sub_kernel` worker 的 Remove 分支）。
+///
+/// ── 为什么清端口而不是把条目摘掉 ────────────────────────────
+/// `sync_subscription_nodes(&[])` 会把订阅镜像整批摘掉，但重装内核后重新镜像
+/// 出来的是**新 id**（`new_id()`），账号里存的旧 id 就永久悬空了 —— 用户只是
+/// 删了个内核，回头再装上却发现所有引用订阅节点的账号都解析不出来，得逐个重配。
+/// 端口置空的语义反而更准：节点还在（订阅还在），只是**这一轮没有监听器**，
+/// 与 lazy listeners 的「未分配端口」是同一个状态；重装内核后同步按
+/// `providerId + node` 命中同一条，端口原位写回，账号引用自然复活。
+///
+/// 保留 `lastTest`（历史读数，重启换端口后同样会留存）。返回变更条数。
+pub fn unprovision_subscription_nodes() -> Result<usize, String> {
+    let now = logging::now_ms();
+    let mut items = read_items();
+    let mut changes = 0usize;
+    for item in items.iter_mut() {
+        if !is_subscription_item(item) || valid_port(item.get("port")).is_none() {
+            continue;
+        }
+        let Some(object) = item.as_object_mut() else { continue };
+        object.insert("port".to_string(), Value::Null);
+        object.insert("updatedAt".to_string(), Value::from(now));
+        changes += 1;
+    }
+    if changes > 0 {
+        write_items(&items)?;
+    }
+    Ok(changes)
+}
+
+/// 被引用的订阅节点键集合（`<订阅id>::<节点名>`，与内核端口注册表的键同一形态）。
+///
+/// `pool_ids` 是账号 proxy 指向的池条目 id（调用方从账号存储收集）。id 不在池里
+/// 的引用（条目已被删）查不出节点、自然跳过 —— 那类引用解析时本来就会报「不存在」。
+/// 内核的 `allocate_listeners` 用它决定「哪些节点开监听器」（lazy listeners）。
+///
+/// **本页禁用中的条目不算**（`is_enabled`）：账号虽然还引用着它，但引用解析已经
+/// 按「已禁用」失败并回退直连了（见 `resolve_reference`）—— 再给它开着监听端口
+/// 就是为一条没人用的节点白占端口，也与用户在启用列上按下的那一下自相矛盾。
+pub fn subscription_node_keys(pool_ids: &std::collections::HashSet<&str>) -> std::collections::HashSet<String> {
+    read_items()
+        .iter()
+        .filter(|item| is_subscription_item(item) && is_enabled(item))
+        .filter(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .map(|id| pool_ids.contains(id))
+                .unwrap_or(false)
+        })
+        .filter_map(|item| {
+            let provider_id = item.get("providerId").and_then(Value::as_str)?;
+            let node = item.get("node").and_then(Value::as_str)?;
+            Some(format!("{provider_id}::{node}"))
+        })
+        .collect()
+}
+
+/// 内核该给哪些节点开监听器：**账号引用中的条目**（禁用中的不算）。
+///
+/// 内核侧（`runtime::listener_node_keys`）与对账判定
+/// （`api::proxies::reconcile_listeners`）都从这一处取，必须同一口径
+/// —— 口径不一致就会出现「判定说没有缺口、内核却不建」这类谁也解释不清的
+/// 状态。测试不在此列（测试走统一测试口，不需要端口，见模块头）。
+pub fn listener_node_keys(pool_ids: &std::collections::HashSet<&str>) -> std::collections::HashSet<String> {
+    subscription_node_keys(pool_ids)
+}
+
+/// 测试目标（`api::proxies::pool_test` 读它）：条目的展示名与订阅节点的定位
+/// 信息（manual / clash 条目的 `provider_id` / `node` 为空串 —— 它们不走内核）。
+pub struct TestTarget {
+    /// 条目展示名（测试结果与日志里标「测的是谁」）
+    pub name: String,
+    /// manual | clash | subscription
+    pub source: String,
+    /// 订阅 id（订阅节点定位内核里的节点用）
+    pub provider_id: String,
+    /// 节点名（同上）
+    pub node: String,
+}
+
+/// 找一条池条目作为测试目标（不存在报错）。
+pub fn test_target(id: &str) -> Result<TestTarget, String> {
+    let Some(item) = find_raw(id) else {
+        return Err(format!("代理「{id}」不存在或已被删除"));
+    };
+    Ok(TestTarget {
+        name: display_name(&item, id),
+        source: text_of(&item, "source"),
+        provider_id: text_of(&item, "providerId"),
+        node: text_of(&item, "node"),
+    })
+}
+
+/// 这条订阅条目现在**需要监听器却没有端口**吗（启用后要不要补建的判据）。
+///
+/// 判据与 `listener_node_keys` 完全同口径（账号引用，禁用中的不算），只是限定
+/// 到一条：条目自身已启用（禁用中的节点不要监听器）、是订阅节点、端口还空着，
+/// 且确实被引用。`referenced` 是账号引用中的池条目 id 集合（调用方从账号存储取）。
+///
+/// 与内核侧同口径是硬要求：口径不一致就会出现「判定说没有缺口、内核却不建」
+/// 这类谁也解释不清的状态（补建那条链的注释里也写着同一句话）。
+pub fn needs_listener(id: &str, referenced: &std::collections::HashSet<&str>) -> bool {
+    let Some(item) = find_raw(id) else {
+        return false;
+    };
+    if !is_subscription_item(&item) || !is_enabled(&item) {
+        return false;
+    }
+    if valid_port(item.get("port")).is_some() {
+        return false;
+    }
+    // `listener_node_keys` 的唯一来源是账号引用；条目已启用，引用即算数
+    referenced.contains(id)
+}
+
+/// 列出池里订阅节点的**端口状态**（`{providerId, node, port}`，`port` 为
+/// null 表示未分配）。
+///
+/// 对账链路（`api::proxies::reconcile_listeners`）的读入口：拿它和「该开
+/// 监听器的节点集合」（`listener_node_keys`）比对 —— 该开却没端口的要补建，
+/// 端口还挂着却不该开的要回收。`provider_nodes`（provider 缓存）里没有的
+/// 节点跳过 —— 订阅还没拉到内容时谈不上补建。
+pub fn subscription_entries_with_ports() -> Vec<(String, String, Option<u16>)> {
+    read_items()
+        .iter()
+        .filter(|item| is_subscription_item(item))
+        .filter_map(|item| {
+            let provider_id = item.get("providerId").and_then(Value::as_str)?.to_string();
+            let node = item.get("node").and_then(Value::as_str)?.to_string();
+            let port = item.get("port").and_then(Value::as_u64).map(|v| v as u16);
+            Some((provider_id, node, port))
+        })
+        .collect()
 }

@@ -74,7 +74,10 @@ const MAX_CLIENTS: usize = 24;
 
 /// 出口 IP 查询服务：拿不到只当作附加信息缺失，不影响连通性结论
 const IP_ECHO_URL: &str = "https://api.ipify.org?format=json";
-/// 连通性测试的默认目标：**上游站点**而不是第三方站点（判据见 test_connectivity）
+/// 连通性测试的默认目标：**上游站点**而不是第三方站点（判据见 test_connectivity）。
+/// 用户可在「网络代理」页的设置里换成自家上游（`core::proxy_settings::test_url`），
+/// 未配置（空）时回落到这里 —— 字面量与 `core::proxy_settings::DEFAULT_TEST_URL`
+/// 保持一致，改一处要同步另一处。
 const DEFAULT_TEST_URL: &str = "https://copilot.tencent.com/v2/config";
 /// 连通性测试默认超时
 const DEFAULT_TEST_TIMEOUT_MS: u64 = 15_000;
@@ -218,7 +221,25 @@ fn base_builder(timeouts: &TimeoutSettings) -> reqwest::ClientBuilder {
 /// 环境变量里的代理设置，不关掉的话用户机器上设了 `HTTPS_PROXY` 就会
 /// 「配置为直连却走了代理」。
 fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
+    build_client_with(proxy, timeouts, false)
+}
+
+/// [`build_client`] 的本体：`no_redirect` 为真时**不自动跟随 3xx**。
+///
+/// 为什么需要这个开关：多步登录链路（商汤日日新的 OAuth2 + PKCE，见
+/// `providers::custom::sensenova_auth`）要自己读每一步的 `Location` 与
+/// `Set-Cookie`，自动跟转会把这些中间响应吞掉。reqwest 0.12 的跳转策略只能
+/// 在建 Client 时定（`RequestBuilder` 上没有逐请求的 `redirect()`），
+/// 所以它做成一个构造开关而不是请求参数。
+fn build_client_with(
+    proxy: Option<&ResolvedProxy>,
+    timeouts: &TimeoutSettings,
+    no_redirect: bool,
+) -> Result<reqwest::Client, String> {
     let mut builder = base_builder(timeouts);
+    if no_redirect {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     match proxy {
         None => {
@@ -264,6 +285,31 @@ fn build_system_proxy_client(timeouts: &TimeoutSettings) -> Result<reqwest::Clie
     base_builder(timeouts)
         .build()
         .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
+}
+
+/// **不自动跟随跳转**、也不进缓存的 Client（每次调用新建一个）。
+///
+/// 只服务需要自己管 Cookie、逐步读 `Location` / `Set-Cookie` 的多步登录链路
+/// （商汤日日新，见 `providers::custom::sensenova_auth`）——那种链路一步一跳，
+/// 自动跟转会吞掉中间响应，而 reqwest 的跳转策略只能建 Client 时定。
+/// 不进 LRU 缓存是刻意的：跳转策略与其它出口的 key 不同维，混进同一张表会
+/// 让「同一个代理有时跟转、有时不跟」这种最难查的行为分叉成为可能；而登录
+/// 是低频动作（每个账号一天几次），新建 Client 的代价可以忽略。
+///
+/// 构造失败退回 `client_for(proxy)`（自动跟转的那条出口）：那条链路会失败，
+/// 但错误会如实回到用户面前 —— 硬约束是绝不 panic（release 是 panic=abort）。
+pub fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+    let timeouts = crate::server::config::timeout_settings();
+    match build_client_with(proxy, &timeouts, true) {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            logging::log(
+                "[Upstream]",
+                &format!("⚠️ {error}（不跟跳转的出口回退自动跟转）"),
+            );
+            client_for(proxy)
+        }
+    }
 }
 
 /// 跟随系统代理的 Client（进程级缓存一份）。
@@ -481,9 +527,19 @@ pub async fn test_connectivity(
     }
 }
 
-/// 用默认超时与默认目标测试出口（路由层的入口）
+/// 用默认超时与测试目标测试出口（路由层的入口）。
+///
+/// 测试目标：代理设置里自定义的网址优先（`core::proxy_settings::test_url`），
+/// 未配置回落 `DEFAULT_TEST_URL` —— 「网络代理」页设置弹窗的写入方，
+/// 语义见 `core::proxy_settings` 的模块头。
 pub async fn test_proxy(proxy: Option<&ResolvedProxy>) -> ConnectivityResult {
-    test_connectivity(proxy, DEFAULT_TEST_TIMEOUT_MS, None).await
+    let url = crate::server::core::proxy_settings::test_url();
+    test_connectivity(
+        proxy,
+        DEFAULT_TEST_TIMEOUT_MS,
+        url.as_deref().or(Some(DEFAULT_TEST_URL)),
+    )
+    .await
 }
 
 /// 错误链的可读描述（对照 Node 版 `proxyErrorDetail`）。

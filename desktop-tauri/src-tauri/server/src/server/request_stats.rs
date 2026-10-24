@@ -32,8 +32,9 @@
 //!   - `requests`：请求明细，一行一条。短窗口指标（缓存命中率的 10 分钟 / 1 小时
 //!     窗口、近 24 小时趋势）必须逐条算，按天的聚合行给不出这种精度。
 //!   - `request_daily`：按天聚合，一行一天。热力图固定 365 天、`all` 区间可能跨年，
-//!     都超出明细的保留期，所以这份**寿命独立于明细**：明细被裁掉后当天的聚合行
-//!     仍在，历史曲线不会因为裁明细而出现空洞。
+//!     都超出报表侧读明细的窗口（`SUMMARY_WINDOW_MS`，改造后只剩 24 小时 ——
+//!     命中率四档已在 SQL 侧聚合，不再要求把窗口内的明细读回来），所以这份
+//!     **寿命独立于明细**：明细被手动清理后当天的聚合行仍在，历史曲线不会出现空洞。
 //! `request_raw` 是本次新增的第三张表：下游原始正文（请求侧 / 响应侧各 128 KiB
 //! 上限），独立成表的理由（大字段不进列表查询）见 `db/schema.rs` 的 V3_SCHEMA。
 //! 两个文件变两张表还顺带解决了原来的两个麻烦：**明细与聚合的一致性**（原来是
@@ -83,7 +84,7 @@ mod sql;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use chrono::Duration as ChronoDuration;
+use chrono::{Duration as ChronoDuration, NaiveDate};
 use serde_json::{json, Value};
 
 use crate::server::db::Db;
@@ -94,10 +95,9 @@ use record::DailyEntry;
 // 拆到子模块的三样，这里引回：record / usage_summary 的折算入口、
 // remap 的库操作体、报表装配（均为 `pub(super)`，见 aggregate.rs 的模块头）
 use aggregate::{fold_into_daily, remap_model_days, summarize};
-use report::{entry_json, provider_label};
+use report::{entry_json, provider_label, CACHE_WINDOWS};
 
-// MAX_ENTRIES / MAX_DAILY_DAYS / MAX_RAW_ROWS / MAX_RAW_BODY_BYTES 一并在此
-// re-export：本模块内部要用（记账容量闸、raw_body 的截断判定），api::pipeline
+// 均在此 re-export：本模块内部要用（raw_body 的截断判定），api::pipeline
 // 的采集侧也要用（同一份上限常量，见 record::MAX_RAW_BODY_BYTES 的说明）。
 // CompactStart 在此 re-export：api::stats_api 的 compact 路由按它分派响应。
 // VacuumStatus 只在本模块内（字段类型 / maintenance 的方法）可见。
@@ -105,14 +105,20 @@ use maintenance::VacuumStatus;
 pub use maintenance::CompactStart;
 pub use record::{
     AttemptDetail, NewRequestEntry, RequestEntry, RequestQuery, Retention, RetryEvent,
-    RunningProgress, SensitiveHit, DEFAULT_LIMIT, MAX_DAILY_DAYS, MAX_ENTRIES, MAX_LIMIT,
-    MAX_RAW_BODY_BYTES, MAX_RAW_ROWS,
+    RunningProgress, SensitiveHit, DEFAULT_LIMIT, MAX_LIMIT, MAX_RAW_BODY_BYTES, MAX_RAW_ROWS,
 };
 
-/// 明细窗口：四档缓存命中率里最长的是 7 天，趋势窗口是 24 小时 ——
-/// 报表要从明细里取的数据**全部落在这个窗口内**，所以查询按它下界，
-/// 不必把 2 万条明细整体读回内存再逐条丢。
-const SUMMARY_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// 报表的**明细窗口**：从明细读行时按它下界，不必把整张明细表读回内存
+/// （明细是全量保留，没有条数上限）。
+///
+/// 改造后只剩**近 24 小时趋势**一件事需要逐条明细（四档命中率已由
+/// `sql::sum_cache_windows` 在 SQL 侧聚合完），所以窗口从 7 天收到 1 天 ——
+/// 这是「读回来的行数」这一项的直接来源（实测库上 26,763 → 5,975 行）。
+///
+/// 与窗口大小无关的两件事：命中率四档里最长的 `last7d` 仍按 7 天算（它在 SQL
+/// 侧的 `WHERE ts >= ?` 里自带下界），`request_daily` 聚合表的读取也不受它影响
+/// （热力图与 `all` 档本来就跨年）。
+const SUMMARY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// 筛选下拉的候选上限（模型名与 provider id 各一份）。
 ///
@@ -164,6 +170,8 @@ pub struct RequestStats {
     /// 保留期取值回调。**每次裁剪时动态调用**，于是设置改完天数下一次记账 /
     /// `prune` 就用新值，不需要重启进程（这正是把保留期做成回调而非构造参数的原因）。
     /// 用 `Arc` 是因为 `RequestStats` 本身被放进 `ServerState`，回调要能独立持有。
+    /// 回调每次裁剪时被调用，应读**内存快照**（如 `config::retention_settings()`），
+    /// 不要每次读盘 —— 记账是每个请求都要走一次的路径。
     get_retention: Arc<dyn Fn() -> Retention + Send + Sync>,
     /// 让「一次公开调用」的多个步骤不被另一次公开调用插进来。
     ///
@@ -352,14 +360,10 @@ impl RequestStats {
                 sql::insert_request(&tx, &record)?;
             }
             // 保留期：每次记账顺手把超期数据裁掉。只在启动与 prune 时裁是不够的：
-            // 桌面端常驻数周不重启，那样明细会一直涨到容量上限才开始丢，
-            // 用户设的 30 天等于没生效。
+            // 桌面端常驻数周不重启，明细会一直涨 —— 用户设的保留天数（默认
+            // 99999 天 ≈ 全量保留）要靠这里落地；改小保存后下一次记账同样生效。
+            // 默认值下这条 DELETE 恒删 0 行（cutoff 远早于任何数据）。
             sql::delete_expired_requests(&tx, bounds.requests_ms)?;
-            // 两个容量维度（旧实现分别是 `insert_sorted` 里那次 drain 与
-            // `trim_daily` 里的 while 循环）。两个 trim 函数**自己先判条数**
-            // 再决定发不发 DELETE —— 这是记账热路径，不该为「没超限」白跑一条
-            // 带子查询的删除语句（见 `sql::trim_requests_capacity` 的说明）。
-            sql::trim_requests_capacity(&tx, MAX_ENTRIES)?;
             // 聚合：**读-改-写当天那一行**（为什么不是增量的 UPDATE：见 `sql.rs` 模块头）
             //
             // 模型测试的行**不折进聚合**（见 `RequestEntry::is_test`）：明细照记
@@ -374,7 +378,26 @@ impl RequestStats {
                 daily::upsert_daily(&tx, &day)?;
             }
             daily::delete_daily_before(&tx, &bounds.daily_key)?;
-            daily::trim_daily_capacity(&tx, MAX_DAILY_DAYS)?;
+            // request_raw 的**条数上限**（见 `record::MAX_RAW_ROWS`）：原始正文
+            // 是这张库里单行最大的字段（实测平均 168 KB），只限单条体积而不限
+            // 条数时会攒成整库最大的一块。判据是一次 `COUNT(*)`（主键索引上
+            // 零点几毫秒），未超限时到此为止 —— 那条带 `ORDER BY` 的 DELETE
+            // 不跑。
+            //
+            // 为什么挂在 `record` 而不是 `store_raw`：正文的写入是独立于记账的
+            // 一次写（大字段不进记账热路径），而清理需要一个事务。记账这条路径
+            // 每请求都走，顺手裁一次的成本比新开一个事务低。副作用是「关了调试
+            // 模式不再写新正文」时也照样会裁（只要还有请求在跑）—— 这正是想要
+            // 的：旧正文不会因为不再产生新行而永久占着空间。
+            //
+            // 两步都**忽略失败**：正文是排障辅助，它这边出任何问题都不该让整条
+            // 记账回滚（回滚的代价是这条请求的明细与日报一起没了）。失败的现场
+            // 只留在控制台（由 `with_conn_mut` 那层打）。
+            if let Ok(raw_rows) = sql::count_raw(&tx) {
+                if raw_rows > MAX_RAW_ROWS {
+                    let _ = sql::trim_raw_rows(&tx, raw_rows - MAX_RAW_ROWS);
+                }
+            }
             tx.commit()
         });
     }
@@ -407,6 +430,9 @@ impl RequestStats {
     /// ── 来源标记（`is_test`，schema v7）───────────────────────────
     /// 与 id / ts 同一时刻定稿：它是**入口**（`api::model_test`）才知道的事实，
     /// 随进行中行一起写下来，于是「进行中」那一段的测试行也一眼可辨。
+    ///
+    /// `client`（来源客户端，schema v12）同理：入口解析请求头后就知道它是谁，
+    /// 随首发写入，进行中行的「客户端」列不必等收尾才显示。
     pub fn record_started(
         &self,
         id: &str,
@@ -414,6 +440,7 @@ impl RequestStats {
         model: &str,
         client_model: &str,
         client_reasoning: &str,
+        client: &str,
         is_test: bool,
     ) {
         if id.is_empty() {
@@ -422,7 +449,16 @@ impl RequestStats {
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
-            sql::insert_started_request(&tx, id, ts, model, client_model, client_reasoning, is_test)?;
+            sql::insert_started_request(
+                &tx,
+                id,
+                ts,
+                model,
+                client_model,
+                client_reasoning,
+                client,
+                is_test,
+            )?;
             // 陈旧清理与插入同事务：僵尸行的判定时点与本次开始时点一致，
             // 中断也只影响「这次有没有清成」，不会留下半删状态
             sql::finish_stale_running(&tx, stale_cutoff(), now_ms())?;
@@ -503,6 +539,12 @@ impl RequestStats {
     /// 存一条请求的**原始正文**（`request_raw` 表；两侧各截断到
     /// `api::pipeline::MAX_RAW_BODY_BYTES`，截断在采集处完成）。
     ///
+    /// ── 谁决定「有没有正文」─────────────────────────────────────
+    /// **采集侧**（`api::pipeline::capture_raw_body` / `capture_raw_json`）——
+    /// 正文仅在调试模式开启时采集（对齐 OmniProxy），关着时两侧都是 None、
+    /// 本方法提前返回不写行。存储层不读配置（依赖方向见 `core/mod.rs` 的约定），
+    /// 所以这道闸不在下面。
+    ///
     /// ── 为什么独立于 `record` ───────────────────────────────────
     /// 正文的大字段不该混进明细记账的热路径（每次记账多搬几百 KB）；同时
     /// 只有部分请求有正文可存（`record_early_failure` 没有请求体、错误响应
@@ -510,8 +552,9 @@ impl RequestStats {
     /// 记账后按需调一次，两侧全空时不写行。
     ///
     /// `id` 为空直接跳过（正文按 id 与明细关联，没有 id 的正文无从取回）。
-    /// UPSERT 覆盖同 id（`sql::upsert_raw`）；容量闸 [`MAX_RAW_ROWS`] 每次写入
-    /// 顺手收一次。失败只打控制台 —— 正文是排障辅助，丢一侧不能影响请求。
+    /// UPSERT 覆盖同 id（`sql::upsert_raw`）；正文不设条数上限 —— 表的增长
+    /// 由「调试模式开关」天然约束（关着不写），清历史走请求日志页的清理。
+    /// 失败只打控制台 —— 正文是排障辅助，丢一侧不能影响请求。
     pub fn store_raw(&self, id: &str, ts: i64, request_body: Option<&str>, response_body: Option<&str>) {
         let id = id.trim();
         if id.is_empty() {
@@ -519,7 +562,7 @@ impl RequestStats {
         }
         let request = request_body.unwrap_or("");
         let response = response_body.unwrap_or("");
-        // 两侧全空不值得占一个容量名额：表的约定是「有行 ⇔ 有正文」
+        // 两侧全空不值得占一行：表的约定是「有行 ⇔ 有正文」
         if request.is_empty() && response.is_empty() {
             return;
         }
@@ -529,7 +572,6 @@ impl RequestStats {
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
             sql::upsert_raw(&tx, id, ts, request, response, size)?;
-            sql::trim_raw_capacity(&tx, MAX_RAW_ROWS)?;
             tx.commit()
         });
     }
@@ -573,9 +615,10 @@ impl RequestStats {
     /// 让页面显示的数据与选项对不上；两层各管一件事，这里保留兜底。
     ///
     /// ── 读取窗口 ────────────────────────────────────────────────
-    /// 聚合整表读（一年最多 365 行）；明细只取**近 7 天** ——
-    /// `cacheRates` 最长的窗口是 7 天、`cacheTrend24h` 是 24 小时，
-    /// 窗口外的条目在纯函数里本来就会被逐条判掉，不必先读回内存。
+    /// 聚合整表读（一年最多 365 行）；命中率四档**不下读明细**（由 SQL 侧按窗口
+    /// 聚合出四组合计，见 `sql::sum_cache_windows`）；明细只取**近 24 小时**的
+    /// 窄列（`sql::select_summary_rows`，只服务逐小时趋势）。窗口外的条目在
+    /// 纯函数里本来就会被逐条判掉，不必先读回内存。
     /// `now` 在这里取**一次**并同时用于查询上界与两个纯函数的窗口判定：
     /// 取两次的话，两次之间到达的条目可能落在「查出来了但不在窗口内」（无害）
     /// 或「在窗口内但没查出来」（少算）这两种边界上，而前者只是白读、后者是错。
@@ -585,20 +628,30 @@ impl RequestStats {
     /// 「暂无数据」的空态，而不是 undefined 造成的渲染异常
     /// （`ui/report.js` 的 `overviewHtml` / `paintRank` 都按 `Number(x) || 0`
     /// 与 `Array.isArray` 消费，空态文案是「所选范围内还没有请求记录」）。
-    pub fn usage_summary(&self, range: &str) -> Value {
+    ///
+    /// `custom` 只在 `range == "custom"` 时有意义（起止本地自然日，路由层已
+    /// 解析校验）；其余档位传 None，区间由 `range_bounds` 现算。
+    pub fn usage_summary(
+        &self,
+        range: &str,
+        custom: Option<(NaiveDate, NaiveDate)>,
+    ) -> Value {
         let now = clock::now_ms();
+        let windows: Vec<i64> = CACHE_WINDOWS.iter().map(|(_, ms)| *ms).collect();
         let loaded = {
             let guard = self.guard();
             self.with_conn(&guard, |conn| {
                 let daily = daily::select_daily_map(conn)?;
-                // 报表侧排除模型测试（见 `select_between` 的说明）：
+                // 四档命中率在 SQL 侧聚合（一次索引扫描出四组合计）
+                let cache_totals = sql::sum_cache_windows(conn, now, &windows)?;
+                // 报表侧排除模型测试（见 `select_summary_rows` 的说明）：
                 // 趋势图与排行回答的是「真实流量长什么样」
-                let entries = sql::select_between(conn, now - SUMMARY_WINDOW_MS, now, true)?;
-                Ok((daily, entries))
+                let entries = sql::select_summary_rows(conn, now - SUMMARY_WINDOW_MS, now)?;
+                Ok((daily, cache_totals, entries))
             })
         };
-        let (daily, entries) = loaded.unwrap_or_default();
-        summarize(&daily, &entries, range, now)
+        let (daily, cache_totals, entries) = loaded.unwrap_or_default();
+        summarize(&daily, &cache_totals, &entries, range, now, custom)
     }
 
     /// 明细查询：倒序（新在前）分页。
@@ -677,12 +730,15 @@ impl RequestStats {
         json!({ "models": models, "providers": providers })
     }
 
-    /// 立即按当前保留期裁剪（供「改小保留天数后立即清理」用）。
+    /// 存储概况（排障与报表页脚用）
     ///
-    /// 只按**时间维度**裁（明细按 `ts`、聚合按 `date` 键），再各收一次容量上限
-    /// （手改库塞进十万行的兜底）。「立刻生效」在数据库上天然成立 ——
-    /// 没有延迟落盘这一说，所以调用方（改小设置后点清理）期望的「盘上也干净了」
-    /// 直接就是事实。
+    /// `file` / `dailyFile` 都指向**库文件**（不再有明细文件与聚合文件之分，
+    /// 按当前保留期裁一遍超期数据（明细 + 按天聚合）。
+    ///
+    /// 调用方是 `stats_api::put_retention`：设置页把保留天数改小后立即触发，
+    /// 否则旧数据要等下一条请求记账才消失，界面会显示「设置是 7 天，
+    /// 日志里还有 30 天前的条目」。`record` 每次记账也会带同样的边界顺手裁
+    /// （见该方法的说明），本方法是「改完设置马上见效」的那一下。
     ///
     /// 降级：库不可用时什么都不做 —— `prune` 的契约是「尽力清理」，
     /// 它没有返回值可以报告失败（调用方 `stats_api` 调完就返回响应），
@@ -693,20 +749,11 @@ impl RequestStats {
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
             sql::delete_expired_requests(&tx, bounds.requests_ms)?;
-            sql::trim_requests_capacity(&tx, MAX_ENTRIES)?;
             daily::delete_daily_before(&tx, &bounds.daily_key)?;
-            daily::trim_daily_capacity(&tx, MAX_DAILY_DAYS)?;
             tx.commit()
         });
-        // 签到记录的明细台账共用「请求日志」的保留天数（不新增设置项），
-        // 在同一条「立即清理」路径里顺手裁 —— 它有自己的库句柄（与请求统计
-        // 同一个库、不同的表），在那边自己执行删除即可。
-        crate::server::core::checkin_records::prune();
     }
 
-    /// 存储概况（排障与报表页脚用）
-    ///
-    /// `file` / `dailyFile` 都指向**库文件**（不再有明细文件与聚合文件之分，
     /// 见 `file_path` 的说明）。`firstTs` / `lastTs` 取明细 `ts` 的最小 / 最大值，
     /// 与旧实现的「升序数组首尾元素的 ts」等价。
     ///
@@ -716,7 +763,6 @@ impl RequestStats {
     /// 而 `storage_api` 会同时给出 `available: false`，界面据此显示「—」
     /// 而不是一排看着正常的 0（0 与「真的没有数据」在数字上无法区分）。
     pub fn stats(&self) -> Value {
-        let retention = self.retention();
         let loaded = {
             let guard = self.guard();
             self.with_conn(&guard, |conn| {
@@ -732,8 +778,6 @@ impl RequestStats {
         json!({
             "total": total,
             "dailyDays": daily_days,
-            "maxEntries": MAX_ENTRIES,
-            "maxDailyDays": MAX_DAILY_DAYS,
             "file": file,
             // 与 file 同值：明细与聚合同居一个库。保留这个字段是为了不破坏
             // 既有读取方（`file` 的语义已经说明它指库文件），但**不要再把两者
@@ -743,10 +787,6 @@ impl RequestStats {
             "firstTs": first_ts,
             "lastTs": last_ts,
             "today": date_key(today()),
-            "retention": {
-                "requestDays": retention.request_days,
-                "dailyDays": retention.daily_days,
-            },
         })
     }
 
@@ -797,10 +837,10 @@ impl RequestStats {
     /// 同一机制）。
     ///
     /// ── 拿不准就不动 ──────────────────────────────────────────
-    /// 沿用 `backfill` 的安全边界：明细会被保留期（天数 + 容量闸）裁掉，
+    /// 沿用 `backfill` 的安全边界：明细可能被用户手动清理过，
     /// 当天「明细条数 ≥ 聚合行 requests」才说明明细足以代表当天，才重算；
     /// 不够的天原样保留 —— 用残缺明细重算会让当天数字凭空缩水，比留着别名
-    /// 分组更糟。超出明细保留期的历史天因此**不修**：那些天没有重算依据。
+    /// 分组更糟。明细已被清掉的历史天因此**不修**：那些天没有重算依据。
     ///
     /// ── 调用时机（与 `account_bootstrap` 同一模式）──────────────
     /// 启动时一次（`server/mod.rs`）；待迁移旧文件还没导入时（`upgrade_pending`）
@@ -832,9 +872,6 @@ impl RequestStats {
 }
 
 /// 保留期的两条边界（明细用毫秒下界，聚合用日期键下界）。
-///
-/// `pub(crate)`：迁移项要拿它算同一套边界（见 `legacy_bounds`），
-/// 而字段仍只在本模块内被读。
 pub(crate) struct RetentionBounds {
     /// 明细的毫秒下界（本地日期零点）
     requests_ms: i64,
@@ -846,8 +883,6 @@ impl RetentionBounds {
     /// 从归一化后的保留期算出两条边界。
     ///
     /// 保留 N 天 = 含今天在内的 N 个自然日，所以往前推 N-1 天。
-    /// 运行期与迁移项**共用这一份**：迁移导入旧数据后也要按同一套边界裁一遍，
-    /// 两处各算一份迟早分叉（而分叉的后果是「同一个设置在迁移前后裁掉的天数不同」）。
     fn of(retention: Retention) -> Self {
         let now_day = today();
         Self {

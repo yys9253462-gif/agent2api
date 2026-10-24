@@ -18,9 +18,16 @@ import { t } from '../i18n'
 
 /* ─── 数据形状（后端 /api/stats/summary，字段都可缺省） ─── */
 
-export type StatsDay = { date?: string; tokens?: number; requests?: number }
+/**
+ * 一天 / 一个整点里的**单个模型用量**（图表悬停读数的分解项，后端
+ * `model` 判别失败的降级名）。`label` 是后端给的展示名（空模型名的那一组
+ * 是「未知模型」），`token` 是这一格的用量。
+ */
+export type StatsSlice = { model?: string; label?: string; tokens?: number; requests?: number }
+export type StatsDay = { date?: string; tokens?: number; requests?: number; models?: StatsSlice[] }
 export type StatsHour = {
   hour?: string; rate?: number; totalTokens?: number; hitTokens?: number; inputTokens?: number
+  models?: StatsSlice[]
 }
 /** 排行 / 环形图共用的一条：模型维度用 model 当身份，提供商与账号维度用 id */
 export type StatsGroup = {
@@ -47,13 +54,21 @@ export type StatsSummary = {
 /* ─── 时间范围（档位与后端白名单逐字一致） ─── */
 
 /** 合法的时间范围：与后端 /api/stats/summary 的白名单逐字一致（非法值后端返回 400） */
-export const RANGES: readonly string[] = ['today', '7', '30', 'month', 'all']
+export const RANGES: readonly string[] = ['today', '7', '30', 'month', 'all', 'custom']
 export const DEFAULT_RANGE = '7'
+/**
+ * 自定义区间档位：选中它时起止日由本页的两个日期输入给出（`startDate` /
+ * `endDate`，本地自然日闭区间）。与后端 `RANGE_CUSTOM` 是同一个字面量。
+ */
+export const CUSTOM_RANGE = 'custom'
 /** 持久化键：沿用项目既有的 workbuddy-desktop-* 前缀（主题 / 页码 / 日志开关是同一套） */
 export const RANGE_KEY = 'workbuddy-desktop-report-range'
+/** 自定义区间的持久化键：与档位分开存（改区间不动档位，反之亦然），值形如 `{"start":"…","end":"…"}` */
+export const CUSTOM_RANGE_KEY = 'workbuddy-desktop-report-custom-range'
 /** 档位对应的展示名（键是后端白名单里的枚举值，不能翻；只有展示串走 t()） */
 export const RANGE_LABEL: Record<string, string> = {
   today: t('今天'), 7: t('近 7 天'), 30: t('近 30 天'), month: t('本月'), all: t('全部'),
+  custom: t('自定义区间'),
 }
 /**
  * 分段控件上的短标签。与 RANGE_LABEL 是两套，别合并：那边是概览小格的说明文字
@@ -61,6 +76,7 @@ export const RANGE_LABEL: Record<string, string> = {
  */
 export const RANGE_OPTION_LABEL: Record<string, string> = {
   today: t('今天'), 7: t('7 天'), 30: t('30 天'), month: t('本月'), all: t('全部'),
+  custom: t('自定义'),
 }
 
 /** 只有明确存过合法值才采纳；无值 / 读取抛错 / 值被改坏都回落默认的 7 天 */
@@ -73,6 +89,45 @@ export function readRange(): string {
   }
 }
 
+/** 自定义区间（本地自然日，`YYYY-MM-DD`，闭区间） */
+export type CustomRange = { start: string; end: string }
+
+/** `YYYY-MM-DD` 的本地日期键。不用 `toISOString()`：那是 UTC，东八区会差一天 */
+export function dayKey(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/** 默认自定义区间：含今天在内的近 7 天（与「7 天」档位同一口径，用户切过去就有内容） */
+export function defaultCustomRange(): CustomRange {
+  const end = new Date()
+  return { start: dayKey(new Date(end.getFullYear(), end.getMonth(), end.getDate() - 6)), end: dayKey(end) }
+}
+
+/** 合法的日期键：后端路由层认的就是这个格式（严格补零）；两个岛也要用它做输入校验 */
+export const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/** 只认「两个都是 YYYY-MM-DD、且 start ≤ end」的存盘值；其余（无值 / 存坏 / 反向）回落默认区间 */
+export function readCustomRange(): CustomRange {
+  try {
+    const raw = localStorage.getItem(CUSTOM_RANGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as { start?: unknown; end?: unknown } | null
+      const start = typeof parsed?.start === 'string' ? parsed.start : ''
+      const end = typeof parsed?.end === 'string' ? parsed.end : ''
+      if (DAY_KEY_RE.test(start) && DAY_KEY_RE.test(end) && start <= end) return { start, end }
+    }
+  } catch { /* 存坏了就用默认区间，本次会话照常 */ }
+  return defaultCustomRange()
+}
+
+/** 写盘失败只影响下次启动（与 RANGE_KEY 同一取向），本次会话以内存里的值为准 */
+export function saveCustomRange(range: CustomRange): void {
+  try {
+    localStorage.setItem(CUSTOM_RANGE_KEY, JSON.stringify(range))
+  } catch { /* 存储不可用 */ }
+}
+
 /** 热力图与折线图共用的星期行标签：只标周一 / 三 / 五，七行全写会糊成一片。
  *  左边的数字是布局行号（周一 = 0），文案走 t()，与 dayLabel 的星期字共用同一批键 */
 export const WEEKDAY_ROWS: readonly (readonly [number, string])[] = [[0, t('一')], [2, t('三')], [4, t('五')]]
@@ -82,8 +137,8 @@ export const WEEKDAY_ROWS: readonly (readonly [number, string])[] = [[0, t('一'
  *
  * 这道闸是必要的：data-tip 由 tooltip.js 自动增强，每个元素都会拿到六个事件监听 + 一个
  * 专属 ResizeObserver。固定开销已经不小 —— 热力图 365 格 + 折线 24 格 —— 柱状图再叠几百
- * 上千个就会明显拖慢切页。阈值 400：加起来仍在一千以内；而 backend 的按天序列理论上能到
- * 4000 天（手改保留期才会出现），那种极端区间必须挡在外面。
+ * 上千个就会明显拖慢切页。阈值 400：加起来仍在一千以内；而 backend 的按天序列上限是
+ * 4000 天（`report.rs` 的 `MAX_TREND_DAYS`），那种极端区间必须挡在外面。
  */
 export const TIP_LIMIT = 400
 
@@ -170,6 +225,73 @@ export function dayLabel(key: unknown): string {
 export function hourText(key: unknown): string {
   const time = String(key || '').slice(11, 13)
   return time ? `${time}:00` : '—'
+}
+
+/* ─── 悬停读数的「按模型分解」───────────────── */
+
+/**
+ * 气泡里最多列出多少个模型：再多就溢成长条，超过部分归并成一句
+ * 「…还有 N 个模型」。后端已按用量降序给出，前几个就是这一天/这一小时的大头。
+ */
+export const TIP_MODEL_LIMIT = 8
+
+/**
+ * 「总 Token + 每个模型的 Token 用量」的模型行（多行气泡的公共部分）。
+ *
+ * 每行形如 `[#f73b00]claude-sonnet-4-5：8000万 tokens`：行首的 `[#rrggbb]`
+ * 是**色点标记**（tooltip.js 认得这个前缀，渲染成模型行前面那枚圆点），
+ * 颜色由调用方给的 `colorOf` 决定 —— 报表页把「模型 → 色」的映射与环形图
+ * 共用一份（见 [`modelColorMap`]），于是气泡里的色点与环形图、图例上的颜色
+ * 说的是同一个模型。`colorOf` 缺省时不给色点（纯文本气泡，向后兼容）。
+ *
+ * 与 OmniProxy 的趋势图悬停提示同一读法：标题行给出这一格的总量，
+ * 下面逐行列出各模型用了多少（后端按用量降序给，"大头"在最上面）。
+ * 全零 / 缺这一维时返回空数组 —— 气泡只留总量行，不会多出一段空标题。
+ */
+export function modelTipLines(
+  models: StatsSlice[] | undefined,
+  colorOf?: (label: string) => string,
+): string[] {
+  const rows = (Array.isArray(models) ? models : [])
+    .map(item => ({
+      // label 是后端给的展示名（空模型名那组是「未知模型」）；两者都空时兜一句
+      name: String(item?.label ?? item?.model ?? '').trim() || t('未知模型'),
+      tokens: Number(item?.tokens) || 0,
+    }))
+    .filter(item => item.tokens > 0)
+  if (!rows.length) return []
+  const head = rows.slice(0, TIP_MODEL_LIMIT)
+  const lines = head.map(item => {
+    const dot = colorOf ? `[${colorOf(item.name)}]` : ''
+    return `${dot}${t('{model}：{tokens} tokens', { model: item.name, tokens: formatTokens(item.tokens) })}`
+  })
+  if (rows.length > head.length) lines.push(t('…还有 {n} 个模型', { n: rows.length - head.length }))
+  return lines
+}
+
+/** 柱状图一格（一天）的悬停读数：日期 / 总量 / 按模型分解，多行 */
+function dayTip(day: StatsDay, colorOf?: (label: string) => string): string {
+  return [
+    dayLabel(day.date),
+    t('总 Token：{tokens}（{n} 次请求）', {
+      tokens: formatTokens(day.tokens), n: formatInt(day.requests),
+    }),
+    ...modelTipLines(day.models, colorOf),
+  ].join('\n')
+}
+
+/** 折线图一格（一个整点）的悬停读数：时刻 / 命中率 / 总 Token / 按模型分解，多行 */
+function hourTip(item: StatsHour, colorOf?: (label: string) => string): string {
+  return [
+    `${dayLabel(String(item.hour).slice(0, 10))} ${hourText(item.hour)}`,
+    t('命中率 {rate}（命中 {hit} / 输入 {input}）', {
+      rate: formatPercent(item.rate),
+      hit: formatTokens(item.hitTokens),
+      input: formatTokens(item.inputTokens),
+    }),
+    t('总 Token：{tokens}', { tokens: formatTokens(item.totalTokens) }),
+    ...modelTipLines(item.models, colorOf),
+  ].join('\n')
 }
 
 /* ─── 纵轴刻度 ─────────────────────────────── */
@@ -390,6 +512,35 @@ export type DonutLegendView = {
 }
 export type DonutView = { size: number; slices: DonutSliceView[]; legend: DonutLegendView[]; totalText: string }
 
+/** 模型行色点取不到颜色时的兜底色（中性灰）。
+ *  只会出现在「模型不在区间级汇总里」的手改数据上 —— 不给它随便借一个色板色：
+ *  借来的色会让两个不同模型撞成同一个颜色，比灰更难解释。 */
+export const TIP_DOT_FALLBACK = '#9aa0a6'
+
+/**
+ * 模型 → 颜色标识（环形图扇区 / 图例，以及图表气泡里模型行前那枚色点共用）。
+ *
+ * 与 [`donutView`] **同一份色板、同一套分配顺序**（列表原序、tokens 全零的组
+ * 不参与、同名只分配一次），所以同一份报表里「环形图某段是什么色、气泡里某行
+ * 是什么色」必然一致。两处各自按下标取色迟早会错位：一边过滤了零值、一边没
+ * 过滤，或某一处改了排序，颜色就整体串位 —— 而串位不会报错，只会让用户以为
+ * 「图上那段和气泡里这行不是同一个模型」。
+ *
+ * key 取**展示名**（`label → model → id` 的兜底链，与 donutView 的行构造同一
+ * 顺序）：那个名字就是图例与气泡里写出来的字，按它取色才对得上。
+ */
+export function modelColorMap(list: StatsGroup[] | undefined): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const item of Array.isArray(list) ? list : []) {
+    const key = String(item?.label ?? item?.model ?? item?.id ?? '').trim()
+    if (!key || map.has(key)) continue
+    // 全零的组不占号（与 donutView 的过滤同一口径，见那个函数）
+    if (!((Number(item?.totalTokens ?? item?.tokens) || 0) > 0)) continue
+    map.set(key, SLICE_COLORS[map.size % SLICE_COLORS.length])
+  }
+  return map
+}
+
 /**
  * 环形图 + 右侧图例列表（模型用量 / 提供商用量的共用实现）。`null` = 这一维没数据。
  *
@@ -399,6 +550,9 @@ export type DonutView = { size: number; slices: DonutSliceView[]; legend: DonutL
  * 图例带上 Token 与百分比：扇区角度只表达「相对占比」，看不出绝对量级 —— 而「这段是
  * 1.2 亿还是 1200 万」正是用户要问的。中心读数是总量：把各扇区的共同分母摆在最显眼处，
  * 右侧每段的百分比立刻有了参照。
+ *
+ * 颜色从 [`modelColorMap`] 取（与图表气泡同一份）；取不到（空名的手改数据）才回落
+ * 到按行下标取色 —— 那条路径正常不会走到。
  */
 export function donutView(list: StatsGroup[] | undefined, unknownLabel: string): DonutView | null {
   const rows = (Array.isArray(list) ? list : [])
@@ -417,6 +571,7 @@ export function donutView(list: StatsGroup[] | undefined, unknownLabel: string):
   const total = rows.reduce((sum, item) => sum + item.tokens, 0)
   if (!total) return null
 
+  const colors = modelColorMap(list)
   const { size, inner, outer, padAngle } = DONUT
   const cx = size / 2
   const cy = size / 2
@@ -437,7 +592,7 @@ export function donutView(list: StatsGroup[] | undefined, unknownLabel: string):
     const start = angle + gap
     const end = angle + sweep - gap
     angle += sweep
-    const fill = SLICE_COLORS[index % SLICE_COLORS.length]
+    const fill = colors.get(item.label) ?? SLICE_COLORS[index % SLICE_COLORS.length]
     // 扇区内的百分比标签：只在 ≥3% 时画（再小就叠成一团），白色加描边保证任意底色上都
     // 读得清 —— 与 OmniProxy 的 renderPieLabel 同一阈值与手法
     let label: DonutSliceView['label'] = null
@@ -680,7 +835,13 @@ export function cacheRateCells(rates: Record<string, CacheRateWindow> | undefine
 /* ─── 板块六：近 24 小时命中率折线 ────────── */
 
 export type ChartHit = { key: string; x: number; width: number; tip: string }
-export type ChartText = { key: string; x: number; y: number; text: string; anchor: 'start' | 'middle' | 'end' }
+/** `rotate` = 这串读数竖排（绕 (x, y) 转 -90°、自下而上读，x 为这一列的中线）：
+ *  柱状图的密区间靠它把每天的读数都标下（见 dailyTrendView 的三级排法） */
+export type ChartText = {
+  key: string; x: number; y: number; text: string
+  anchor: 'start' | 'middle' | 'end'
+  rotate?: boolean
+}
 export type ChartLine = { points: string; dots: { key: string; cx: number; cy: number }[] }
 
 export type CacheTrendView = {
@@ -712,9 +873,14 @@ export type CacheTrendView = {
  * 否则会连成一排毫无信息量的「0%」。标注会互相避让：放不下就整条跳过（宁可少标一个，
  * 也不让两串数字叠成一团）—— 跳过的点仍能用悬停气泡读到完整数值。
  *
+ * `colorOf` 给悬停气泡里模型行的色点用（见 [`modelTipLines`]），缺省时是纯文本行。
  * `null` = 这一维没有数据（给空态）。
  */
-export function cacheTrendView(series: StatsHour[] | undefined, width: number): CacheTrendView | null {
+export function cacheTrendView(
+  series: StatsHour[] | undefined,
+  width: number,
+  colorOf?: (label: string) => string,
+): CacheTrendView | null {
   const list = Array.isArray(series) ? series : []
   if (!list.length) return null
 
@@ -836,17 +1002,10 @@ export function cacheTrendView(series: StatsHour[] | undefined, width: number): 
   const plotRight = pad.left + plotW
   const hits: ChartHit[] | null = list.length <= TIP_LIMIT
     ? list.map((item, index) => {
-      const tip = t('{date} {time} · 命中率 {rate} · 总 {tokens} tokens（命中 {hit} / 输入 {input}）', {
-        date: dayLabel(String(item.hour).slice(0, 10)),
-        time: hourText(item.hour),
-        rate: formatPercent(item.rate),
-        tokens: formatTokens(item.totalTokens),
-        hit: formatTokens(item.hitTokens),
-        input: formatTokens(item.inputTokens),
-      })
       const left = Math.max(plotLeft, xAt(index) - band / 2)
       const right = Math.min(plotRight, xAt(index) + band / 2)
-      return { key: `h${index}`, x: round1(left), width: round1(right - left), tip }
+      // 读数由 hourTip 统一给（多行：时刻 / 命中率 / 总 Token / 按模型分解）
+      return { key: `h${index}`, x: round1(left), width: round1(right - left), tip: hourTip(item, colorOf) }
     })
     : null
 
@@ -887,13 +1046,30 @@ export type DailyTrendView = {
 }
 
 /**
+ * 竖排读数所需的最小列宽：rotate(-90) 后一串数字只占一行字高（11px 字号加一点缝）。
+ * 列宽（step）小于它时相邻两列的字会互相压住，只能回到「只标最大的那几根」。
+ */
+const VERTICAL_LABEL_MIN_STEP = 13
+
+/**
  * 按天 Token 柱状图。柱顶直接标出当天的用量。
  *
- * 标注的取舍与折线图一致（见 cacheTrendView）：给的是「扫一眼看量级」的读数，所以不必
- * 每根柱子都标 —— 柱子密到标注必然重叠时，只标当区间里最大的那几根，其余靠悬停气泡读。
- * 这样图始终是干净的，而峰值一眼可见。
+ * ── 标注的三级排法 ────────────────────────────────
+ * 1. **横排**：每根柱子的读数横着摆在柱顶，相邻不重叠 —— 区间短时就这样（`allFit`）。
+ * 2. **竖排**：横排挤不下（近 30 天起就开始挤）时整排改竖排 rotate(-90)，读数自下而上
+ *    贴着柱顶排。一串数字横过来只占一行字高，列宽十几像素就够 —— 每一天的量都标得出，
+ *    不必再悬停补读。这是「近 30 天」这类常规区间的主排法。
+ * 3. **只标峰值**：连竖排都塞不进（柱子密到列宽只剩几像素，如「全部」这种超长区间）时，
+ *    退回只标最大的那几根 —— 此时任何排法都必然糊成一片，索性让峰值一眼可见，其余靠气泡。
+ *    挑的时候按用量从高到低放、遇到会压住已放标注的就跳过，所以标出来的仍然互不遮挡。
+ *
+ * `colorOf` 给悬停气泡里模型行的色点用（见 [`modelTipLines`]），缺省时是纯文本行。
  */
-export function dailyTrendView(series: StatsDay[] | undefined, width: number): DailyTrendView | null {
+export function dailyTrendView(
+  series: StatsDay[] | undefined,
+  width: number,
+  colorOf?: (label: string) => string,
+): DailyTrendView | null {
   const list = Array.isArray(series) ? series : []
   if (!list.length) return null
 
@@ -901,13 +1077,24 @@ export function dailyTrendView(series: StatsDay[] | undefined, width: number): D
   const height = 240
   const pad = { left: 50, right: 14, top: 26, bottom: 26 }
   const plotW = Math.max(40, width - pad.left - pad.right)
+  const step = plotW / list.length
+
+  // 柱顶读数先在这里定排法：pad.top 得跟着排法走（竖排要从柱顶往上长出最长那一串），
+  // 而 plotH 又要用到 pad.top，所以先算这一步再定版面
+  const texts = list.map(item => (Number(item.tokens) > 0 ? formatTokens(item.tokens) : ''))
+  const widest = Math.max(0, ...texts.map(textWidth))
+  const allFit = texts.every(text => !text) || widest + 4 <= step   // +4：相邻标注之间留一点缝
+  const vertical = !allFit && step >= VERTICAL_LABEL_MIN_STEP
+  // 竖排读数自柱顶往上排，顶格柱子的标注也不能被裁掉：顶部留出最长那一串的高度。
+  // textWidth 是估算值（见它自己的说明），乘个系数放宽一点当余量。
+  if (vertical) pad.top = 10 + Math.ceil(widest * 1.25)
+
   const plotH = height - pad.top - pad.bottom
 
   const values = list.map(item => Number(item.tokens) || 0)
   const peak = Math.max(...values)
   const yMax = axisMax(peak)
-  const step = plotW / list.length
-  // 极长区间（手改保留期才会出现）下柱子只剩一两像素：此时不再压窄，保证看得见
+  // 极长区间（接近后端 4000 天上限）下柱子只剩一两像素：此时不再压窄，保证看得见
   const barW = Math.max(1, Math.min(28, step * 0.68))
   const baseY = pad.top + plotH
   const yAt = (value: number) => pad.top + plotH - (plotH * value) / yMax
@@ -941,56 +1128,73 @@ export function dailyTrendView(series: StatsDay[] | undefined, width: number): D
       width: round1(barW),
       height: round1(Math.max(1, baseY - y)),
       rx: barW > 4 ? 2 : 1,
-      tip: t('{date} · {tokens} tokens · {n} 次请求', {
-        date: dayLabel(item.date), tokens: formatTokens(value), n: formatInt(item.requests),
-      }),
+      // 柱子的读数**只为超长区间的 SVG 原生 <title> 准备**（纯文本形态，不带色点
+      // 标记 —— <title> 会把 `[#rrggbb]` 原样显示出来）。常规区间里柱子不挂
+      // data-tip，悬停读的是下面热区层的 tip（带色点的那份）
+      tip: dayTip(item),
       // 超长区间不挂 data-tip 时改用 SVG 原生 <title>：提示成本降到零，hover 仍有读数
       nativeTip: !tips,
     })
   })
 
-  // 柱顶读数：每根柱子都要放得下才逐一标注（区间一长、柱子一密就必然重叠）。放不下时退成
-  // 「只标最大的那几根」—— 峰值是最该一眼看到的那个数，而每一根的具体值仍能从气泡读到。
-  const texts = list.map(item => (Number(item.tokens) > 0 ? formatTokens(item.tokens) : ''))
-  const widest = Math.max(0, ...texts.map(textWidth))
-  const allFit = texts.every(text => !text) || widest + 4 <= step   // +4：相邻标注之间留一点缝
+  const barLabels: ChartText[] = []
+  // 已放下的标注占位（只给第三级退让做避让用；横排由 allFit 保证不叠、竖排各占一列）
+  const boxes: { left: number; right: number; top: number; bottom: number }[] = []
 
-  // 退让模式下取用量最高的前几名；并列多少就取多少（上限只是防极端区间标出一大串）
-  const marked = new Set<number>()
-  if (!allFit) {
-    list
+  /** 放一根柱子的读数。`avoid` 为真时与已放好的标注相撞就返回 null（见第三级退让） */
+  const place = (index: number, avoid: boolean): ChartText | null => {
+    const text = texts[index]
+    const top = yAt(Number(list[index].tokens) || 0)
+    const x = round1(pad.left + step * index + step / 2)
+    // 竖排：贴着柱顶往上排，rotate(-90) 后自锚点往上走，列内左右居中由 dominantBaseline 管
+    // （见 report-page 的 ChartLabels）。顶部预留见上面的 pad.top，满格柱子的读数也裁不到。
+    if (vertical) return { key: `b${index}`, x, y: round1(top - 6), anchor: 'start', text, rotate: true }
+    const y = top - 6
+    // 顶到画布边（柱子接近 100%）时翻到柱子内侧，免得文字被裁掉
+    const inside = y - 9 < pad.top - 10
+    const ly = round1(inside ? y + 13 : y)
+    if (avoid) {
+      const half = textWidth(text) / 2
+      const box = { left: x - half, right: x + half, top: ly - 8.5, bottom: ly + 2.5 }
+      // 留 2px 横向、1px 纵向的呼吸：贴着不重叠也算「挤在一起」，一样难认（与折线图同一口径）
+      if (boxes.some(item => box.left < item.right + 2 && box.right > item.left - 2
+        && box.top < item.bottom + 1 && box.bottom > item.top - 1)) return null
+      boxes.push(box)
+    }
+    return { key: `b${index}`, x, y: ly, anchor: 'middle', text }
+  }
+
+  if (allFit || vertical) {
+    texts.forEach((text, index) => {
+      if (!text) return
+      const placed = place(index, false)
+      if (placed) barLabels.push(placed)
+    })
+  } else {
+    // 第三级退让：只标用量最高的那几根，**按用量从高到低依次放、撞上已放好的就跳过** ——
+    // 峰值常落在相邻几天（连着两个 13 亿的日子），列宽只剩几像素时谁也不让谁，读数必然叠成
+    // 一团；避让之后标出来的一定互不遮挡，代价是相邻的那根改由悬停气泡读。上限 8 根只是
+    // 防极端区间标出一大串。
+    const ranked = list
       .map((item, index) => ({ index, value: Number(item.tokens) || 0 }))
       .filter(item => item.value > 0)
       .sort((left, right) => right.value - left.value)
-      .slice(0, 8)
-      .forEach(item => marked.add(item.index))
+    for (const item of ranked) {
+      if (barLabels.length >= 8) break
+      const placed = place(item.index, true)
+      if (placed) barLabels.push(placed)
+    }
   }
 
-  const barLabels: ChartText[] = []
-  list.forEach((item, index) => {
-    if (!texts[index]) return
-    if (!allFit && !marked.has(index)) return
-    const y = yAt(Number(item.tokens) || 0) - 6
-    // 顶到画布边（柱子接近 100%）时翻到柱子内侧，免得文字被裁掉
-    const inside = y - 9 < pad.top - 10
-    barLabels.push({
-      key: `b${index}`,
-      x: round1(pad.left + step * index + step / 2),
-      y: round1(inside ? y + 13 : y),
-      anchor: 'middle',
-      text: texts[index],
-    })
-  })
-
-  // 热区整列铺满（含零值日），鼠标扫过任何一列都能读到当天读数
+  // 热区整列铺满（含零值日），鼠标扫过任何一列都能读到当天读数。
+  // **这一层才是柱状图悬停读数的实际来源**（柱子自身不挂 data-tip），所以色点
+  // 标记必须在这里给上 —— 少了它，气泡里的模型行就没有颜色标识
   const hits: ChartHit[] | null = tips
     ? list.map((item, index) => ({
       key: `h${index}`,
       x: round1(pad.left + step * index),
       width: round1(step),
-      tip: t('{date} · {tokens} tokens · {n} 次请求', {
-        date: dayLabel(item.date), tokens: formatTokens(item.tokens), n: formatInt(item.requests),
-      }),
+      tip: dayTip(item, colorOf),
     }))
     : null
 

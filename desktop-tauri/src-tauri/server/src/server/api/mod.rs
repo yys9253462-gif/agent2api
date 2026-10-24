@@ -38,10 +38,18 @@ pub mod accounts;
 // `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
 pub mod accounts_usage;
+// AI 助手（GET/PUT /api/assistant/config + POST /api/assistant/chat）：
+// 设置读写与流式对话转发。工具定义与执行都在前端，后端不认识任何工具，
+// 见该文件模块头
+pub mod assistant;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
 // `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
 pub mod backup_api;
 pub mod auto_checkin;
+// 长度截断的自动续写（开关 + 轮数上限）：`GET/PUT /api/auto-continue`。
+// 判据与执行链在 `core::upstream::continuation`，这里只是那两个数的读写入口；
+// 独立成文件而不是塞进 config_api —— 理由见该模块头。
+pub mod auto_continue;
 pub mod billing;
 pub mod captcha;
 pub mod chat;
@@ -98,6 +106,10 @@ pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
 pub mod retry_api;
+// 开发者角色兼容开关（GET/PUT /api/developer-role-compat）：与 /api/sanitize
+// 同形的单开关端点，转换实施点在 `core::upstream::payload` 的 send_body，
+// 见该文件模块头
+pub mod role_compat;
 pub mod routing_api;
 pub mod sanitize;
 pub mod scheduled_tasks;

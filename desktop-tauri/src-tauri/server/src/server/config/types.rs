@@ -36,10 +36,16 @@ pub const DEFAULT_LOCALE: &str = "zh-CN";
 
 /// 事件日志（统一库的 `logs` 表）保留天数
 pub const KEY_LOG_RETENTION_DAYS: &str = "logRetentionDays";
-/// 请求日志（统一库的 `requests` 表）保留天数
-pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestRetentionDays";
-/// 按天聚合（统一库的 `request_daily` 表）保留天数
-pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyRetentionDays";
+/// 请求日志（统一库的 `requests` 表）保留天数。
+///
+/// 为什么不是旧版的 `requestRetentionDays`：那个键在「全量保留」时期
+/// （`4a0e104`）退役过，老库 / 旧 config.json 里残留的值是**旧默认**（30 天）。
+/// 恢复这项设置时默认改成了 99999 天 —— 沿用旧键会让那些残留值悄悄生效，
+/// 升级后的第一次记账就把老日志裁掉。换新键让它从新默认起步；旧键残留
+/// 不被读取、也无害（与全量保留时期的口径一致）。
+pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestLogRetentionDays";
+/// 按天聚合（统一库的 `request_daily` 表）保留天数（改名理由同上）
+pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyAggregateRetentionDays";
 
 /// 事件日志的保存目录（config.json 键）。
 ///
@@ -60,6 +66,45 @@ pub const KEY_DEBUG_DIR: &str = "debugDir";
 /// 归一与解析都复用账号代理那两份实现（`normalize_account_proxy` /
 /// `resolve_account_proxy`），这里只存取。
 pub const KEY_UPDATE_PROXY: &str = "updateProxy";
+
+/// 「加入 beta 版」开关（config.json 键，**缺省 = 关**）。
+///
+/// 开启后「检查更新」改问 GitHub 的 Release **列表**，把预发布版（beta）一并
+/// 纳入候选、取版本号最高的一个；关闭时仍问 `/releases/latest`（GitHub 自己
+/// 排除预发布与草稿）。检查结果同时喂给面板、侧栏徽标与下载安装包三条路，
+/// 所以拨一下开关不用重启，下一次检查就换通道（含定时任务）。
+///
+/// **默认关**：beta 版由 beta 分支构建、可能不稳定，只有明确想尝鲜的人才会打开
+/// （与 `debugMode` 同一取向 —— 默认关的代价只是「功能对没打开的人不存在」）。
+///
+/// 与之配套的一条约定：**beta 版的版本号必须与 tag 一致**（tag `v3.1.0-beta.1`
+/// 就要把应用版本写成 `3.1.0-beta.1`），否则版本比较会把「当前 beta」判成比
+/// 「待装的 beta」新，通道打开也收不到更新 —— 比较规则见
+/// `core::update::version` 的预发布段处理。
+pub const KEY_UPDATE_BETA: &str = "updateBeta";
+
+/// 代理内核（mihomo）的**存放目录**（config.json 键）。
+///
+/// 值是**绝对路径**；缺省 / 空串 / 相对路径（读侧视为写坏）都回落
+/// `{config_dir}/proxy-kernel` —— 与 `logDir` 那几个键同一口径。
+/// 目录由内核下载弹窗选择（「网络代理」页 →「下载内核」），里面放二进制、
+/// `config.yaml`、`kernel-state.json`（节点 → 端口映射）与 provider 缓存，
+/// **整份都跟着这个键走**：改目录 = 换一整套内核数据的位置。
+/// 所以它只在「未安装」时可改（弹窗只在此时出现）—— 已装之后改键会让
+/// `installed()` 指向一个空目录，界面上看着像「内核没装」而旧文件仍在原处。
+pub const KEY_KERNEL_DIR: &str = "kernelDir";
+
+/// 代理内核的**下载出网线路**（config.json 键，缺省 = 默认链）。
+///
+/// 形状与 `updateProxy` 完全相同（归一后的账号代理配置对象 / null），
+/// 归一与解析复用同一套实现。**与 `updateProxy` 是两个独立的键**：下载内核
+/// 走哪条线路与「软件更新」走哪条线路是两件事（前者是订阅功能的前置条件，
+/// 后者是壳自己的更新），互不覆盖。
+///
+/// 缺省（未设置 / null）= 默认链：直连失败自动借 Clash 混合端口重试一次
+/// （见 `core::sub_kernel::download` 的出口候选）。**显式选定后只走选的那条**
+/// —— 用户专门选了出口，静默改走别的（尤其改走直连）会让失败信息变得不可信。
+pub const KEY_KERNEL_PROXY: &str = "kernelProxy";
 
 /// GitHub 令牌的密文信封（config.json 键，**存的不是明文**）。
 ///
@@ -86,6 +131,18 @@ pub const KEY_DEBUG_MODE: &str = "debugMode";
 /// 上游，那正是模板句被误拦（400 code=11128）的原因。
 /// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
 pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
+
+/// 开发者角色兼容开关（config.json 键，设置页「网关 → 开发者角色兼容」）。
+///
+/// 开启后转发层在每次出站前把请求 `messages` 里 `role: "developer"` 的消息
+/// 改写为 `role: "system"`（OpenAI 新版 API 用 developer 取代 system 承载
+/// 指令），兼容不认识 developer 角色的 OpenAI 兼容上游 —— 自定义提供商是
+/// 请求体原样透传的，不归一的话这类消息会原样发出去被上游 400。
+/// **默认开启**（与 OmniProxy 同默认）：改写语义无损（两类角色在 OpenAI 语义
+/// 上等价），而默认关会让发 developer 角色的客户端一上来就撞不认识它的上游。
+/// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
+/// 转换实施点见 `core::upstream::payload`（send_body 的角色归一层）。
+pub const KEY_DEVELOPER_ROLE_COMPAT: &str = "developerRoleCompat";
 
 /// **Cline 转发头的逐键覆盖**（config.json 键）。
 ///
@@ -337,10 +394,15 @@ pub struct ProviderPrompt {
     pub file_error: Option<String>,
 }
 
-/// 三档保留天数的默认值（缺失时用它们）
+/// 三档保留天数的默认值（缺失时用它们）。
+///
+/// 请求日志与按天聚合的默认是 99999 天（约 274 年）：效果上等于「全量保留」，
+/// 同时界面仍是一个普通的天数输入框 —— 想清理历史数据的用户可以把它改小，
+/// 不必再专程去各页面找「清空」入口（旧「全量保留」版本的行为仍是兜底：
+/// 清空 / 按筛选删除的入口保留）。
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
-pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 30;
-pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 365;
+pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 99999;
+pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 99999;
 
 /// **历史**路由优先级键：`{"workbuddy": 10, "raccoon": 20}`。
 ///
@@ -350,20 +412,24 @@ pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 365;
 /// 文件里残留的值也不会被抹掉（未知字段全量保留）。
 pub const KEY_PROVIDER_ROUTE: &str = "providerRoute";
 
-/// 天数的合法范围：下限 1 天（保留 0 天等于什么都不存，不是有效配置），
-/// 上限 10 年（防手改 config.json 写个天文数字让裁剪逻辑空转）。
+/// 保留天数的合法范围：下限 1 天（保留 0 天等于什么都不存，不是有效配置），
+/// 上限即「近似无限」的默认值 99999 天 —— 再往上没有语义（99999 天已约 274 年），
+/// 又能防手改 config.json 写个天文数字让裁剪逻辑空转。
 ///
 /// **写侧（`stats_api::parse_days`）与读侧（`days_field`）共用这两个常量**：
 /// 若两边各写一套数字，手改文件与走接口设值就会出现两套口径
 /// （比如接口拒绝 5000 而读侧接受它）。两侧的处理方式不同是有意的：
 /// 走接口的非法值给 400（用户当场能改），手改文件的非法值回落到默认（不打扰）。
 pub const RETENTION_MIN_DAYS: i64 = 1;
-pub const RETENTION_MAX_DAYS: i64 = 3650;
+pub const RETENTION_MAX_DAYS: i64 = 99999;
 
 /// 三档保留天数（设置页「数据保留」区域）。
 ///
-/// 用独立结构而不是三个散落的取值函数：三个值总是一起用（GET 一起返回、
-/// 裁剪时各自取用），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
+/// 请求日志与按天聚合的默认 99999 天是**故意的近似无限**：默认行为与
+/// 「全量保留」一致，但用户随时可以把某一项改小 —— 保存后立即裁剪
+/// （`stats_api::put_retention`），不用去各页面手动清。事件日志维持 30 天默认
+/// 不变。保留结构而不直接摊成三个函数：GET / PUT 与日志存储的回调都按
+/// 「一份 `Copy` 值」的形状传，将来若再加保留项，调用方不必跟着改签名。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSettings {
     /// 事件日志保留天数
@@ -924,8 +990,12 @@ pub const KEY_ROUTING_STRATEGY: &str = "routingStrategy";
 pub const KEY_ROUTING_STICKY: &str = "routingSticky";
 /// 失败退避：转发失败的账号休息一会儿再回来（`routingFailoverBackoff`，默认开）
 pub const KEY_ROUTING_FAILOVER_BACKOFF: &str = "routingFailoverBackoff";
-/// 限流垫底（Sink）：还有额度时被 429 的账号排到队尾，轮一圈才回来
-/// （`routingSink`，默认开）
+/// 限流垫底（Sink）：还有额度时被 429 的账号排到队尾，**30 分钟后自动回到队列**，
+/// 或提前成功转发一次即解除（`routingSink`，默认开）。
+///
+/// 数值以 `route_state::SINK_TTL_MS` 为准，别在这里写一个具体数字：从前这里是
+/// 「轮一圈才回来」，而那个语义正是自锁的成因（429 沉底 → 排到队尾 → 轮不到 →
+/// 没机会成功 → 永远解不开；实测国际版 11 个账号被逐个撞完后全部永久沉底）。
 pub const KEY_ROUTING_SINK: &str = "routingSink";
 /// 熔断开关（`routingBreakerEnabled`，默认关）
 pub const KEY_ROUTING_BREAKER_ENABLED: &str = "routingBreakerEnabled";
@@ -938,6 +1008,11 @@ pub const KEY_ROUTING_BREAKER_SUCCESS: &str = "routingBreakerSuccessThreshold";
 
 pub const ROUTING_STRATEGY_ORDER: &str = "order";
 pub const ROUTING_STRATEGY_ROTATE: &str = "rotate";
+/// 家内轮询（`provider`）：家之间按优先级，同一家内部轮流用各账号。
+///
+/// 与「负载均衡」的差别在**轮转的边界**：这里家的先后固定（由优先级定），
+/// 只有家内换人 —— 适合「想优先用某几家、又不愿把某一家的某个账号焊死」。
+pub const ROUTING_STRATEGY_PROVIDER: &str = "provider";
 
 pub const STICKY_OFF: &str = "off";
 pub const STICKY_TURN: &str = "turn";
@@ -956,12 +1031,15 @@ pub const ROUTING_BREAKER_MAX_SUCCESS: i64 = 10;
 
 /// 路由策略（`RouteStrategy` 的 Rust 形态；配置里存 `as_str`）
 ///
-/// 两档：顺序优先（队列第 1 位接走所有请求）与负载均衡（逐请求轮换）。
+/// 三档：顺序优先（队列第 1 位接走所有请求）、负载均衡（逐请求轮换）、
+/// 家内轮询（家之间按优先级、同一家内部轮流用各账号）。
 /// 「余额优先（usage）」已下线（2026-10，按用户要求移除）—— 见 `from_id` 的兜底说明。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteStrategy {
     Order,
     Rotate,
+    /// 家内轮询（本仓新增，上游没有）：轮转的边界收在「家」里面
+    Provider,
 }
 
 impl RouteStrategy {
@@ -969,6 +1047,7 @@ impl RouteStrategy {
         match self {
             Self::Order => ROUTING_STRATEGY_ORDER,
             Self::Rotate => ROUTING_STRATEGY_ROTATE,
+            Self::Provider => ROUTING_STRATEGY_PROVIDER,
         }
     }
 
@@ -979,6 +1058,7 @@ impl RouteStrategy {
     /// 静默退回「排第 1 的接走所有请求」会与他的本意相反。
     pub fn from_id(value: &str) -> Self {
         match value {
+            ROUTING_STRATEGY_PROVIDER => Self::Provider,
             ROUTING_STRATEGY_ROTATE | "usage" => Self::Rotate,
             _ => Self::Order,
         }
@@ -1063,4 +1143,80 @@ pub struct RoutingPatch {
     pub breaker_threshold: Option<i64>,
     pub breaker_timeout_seconds: Option<i64>,
     pub breaker_success_threshold: Option<i64>,
+}
+
+// ─── 长度截断的自动续写（autoContinue / autoContinueMaxRounds）─────────
+//
+// 判据、执行链与代价口径都在 `core::upstream::continuation`（六条判据、两道停机
+// 条件都写在那个模块头），这里只存「开不开」与「最多续几轮」两个数。
+//
+// ── 为什么是两个键，而不是一个 off/1/3/8 的档位 ──────────────
+// 「要不要续」与「最多问几轮」是两个独立的选择：只想多问一次（省额度）与
+// 愿意问满，都发生在「要开」这个前提之下。合成一个枚举会把「关掉」这个**默认态**
+// 塞进某个数字里 —— 于是配置里出现两种表达同一件事的写法（0 与 off），
+// 而它们将来各走各的路只是时间问题。
+
+/// 「上游说到一半就停、网关自己把它问完」开关的键（config.json 键，判据见
+/// `core::upstream::continuation`）。
+///
+/// **默认关闭**，与 `stripNewlineKeepalive` 同一取向，但代价的方向不同：那条
+/// 丢帧改的是「客户端看到哪些字节」，本条多花的是**真金白银的上游往返** ——
+/// 续写的每一轮都带着前几轮的全部历史，一轮的成本不覆盖前一轮（合并口径见
+/// `core::upstream::continuation` 的模块头）。改可观测行为 + 花额度，两条各自
+/// 都够格让默认值取关。
+///
+/// 开着时是否真的续，还要过六条判据（**工具轮永不续**排在最前，那是客户端的
+/// 执行权）；关掉时调用侧根本不包装，下发字节与接入前逐字一致。留一个在线开关
+/// 的理由与 `/api/keepalive-strip` 相同 —— 「在真流量上验一次、不对立刻撤回」
+/// 不该需要重新构建镜像（见 `api::auto_continue`）。
+///
+/// 部署级兜底：配置里没有这个键时读环境变量 `AGENT2API_AUTO_CONTINUE`
+/// （`1` / `true` / `on` 才算开启，其余含空值都算关，判据与
+/// `AGENT2API_STRIP_NEWLINE_KEEPALIVE` 共用同一份实现，见
+/// `parse::env_auto_continue`）—— Docker 部署想从第一次启动就打开的，
+/// 不必先进面板点一次开关。
+pub const KEY_AUTO_CONTINUE: &str = "autoContinue";
+
+/// 自动续写的**轮数上限**（config.json 键）：一次请求最多「再问一次」几回。
+///
+/// 两道停机条件里它是**硬保险**：另一道（相似度闸）判的是「续出来的这段是不是
+/// 上一段的复读」，阈值 0.5 是软判据，卡在边缘上的文本照样过得去。上限本身就是
+/// 那条续写链的次数，所以设多大都不构成死循环 —— 这个数管的只是一件成本问题
+/// （见 [`AUTO_CONTINUE_MAX_ROUNDS`]），分工见 `core::upstream::continuation` 的模块头。
+///
+/// 环境变量兜底 `AGENT2API_AUTO_CONTINUE_MAX`：非整数或越界都算「没配」，
+/// 与文件侧同一口径（**回落默认而不是夹紧**，理由见 `parse` 模块头）。
+pub const KEY_AUTO_CONTINUE_MAX_ROUNDS: &str = "autoContinueMaxRounds";
+
+/// 轮数上限默认值：3 轮 —— 参考实现（社区件 Trae2api-cn 的 `continuation.py`）
+/// 的默认值，也符合「一次腰斩通常一问就补完」的实测形状；与
+/// `DEFAULT_RETRY_COUNT` 那个「先试三次」是同一个量级的取向。
+pub const DEFAULT_AUTO_CONTINUE_MAX_ROUNDS: i64 = 3;
+
+/// 轮数下限：1，**不收 0**。
+///
+/// 开着开关却一轮都不续，与「关掉开关」是同一件事；把这个状态留在配置里只会
+/// 让人以为功能生效了。想关就去关 [`KEY_AUTO_CONTINUE`]，不要用数字表达关闭
+/// （与 `retryCount` 那档相反：那里的 0 是「不重发、直接换号」的真实行为）。
+pub const AUTO_CONTINUE_MIN_ROUNDS: i64 = 1;
+
+/// 轮数上限：8。
+///
+/// 每多一轮都是一次完整的上游往返（含前几轮全部历史的 prompt），第 9 轮起
+/// 边际收益远低于代价；而「续到第八轮还没说完」实际意味着这条链在复读，
+/// 该停的是它而不是继续加预算。
+pub const AUTO_CONTINUE_MAX_ROUNDS: i64 = 8;
+
+/// 自动续写的**部分**更新入参（`None` = 该项不动）。
+///
+/// 形状与 `RoutingPatch` 相同（开关 + 若干个有界整数一起写），存在的理由是
+/// **一次 PUT 只落一次盘**：两项各写一次会留出「开关已开、上限还是旧值」的
+/// 半套状态，而这两项要一起读才有意义。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AutoContinuePatch {
+    /// 开关（`None` = 该项不动）
+    pub enabled: Option<bool>,
+    /// 轮数上限（`None` = 该项不动）。调用方须先按
+    /// `AUTO_CONTINUE_MIN_ROUNDS..=AUTO_CONTINUE_MAX_ROUNDS` 校验过。
+    pub max_rounds: Option<i64>,
 }

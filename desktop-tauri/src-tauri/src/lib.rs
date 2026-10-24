@@ -273,6 +273,8 @@ pub fn run() {
             commands::panel_admin_status,
             commands::panel_register,
             commands::change_lan_access,
+            // 界面直连网关时的凭证头（AI 助手页不经桥发请求，见 commands.rs）
+            commands::direct_credentials,
             commands::local_ip,
             commands::start_login,
             commands::start_autoclaw_oauth_login,
@@ -281,6 +283,7 @@ pub fn run() {
             commands::login_state,
             commands::cancel_login,
             commands::export_logs,
+            commands::pick_folder,
             commands::get_app_settings,
             commands::save_app_settings,
             commands::export_accounts,

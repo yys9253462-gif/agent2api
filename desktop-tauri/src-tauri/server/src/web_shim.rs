@@ -28,7 +28,10 @@
 //!   · AutoClaw（OAuth）：优先接收 loopback 回调，远程面板由网页端粘贴
 //!     最终回调地址兜底；CatPaw 由服务端 poll-token 兜底；
 //!   · 小浣熊：网页端把授权页切换到官方 `redirect` 分支，直接回到网关的
-//!     HTTP 回调；Trae / Accio / CodeArts：网页端自动提供“粘贴回调地址”兜底。
+//!     HTTP 回调 —— 前提是浏览器以回环地址访问面板（上游白名单只收
+//!     http://127.0.0.1 / localhost / [::1] + 显式端口，见
+//!     `raccoonCallbackOriginProblem`），不满足时发起前就弹指引拦下；
+//!     Trae / Accio / CodeArts：网页端自动提供“粘贴回调地址”兜底。
 //!
 //! ── 壳特有命令的降级 ────────────────────────────────────────
 //! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框导入导出
@@ -180,8 +183,56 @@ pub fn shim_js() -> &'static str {
   // 浏览器地址栏不会暴露授权码。该页面还支持 redirect 分支：去掉 desktop
   // 标记后，它会把 authorization_code 追加到 redirect URL 并导航过去。
   // 这里把回调地址放在当前面板 Origin，浏览器因此能直接访问 Docker 网关。
+  //
+  // ── 为什么发起前要先检查面板自身地址（raccoonCallbackOriginProblem）──
+  // 上游授权页对 redirect 参数有一份写死的白名单（实测 2026-10）：http 协议
+  // + 回环主机（127.0.0.1 / localhost / [::1]）+ 显式端口；域名、局域网 IP、
+  // https、省略端口一律拒收 —— 服务端直接把授权上下文置空，页面渲染
+  // 「授权链接无效，请从客户端重新发起登录。」这句话对我们的用户毫无信息量
+  // （链接是面板自己拼的，用户没改过任何参数），所以在发起登录前先按同一
+  // 口径检查面板地址，不满足就弹指引拦下，不送用户去授权页吃那句报错。
+  function raccoonCallbackOriginProblem() {
+    var hostname = window.location.hostname;
+    var port = String(window.location.port || '');
+    var loopback = hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '[::1]';
+    if (window.location.protocol === 'http:' && loopback && port !== '') return null;
+    var reason;
+    if (window.location.protocol !== 'http:') {
+      reason = '小浣熊授权页只接受 http:// 的回调地址，当前面板以 '
+        + window.location.protocol + ' 访问';
+    } else if (!loopback) {
+      reason = '小浣熊授权页只接受 127.0.0.1 / localhost 的回调地址，当前面板主机是 ' + hostname;
+    } else {
+      reason = '小浣熊授权页要求回调地址带显式端口，当前面板地址未带（默认端口访问）';
+    }
+    var displayPort = port || (window.location.protocol === 'https:' ? '443' : '80');
+    var html = '<div style="margin-bottom:10px;">小浣熊官方授权页只接受<strong>浏览器本机的回环地址</strong>'
+      + '（127.0.0.1 / localhost，http 且带端口）作为登录回调；当前面板地址是 <code>'
+      + escapeHtml(window.location.origin) + '</code>，继续发起只会看到「授权链接无效」。</div>'
+      + '<div style="margin-bottom:6px;">可行的做法：</div>'
+      + '<div style="margin-bottom:6px;">① 在打开面板的这台电脑上，改用 <code>http://localhost:'
+      + escapeHtml(displayPort) + '</code> 访问面板后再登录；面板部署在别的机器时，先做端口转发'
+      + '（例如 <code>ssh -L ' + escapeHtml(displayPort) + ':127.0.0.1:' + escapeHtml(displayPort)
+      + ' 用户@面板主机</code>，端口按实际改）。</div>'
+      + '<div>② 改用「粘贴 token / refreshToken」方式添加小浣熊账号，不走授权页。</div>';
+    return { title: '小浣熊网页登录无法在当前地址发起', html: html, reason: reason };
+  }
+
+  // 预检不过的完整处置：先弹指引层（模态，细节在这里讲清），用户关闭后再
+  // reject —— 引擎会 toast 一次 reason 收尾（弹层承载细节，toast 只做结论）。
+  async function reportRaccoonCallbackProblem(problem) {
+    await ensureOverlay(problem.title, problem.html, '知道了');
+    throw new Error(problem.reason);
+  }
+
   function buildRaccoonWebAuthUrl(provider, state, authUrl) {
     if (provider !== 'raccoon') return authUrl;
+    // 防御纵深：startLogin 已预检过（弹指引并拦下）。这里再查一次，是因为
+    // 本函数是 redirect 分支的唯一入口 —— 未来新增调用方不必记得「必须回环
+    // 访问」这条前提；走到这里才失败时，runLoginFlow 的 finally 会关掉窗口，
+    // 已建的后台任务无人认领会自行超时落定。
+    var problem = raccoonCallbackOriginProblem();
+    if (problem) throw new Error(problem.reason);
     var authorizeUrl;
     try {
       authorizeUrl = new URL(authUrl, window.location.href);
@@ -452,14 +503,25 @@ pub fn shim_js() -> &'static str {
       return httpCall(request.method || 'GET', request.path || '/', request.body);
     },
     check_update: function () {
-      // 网页端走镜像更新（拉新镜像重启容器），不提供安装包下载
-      return Promise.resolve({
-        currentVersion: 'web', latestVersion: 'web', hasUpdate: false,
-        notes: '网页端通过 Docker 镜像更新：拉取新镜像后重启容器即可。',
-        publishedAt: '', pageUrl: '', installerKind: 'none',
-      });
+      // 网页端没有「壳打包的版本号」这个概念：不带 current，服务端按自己的
+      // 编译期版本比较（见 api/update 的 check 分支）。返回里带 selfUpdate /
+      // serverAsset / backupAvailable —— 面板据此决定显示「一键更新」、
+      // 「回滚」还是退回手动升级命令，不再由这里硬编码。
+      return call('GET', '/api/update/check');
     },
     get_update_status: function () { return call('GET', '/api/update/status'); },
+    // 下载三件套：下载落在服务端的数据目录（/data/updates），进度由面板轮询。
+    // 桌面端这三个走壳命令（壳要往后端转发），网页端直接打接口 —— 桥的两侧
+    // 名字一致，面板代码不感知差异。
+    download_update: function (args) {
+      var payload = args || {};
+      return call('POST', '/api/update/download', {
+        url: String(payload.url || ''),
+        name: payload.name != null ? String(payload.name) : '',
+      });
+    },
+    update_progress: function () { return call('GET', '/api/update/progress'); },
+    cancel_update: function () { return call('POST', '/api/update/cancel', {}); },
     backend_status: function () {
       return Promise.resolve({ ready: true, port: null, portFromEnv: false, failure: null });
     },
@@ -526,34 +588,121 @@ pub fn shim_js() -> &'static str {
     // 文件对话框类：导入要走文件选择，单独给一条带输入框的链路
     if (command === 'import_accounts') return importAccountsViaFile();
     return Promise.reject(new Error(
-      command === 'download_update' || command === 'update_progress' || command === 'cancel_update'
-      || command === 'run_installer'
-        ? '软件更新在网页端不可用：请通过 Docker 镜像更新'
+      command === 'run_installer'
+        ? '网页端不启动安装程序：容器内的更新请用「一键更新」（设置 → 软件更新）'
         : SHELL_UNAVAILABLE
     ));
   }
 
-  async function importAccountsViaFile() {
+  /**
+   * 网页端的「导入账号」：浏览器没有原生文件对话框，用 <input type=file> 顶替。
+   *
+   * 移动端的三处坑（都踩过，改动时别退回去）：
+   *   · 输入框**不能** `display:none` —— iOS Safari 会忽略对隐藏 file input 的
+   *     程序化 `click()`，表现成「点了没反应」。改成视觉隐藏（离屏 + 透明）。
+   *   · 在系统选择器里点「取消」时 `change` 不触发，Promise 永远挂着、按钮卡在
+   *     「导入中…」。用 window focus / visibilitychange 兜底：回到页面后仍没拿到
+   *     文件就按取消落定（与桌面壳返回 `{canceled:true}` 同一契约）。
+   *   · `accept` 只写扩展名：Android 各家文件管理器对 MIME 形（application/json）
+   *     支持不一，带上它反而可能把 .json 过滤掉。
+   *
+   * 解析口径与桌面壳 `commands.rs::import_accounts` 对齐，见 buildImportPayload。
+   */
+  function importAccountsViaFile() {
     return new Promise(function (resolve, reject) {
       var input = document.createElement('input');
       input.type = 'file';
-      input.accept = '.json,application/json';
-      input.style.display = 'none';
-      input.addEventListener('change', async function () {
-        var file = input.files && input.files[0];
+      input.accept = '.json';
+      input.setAttribute('aria-hidden', 'true');
+      input.tabIndex = -1;
+      // 视觉隐藏而非 display:none（理由见上）
+      input.style.position = 'fixed';
+      input.style.left = '-9999px';
+      input.style.top = '0';
+      input.style.width = '1px';
+      input.style.height = '1px';
+      input.style.opacity = '0';
+
+      var settled = false;      // 结果只落定一次
+      var picked = false;       // change 是否已同步拿到文件（压过取消兜底）
+      var settleTimer = null;
+
+      function cleanup() {
+        window.removeEventListener('focus', onReturn);
+        document.removeEventListener('visibilitychange', onVisibility);
+        if (settleTimer !== null) { window.clearTimeout(settleTimer); settleTimer = null; }
         input.remove();
-        if (!file) { reject(new Error('未选择文件')); return; }
-        try {
-          var text = await file.text();
-          var payload = JSON.parse(text);
-          resolve(await call('POST', '/api/accounts/import', payload));
-        } catch (error) {
+      }
+      function settleCancel() {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ canceled: true });
+      }
+      function onReturn() {
+        if (settleTimer !== null) return;
+        // 给系统选择器一点时间派发 change，再判定「没选」= 取消
+        settleTimer = window.setTimeout(function () {
+          settleTimer = null;
+          if (!picked) settleCancel();
+        }, 400);
+      }
+      function onVisibility() {
+        if (document.visibilityState === 'visible') onReturn();
+      }
+
+      input.addEventListener('change', function () {
+        var file = input.files && input.files[0];
+        if (!file) { settleCancel(); return; }
+        picked = true;          // 同步置位：兜底那条链不再当取消
+        cleanup();
+        file.text().then(function (text) {
+          var payload;
+          try {
+            payload = buildImportPayload(JSON.parse(text));
+          } catch (error) {
+            settled = true;
+            reject(asError(error));
+            return;
+          }
+          call('POST', '/api/accounts/import', payload).then(
+            function (result) { settled = true; resolve(result); },
+            function (error) { settled = true; reject(asError(error)); }
+          );
+        }, function (error) {
+          settled = true;
           reject(asError(error));
-        }
+        });
       });
+
       document.body.appendChild(input);
+      window.addEventListener('focus', onReturn);
+      document.addEventListener('visibilitychange', onVisibility);
       input.click();
     });
+  }
+
+  /**
+   * 把用户选的文件整成 `POST /api/accounts/import` 的请求体。
+   * 与桌面壳 `commands.rs::import_accounts` + `unwrap_envelope_file` 同口径：
+   * 「导出文件」（顶层 accounts）、「裸账号数组」、以及网页端旧版把 `{success,data}`
+   * 信封整个存进文件的情况 —— 三种形状都认，自定义提供商定义一并带上。
+   */
+  function buildImportPayload(parsed) {
+    var document_ = parsed;
+    if (document_ && !Array.isArray(document_)
+      && !document_.accounts && document_.data && document_.data.accounts) {
+      document_ = document_.data;
+    }
+    var accounts = Array.isArray(document_) ? document_ : (document_ && document_.accounts);
+    if (!Array.isArray(accounts)) {
+      throw new Error('文件里没有 accounts 数组（不是本程序导出的账号文件？）');
+    }
+    var body = { accounts: accounts };
+    if (document_ && !Array.isArray(document_) && document_.customProviders) {
+      body.customProviders = document_.customProviders;
+    }
+    return body;
   }
 
   // ── 装配对外接口 ─────────────────────────────────────────
@@ -580,6 +729,14 @@ pub fn shim_js() -> &'static str {
     getState: function () { return call('GET', '/api/session'); },
     startLogin: function (edition, mode, provider) {
       var target = provider || 'workbuddy';
+      // 小浣熊的 redirect 分支只有在浏览器以回环地址访问面板时才成立
+      // （前提见 raccoonCallbackOriginProblem 的注释）。预检不过就不发
+      // /start（省一个注定失败的登录任务），弹指引并 reject，由引擎 toast
+      // 收尾 —— 用户看到的不再是授权页那句「授权链接无效」。
+      if (target === 'raccoon') {
+        var problem = raccoonCallbackOriginProblem();
+        if (problem) return reportRaccoonCallbackProblem(problem);
+      }
       return runLoginFlow(target, call('POST', '/api/session/login/start', {
         edition: edition || 'cn',
         provider: target,
@@ -786,9 +943,16 @@ pub fn shim_js() -> &'static str {
     getProxyPool: function () { return call('GET', '/api/proxies/pool'); },
     createProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool', payload || {}); },
     updateProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool/update', payload || {}); },
+    // 启用 / 禁用（三种来源都放行；订阅节点禁用时后端会走关闭监听端口流程，
+    // 响应带 `listener`：none / closing / opening —— 前端据此轮询列表看端口落地）
+    setProxyPoolItemEnabled: function (payload) { return call('POST', '/api/proxies/pool/enable', payload || {}); },
     removeProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/remove', { id: String(id || '') }); },
     testProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/test', { id: String(id || '') }); },
     syncClashToProxyPool: function () { return call('POST', '/api/proxies/pool/sync-clash', {}); },
+    // 代理设置（「网络代理」页的设置弹窗；与桌面壳 bridge.rs 的同名方法
+    // 成对存在，契约见 api::proxies 的模块头 settings 两条）
+    getProxySettings: function () { return call('GET', '/api/proxies/settings'); },
+    saveProxySettings: function (payload) { return call('POST', '/api/proxies/settings', payload || {}); },
     // 订阅（「网络代理」页的订阅区块；与桌面壳 bridge.rs 的同名方法成对存在，
     // 契约见 api::subscriptions 的模块头 —— 写操作后端投一条内核命令（异步），
     // 节点数与运行状态由轮询 kernel 看结果）
@@ -799,8 +963,15 @@ pub fn shim_js() -> &'static str {
     removeSubscription: function (id) { return call('POST', '/api/subscriptions/remove', { id: String(id || '') }); },
     decodeQrImage: function (payload) { return call('POST', '/api/subscriptions/decode-qr', payload || {}); },
     getKernelStatus: function () { return call('GET', '/api/subscriptions/kernel'); },
-    downloadKernel: function () { return call('POST', '/api/subscriptions/kernel/download', {}); },
+    downloadKernel: function (payload) { return call('POST', '/api/subscriptions/kernel/download', payload || {}); },
+    cancelKernelDownload: function () { return call('POST', '/api/subscriptions/kernel/download/cancel', {}); },
     restartKernel: function () { return call('POST', '/api/subscriptions/kernel/restart', {}); },
+    // 手动关闭内核（与桌面壳 bridge.rs 的同名方法成对存在；只停进程，订阅与端口注册表保留）
+    stopKernel: function () { return call('POST', '/api/subscriptions/kernel/stop', {}); },
+    removeKernel: function () { return call('POST', '/api/subscriptions/kernel/remove', {}); },
+    // 文件夹选择框是**壳的能力**（web 版没有壳）：回 `unsupported`，界面据此提示
+    // 手输路径 —— 只回 `canceled` 的话，点一下按钮什么都不会发生，用户会以为卡了
+    pickFolder: function () { return Promise.resolve({ canceled: true, unsupported: true }); },
 
     // ── 积分 / 签到 ──
     getUsage: function () { return call('GET', '/api/usage'); },
@@ -905,6 +1076,10 @@ pub fn shim_js() -> &'static str {
     runCheckinActivity: function (id, mode) { return call('POST', '/api/checkin-activity', { id: id, mode: mode }); },
     // 签到中心的聚合快照（与 bridge.rs 的同名方法同一路径）
     getCheckinCenter: function () { return call('GET', '/api/checkin-center'); },
+    // Qoder UMID 组件（设备风控身份）的状态与安装（与 bridge.rs 的同名方法成对）。
+    // 路径挂 protected：headless 形态必须带面板凭据，所以页面只能走桥、不能裸 fetch。
+    getQoderUmid: function () { return call('GET', '/api/qoder-umid'); },
+    installQoderUmid: function () { return call('POST', '/api/qoder-umid/install', {}); },
     // 签到记录明细台账（查询 / 清空；参数对象里空值不带，与 bridge.rs 成对）
     getCheckinRecords: function (params) {
       const query = new URLSearchParams();
@@ -934,7 +1109,7 @@ pub fn shim_js() -> &'static str {
       return call('POST', '/api/scheduled-tasks/' + encodeURIComponent(String(id || '')) + '/run', {});
     },
 
-    // ── 软件更新（检查可用，下载 / 安装明确拒绝）──
+    // ── 软件更新（检查 / 下载 / 容器内更新；只有「跑安装程序」是桌面专有）──
     checkUpdate: function () { return invokeShell('check_update'); },
     getUpdateStatus: function () { return call('GET', '/api/update/status'); },
     // 「软件更新」的出网线路（null = 直连）：与桌面 bridge 对齐，面板下拉读写
@@ -943,6 +1118,10 @@ pub fn shim_js() -> &'static str {
     // GitHub 令牌：读只报 {filled, origin}，写传 {token: '…' | null}
     getUpdateToken: function () { return call('GET', '/api/update/token'); },
     setUpdateToken: function (payload) { return call('POST', '/api/update/token', payload); },
+    // 「加入 beta 版」：读只报 {enabled}，写传 {enabled: true|false}（与桌面 bridge
+    // 逐字同形 —— 两侧接口名与签名必须一致，界面代码零改动地跑在两边）
+    getUpdateBeta: function () { return call('GET', '/api/update/beta'); },
+    setUpdateBeta: function (payload) { return call('POST', '/api/update/beta', payload); },
     downloadUpdate: function (payload) { return invokeShell('download_update', payload); },
     updateProgress: function () { return invokeShell('update_progress'); },
     cancelUpdate: function () { return invokeShell('cancel_update'); },
@@ -950,11 +1129,29 @@ pub fn shim_js() -> &'static str {
       return invokeShell('run_installer', { path: String(path || ''), restart: restart !== false });
     },
     openReleasePage: function (url) { return invokeShell('open_release_page', { url: String(url || '') }); },
+    // ── 容器内更新（Linux headless / Docker）：安装 → 重启 ──
+    // 三步走：下载（上面三条已接）→ installUpdate（校验 sha256 后原地替换
+    // 二进制与 ui 目录）→ restartService（进程优雅退出，容器由 restart 策略
+    // 拉起，同一个容器、可写层保留）。未开 AGENT2API_SELF_UPDATE 的部署由
+    // 后端 400 拒绝；面板按 check 返回的 selfUpdate 字段决定是否显示这些入口。
+    // 回滚用的是 install 留下的 .backup 备份（同一套替换逻辑的反向操作）。
+    installUpdate: function () { return call('POST', '/api/update/install', {}); },
+    rollbackUpdate: function () { return call('POST', '/api/update/rollback', {}); },
+    restartService: function () { return call('POST', '/api/update/restart', {}); },
 
     // ── 出站指纹脱敏 ──
     getSanitize: function () { return call('GET', '/api/sanitize'); },
     saveSanitize: function (enabled) {
       return call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true });
+    },
+
+    // ── 开发者角色兼容 ──
+    // 与桌面桥（src/bridge.rs 的 getDeveloperRoleCompat / saveDeveloperRoleCompat）
+    // 同一映射：两边接口名与签名必须一致，界面代码零改动地跑在两边
+    //（漏一侧的症状见 getClineHeaders 那段）。
+    getDeveloperRoleCompat: function () { return call('GET', '/api/developer-role-compat'); },
+    saveDeveloperRoleCompat: function (enabled) {
+      return call('PUT', '/api/developer-role-compat', { developerRoleCompat: enabled === true });
     },
 
     // ── Cline 伪装头（转发头逐键覆盖）──
@@ -1003,8 +1200,14 @@ pub fn shim_js() -> &'static str {
     exportLogs: function () { return invokeShell('export_logs'); },
 
     // ── 请求统计报表 / 数据保留 ──
-    getStatsSummary: function (range) {
-      return call('GET', '/api/stats/summary?range=' + encodeURIComponent(range));
+    // dates（`{start, end}`，`YYYY-MM-DD`）只在 range=custom 时给，
+    // 与桌面壳 bridge.rs 的同名方法同一口径（toQuery 负责跳过空值）
+    getStatsSummary: function (range, dates) {
+      return call('GET', '/api/stats/summary' + toQuery({
+        range: range,
+        startDate: dates && dates.start,
+        endDate: dates && dates.end,
+      }));
     },
     getStatsRequests: function (query) { return call('GET', '/api/stats/requests' + toQuery(query)); },
     getStatsRequestFilters: function () { return call('GET', '/api/stats/requests/filters'); },
@@ -1034,6 +1237,26 @@ pub fn shim_js() -> &'static str {
       await call('POST', '/api/panel/logout', {});
       // 服务端已撤销会话链；本地保管的双令牌一并清掉。
       clearPanelAuth();
+    },
+
+    // ── 直连网关的凭证（AI 助手页专用；桌面 bridge 的同名方法见 bridge.rs）
+    // 助手页为流式对话直接 fetch 网关基址、不经 call（见 ui-islands 的
+    // assistant-state.ts），那条请求带什么凭证由这里说了算 —— 口径必须与
+    // httpCall 完全一致，否则会出现「设置页能读、助手页 401」这种分叉：
+    //   · 直连环境：会话在 HttpOnly cookie 里，同源请求浏览器自动带，
+    //     这张表通常为空（令牌不进 JS 正是我们想保住的性质）；
+    //   · 宿主中转（cookie 往返不通）：令牌在 localStorage，必须放进
+    //     `x-panel-token`（自定义头被剥时还有标准的 Authorization 兜底）；
+    //   · 未注册管理员的部署：用户输入的网关 Key 是唯一凭证。
+    directCredentials: function () {
+      var headers = {};
+      var access = storedPanelToken('access');
+      if (access) {
+        headers['x-panel-token'] = access;
+        headers['Authorization'] = 'Bearer ' + access;
+      }
+      if (apiKey) headers['x-api-key'] = apiKey;
+      return Promise.resolve(headers);
     },
 
     // ── 机器人校验开关（登录 / 注册的 ALTCHA proof-of-work）──

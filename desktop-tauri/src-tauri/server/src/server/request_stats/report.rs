@@ -8,8 +8,11 @@
 //!   - `overview` / `dailyTrend` / `heatmap` / `streak` 走**聚合**：
 //!     这些口径要跨年（热力图固定 365 天、`all` 可能一年以上），
 //!     而明细只留 30 天，靠明细算会越算越少。
-//!   - `cacheRates` / `cacheTrend24h` 走**明细**：窗口 ≤7 天，
-//!     且要精确到分钟/整点，按天的聚合行给不出这种精度。
+//!   - `cacheRates` 走**SQL 侧聚合**（`sql::sum_cache_windows` 一次算出四档
+//!     窗口的合计，本层只做零除与百分比）：四档窗口最长 7 天，而「按窗口求和」
+//!     没有精度损失 —— 把窗口内的明细搬回内存再遍历四遍，算出来的是一样的数。
+//!   - `cacheTrend24h` 走**明细**：要精确到本地整点，按天的聚合行给不出这种
+//!     精度；也只取近 24 小时的窄列（`sql::select_summary_rows`）。
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -33,6 +36,38 @@ pub(super) const UNKNOWN_ACCOUNT_LABEL: &str = "未知账号";
 /// 热力图固定返回的天数（与 range 解耦）
 pub(super) const HEATMAP_DAYS: i64 = 365;
 
+/// 报表要读的**明细窄列**（`sql::SUMMARY_COLUMNS` 的结构形态）。
+///
+/// 为什么要有这个独立类型（不复用 `RequestEntry`）：报表对明细的消费只有
+/// 「按整点归桶 + 按模型累计」两件事，用到的字段就是这 6 个。带上完整
+/// `RequestEntry` 意味着读取侧要按 25 列去取行（`route` / `attempt_details`
+/// 都在里面），而这份数据一个字段都用不上 —— 类型窄一分，读取那一侧就没法
+/// 「顺手多取几列」（见 `sql::select_summary_rows` 与 `db::schema` 的 v15 段）。
+#[derive(Clone, Debug)]
+pub(super) struct SummaryRow {
+    pub ts: i64,
+    pub model: String,
+    /// 上游实际发出的模型名（空串 = 一次都没发出去），统计键的回落见
+    /// [`model_stat_key`]
+    pub upstream_model: String,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub prompt_tokens: i64,
+}
+
+/// 四档缓存命中率窗口：**JSON 键名 + 窗口毫秒**。
+///
+/// 两件事绑在一处是必须的：`cache_rates` 按这个数组的顺序取出 SQL 侧那四组
+/// 合计（`sql::sum_cache_windows` 的返回顺序与入参一一对应），键名又直接是
+/// 前端读的 `cacheRates.last10m` 等字段 —— 分成两个数组（一个放键名、一个放
+/// 毫秒值）迟早会漂成「第三档的键配了第二档的窗口」，且极难从界面上看出来。
+pub(super) const CACHE_WINDOWS: [(&str, i64); 4] = [
+    ("last10m", 10 * 60_000),
+    ("last1h", 60 * 60_000),
+    ("last24h", 24 * 60 * 60_000),
+    ("last7d", 7 * 24 * 60 * 60_000),
+];
+
 /// 逐天序列 / 连续天数的循环上限（兜底手改出来的超长区间）
 const MAX_TREND_DAYS: i64 = 4000;
 
@@ -42,6 +77,9 @@ const RANGE_7: &str = "7";
 const RANGE_30: &str = "30";
 const RANGE_MONTH: &str = "month";
 const RANGE_ALL: &str = "all";
+/// 自定义区间：起止日由查询串的 `startDate` / `endDate` 给出（路由层已校验），
+/// 存储层只负责把这一档与那两个日期对上。
+pub(super) const RANGE_CUSTOM: &str = "custom";
 
 /// range 归一：非法值按 `"7"`（取舍见 `usage_summary` 的注释）
 pub(super) fn normalize_range(range: &str) -> &'static str {
@@ -50,6 +88,7 @@ pub(super) fn normalize_range(range: &str) -> &'static str {
         RANGE_30 => RANGE_30,
         RANGE_MONTH => RANGE_MONTH,
         RANGE_ALL => RANGE_ALL,
+        RANGE_CUSTOM => RANGE_CUSTOM,
         _ => RANGE_7,
     }
 }
@@ -60,11 +99,32 @@ pub(super) fn normalize_range(range: &str) -> &'static str {
 /// - `month` 为本月 1 号到今天（本地时区）
 /// - `all` 取聚合里最早的一天；**完全没有数据**时给「今天往前 29 天」，
 ///   让前端拿到一个合法区间而不是空串或 null
+/// - `custom` 用调用方给出的两个日期（路由层已解析校验 `YYYY-MM-DD`）；
+///   `custom` 却没带日期（不该出现，路由层会先拦）时按 `7` 兜底 ——
+///   宁可给一个能显示的口径，也不要让整页报表 500
+///
+/// 归一的两条防御（都只兜手改查询串 / 时钟回拨这类外部输入）：
+///   - `start > end` 时交换：反向区间会让前端画出负长度时间轴；
+///   - `end` 夹到今天：未来的日期没有任何数据，如实回显一个「比今天晚」的
+///     区间只会让图例与读数看起来像坏了（聚合里本来就不会有未来的行）。
 pub(super) fn range_bounds(
     range: &str,
     daily: &BTreeMap<String, DailyEntry>,
     today: NaiveDate,
+    custom: Option<(NaiveDate, NaiveDate)>,
 ) -> (String, String) {
+    if range == RANGE_CUSTOM {
+        if let Some((custom_start, custom_end)) = custom {
+            let (custom_start, custom_end) = if custom_start > custom_end {
+                (custom_end, custom_start)
+            } else {
+                (custom_start, custom_end)
+            };
+            let end = custom_end.min(today);
+            let start = custom_start.min(end);
+            return (date_key(start), date_key(end));
+        }
+    }
     let end = today;
     let start = match range {
         RANGE_TODAY => today,
@@ -203,6 +263,76 @@ pub(super) fn push_model_accum(list: &mut Vec<ModelAccum>, model: &str, tokens: 
     }
 }
 
+/// 报表按模型聚合用的**统计键**：上游真名优先，请求名回落。
+///
+/// ── 为什么不能直接用 `model` ────────────────────────────────
+/// 映射语义重做后（见 `pipeline::resolve_model` 的说明），请求名全程保持
+/// 客户端原值，改写下沉到发送侧按家进行（`payload::send_body` →
+/// `catalog::wire_target_for_provider`）。于是 `model`（请求侧解析名）在
+/// 客户端点名映射别名时就是**别名本身** —— 报表若按它聚合，同一个上游模型
+/// 会被拆成「真名 + 各家别名」好几行。而映射只是代名，实际请求的仍是上游
+/// 那一个模型：`upstream_model`（telemetry 在发送侧采集的最终下发名）才是
+/// 「用量花在哪个模型上」的正确答案。
+///
+/// ── 回落 ──────────────────────────────────────────────────
+/// 转发前就失败的请求一次都没发出去，`upstream_model` 为空串 —— 请求名是
+/// 此时我们所知的最好信息（token 已清零，只影响请求数维度）。还没有
+/// `upstreamModel` 键的旧明细同样走回落：这不是「给旧数据猜值」，空串回落
+/// 保留的是明细里本来就有的信息。
+///
+/// 口径的落点有三个（各维求和 = 当天总量的前提就在这里）：日报折算
+/// （`aggregate::fold_into_daily`）、近 24 小时趋势（本文件的 `cache_trend_24h`）
+/// 与整行重算（`aggregate::rebuild_day` 经前者），三处**必须调同一个函数**。
+///
+/// ── 为什么接两个 &str 而不是 &RequestEntry ───────────────────
+/// 同一口径现在要服务两种行：完整的 `RequestEntry`（按天重算）与报表的窄行
+/// [`SummaryRow`]（近 24 小时趋势，只读 6 列，见 `sql::select_summary_rows`）。
+/// 若签名收 `&RequestEntry`，窄行那一侧就只能自己再写一遍 `if upstream 空就
+/// 回落` —— 那正是这个函数要防的「同一口径两处维护」。取字段而不是取整行，
+/// 两种调用方都能直接用。
+pub(super) fn model_stat_key<'a>(model: &'a str, upstream_model: &'a str) -> &'a str {
+    if upstream_model.is_empty() {
+        model
+    } else {
+        upstream_model
+    }
+}
+
+/// 模型分解 → 报表 JSON 数组（按天柱状图与 24 小时折线的悬停读数用）。
+///
+/// 形状 `[{model, label, tokens, requests}]`，按 tokens 降序（并列比 requests，
+/// 再并列比名字，保证同一份数据多次调用顺序一致）。
+///
+/// 与 `build_models` 的两处口径差异：
+///   - 全零组剔除的判据是 `tokens > 0`（这里只给悬停读数用，一条 token 为 0
+///     的模型没有可读的量；请求数维度它是过程量，见 `fold_into_daily` 的说明）；
+///   - 空模型名照常返回（label 为「未知模型」）：它代表的真实用量不该从读数里
+///     消失，否则各行之和与当天总量对不上。
+pub(super) fn model_breakdown_json(list: &[ModelAccum]) -> Vec<Value> {
+    let mut rows: Vec<&ModelAccum> = list.iter().filter(|item| item.tokens > 0).collect();
+    rows.sort_by(|left, right| {
+        right
+            .tokens
+            .cmp(&left.tokens)
+            .then(right.requests.cmp(&left.requests))
+            .then(left.model.cmp(&right.model))
+    });
+    rows.into_iter()
+        .map(|item| {
+            json!({
+                "model": item.model,
+                "label": if item.model.is_empty() {
+                    UNKNOWN_MODEL_LABEL.to_string()
+                } else {
+                    item.model.clone()
+                },
+                "tokens": item.tokens,
+                "requests": item.requests,
+            })
+        })
+        .collect()
+}
+
 /// 把一批（一条或一天的）请求并进按 provider 的累计表。
 ///
 /// 与 `push_model_accum` 同一取舍：provider 数量是个位数，线性查找比 HashMap
@@ -273,24 +403,21 @@ pub(super) fn push_account_accum(
     }
 }
 
-/// provider id → 展示 label（中文名）。
+/// provider id → 展示 label。
 ///
-/// 走 `providers::meta` 的注册表换算，**不在这里维护第二份 id→label 映射**：
-/// 注册表是 provider 身份的唯一事实来源，两处映射迟早漂移，而这类漂移不会报错，
-/// 只会让报表里的名字与账号页对不上。
+/// 直接委托 `providers::label_of` —— 「id → 给人看的名字」的唯一入口，报表层
+/// **不得**自建换算（注册表是 provider 身份的唯一事实来源，两处映射迟早漂移，
+/// 而这类漂移不会报错，只会让报表里的名字与账号页对不上）。入口统一处理两类
+/// 身份：内置 provider 走注册表 `meta().label`；`custom-` 前缀的自定义提供商
+/// 查存储里用户起的名字 —— 那是运行期数据（config 内存快照，不碰磁盘），
+/// 只走注册表的话会被原样回显成 `custom-…`。
 ///
-/// 未注册的 id（前端比后端新、或手改文件塞进来的值）**原样返回**：
-/// 显示一个陌生的英文 id 好过显示空白，至少能提示「这是谁」。
-/// 空串同样原样返回（空 label），由展示层决定用什么占位（当前约定是「—」）——
-/// 这一层只回答「id 对应什么名字」，不做展示决策。
+/// 未登记 / 已删除的 id 仍由入口原样回显：显示一个陌生的英文 id 好过显示空白，
+/// 至少能提示「这是谁」。空串同样原样返回（空 label），由展示层决定用什么
+/// 占位（当前约定是「未知」/「—」）—— 这一层只回答「id 对应什么名字」，
+/// 不做展示决策。
 pub(super) fn provider_label(id: &str) -> String {
-    if id.is_empty() {
-        return String::new();
-    }
-    match crate::server::core::providers::kind_from_id(id) {
-        Some(kind) => crate::server::core::providers::meta(kind).label.to_string(),
-        None => id.to_string(),
-    }
+    crate::server::core::providers::label_of(id)
 }
 
 /// 区间级的按 provider 汇总 → `/api/stats/summary` 的 `providers` 数组。
@@ -517,6 +644,11 @@ pub(super) fn build_top_model(totals: &[ModelAccum], range_tokens: i64) -> Value
 ///
 /// 前端按天画柱状图，缺的那天必须占位（补 0）而不是不返回 ——
 /// 少一天会让整条曲线在视觉上被压缩，趋势看起来是错的。
+///
+/// 每天额外带 `models`（`[{model, label, tokens, requests}]`，按 tokens 降序）：
+/// 柱状图的悬停读数要给出「这一天总用量是多少、分别花在哪些模型上」，
+/// 而按模型的分解只存在于聚合行（`model_tokens` 列）—— 明细只在报表读明细的
+/// 24 小时窗口里才被读，这里拿不到也不会回算（见 [`model_breakdown_json`]）。
 pub(super) fn daily_trend(daily: &BTreeMap<String, DailyEntry>, start: &str, end: &str) -> Vec<Value> {
     let (Some(start_date), Some(end_date)) = (parse_key(start), parse_key(end)) else {
         return Vec::new();
@@ -526,11 +658,15 @@ pub(super) fn daily_trend(daily: &BTreeMap<String, DailyEntry>, start: &str, end
     // 上限兜底：手改文件把区间撑到十年也不会把响应撑爆
     while cursor <= end_date && out.len() < MAX_TREND_DAYS as usize {
         let key = date_key(cursor);
-        let (tokens, requests) = daily
-            .get(&key)
-            .map(|day| (day.tokens, day.requests))
-            .unwrap_or((0, 0));
-        out.push(json!({ "date": key, "tokens": tokens, "requests": requests }));
+        let day = daily.get(&key);
+        let (tokens, requests) = day.map(|item| (item.tokens, item.requests)).unwrap_or((0, 0));
+        let models = day.map(|item| model_breakdown_json(&item.model_tokens)).unwrap_or_default();
+        out.push(json!({
+            "date": key,
+            "tokens": tokens,
+            "requests": requests,
+            "models": models,
+        }));
         cursor += ChronoDuration::days(1);
     }
     out
@@ -581,27 +717,18 @@ pub(super) fn streak(daily: &BTreeMap<String, DailyEntry>, today: NaiveDate) -> 
 // ─── 缓存命中率（窗口都很短，必须从明细算）────────────────────
 
 /// 四档缓存命中率
-pub(super) fn cache_rates(entries: &[RequestEntry], now: i64) -> Value {
-    const MINUTE: i64 = 60_000;
-    json!({
-        "last10m": cache_rate(entries, now - 10 * MINUTE, now),
-        "last1h": cache_rate(entries, now - 60 * MINUTE, now),
-        "last24h": cache_rate(entries, now - 24 * 60 * MINUTE, now),
-        "last7d": cache_rate(entries, now - 7 * 24 * 60 * MINUTE, now),
-    })
-}
-
-/// 单窗口的命中率（`[since_ms, now]` 闭区间）
-fn cache_rate(entries: &[RequestEntry], since_ms: i64, now: i64) -> Value {
-    let mut hit: i64 = 0;
-    let mut input: i64 = 0;
-    for item in entries {
-        if item.ts >= since_ms && item.ts <= now {
-            hit += item.cache_read_tokens;
-            input += item.prompt_tokens;
-        }
+pub(super) fn cache_rates(totals: &[(i64, i64)]) -> Value {
+    let mut out = serde_json::Map::new();
+    for (index, (key, _window)) in CACHE_WINDOWS.iter().enumerate() {
+        // 缺项按「这个窗口没有数据」补零（不该发生：SQL 侧每个窗口都有一组
+        // 合计，见 `sql::sum_cache_windows`）—— 与 safe_rate 的零除口径一致
+        let (hit, input) = totals.get(index).copied().unwrap_or((0, 0));
+        out.insert(
+            key.to_string(),
+            json!({ "hitTokens": hit, "inputTokens": input, "rate": safe_rate(hit, input) }),
+        );
     }
-    json!({ "hitTokens": hit, "inputTokens": input, "rate": safe_rate(hit, input) })
+    Value::Object(out)
 }
 
 /// 近 24 个**本地整点**的命中率与用量趋势（无数据的整点补零）。
@@ -612,33 +739,61 @@ fn cache_rate(entries: &[RequestEntry], since_ms: i64, now: i64) -> Value {
 /// 每个整点同时给出 `totalTokens`：前端那一张图要画**两条线**
 /// （命中率 + 总 Token），两段数据必须同源同桶 —— 分成两次请求会让两条线
 /// 在「这一小时算不算」上出现分歧，看起来像其中一条错位了一格。
-pub(super) fn cache_trend_24h(entries: &[RequestEntry], now: i64) -> Vec<Value> {
+///
+/// 每个整点还带 `models`（`[{model, label, tokens, requests}]`，按 tokens 降序）：
+/// 折线图的悬停读数要给出「这一小时总用量是多少、分别花在哪些模型上」。
+/// 模型统计键走 [`model_stat_key`]（与日报折算同一口径），于是同一小时里
+/// 「各模型之和」必然等于该小时的 `totalTokens`（当份数据之内）。
+///
+/// 入参是**报表窄行**（[`SummaryRow`]，只 6 列）而不是完整明细：本函数是改造后
+/// 唯一还要逐条读明细的地方，而它需要的字段全在窄行的列集里（见
+/// `sql::select_summary_rows`）。窗口外（`ts` 早于 23 个整点前）的行照旧跳过 ——
+/// 调用方给的可能是整个 `request_stats::SUMMARY_WINDOW_MS` 窗口，两者在边界上
+/// 不完全重合（本地时区的整点切法与「now 往前推 N 小时」差几十分钟）。
+pub(super) fn cache_trend_24h(entries: &[SummaryRow], now: i64) -> Vec<Value> {
+    /// 单个整点的桶：三项总量 + 按模型的累计（模型数是个位到十位级，
+    /// 线性查找即可 —— 与 `push_model_accum` 同一取舍）
+    #[derive(Default)]
+    struct HourBucket {
+        hit: i64,
+        input: i64,
+        total: i64,
+        models: Vec<ModelAccum>,
+    }
+
     let start = hour_floor(ms_to_local(now)) - ChronoDuration::hours(23);
     let start_ms = start.timestamp_millis();
 
     // 先把窗口内的条目按整点键归桶，再按 24 个整点取值 ——
     // 逐个整点扫一遍明细是 24×N，这样只需一次遍历
-    let mut buckets: HashMap<String, (i64, i64, i64)> = HashMap::new();
+    let mut buckets: HashMap<String, HourBucket> = HashMap::new();
     for item in entries {
         if item.ts < start_ms || item.ts > now {
             continue;
         }
-        let slot = buckets.entry(hour_key(ms_to_local(item.ts))).or_insert((0, 0, 0));
-        slot.0 += item.cache_read_tokens;
-        slot.1 += item.prompt_tokens;
-        slot.2 += item.total_tokens;
+        let slot = buckets.entry(hour_key(ms_to_local(item.ts))).or_default();
+        slot.hit += item.cache_read_tokens;
+        slot.input += item.prompt_tokens;
+        slot.total += item.total_tokens;
+        push_model_accum(
+            &mut slot.models,
+            model_stat_key(&item.model, &item.upstream_model),
+            item.total_tokens,
+            1,
+        );
     }
 
     let mut out = Vec::with_capacity(24);
     for step in 0..24 {
         let key = hour_key(start + ChronoDuration::hours(step));
-        let (hit, input, total) = buckets.get(&key).copied().unwrap_or((0, 0, 0));
+        let slot = buckets.remove(&key).unwrap_or_default();
         out.push(json!({
             "hour": key,
-            "hitTokens": hit,
-            "inputTokens": input,
-            "totalTokens": total,
-            "rate": safe_rate(hit, input),
+            "hitTokens": slot.hit,
+            "inputTokens": slot.input,
+            "totalTokens": slot.total,
+            "rate": safe_rate(slot.hit, slot.input),
+            "models": model_breakdown_json(&slot.models),
         }));
     }
     out

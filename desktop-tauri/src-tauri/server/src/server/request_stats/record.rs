@@ -16,7 +16,7 @@
 //!
 //! ── 为什么读入侧全字段带 `default` ───────────────────────────
 //! 两个地方要靠它容错，都还在生效：
-//!   - **旧文件解析**（迁移项）：明细 30 天、聚合一年，中间可能跨好几个版本，
+//!   - **旧文件解析**（迁移项）：旧文件里的行可能跨好几个版本，
 //!     缺少新字段的旧行必须还能读进来（缺的按 0 / 空算），否则升级一次
 //!     就会把用户已有的曲线整段丢掉；
 //!   - **聚合的三个 JSON 列**（`model_tokens` / `provider_stats` /
@@ -26,27 +26,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 明细保留的最大条数（超出丢最旧的）。
-///
-/// 与按时间的保留期是双保险：保留期管「多久」，上限管「多少」——
-/// 短时间内的突发流量不该按天数比例吃光磁盘。
-///
-/// 改造前它是「内存数组的环形保留」（在 `insert_sorted` 里 drain）；现在由
-/// `sql::trim_requests_capacity` 用一条 `DELETE` 守住，**按 ts 保留最新的 N 条**
-/// —— 与旧实现「从升序数组头部 drain 掉溢出部分」等价（头部就是 ts 最小的那些）。
-pub const MAX_ENTRIES: usize = 20_000;
-
-/// 聚合行保留的最大天数（兜底：手改库塞进十万行时不至于把报表撑爆）
-pub const MAX_DAILY_DAYS: usize = 4000;
-
-/// 原始报文（`request_raw` 表）保留的最大行数（超出丢最旧的，按 ts）。
-///
-/// 报文是「预览对话」的原料，也是三张请求统计表里单行最大的 —— 明细 2 万行
-/// 若每行都配一份 128 KiB 的正文，库会平白多出两个多 GB 的上限。2000 行
-/// 覆盖最近几天的高频使用（按 ts 丢最旧），足够回看最近的对话；更早的正文
-/// 随容量闸让位给新请求，明细行本身仍在（只是详情弹窗里没有正文了）。
-pub const MAX_RAW_ROWS: usize = 2000;
-
 /// 原始正文的**单侧**字节上限：请求侧 / 响应侧各自独立计，超出截断。
 ///
 /// 为什么放在存储层而不是采集处（`api::pipeline`）：`raw_body` 读取时要按
@@ -55,9 +34,30 @@ pub const MAX_RAW_ROWS: usize = 2000;
 ///
 /// 为什么是 128 KiB：足够装下绝大多数对话轮的完整 JSON（含 system 与工具
 /// 定义）；更长的报文通常是超大上下文或附件 —— 那种报文的前 128 KiB 已足够
-/// 「预览对话」辨认这一轮聊了什么，全文有调试模式（`core::debug_traffic`，
-/// 上限更小、按开关采集）可查。两侧各自截断：一侧超长不该吃掉另一侧的配额。
+/// 「预览对话」辨认这一轮聊了什么。采集与调试模式同一个开关（见
+/// `api::pipeline::capture_raw_body`）：关着时两侧都不采，本上限只约束
+/// 开着时的单条体积。两侧各自截断：一侧超长不该吃掉另一侧的配额。
 pub const MAX_RAW_BODY_BYTES: usize = 128 * 1024;
+
+/// `request_raw`（原始正文）的**总条数上限**：超出时按 `ts` 从旧到新删。
+///
+/// 为什么需要它：`MAX_RAW_BODY_BYTES` 只管「一条多大」，不管「一共存多少条」——
+/// 调试模式开着跑一阵，这张表就会攒成整个库里最大的一块。实测某用户的库：
+/// 明细三万余行、原始正文只有 1,455 条，后者却占 **244 MB**（平均每条 168 KB，
+/// 因为对话轮次的完整 JSON 基本都贴着上限）。库文件因此膨胀到 470 MB，而
+/// SQLite 的页面缓存只有几 MB 量级 —— 受影响的已经不只是这张表的读取，而是
+/// 同库所有查询的页命中率。
+///
+/// 为什么按**条数**判而不是按字节：条数一条 `COUNT(*)` 就数出来（主键索引上
+/// 零点几毫秒），而按字节要 `SUM(size)` / `SUM(length(...))` —— 实测在同一个库上
+/// 分别要 180 ms / 270 ms（要走 overflow 页读大字段），放进每请求都要跑的记账
+/// 路径是拿一个真问题换一个更大的问题（见 `sql::count_raw` 的原话）。
+///
+/// 1,000 条的取舍：预览对话服务的是排查（「刚才那条请求发了什么」），最近的
+/// 一千条覆盖了全部近期排查场景；按当前库的平均体积折算约 160 MB，比不限量
+/// 好得多，又不必让用户去找开关。真要看更早的正文，`ts` 与明细都还在 ——
+/// 少的是正文，不是记录本身。
+pub const MAX_RAW_ROWS: usize = 1000;
 
 /// 查询分页的默认条数与上限。
 /// 两个常量都被 `RequestStats::query_requests`（路由 `/api/stats/requests`）
@@ -65,10 +65,13 @@ pub const MAX_RAW_BODY_BYTES: usize = 128 * 1024;
 pub const DEFAULT_LIMIT: usize = 50;
 pub const MAX_LIMIT: usize = 500;
 
-/// 保留期设置（对应以后设置页里的两个天数，带默认值）。
+/// 保留期设置（对应设置页「数据保留」里的两个天数，带默认值）。
 ///
 /// 用独立结构而不是把天数直接摊进构造函数：将来设置里加字段时
-/// `new(directory, get_retention)` 的签名不用变，调用方也不用跟着改。
+/// `with_db(db, get_retention)` 的签名不用变，调用方也不用跟着改。
+///
+/// 默认 99999 天（约 274 年）是**故意的近似无限**：默认行为与「全量保留」
+/// 一致，用户随时可以把某一项改小、保存后立即裁剪。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retention {
     /// 明细保留天数
@@ -79,17 +82,20 @@ pub struct Retention {
 
 impl Default for Retention {
     fn default() -> Self {
-        Self { request_days: 30, daily_days: 365 }
+        Self { request_days: 99999, daily_days: 99999 }
     }
 }
 
 impl Retention {
-    /// 归一化：下限 1 天（保留 0 天等于什么都不存，不是有效配置），
-    /// 上限 10 年（防手改 config.json 写个天文数字让裁剪逻辑空转）
+    /// 归一化：夹到与后端同一套范围里（`config::RETENTION_MIN_DAYS` /
+    /// `RETENTION_MAX_DAYS`，常量注释写明两侧必须同源）。读侧（config 解析）
+    /// 与写侧（PUT 校验）都已按这套范围处理过，这里再夹一次是防御：
+    /// `Retention` 还会被手改的库值构造出来。
     pub(super) fn normalized(self) -> Self {
+        use crate::server::config::{RETENTION_MAX_DAYS, RETENTION_MIN_DAYS};
         Self {
-            request_days: self.request_days.clamp(1, 3650),
-            daily_days: self.daily_days.clamp(1, 3650),
+            request_days: self.request_days.clamp(RETENTION_MIN_DAYS, RETENTION_MAX_DAYS),
+            daily_days: self.daily_days.clamp(RETENTION_MIN_DAYS, RETENTION_MAX_DAYS),
         }
     }
 }
@@ -301,6 +307,20 @@ pub struct RequestEntry {
     /// `row.get(n)` 的序号。
     #[serde(rename = "isTest", default)]
     pub is_test: bool,
+    /// **请求来源客户端**（由入口从下游 `User-Agent` 识别的类型，schema v12
+    /// 加的列；旧行 `default` 读成空串 = 没有记录）。
+    ///
+    /// 取值是 `core::client::classify` 的输出：`Codex` / `ZCode` /
+    /// `Claude Code` / `deepseek-harness` / `GitHub Copilot` / `CherryStudio` /
+    /// `other`，无 UA 时为空串。存的是**归类结果**而不是原始 UA：UA 带版本号，
+    /// 逐条存会把明细撑大且没法直接读；「是哪家客户端」这一维只需要归类。
+    ///
+    /// 取值本身就是展示值（产品名不翻译），前端只把 `other` 显示成「其它」、
+    /// 空串显示成占位符。请求日志的「客户端」列读它。
+    ///
+    /// 与 `phase` 同一位置纪律：新加的列排在结构体末尾。
+    #[serde(default)]
+    pub client: String,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -466,6 +486,10 @@ pub struct NewRequestEntry {
     pub sensitive_hits: Vec<SensitiveHit>,
     /// 这条请求是不是模型测试发起的（见 `RequestEntry::is_test`；默认 false）。
     pub is_test: bool,
+    /// 请求来源客户端（入口由 `User-Agent` 判别后带入，见 `RequestEntry::client`；
+    /// 不采集的路径为空串）。模型测试没有下游 UA，保持空串 —— 「谁发起的」
+    /// 那件事已经由 `is_test` 表达，这里不编一个 `test` 值出来。
+    pub client: String,
 }
 
 impl NewRequestEntry {
@@ -502,6 +526,9 @@ impl NewRequestEntry {
             // 默认是真实流量；模型测试那一条由 `api::model_test` 显式改成 true
             // （`RecordContext::is_test` 一路带过来）
             is_test: false,
+            // 客户端同样「有采集才有值」：入口取到 UA 才填（见 `RequestEntry::client`），
+            // 拿不到 UA 的路径保持空串，前端显示占位符
+            client: String::new(),
         }
     }
 
@@ -614,6 +641,10 @@ impl NewRequestEntry {
             // 来源标记原样透传（不做任何推导）：它是调用方（入口 handler）
             // 才知道的事实，存储层只负责把它带进库里
             is_test: self.is_test,
+            // 客户端同理原样透传（trim 的理由与 provider 相同）：入口已经过
+            // `core::client::classify`，存储层不再重新归类 —— 存储层不认识
+            // UA 规则，两处各判一遍迟早会漂
+            client: self.client.trim().to_string(),
         }
     }
 }
@@ -697,9 +728,9 @@ pub struct DailyEntry {
     pub cache_input_tokens: i64,
     /// 当天的按模型累计（**契约之外的补充字段**）。
     ///
-    /// 为什么必须存在：`topModel` 要按区间跨天累计，而明细只留 30 天，
-    /// `"all"` / `"month"` 这类跨年区间只能靠聚合行算模型占比；
-    /// 没有它，全年 tokens 冠军会在明细到期后突然变形。
+    /// 为什么必须存在：`topModel` 要按区间跨天累计，而报表侧只从明细取近
+    /// 7 天窗口（`SUMMARY_WINDOW_MS`），`"all"` / `"month"` 这类跨年区间
+    /// 只能靠聚合行算模型占比；没有它，全年 tokens 冠军就只剩最近一周看得见。
     /// 前端只读自己认识的键，多一个 `modelTokens` 不影响既有契约。
     /// 单天无模型明细时整键省略（`skip_serializing_if`）——
     /// 这条在**旧文件解析**时仍生效（迁移读的就是旧格式），入库时那三个列由
@@ -714,15 +745,15 @@ pub struct DailyEntry {
     /// 字段，也让「模型累计」这个概念的读者要自己分辨哪几个字段有意义。
     ///
     /// 与 `modelTokens` 同理，这份累计必须存在：`topModel` 之外的任何区间级
-    /// 分组统计都要跨过明细的 30 天保留期（`all` / `month` 可能跨年），
-    /// 只靠明细算会在明细到期后突然少掉一大段。
+    /// 分组统计都要跨过报表读明细的窗口（`SUMMARY_WINDOW_MS`，`all` / `month`
+    /// 可能跨年），只靠明细算会少掉一大段。
     /// 键名不沿用 `*Tokens` 是因为它承载的语义比 tokens 宽（请求数与成功数）。
     #[serde(rename = "providerStats", default, skip_serializing_if = "Vec::is_empty")]
     pub provider_stats: Vec<ProviderAccum>,
     /// 当天的按账号累计（**契约之外的补充字段**）。
     ///
-    /// 与 `providerStats` 同一理由：区间级的账号用量排行要跨过明细的 30 天
-    /// 保留期，只有明细的话 `all` / `month` 会在明细到期后突然少掉一大段。
+    /// 与 `providerStats` 同一理由：区间级的账号用量排行要跨过报表读明细的
+    /// 窗口，只有明细的话 `all` / `month` 会少掉一大段。
     #[serde(rename = "accountStats", default, skip_serializing_if = "Vec::is_empty")]
     pub account_stats: Vec<AccountAccum>,
 }

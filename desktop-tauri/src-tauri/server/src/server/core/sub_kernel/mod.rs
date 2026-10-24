@@ -5,14 +5,16 @@
 //! （`core::egress`）只认 http / socks5 —— 内核负责把订阅转换成本地
 //! http/socks 监听器（每节点一个端口），出网层照旧连 `127.0.0.1:端口`，
 //! 协议代码一行不改。内核本体是 mihomo 官方二进制（GPL-3.0，按需下载、
-//! sha256 校验后落 `{config_dir}/proxy-kernel/`），与本进程是**两个独立
-//! 程序**（通过本地 socket 通信，GPL 的「聚合」语义，本项目保持 MIT）。
+//! sha256 校验后落 `kernel_dir()` —— 默认 `{config_dir}/proxy-kernel/`，
+//! 下载弹窗里能改到别的盘上），与本进程是**两个独立程序**（通过本地 socket
+//! 通信，GPL 的「聚合」语义，本项目保持 MIT）。
 //!
 //! ── 下载按需而不是捆绑 ───────────────────────────────────────
 //! 内核 ~20-40MB/平台，捆绑进安装包会让所有用户（多数不用订阅功能）白背
-//! 这份体积；按需下载在「订阅」区块第一次点「下载内核」时才拉（GitHub
-//! Release 的预编译产物，出口候选与软件更新同一套：设置的更新出口 → 直连
-//! → Clash 混合端口兜底），sha256 与 pin 死的值对不上就整体拒装。
+//! 这份体积；按需下载在「订阅管理」第一次点「下载内核」时才拉（GitHub
+//! Release 的预编译产物）。出口与目录都由**下载弹窗**在开始前定下并落配置：
+//! 出口是选定的那条线路（没选时走直连 → Clash 混合端口兜底的默认链），
+//! 目录是 `kernelDir`；sha256 与 pin 死的值对不上就整体拒装。
 //!
 //! ── 单 worker 串行（为什么不并发 spawn / kill）────────────────
 //! 内核操作（下载 / 重建配置 / 重启 / 刷新）互相踩：并发重启会 spawn 出两个
@@ -35,6 +37,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
+use crate::server::core::account_store::AccountStore;
 use crate::server::core::proxy_pool;
 use crate::server::logging;
 
@@ -48,9 +51,40 @@ pub const KERNEL_VERSION: &str = "v1.19.32";
 /// 内核目录名（`config_dir` 下的子目录，与日志 / updates 同级）
 pub const KERNEL_DIR_NAME: &str = "proxy-kernel";
 
-/// 内核目录：`{config_dir}/proxy-kernel/`
-pub fn kernel_dir() -> PathBuf {
+/// 内核的**默认**存放目录：`{config_dir}/proxy-kernel/`
+pub fn default_kernel_dir() -> PathBuf {
     crate::paths::config_dir().join(KERNEL_DIR_NAME)
+}
+
+/// 内核目录：配置里 `kernelDir` 写了**绝对路径**就用它，否则回落默认目录。
+///
+/// 「写坏回落而不是报错」与本项目其它目录型配置（`logDir`）同一取向：这里报错
+/// 会让内核功能整个不可用，而「手改配置写了个相对路径」最多是配置不规范。
+/// 目录本身未必存在 —— 下载时才 `create_dir_all`（改目录后第一次下载就建好）。
+pub fn kernel_dir() -> PathBuf {
+    crate::server::config::kernel_dir_raw()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(default_kernel_dir)
+}
+
+/// 进程级账号存储句柄（bootstrap 时 install 一次）。
+///
+/// 内核的 lazy listeners（`runtime::allocate_listeners`）要回答「哪些节点该开
+/// 监听器」—— 其中**账号引用**那一半的答案在账号存储里，而 worker 是独立任务、
+/// 拿不到 `ServerState`。与 `proxy_pool::install` 同一形态：bootstrap 把句柄装
+/// 进来，runtime 用它读引用集合。`None`（库不可用）时引用集合按空处理 —— 账号
+/// 引用的节点一个都不开，但**测试钉住的节点照常开**（那一半在代理池里，与账号
+/// 库无关，见 `runtime::listener_node_keys`），节点仍镜像进池、可恢复。
+static STORE: OnceLock<Option<AccountStore>> = OnceLock::new();
+
+/// 接线（`ServerState::bootstrap` 调用）。重复调用无副作用。
+pub fn install_store(store: Option<AccountStore>) {
+    let _ = STORE.set(store);
+}
+
+fn account_store() -> Option<&'static AccountStore> {
+    STORE.get().and_then(Option::as_ref)
 }
 
 /// 当前平台的发布资产（名字 + sha256 pin）。
@@ -114,8 +148,15 @@ pub struct ProviderInput {
     pub id: String,
     /// 订阅名（代理池节点条目的命名来源）
     pub name: String,
-    /// 订阅链接
+    /// 订阅链接（本地文件订阅为空串）
     pub url: String,
+    /// 本地 YAML 原文（`kind: local` 的订阅才有；http 订阅为空串）。
+    ///
+    /// **content 非空 = file provider**（配置生成与文件落位都以它判别，不另设
+    /// kind 字段 —— 订阅存储侧已保证 local 条目的 content 必非空，空内容进
+    /// 不了库）。内容不写死在配置里：runtime 每次重启前把它写进 provider
+    /// 缓存位（`providers/sub_<id>.yaml`），内核照普通 file provider 读它。
+    pub content: String,
 }
 
 /// 内核状态快照（worker 每步操作后更新；status_json 读它）
@@ -127,9 +168,16 @@ pub struct StatusSnapshot {
     /// 各订阅最后一次成功同步：`subId → {name, count, at}`
     pub provider_sync: Map<String, Value>,
     pub download: DownloadProgress,
+    /// 手动关闭闩：「关闭内核」（[`request_halt`]）置位，任何 Restart 执行时
+    /// 清零。置位期间测试 / 保存引用 / 订阅同步不再悄悄把内核拉起来，
+    /// 改为提示先点「启动内核」。
+    pub halted: bool,
 }
 
-/// 下载进度（状态机：idle → downloading → done / error）
+/// 下载进度（状态机：idle → downloading → done / error / canceled）
+///
+/// `canceled` 是**用户按了「停止下载」**（不是失败）：临时压缩包已删掉，
+/// 界面既不报错也不提示重试，回到「可以重新开始」的形态。
 pub struct DownloadProgress {
     pub state: &'static str,
     pub received: u64,
@@ -151,6 +199,7 @@ impl Default for StatusSnapshot {
                 total: 0,
                 error: None,
             },
+            halted: false,
         }
     }
 }
@@ -185,7 +234,15 @@ enum Command {
     Refresh { sub_id: String, providers: Vec<ProviderInput> },
     /// 下载内核；带非空 providers 时下完自动拉起
     Download(Vec<ProviderInput>),
-    Stop,
+    /// 停掉内核并删除已下载的内核（二进制 / 配置 / 端口映射）
+    Remove,
+    /// 停掉内核。`clear_pool` = 是否把订阅节点镜像一并摘掉：
+    ///   · `true`  ——「一条启用订阅都不剩」的自动停（订阅删光 / 全部禁用后调用），
+    ///              镜像要清（理由见 execute 分支里的说明）；
+    ///   · `false` —— 手动「关闭内核」（内核状态条的按钮）：订阅还在、账号引用
+    ///              还在，池条目与端口注册表**原样保留**，「启动内核」后原位
+    ///              恢复（端口沿用注册表，账号引用不漂移）。
+    Stop { clear_pool: bool },
 }
 
 static SENDER: OnceLock<mpsc::UnboundedSender<Command>> = OnceLock::new();
@@ -215,7 +272,9 @@ pub fn spawn_worker() {
 async fn execute(command: Command) {
     match command {
         Command::Restart(providers) => {
+            // 启动 / 重启 = 用户明确要内核起来，手动关闭闩在此清零
             patch_status(|snapshot| {
+                snapshot.halted = false;
                 snapshot.download.error = None;
             });
             if let Err(error) = runtime::run_restart(&providers).await {
@@ -236,7 +295,7 @@ async fn execute(command: Command) {
         }
         Command::Download(providers) => {
             match download::run_download().await {
-                Ok(()) => {
+                Ok(download::DownloadOutcome::Done) => {
                     patch_status(|snapshot| {
                         snapshot.download.state = "done";
                         snapshot.download.error = None;
@@ -257,6 +316,17 @@ async fn execute(command: Command) {
                         }
                     }
                 }
+                // 用户按了停止：不是失败，**不写 last_error**（那是给「真出错」留的
+                // 位置，写进去会让内核状态条上挂着一条用户自己按出来的红字）
+                Ok(download::DownloadOutcome::Canceled) => {
+                    patch_status(|snapshot| {
+                        snapshot.download.state = "canceled";
+                        snapshot.download.received = 0;
+                        snapshot.download.total = 0;
+                        snapshot.download.error = None;
+                    });
+                    logging::log("[Subscription]", "⏹️ 已停止下载代理内核（临时文件已删除）");
+                }
                 Err(error) => {
                     patch_status(|snapshot| {
                         snapshot.download.state = "error";
@@ -267,17 +337,68 @@ async fn execute(command: Command) {
                 }
             }
         }
-        Command::Stop => {
+        Command::Remove => {
+            // 先停进程再动文件：Windows 上运行中的 exe 删不掉（共享冲突）。
+            // 两步都做：cleanup_stale_kernel 收拾上次运行遗留的（pid 从状态文件里来，
+            // 控制器的 secret 对上才杀），stop_kernel 收当前这个子进程句柄 ——
+            // 只做后者时，遗留进程占着二进制会让删除失败。
+            runtime::cleanup_stale_kernel().await;
             runtime::stop_kernel().await;
-            // 一条启用订阅都不剩 → 订阅节点镜像一并清空（空目标集合 = 摘掉
-            // 全部 subscription 条目，见 `proxy_pool::sync_subscription_nodes`）。
-            //
-            // **必须在停内核这条路径上清**：只有「还有其它启用订阅」时才会走
-            // 重启路径顺带同步，删掉最后一条订阅时若不清，节点镜像就留在池里
-            // 成了孤儿 —— 归属订阅已不存在，界面上挂着且删不掉（实测踩过）。
-            sync_nodes_to_pool(&[]);
+            match download::uninstall() {
+                Ok(()) => {
+                    // 内核没了 = 订阅节点的监听器全没了：端口必须一起回收，否则
+                    // 池里那些地址指向的是**没人监听**的端口，界面上却看着像能用。
+                    // 不摘条目（保 id / 保账号引用），只把端口置空 —— 重装内核后
+                    // 同步按 providerId + node 原位写回，见该函数的说明。
+                    match proxy_pool::unprovision_subscription_nodes() {
+                        Ok(changes) if changes > 0 => logging::log(
+                            "[Subscription]",
+                            &format!("🔄 已回收 {changes} 个订阅节点的监听端口"),
+                        ),
+                        Ok(_) => {}
+                        Err(error) => logging::log(
+                            "[Subscription]",
+                            &format!("❌ 回收订阅节点端口失败: {error}"),
+                        ),
+                    }
+                    // 整份状态回到初始：上一次运行的端口 / 监听器数 / 各订阅同步
+                    // 记录（订阅表里的「N 个节点」「上次同步」由它注入）都不再成立；
+                    // 保留 last_error 才是错的（那说的是已经不在磁盘上的内核）
+                    patch_status(|snapshot| {
+                        *snapshot = StatusSnapshot::default();
+                    });
+                    logging::log(
+                        "[Subscription]",
+                        &format!("🗑️ 已删除代理内核 {KERNEL_VERSION}（订阅与账号引用保留）"),
+                    );
+                }
+                Err(error) => {
+                    patch_status(|snapshot| {
+                        snapshot.last_error = Some(error.clone());
+                    });
+                    logging::log("[Subscription]", &format!("❌ 删除内核失败: {error}"));
+                }
+            }
+        }
+        Command::Stop { clear_pool } => {
+            runtime::stop_kernel().await;
+            if clear_pool {
+                // 一条启用订阅都不剩 → 订阅节点镜像一并清空（空目标集合 = 摘掉
+                // 全部 subscription 条目，见 `proxy_pool::sync_subscription_nodes`）。
+                //
+                // **必须在停内核这条路径上清**：只有「还有其它启用订阅」时才会走
+                // 重启路径顺带同步，删掉最后一条订阅时若不清，节点镜像就留在池里
+                // 成了孤儿 —— 归属订阅已不存在，界面上挂着且删不掉（实测踩过）。
+                // 手动「关闭内核」（clear_pool=false）**不清**：订阅与引用都还在，
+                // 清了会让账号引用全部悬空、重开内核后条目换新 id。
+                sync_nodes_to_pool(&[]);
+            }
             patch_status(|snapshot| {
                 snapshot.running = false;
+                // 手动「关闭内核」置闩（测试 / 保存引用不再悄悄重启内核）；
+                // 自动停（clear_pool=true）不置 —— 那是「没订阅了」，不是用户
+                // 要内核一直停着。
+                snapshot.halted = !clear_pool;
             });
         }
     }
@@ -286,7 +407,16 @@ async fn execute(command: Command) {
 // ─── 公开操作（api 层入口）─────────────────────────────────
 
 /// 请求下载内核；`providers` 非空时下完自动拉起。
+///
+/// 下载参数（出口线路 / 存放目录）**不在命令里带**：它们是配置项
+/// （`kernelProxy` / `kernelDir`），api 层在投命令之前就已落盘 —— 命令里再带
+/// 一份就等于同一件事有两个真相，而 worker 执行时刻读配置拿到的必然是最新的
+/// 那个（包括「投命令之后又改了一次设置」的极端时序）。
 pub fn request_download(providers: Vec<ProviderInput>) {
+    // 新一轮下载：上一轮可能残留的「停止」请求作废。要在这里清而不是在
+    // download::run_download 里清 —— 「点下载」与「worker 真正开跑」之间隔着
+    // 队列（前面可能排着一次内核重启），这期间用户点停止必须算数。
+    download::reset_cancel();
     patch_status(|snapshot| {
         snapshot.download.state = "downloading";
         snapshot.download.received = 0;
@@ -294,6 +424,22 @@ pub fn request_download(providers: Vec<ProviderInput>) {
         snapshot.download.error = None;
     });
     send(Command::Download(providers));
+}
+
+/// 请求停止正在进行的下载（界面上的「停止下载」）。
+///
+/// ── 为什么不走命令队列（本模块唯一的例外）────────────────────
+/// 队列是串行消费的，而「正在下载」这件事本身就意味着 worker 正**阻塞在**
+/// 队列里 —— 这时候投一条 Cancel 只会排在下载后面，等它执行时下载早已结束。
+/// 所以这里直接置一个原子标志，下载循环每个分片读一次；返回 false 表示当前
+/// 没有在下载（调用方据此报「没有正在进行的下载」而不是假装停成功了）。
+pub fn request_cancel_download() -> bool {
+    let downloading = with_status(|snapshot| snapshot.download.state == "downloading");
+    if !downloading {
+        return false;
+    }
+    download::request_cancel();
+    true
 }
 
 /// 请求启动 / 重启内核（重建配置：订阅增删改、手动重启都走它）。
@@ -306,9 +452,36 @@ pub fn request_refresh(sub_id: String, providers: Vec<ProviderInput>) {
     send(Command::Refresh { sub_id, providers });
 }
 
-/// 请求停掉内核（一条启用订阅都不剩时调用；空跑的内核只会白占端口）
+/// 请求停掉内核并**清空订阅节点镜像**（一条启用订阅都不剩时调用；
+/// 空跑的内核只会白占端口）。
 pub fn request_stop() {
-    send(Command::Stop);
+    send(Command::Stop { clear_pool: true });
+}
+
+/// 请求**手动关闭**内核（内核状态条的「关闭内核」）。
+///
+/// 与 [`request_stop`] 的唯一区别是**不清订阅节点镜像**：订阅与账号引用都在，
+/// 池条目与端口注册表原样保留，「启动内核」（`request_restart`）后原位恢复。
+/// 已停止时是幂等的 no-op（stop_kernel 没有子进程可停，直接落状态）。
+pub fn request_halt() {
+    send(Command::Stop { clear_pool: false });
+}
+
+/// 手动关闭闩当前是否置位（见 [`StatusSnapshot::halted`]）。
+///
+/// 「测试 / 保存引用 / 订阅同步」这些路径在置位时**不投 Restart 命令** ——
+/// 静默把内核带起来会推翻用户刚刚按下的「关闭」；改由各自路径提示
+/// 「先点启动内核」。
+pub fn is_manually_halted() -> bool {
+    with_status(|snapshot| snapshot.halted)
+}
+
+/// 请求停掉内核并删除已下载的内核（界面上的「删除内核」）。
+///
+/// 走命令队列而不是直接在 handler 里删文件：删除与重启 / 下载会互相踩
+/// （删到一半来个 Restart 会按半截目录启动），串行化是这一模块的唯一约定。
+pub fn request_remove() {
+    send(Command::Remove);
 }
 
 /// 状态 JSON（GET /api/subscriptions 与列表响应共用）。
@@ -327,6 +500,7 @@ pub fn status_json() -> Value {
         let download_received = snapshot.download.received;
         let download_total = snapshot.download.total;
         let download_error = snapshot.download.error.clone();
+        let halted = snapshot.halted;
         let running = snapshot_running
             && controller_port
                 .map(|port| controller_alive(port))
@@ -338,8 +512,20 @@ pub fn status_json() -> Value {
             "running": running,
             "controllerPort": controller_port,
             "listenerCount": listener_count,
+            // 统一测试口（「网络代理」页的节点测试全走它；见 runtime::select_test_node）
+            "testPort": runtime::test_port(),
             "kernelDir": kernel_dir().to_string_lossy(),
+            // 默认目录单列一个读数：下载弹窗要给「恢复默认」一个具体的目标值
+            // （界面不该自己去拼 `{config_dir}/proxy-kernel`，那是后端的布局）
+            "kernelDirDefault": default_kernel_dir().to_string_lossy(),
+            // 已存的下载线路（描述形态，与 /api/update/proxy 同口径）：
+            // 弹窗用它把「当前选的是哪条」显示出来 —— null = 默认链
+            "downloadProxy": crate::server::core::proxies::describe_account_proxy(
+                crate::server::config::kernel_proxy().as_ref(),
+            ),
             "lastError": last_error,
+            // 手动关闭闩（前端用它把停止态的文案从「已停止」换成「已手动关闭」）
+            "halted": halted,
             "providerSync": provider_sync,
             "download": {
                 "state": download_state,

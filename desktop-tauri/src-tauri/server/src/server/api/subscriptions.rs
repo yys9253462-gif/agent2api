@@ -1,14 +1,19 @@
-//! 订阅路由（「网络代理」页的「订阅」区块）。
+//! 订阅路由（「网络代理」页的「订阅管理」）。
 //!
 //!   GET  /api/subscriptions              订阅列表 + 内核状态
-//!   POST /api/subscriptions/add          新增订阅 {name, url}
-//!   POST /api/subscriptions/save         编辑订阅 {id, name, url, enabled}
+//!   POST /api/subscriptions/add          新增订阅 {name, url} 或本地文件
+//!                                        {name, fileName, contentBase64}
+//!   POST /api/subscriptions/save         编辑订阅 {id, name, url, enabled}；
+//!                                        本地订阅可带 contentBase64 换文件
 //!   POST /api/subscriptions/refresh      强制刷新一条订阅的内容 {id}
 //!   POST /api/subscriptions/remove       删除订阅 {id}
 //!   POST /api/subscriptions/decode-qr    从图片解二维码 {imageBase64} → {url}
 //!   GET  /api/subscriptions/kernel       内核状态（下载进度 / 运行状态）
-//!   POST /api/subscriptions/kernel/download  开始下载内核（后台任务，轮询看进度）
+//!   POST /api/subscriptions/kernel/download  开始下载内核（{proxy, dir} 可选，
+//!                                        后台任务，轮询看进度）
+//!   POST /api/subscriptions/kernel/download/cancel  停止下载（删掉半截文件）
 //!   POST /api/subscriptions/kernel/restart   启动 / 重启内核（重建配置）
+//!   POST /api/subscriptions/kernel/remove    删除已下载的内核（先停进程再删文件）
 //!
 //! ── 分发方式 ────────────────────────────────────────────────
 //! 与 proxies 同构：一条 `/api/subscriptions` 固定路径入口 + 按 (方法, 剩余
@@ -76,6 +81,13 @@ fn sync_kernel_after_change() {
     let enabled = subscriptions::enabled_provider_inputs();
     if enabled.is_empty() {
         sub_kernel::request_stop();
+    } else if sub_kernel::is_manually_halted() {
+        // 手动关闭闩：订阅变更先落库，但不悄悄把内核拉起来；变更在下次
+        // 「启动内核」重建配置时生效（订阅、节点、监听器都在重建范围里）
+        logging::log(
+            "[Subscription]",
+            "内核已手动关闭 —— 订阅变更已保存，「启动内核」后生效",
+        );
     } else {
         sub_kernel::request_restart(enabled);
     }
@@ -108,8 +120,11 @@ pub async fn entry(request: axum::extract::Request) -> Response {
         ("POST", "remove") => remove(&body).await,
         ("POST", "decode-qr") => decode_qr(&body),
         ("GET", "kernel") => ok_json(sub_kernel::status_json()),
-        ("POST", "kernel/download") => kernel_download().await,
+        ("POST", "kernel/download") => kernel_download(&body).await,
+        ("POST", "kernel/download/cancel") => kernel_download_cancel(),
         ("POST", "kernel/restart") => kernel_restart(),
+        ("POST", "kernel/stop") => kernel_stop(),
+        ("POST", "kernel/remove") => kernel_remove(),
         _ => management_error(
             404,
             format!("Not found: {} {full_path}", method.as_str()),
@@ -119,12 +134,48 @@ pub async fn entry(request: axum::extract::Request) -> Response {
 
 // ─── 订阅 CRUD ─────────────────────────────────────────────
 
+/// 把请求体里的本地文件内容（`contentBase64`，兼容 data URL 前缀）解出来，
+/// 就地改写成存储形态（`kind: "local"` + 明文 `content`）；没带就原样放行。
+///
+/// base64 是**传输形态**（YAML 原文走 JSON 转义既臃肿又容易在壳层被改写坏，
+/// 与二维码图片同一套传法），解完即剥掉 `contentBase64` —— 存储里只留明文
+/// content。YAML 形状校验在 `core::subscriptions::normalize_item`（存储层拥有
+/// 「什么内容能入库」的判断权，api 层只负责把传输形态翻译过来）。
+fn attach_local_content(payload: &mut Value) -> Result<(), String> {
+    let Some(encoded) = payload
+        .get("contentBase64")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return Ok(());
+    };
+    let encoded = encoded
+        .split_once("base64,")
+        .map(|(_, rest)| rest)
+        .unwrap_or(encoded);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "文件内容不是有效的 base64".to_string())?;
+    let text = String::from_utf8(bytes).map_err(|_| "YAML 文件不是 UTF-8 编码".to_string())?;
+    let Some(object) = payload.as_object_mut() else {
+        return Err("订阅条目必须是对象".to_string());
+    };
+    object.insert("kind".to_string(), Value::String("local".to_string()));
+    object.insert("content".to_string(), Value::String(text));
+    object.remove("contentBase64");
+    Ok(())
+}
+
 /// POST /api/subscriptions/add
 async fn add(body: &Bytes) -> Response {
-    let payload = match parse_body(body) {
+    let mut payload = match parse_body(body) {
         Ok(value) => value,
         Err(_) => return management_error(400, "请求内容不是有效 JSON"),
     };
+    if let Err(message) = attach_local_content(&mut payload) {
+        return management_error(400, message);
+    }
     match subscriptions::create(&payload) {
         Ok(_) => {
             sync_kernel_after_change();
@@ -136,10 +187,13 @@ async fn add(body: &Bytes) -> Response {
 
 /// POST /api/subscriptions/save
 async fn save(body: &Bytes) -> Response {
-    let payload = match parse_body(body) {
+    let mut payload = match parse_body(body) {
         Ok(value) => value,
         Err(_) => return management_error(400, "请求内容不是有效 JSON"),
     };
+    if let Err(message) = attach_local_content(&mut payload) {
+        return management_error(400, message);
+    }
     match subscriptions::update(&payload) {
         Ok(_) => {
             sync_kernel_after_change();
@@ -169,6 +223,14 @@ fn refresh(body: &Bytes) -> Response {
         }
         Some(false) => return management_error(400, "该订阅已禁用（先启用再刷新）"),
         Some(true) => {}
+    }
+    // 本地文件订阅没有链接可拉：内容在导入时就已写进内核缓存位（每次重启还会
+    // 从存储重写一遍），「强制拉取」对它没有意义 —— 当场说明，不假装刷新成功
+    if subscriptions::kind_of(id) == Some("local") {
+        return management_error(
+            400,
+            "本地文件订阅无需刷新：要更新内容请编辑该订阅、重新选择 YAML 文件",
+        );
     }
     sub_kernel::request_refresh(id.to_string(), subscriptions::enabled_provider_inputs());
     saved_payload()
@@ -267,13 +329,110 @@ fn decode_qr(body: &Bytes) -> Response {
 // ─── 内核操作 ───────────────────────────────────────────────
 
 /// POST /api/subscriptions/kernel/download（后台下载，进度轮询看）
-async fn kernel_download() -> Response {
+///
+/// 请求体（两个字段都可省）：`{proxy: null | {source,…}, dir: "D:\\kernel" | ""}`
+/// —— 对应下载弹窗里的两个选择。**先落配置再投命令**：worker 执行时读配置决定
+/// 走哪条线路、装到哪儿（见 `sub_kernel::request_download` 的说明），所以这两个
+/// 值同时是「本次下载的参数」与「下次的默认值」—— 弹窗下次打开显示的就是它们，
+/// 不必另设一个「保存」按钮（也就不会出现「改了没点保存」的中间态）。
+///
+/// `dir` 空串 = 恢复默认目录；非绝对路径当场 400 —— 宁可在这里说清楚，也不要
+/// 等下载时报一句「创建内核目录失败」。
+async fn kernel_download(body: &Bytes) -> Response {
     if sub_kernel::installed() {
         return ok_json(sub_kernel::status_json());
     }
+    // 下载中重复投命令只会让 worker 排队（它此刻正忙着下载），用户看到的是
+    // 「点了没反应」；当场说清楚
+    if downloading() {
+        return management_error(400, "内核正在下载中，先停止或等它下完");
+    }
+    let payload = match parse_body(body) {
+        Ok(value) => value,
+        Err(_) => return management_error(400, "请求内容不是有效 JSON"),
+    };
+    // 出口：与账号代理 / 更新出口同一套归一（null / 空 = 默认链）
+    let proxy = match crate::server::core::proxies::normalize_account_proxy(
+        payload.get("proxy").unwrap_or(&Value::Null),
+    ) {
+        Ok(proxy) => proxy,
+        Err(error) => return management_error(400, &error.message),
+    };
+    // 轮询档要在这里挡下：它是**账号级**出网配置（逐请求换出口，见
+    // `core::proxy_rotate`），订阅下载是一条固定的抓取动作，没有这个语义；
+    // 放行只会存进一条解析不出地址的配置（下载静默走直连）。
+    if proxy
+        .as_ref()
+        .is_some_and(crate::server::core::proxies::is_rotate_config)
+    {
+        return management_error(400, "订阅下载出口不支持「轮询」档（轮询用于 OpenCode Zen 账号的出网）");
+    }
+    // 目录：**缺字段 = 不动已存的设置**（老客户端与别的入口不带它）；
+    // 有值就必须是绝对路径（空串 = 恢复默认）
+    let dir = match payload.get("dir") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Some(None)
+            } else if std::path::Path::new(trimmed).is_absolute() {
+                Some(Some(trimmed.to_string()))
+            } else {
+                return management_error(400, "存放目录必须是绝对路径（例如 D:\\proxy-kernel）");
+            }
+        }
+        Some(_) => return management_error(400, "存放目录必须是字符串"),
+    };
+    // 两个键各自落盘，任一失败都算「没完全落盘」（进程内已生效，重启会回到旧值）
+    let proxy_saved = if payload.get("proxy").is_some() {
+        crate::server::config::set_kernel_proxy(proxy)
+    } else {
+        true
+    };
+    let dir_saved = match dir {
+        Some(value) => crate::server::config::set_kernel_dir(value),
+        None => true,
+    };
     sub_kernel::request_download(subscriptions::enabled_provider_inputs());
-    logging::log("[Subscription]", "⬇️ 开始下载代理内核");
-    ok_json(sub_kernel::status_json())
+    logging::log(
+        "[Subscription]",
+        &format!(
+            "⬇️ 开始下载代理内核（存放目录 {}）",
+            sub_kernel::kernel_dir().to_string_lossy()
+        ),
+    );
+    let mut status = sub_kernel::status_json();
+    if let Some(object) = status.as_object_mut() {
+        object.insert("saved".to_string(), Value::Bool(proxy_saved && dir_saved));
+    }
+    ok_json(status)
+}
+
+/// POST /api/subscriptions/kernel/download/cancel（停止下载）。
+///
+/// 只有**正在下载**时才受理：`{canceled: true}` 表示停止请求已置位（真正的
+/// 落地由前端轮询 `download.state` 收敛 —— 下载循环在下个分片就响应，毫秒级）；
+/// 不在下载中时 `{canceled: false}`，不假装停成功了（与 remove 的「幂等但如实
+/// 报」同一取向）。
+fn kernel_download_cancel() -> Response {
+    let canceled = sub_kernel::request_cancel_download();
+    if canceled {
+        logging::log("[Subscription]", "⏹️ 请求停止下载代理内核");
+    }
+    let mut status = sub_kernel::status_json();
+    if let Some(object) = status.as_object_mut() {
+        object.insert("canceled".to_string(), Value::Bool(canceled));
+    }
+    ok_json(status)
+}
+
+/// 快照里的下载状态是不是 downloading（下载与删除两个入口共用同一个判据）
+fn downloading() -> bool {
+    sub_kernel::status_json()
+        .get("download")
+        .and_then(|download| download.get("state"))
+        .and_then(Value::as_str)
+        == Some("downloading")
 }
 
 /// POST /api/subscriptions/kernel/restart（手动启动 / 重启；先落日志便于排障）
@@ -284,4 +443,49 @@ fn kernel_restart() -> Response {
     }
     sub_kernel::request_restart(enabled);
     ok_json(sub_kernel::status_json())
+}
+
+/// POST /api/subscriptions/kernel/stop（手动关闭内核；内核状态条的「关闭内核」）。
+///
+/// 与「一条启用订阅都不剩」那条自动停（`request_stop`，会清空订阅节点镜像）
+/// 的区别：这里**只停进程** —— 订阅还在、账号引用还在，池条目与端口注册表
+/// 原样保留，「启动内核」后原位恢复（端口沿用注册表，账号引用不漂移）。
+///
+/// 幂等：没在跑（或没装）直接返回现状 —— 这个动作的目标状态是「内核不在运行」，
+/// 它已经成立。响应是**投命令前**的快照（命令异步执行）：`running` 由前端轮询
+/// 收敛（与删除 / 重启同一套）。
+fn kernel_stop() -> Response {
+    let status = sub_kernel::status_json();
+    if status.get("running") != Some(&Value::Bool(true)) {
+        return ok_json(status);
+    }
+    sub_kernel::request_halt();
+    logging::log("[Subscription]", "🛑 关闭代理内核（手动；订阅与端口注册表保留）");
+    ok_json(status)
+}
+
+/// POST /api/subscriptions/kernel/remove（删除已下载的内核）。
+///
+/// 幂等：没装（或已经删掉）直接返回现状，不报错 —— 这个动作的目标状态是
+/// 「内核不在磁盘上」，它已经成立。下载中直接拒绝：命令队列是串行的，此时投
+/// 删除会排在下载后面，用户看到的是「点了没反应」，不如当场说清楚。
+///
+/// 响应是**投命令前**的快照（命令异步执行）：真正的落地状态由前端轮询
+/// `installed` 收敛（与下载 / 重启同一套）。
+fn kernel_remove() -> Response {
+    let status = sub_kernel::status_json();
+    let downloading = status
+        .get("download")
+        .and_then(|download| download.get("state"))
+        .and_then(Value::as_str)
+        == Some("downloading");
+    if downloading {
+        return management_error(400, "内核正在下载中，等下载结束后再删除");
+    }
+    if !sub_kernel::installed() {
+        return ok_json(status);
+    }
+    sub_kernel::request_remove();
+    logging::log("[Subscription]", "🗑️ 删除代理内核（停进程 + 清内核目录）");
+    ok_json(status)
 }

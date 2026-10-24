@@ -13,7 +13,7 @@
 //! ```
 //!
 //! ── 为什么两条前缀放在一个文件里 ─────────────────────────────
-//! `/api/retention` 是这三条数据保留期的**统一入口**（事件日志在 `logs_store`、
+//! `/api/retention` 是三档数据保留期的**统一入口**（事件日志在 `logs_store`、
 //! 请求日志与聚合在 `request_stats`），其中两条属于请求统计；而改完设置必须
 //! 立刻裁剪，裁剪又要拿 `request_stats` 句柄 —— 两者共享同一份校验与清理逻辑，
 //! 拆成两个文件只会让「校验 → 写配置 → 立即清理」这条链断成两段。
@@ -78,8 +78,9 @@ use crate::server::request_stats::RequestQuery;
 use crate::server::ServerState;
 
 /// `/api/stats/summary` 的合法 range 取值（与 `request_stats::report` 的
-/// `normalize_range` 白名单逐字一致；那边是存储层的归一，这里是路由层的校验）
-const RANGES: [&str; 5] = ["today", "7", "30", "month", "all"];
+/// `normalize_range` 白名单逐字一致；那边是存储层的归一，这里是路由层的校验）。
+/// `custom` 另需 `startDate` / `endDate`（见 `stats_summary`）。
+const RANGES: [&str; 6] = ["today", "7", "30", "month", "all", "custom"];
 /// range 缺省值：与存储层「非法/缺省按 7 处理」的默认口径相同
 const DEFAULT_RANGE: &str = "7";
 
@@ -130,7 +131,12 @@ fn parse_limit(value: Option<&String>) -> Option<usize> {
     text.parse::<usize>().ok().filter(|size| *size > 0)
 }
 
-/// GET /api/stats/summary?range=7
+/// GET /api/stats/summary?range=7&startDate=&endDate=
+///
+/// `range=custom` 时必须带 `startDate` / `endDate`（`YYYY-MM-DD`，本地自然日，
+/// 闭区间）：两个日期都由用户在选择器上显式选定，缺失 / 格式错 / 起止倒置一律
+/// 400 —— 与 `range` 同一取舍（隐式换一个区间会让页面显示的与选的对不上，
+/// 报错比默默改口径好排查）。
 pub async fn stats_summary(State(state): State<ServerState>, Query(params): Query<Params>) -> Response {
     // 先 trim 再比对：存储层的 `normalize_range` 也是先 trim 后匹配，
     // 若这里比对未 trim 的值，`?range=%207%20` 会被判 400 而存储层本可接受它 ——
@@ -143,10 +149,67 @@ pub async fn stats_summary(State(state): State<ServerState>, Query(params): Quer
             format!("range 取值非法: {requested}（合法值: {}）", RANGES.join("、")),
         );
     }
+    let custom = if requested == "custom" {
+        let start = match parse_day_param(&params, "startDate") {
+            Ok(value) => value,
+            Err(message) => return errors::management_error(400, message),
+        };
+        let end = match parse_day_param(&params, "endDate") {
+            Ok(value) => value,
+            Err(message) => return errors::management_error(400, message),
+        };
+        if start > end {
+            return errors::management_error(
+                400,
+                format!(
+                    "开始日期不能晚于结束日期（startDate={}, endDate={}）",
+                    start, end
+                ),
+            );
+        }
+        Some((start, end))
+    } else {
+        None
+    };
     // 原样透传存储层的报表结果（`{range, startDate, endDate, overview, providers,
     // heatmap, cacheRates, cacheTrend24h, dailyTrend}`），路由层不加工，避免两处口径。
     // `providers` 是 W4 新增的 provider 维度汇总（见文件头的说明）
-    ok_json(state.request_stats().usage_summary(&requested))
+    //
+    // ── 为什么在 `spawn_blocking` 里算 ──────────────────────────
+    // `usage_summary` 整条路是**同步**的（SQLite 读 + 纯函数），而且持着统计库
+    // 那把全局连接锁。直接在 async handler 里调用会占住一个 tokio worker 线程
+    // 直到它跑完 —— 报表是前端轮询的接口（默认每秒一次、可在定时任务里调），
+    // 这种「同步读库」不该出现在 async 运行时线程上。与 `backup_api` /
+    // `upgrade_api` 的慢操作同一处理。
+    //
+    // 锁竞争（与转发记账抢同一把 `Db` 锁）不因这一层改变 —— 那件事由「报表
+    // 只读 24 小时窄列 + 命中率下推 SQL」在**工作量**上解决（见
+    // `RequestStats::usage_summary` 的读取窗口说明）；这里解决的是「占着
+    // runtime 线程」这一半。
+    let stats = state.request_stats();
+    let result = tokio::task::spawn_blocking(move || stats.usage_summary(&requested, custom)).await;
+    match result {
+        Ok(value) => ok_json(value),
+        // 任务被取消（runtime 关闭中）或 panic：给一个可读的 500 而不是让
+        // axum 把一个无 body 的错误连接丢给前端
+        Err(error) => errors::management_error(500, format!("报表计算任务失败: {error}")),
+    }
+}
+
+/// 解析 `YYYY-MM-DD` 的日期参数：缺失 / 空白 / 格式错都给可读的 400 文案。
+///
+/// 只认严格格式（`2026-1-5` 这种补零缺失的写法也拒绝）：这个值由前端的
+/// `<input type="date">` 产出，格式天然规范；宽容解析反而会掩盖「前端传了
+/// 别的东西」这类问题。错误文案把收到的原值带出来，便于对照。
+fn parse_day_param(
+    params: &Params,
+    key: &str,
+) -> Result<chrono::NaiveDate, String> {
+    let Some(text) = text_of(params, key) else {
+        return Err(format!("range=custom 时必须带 {key}（格式 YYYY-MM-DD）"));
+    };
+    chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d")
+        .map_err(|_| format!("{key} 格式非法: {text}（需要 YYYY-MM-DD）"))
 }
 
 /// GET /api/stats/requests?offset=&limit=&model=&provider=&status=&start=&end=
@@ -287,8 +350,9 @@ pub async fn clear_stats_requests(
 ///
 /// 详情弹窗（预览对话）的数据源：`{id, requestBody, responseBody, truncated}`，
 /// 两个文本字段原样返回（两侧各截断到存储层的采集上限，`truncated` 提示
-/// 前端正文可能不完整）。不存在给 404 —— 正文有自己的容量闸（按 ts 丢最旧），
-/// 「明细还在、正文已被挤掉」是正常状态，不是错误。
+/// 前端正文可能不完整）。不存在给 404 —— 正文只在**调试模式开启期间**的
+/// 请求上采集（关着时不写行，见 `api::pipeline::capture_raw_body`），
+/// 此外也可能已被清理过；两种情况都是正常状态，不是错误。
 pub async fn stats_request_raw(
     State(state): State<ServerState>,
     Query(params): Query<Params>,
@@ -370,12 +434,12 @@ pub async fn get_retention(State(_state): State<ServerState>) -> Response {
     ok_json(retention_json(config::retention_settings()))
 }
 
-/// PUT /api/retention —— body `{logRetentionDays?, requestRetentionDays?, dailyRetentionDays?}`
+/// PUT /api/retention —— body `{logRetentionDays?, requestLogRetentionDays?, dailyAggregateRetentionDays?}`
 ///
 /// 允许部分字段（未出现的项保持原值）。校验通过后：写 config.json → 立即裁剪
 /// → 返回**生效后**的值（前端直接用响应刷新界面，不必再 GET 一次）。
 ///
-/// 立即裁剪的必要性：保留期只在「记账 / 写日志 / 启动载入」时顺带生效，
+/// 立即裁剪的必要性：保留期只在「记账 / 写日志」时顺带生效，
 /// 用户把 30 天改成 7 天之后如果不动，旧数据要等到下一条请求或下次重启才消失 ——
 /// 那时的界面会显示「设置是 7 天，日志里还有 30 天前的条目」，看起来像没生效。
 pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Response {

@@ -25,7 +25,7 @@ import { t } from '../i18n'
  *   window.wbRequestPhase  = { labelOf, badgeHtml, elapsedLineHtml, elapsedText, phaseOf }
  *
  * ── 数据口径（照旧，别改）──────────────────────────────────────
- * 明细按保留期存盘、条数无上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
+ * 明细全量保留（不按天数 / 条数自动删除），条数没有上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
  * 页数才算得出来）。后端支持时间区间 / 状态 / 模型 / 提供商四个维度，四者在存储层的**同一份
  * FilterPlan** 里编译成 SQL —— 所以「页面上筛出来的 N 条」与「清理弹窗删掉的那批」必然是同一个
  * 集合。前端这份口径只有一处实现（filterParams），列表 GET 与 clearParams 都从它取（见下）。
@@ -76,6 +76,9 @@ type RequestEntry = {
   /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
   isTest?: boolean
   phase?: string; phaseElapsedMs?: number | null; phaseStartedAt?: number | null
+  /** 来源客户端（后端 `client`：入口按下游 User-Agent 分类的结果；
+   *  空串 / 缺键 = 没有记录 —— 旧行、模型测试、请求未带 UA 的行） */
+  client?: string
 }
 
 type RequestQueryResult = {
@@ -261,6 +264,7 @@ const COLUMNS: Column[] = [
   { key: 'retry', label: t('重试'), sel: '.req-retry', track: '52px' },
   { key: 'status', label: t('状态'), sel: '.req-status', track: '96px' },
   { key: 'model', label: t('模型'), sel: '.req-model', track: 'minmax(0, 1.3fr)' },
+  { key: 'client', label: t('客户端'), sel: '.req-client', track: '110px' },
   { key: 'dur', label: t('用时'), sel: '.req-dur', track: '96px', align: 'right' },
   { key: 'usage', label: t('用量'), sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
   { key: 'error', label: t('错误'), sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
@@ -583,9 +587,9 @@ function countRetries(entry: RequestEntry): number {
   }, 0)
 }
 
-/** 提供商展示名：providers.js 目录 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
+/** 提供商展示名：providers.js 目录（注册名）→ 查词典 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
 function providerLabelOf(id: string): string {
-  return shared().wbProviders?.labelOf?.(id) || id
+  return t(shared().wbProviders?.labelOf?.(id) || id)
 }
 
 /** 行 key 的去重：ts 在同一毫秒可能重复（并发请求），重复的补一个序号后缀，避免 React 报重复 key */
@@ -617,7 +621,7 @@ async function refreshFilterOptions(): Promise<void> {
   try {
     const filters = await shared().workbuddyDesktop?.getStatsRequestFilters()
     const providers: ProviderOption[] = (Array.isArray(filters?.providers) ? filters.providers : [])
-      .map(item => ({ value: String(item?.id || ''), label: String(item?.label || item?.id || '') }))
+      .map(item => ({ value: String(item?.id || ''), label: t(String(item?.label || item?.id || '')) }))
       .filter(item => item.value)
     const models: string[] = (Array.isArray(filters?.models) ? filters.models : [])
       .map(name => String(name || ''))
@@ -768,7 +772,8 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
     case 'target': {
       const id = String(entry.provider ?? '').trim()
       const fromBackend = String(entry.providerLabel ?? '').trim()
-      const provider = fromBackend || (id ? providerLabelOf(id) : '')
+      // 后端给的是注册名（「WorkBuddy 国内版」这类），与目录侧一样要过一遍词典
+      const provider = fromBackend ? t(fromBackend) : (id ? providerLabelOf(id) : '')
       // 账号为空 = 请求在选定账号之前就失败了（后端契约：无账号时给空串），显式给破折号而不是留空
       return (
         <span key={key} className={className}>
@@ -894,6 +899,28 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
             title={t('转发到上游的模型：{model}', { model: upText })}>⬆️ {upText}</span>
           <span className='req-model-line sub'
             title={t('下游请求的模型：{model}', { model: downText })}>⬇️ {downText}</span>
+        </span>
+      )
+    }
+
+    case 'client': {
+      // 后端存的是**归类结果**（Codex / ZCode / Claude Code / …，见 core::client），
+      // 空串 = 没有记录（旧行、模型测试、请求未带 UA）。产品名是标识符不翻译，
+      // 只有兜底类 `other` 翻成「其它」；空值给占位符而不是空格子。
+      const value = String(entry.client ?? '').trim()
+      if (!value) {
+        return (
+          <span key={key} className={`${className} is-empty`}
+            title={t('这条明细没有记录来源客户端（旧数据、模型测试，或请求未带 User-Agent）')}>—</span>
+        )
+      }
+      const label = value === 'other' ? t('其它') : value
+      return (
+        <span key={key} className={className}
+          title={value === 'other'
+            ? t('识别到 User-Agent，但不属于已知的客户端类型：{ua}', { ua: value })
+            : t('来源客户端：{client}', { client: label })}>
+          {label}
         </span>
       )
     }
@@ -1088,7 +1115,7 @@ function RequestsPage() {
         loaded: true,
         error: '',
       }
-      // 明细被清空或被保留期裁掉后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
+      // 明细被清空后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
       const lastOffset = Math.max(0, (Math.ceil(next.matched / current.size) - 1) * current.size)
       if (current.offset > lastOffset) {
         applyOffset(lastOffset)
@@ -1306,7 +1333,7 @@ function RequestsPage() {
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像这枚徽标的文案与配色（data-tone 空串
             = 无修饰，与旧实现 renderBadge 只写 'badge' 等价） */}
         <Badge id='req-badge' variant='outline' data-tone=''>{badgeText + liveText}</Badge>
-        <span className='panel-sub'>{t('按时间倒序，保留期在设置页可调')}</span>
+        <span className='panel-sub'>{t('按时间倒序，全量保留')}</span>
         <div className='head-actions'>
           {/* 打开清理弹窗（request-clear-modal.tsx）：两种删除方式 + 预览统计 + 压缩数据库都在
               那边；本页只负责把当前筛选参数给它（见 clearParams） */}

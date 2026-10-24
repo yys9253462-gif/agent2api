@@ -29,8 +29,10 @@
  *   · 拖分组带（`.queue-grip`）= 改这一家的**组顺位**；
  *   · 拖行里的把手（`.order-grip`）= 改它在这一家内的**组内顺位**。
  * 两者合并成一条队列交给后端整队重编号（`POST /api/accounts/reorder`，见
- * accounts-data.ts 的 reorderQueue）。筛选 / 搜索 / 分页生效时顺序不可见（行被裁过，
- * 序号也断了），此时**锁定拖拽**并给一次提示 —— 拖动必然错位。
+ * accounts-data.ts 的 reorderQueue）。**组顺位**在筛选 / 搜索 / 分页生效时不可拖
+ * （别家的组整组不可见，落点没法定位），此时**锁定拖拽**并给一次提示；**组内顺位**
+ * 不锁 —— 落点按渲染出来的行算出锚点、再换算回完整 members（见 onDrop），可见与
+ * 全量的映射是确定的，拖动不会错位。
  *
  * ── 静态表头（本页最容易出错的地方）────────────────────
  * `<colgroup>` 的 `col[data-col]` 与 `<thead>` 的 `th[data-col]`（见 accounts-panels.tsx
@@ -158,7 +160,7 @@ function AccountsPage() {
    * 于是「哪家有账号、各有多少」不切页就能看到（家数动态，这也是它用下拉不用分段的原因）。
    */
   const providerOptions = [{ value: 'all', label: t('全部（{n}）', { n: all.length }) }]
-    .concat(providerSummaryList().map(item => ({ value: item.id, label: t('{label}（{count}）', { label: item.label, count: item.count }) })))
+    .concat(providerSummaryList().map(item => ({ value: item.id, label: t('{label}（{count}）', { label: t(item.label), count: item.count }) })))
   /** 真正会渲染出来的行（组序 → 组内序）。全选 / 计数 / 分页都以它为基准：
    *  被隐藏的组（一个启用的都没有）不该算进「当前看到的这些」—— 否则「全选（8 个）」
    *  会连看不见的行一起勾上，数字也对不上。分段计数（工具条那几枚徽标）另一回事：
@@ -170,13 +172,14 @@ function AccountsPage() {
    * 客户端分页（通用表格外壳）：默认给「全部」这一档 —— 分组模式下按行分页会把
    * 一家的行切成两页（组头留在上一页），想分页的用户可以在页脚自己换档位。
    *
-   * 分页生效时**顺序不可拖**（见 locked）：拖拽落点由渲染出来的行算，而重排要的是
-   * 完整队列，两者在分页下对不上。所以它进了锁的判据（与筛选同一个口径）。
+   * 分页生效时**组顺位不可拖**（见 groupLocked）：整组落点在分页下难以定位到
+   * 「哪个可见组」锚点（被分掉的组看不见），所以它进了锁的判据；组内行不受它
+   * 限制 —— 落点按可见行换算（见 onDrop），当前页里照常拖得动。
    */
   const paging = useClientPaging(shown.length, 'accounts', { defaultSize: 'all' })
   const pageRows = paging.paged ? paging.slice(shown) : shown
-  const locked = filterActive() || paging.paged
-  /** 筛选 / 搜索 / 分页任一在效时，顺序不可调整 —— 提示语要说清是卡在哪一条上 */
+  /** 组顺位的锁（组内行不锁，落点可按可见行换算）：提示语要说清是卡在哪一条上 */
+  const groupLocked = filterActive() || paging.paged
   const lockReason = filterActive() ? t('清除筛选') : t('把每页调回「全部」')
 
   // 代理列的选项（「网络代理」页的池条目）没就绪就补拉（节流 30 秒，失败不缓存）。
@@ -250,15 +253,26 @@ function AccountsPage() {
    *
    * 队列从分组的 `members`（全量，含折叠起来的组）拼，而不是从 DOM 现查：折叠的组
    * 在 DOM 里没有行，而后端要求「全部账号的一个排列」（少一个都会 400）。
-   * 落点下标由拖拽模块给（按同级兄弟项的中点比出来），这里只做数组搬迁。
+   * 落点下标由拖拽模块给（按同级兄弟项的中点比出来），这里只做数组搬迁；
+   * 筛选 / 搜索 / 分页裁行裁组时按锚点换算回全量（见两处分支的说明）。
    */
   /** 拖拽要看两份分组：`all` 用来拼**完整**队列（被筛选挡住的组不渲染，但它家的账号
    *  仍在队列里，少一条就会被后端按「队列不完整」400 拒掉）；`displayed` 用来把落点
-   *  下标（按渲染出来的组数出来的）换算成「插在哪个可见组之前」的锚点。 */
-  const dragRef = React.useRef({ displayed: groups, all: allGroups })
-  React.useEffect(() => { dragRef.current = { displayed: groups, all: allGroups } })
+   *  下标（按渲染出来的组数出来的）换算成「插在哪个可见组之前」的锚点；`renderedRows`
+   *  给组内行做同一件事 —— 组内落点按**真画出来的行**（本页那一段）换算，见 onDrop。 */
+  const renderedRows = new Map<string, string[]>()
+  for (const group of groups) {
+    renderedRows.set(group.provider,
+      pageRows.filter(account => providerOf(account) === group.provider).map(account => account.id))
+  }
+  const dragRef = React.useRef({ displayed: groups, all: allGroups, renderedRows })
+  React.useEffect(() => { dragRef.current = { displayed: groups, all: allGroups, renderedRows } })
   /** 拖拽模块的处理器（绑定一次、读最新值，见下面的 effect） */
-  const dragHandlers = React.useRef({ locked: false, lockReason: '', onDrop: (_drop: QueueDrop) => {} })
+  const dragHandlers = React.useRef({
+    locked: false,
+    lockReason: '',
+    onDrop: (_drop: QueueDrop) => {},
+  })
   const onDrop = React.useCallback((drop: QueueDrop) => {
     const { displayed, all: current } = dragRef.current
     if (drop.kind === 'group') {
@@ -284,25 +298,34 @@ function AccountsPage() {
     if (from < 0) return
     const moved = group.members[from]
     const rest = group.members.filter((_, position) => position !== from)
-    const to = Math.max(0, Math.min(rest.length, drop.index))
+    // 落点下标来自**渲染出来的**那些行（筛选 / 搜索 / 分页会把组内的行裁掉一部分），
+    // 而重排要的是完整 members —— 按锚点换算：插到第 N 个渲染行之前 = 完整 members
+    // 里那行所在的下标之前；N 等于渲染行数 = 插到组尾（被裁掉的行留在原处）。
+    // 渲染行从 dragRef 取（而不是 group.accounts 的全量可见行）：分页把一组的行切成
+    // 两页时，DOM 里只有本页那一段，锚点必须按「真画出来的行」数，否则错一位。
+    // 与组顺位分支（displayed → all）同一个手法：可见与全量的映射是确定的，错不了位。
+    const visible = dragRef.current.renderedRows.get(drop.provider) || []
+    const anchor = drop.index < visible.length ? visible[drop.index] : null
+    const at = anchor === null ? -1 : rest.findIndex(account => account.id === anchor)
+    const to = anchor === null || at < 0 ? rest.length : at
     if (to === from) return
     const nextMembers = [...rest.slice(0, to), moved, ...rest.slice(to)]
     const next = current.map(item => item.provider === drop.provider ? { ...item, members: nextMembers } : item)
     const queue = next.flatMap(item => item.members.map(account => account.id))
     void reorderQueue(queue, t('{name} 移到 {group} 组内第 {rank} 位', {
-      name: String(moved.name || moved.id), group: group.label, rank: to + 1,
+      name: String(moved.name || moved.id), group: t(group.label), rank: to + 1,
     }))
   }, [])
 
   // 顺序拖拽（组顺位 / 组内顺位）：委托在滚动容器上，表格整表重画后监听仍然有效。
   // 绑定只做一次（与列宽拖拽同一手法）—— 处理器经 ref 读最新值：锁状态与分组
   // 每次渲染都会变，若把它们做进依赖数组，每变一次就往容器上再挂一份监听。
-  React.useEffect(() => { dragHandlers.current = { locked, lockReason, onDrop } })
+  React.useEffect(() => { dragHandlers.current = { locked: groupLocked, lockReason, onDrop } })
   React.useEffect(() => {
     bindQueueDrag(listRef.current, {
       isLocked: () => dragHandlers.current.locked,
       onLockedAttempt: () => toast(
-        t('当前视图不能调整顺序：{reason} 之后再拖动', { reason: dragHandlers.current.lockReason }),
+        t('当前视图不能调整组顺位：{reason} 之后再拖动', { reason: dragHandlers.current.lockReason }),
         'err',
       ),
       onDrop: drop => dragHandlers.current.onDrop(drop),
@@ -353,7 +376,11 @@ function AccountsPage() {
           <div className='group' data-provider-group='1'>
             <span className='label'>{t('提供商')}</span>
             <Select value={store.filter.provider} onValueChange={value => setProviderFilter(String(value))}>
-              <SelectTrigger className='max-w-[200px] min-w-[130px]' aria-label={t('按提供商筛选账号')}>
+              {/* 宽度：桌面锁 200px（同排搜索框对齐）；手机上工具条改纵向排列，
+                  触发器要撑满整行，否则右边缘比同排的搜索框短 14px（见
+                  ui/css/mobile.css 的 .toolbar 段）。用 min-[768px]: 变体分隔，
+                  比在 mobile.css 里用 !important 跟 Tailwind 的任意值类斗优先级可靠。 */}
+              <SelectTrigger className='max-w-none min-w-0 w-full min-[768px]:max-w-[200px] min-[768px]:min-w-[130px] min-[768px]:w-auto' aria-label={t('按提供商筛选账号')}>
                 <SelectValue>
                   {providerOptions.find(item => item.value === store.filter.provider)?.label || t('全部')}
                 </SelectValue>
@@ -380,8 +407,11 @@ function AccountsPage() {
 
           <div className='group'>
             <span className='label'>{t('状态')}</span>
-            {/* 两个分段维度（状态 / 限额）是**受控**的（取值与计数都以 store 为准），
-                限流组在状态筛成「禁用」时置灰 —— 已禁用账号既不算正常也不算已限流 */}
+            {/* 两个分段维度（状态 / 限额）是**受控**的（取值与计数都以 store 为准）。
+                计数按两级筛选分工（见 filterCounts 的说明）：状态是一级，徽标数全量
+                （只随提供商与搜索收窄，切限额不动它）；限额是二级，徽标数「状态收窄
+                后」的范围。限流组在状态筛成「禁用」时置灰 —— 已禁用账号既不算正常
+                也不算已限流 */}
             <SegmentedControl options={[
               { value: 'all', label: t('全部'), count: counts.enabledAll ?? 0 },
               { value: 'enabled', label: t('启用'), count: counts.enabled ?? 0 },
@@ -443,9 +473,10 @@ function AccountsPage() {
               ? t('{groups} 家 · 显示 {rows} 行', { groups: groups.length, rows: visibleIds.length })
               : ''}
           </span>
-          {locked ? (
-            <span className='batch-hidden' title={t('筛选 / 搜索 / 分页生效时顺序不可拖动（行被裁过，拖动会错位）')}>
-              {t('顺序已锁定')}
+          {/* 锁定条只管**组顺位**（组内行按可见行换算落点，筛选下照常拖得动） */}
+          {groupLocked ? (
+            <span className='batch-hidden' title={t('筛选 / 搜索 / 分页生效时组顺位不可拖动（别家的组整组不可见，落点没法定位）')}>
+              {t('组顺位已锁定')}
             </span>
           ) : null}
           {filterActive() ? (

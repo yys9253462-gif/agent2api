@@ -5,10 +5,14 @@
 #   bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 #
 # 做三件事：
-#   1. 下载 build 工作流的两个安装包 artifact（windows-nsis / macos-universal）到 dist/；
+#   1. 下载 build 工作流的产物 artifact（windows-nsis / macos-universal，以及
+#      新版的 linux-server-amd64 / -arm64 两个容器内更新包）到 dist/；
 #   2. 用 tag 所指提交的提交信息（= 更新日志，见 agent.md 第 5 节）创建 / 更新
-#      GitHub Release 并挂两个附件；
+#      GitHub Release 并挂全部附件；
 #   3. 打印验收提示。
+#
+# linux-server-* 两个 artifact 是后加的（容器内一键更新用）：老 tag 的 run 里
+# 没有它们，脚本只提醒、不中断（历史 tag 仍可重跑收尾）。
 #
 # 幂等可重跑：附件 `--clobber` 覆盖上传。
 
@@ -21,6 +25,19 @@ case "$TAG" in
   v*) ;;
   *) echo "错误: '$TAG' 不是 v* 形式的 tag" >&2; exit 1 ;;
 esac
+
+# ── beta 版：tag 带预发布后缀（v3.1.0-beta.1）时，Release 必须标 pre-release ──
+# 这个标记是应用里「加入 beta 版」开关的分界线：正式通道走 GitHub 的
+# /releases/latest，它**排除**被标记的预发布；只有打开开关的人才从 /releases
+# 列表里把 beta 捞出来。漏标 = beta 会被所有正式版用户当成正式更新收到；
+# 给正式版误标则谁都不更新。所以这里按 tag 自动判、并顺手修正已存在的 Release。
+case "${TAG#v}" in
+  *-*) PRERELEASE=true ;;
+  *)   PRERELEASE=false ;;
+esac
+if [ "$PRERELEASE" = true ]; then
+  echo "→ 检测到预发布后缀（${TAG#v}），Release 标记为 pre-release（只发给「加入 beta 版」的用户）"
+fi
 
 command -v gh   >/dev/null || { echo "错误: 未安装 gh CLI" >&2; exit 1; }
 # gh 的 JSON 输出用 node 解析（不引入 jq 依赖，两端都有 node）
@@ -70,6 +87,20 @@ EXE=$(ls dist/windows-nsis/*.exe)
 DMG=$(ls dist/macos-universal/*.dmg)
 echo "→ 已下载 $(basename "$EXE") / $(basename "$DMG")"
 
+# 容器内更新包：两个架构的 tar.gz + 同名 .sha256（面板按名找校验文件，
+# 缺了会拒绝安装）。老 tag 的 run 没有这两个 artifact —— 提醒一句继续走。
+ASSETS=("$EXE" "$DMG")
+if [ -d dist/linux-server-amd64 ] && [ -d dist/linux-server-arm64 ]; then
+  # 两个目录下各是 <包名>.tar.gz 与 <包名>.tar.gz.sha256，原样全带上
+  for file in dist/linux-server-amd64/* dist/linux-server-arm64/*; do
+    ASSETS+=("$file")
+  done
+  echo "→ 已下载 $(basename "$(ls dist/linux-server-amd64/*.tar.gz)") / $(basename "$(ls dist/linux-server-arm64/*.tar.gz)")（含 .sha256）"
+else
+  echo "⚠️  这个 run 里没有 linux-server-* 产物（本功能上线前的 tag？）——"
+  echo "    Release 将不含容器内更新包，面板更新入口会退回「手动升级命令」提示"
+fi
+
 # ── 2. 更新日志 = tag 所指提交的提交信息 ──────────────────────
 NOTES_FILE=$(mktemp)
 trap 'rm -f "$NOTES_FILE"' EXIT
@@ -77,15 +108,29 @@ git log -1 --format=%B "$TAG" > "$NOTES_FILE"
 
 echo "→ GitHub Release"
 if gh release view "$TAG" >/dev/null 2>&1; then
-  gh release upload "$TAG" --clobber "$EXE" "$DMG"
-  echo "  ↳ 已存在，附件覆盖上传"
+  gh release upload "$TAG" --clobber "${ASSETS[@]}"
+  # 已存在时也把预发布标记纠正一遍（重跑收尾 / 当初漏标的情形都靠这一行自愈）
+  gh release edit "$TAG" --prerelease="$PRERELEASE"
+  echo "  ↳ 已存在，附件覆盖上传（pre-release=$PRERELEASE）"
 else
-  gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" "$EXE" "$DMG"
+  gh release create "$TAG" --prerelease="$PRERELEASE" --title "$TAG" \
+    --notes-file "$NOTES_FILE" "${ASSETS[@]}"
+  echo "  ↳ 已创建（pre-release=$PRERELEASE）"
 fi
 
 # ── 3. 验收提示 ───────────────────────────────────────────────
 echo
 echo "发版收尾完成。核对："
 echo "  [1] GitHub Release:  gh release view $TAG"
-echo "  [2] Docker Hub:      https://hub.docker.com/r/aimodcc/agent2api/tags （$TAG 版本号 + latest）"
+if [ "$PRERELEASE" = true ]; then
+  echo "      ↑ beta 版：Release 应显示 Prerelease —— 正式版用户收不到它，"
+  echo "        只有开了「加入 beta 版」的用户收得到（见 agent.md 第 4 节）"
+else
+  echo "  [2] Docker Hub:      https://hub.docker.com/r/aimodcc/agent2api/tags （$TAG 版本号 + latest）"
+fi
 echo "  [3] 安装包「关于」页版本号与 $TAG 一致"
+echo "  [4] 容器内更新：面板「设置 → 软件更新」出现「下载并更新」，且 Release 里"
+echo "      agent2api-server-linux-{amd64,arm64}.tar.gz 与各自的 .sha256 都在"
+if [ "$PRERELEASE" = true ]; then
+  echo "  [5] Docker 镜像：只出 $TAG 那个版本 tag（beta tag 不移动 :latest）"
+fi

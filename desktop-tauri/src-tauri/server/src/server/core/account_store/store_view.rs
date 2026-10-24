@@ -23,6 +23,7 @@ use serde_json::{json, Map, Value};
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
 use crate::server::core::account_store::store::{forwards_requests, AccountStore};
 use crate::server::core::account_store::store_util::{js_truthy, max_concurrent_public_for, value_or, value_or_nullish};
+use crate::server::core::custom_providers;
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
 
@@ -149,6 +150,57 @@ impl AccountStore {
         let _guard = self.guard();
         let state = self.load(&_guard);
         self.snapshot(&state)
+    }
+
+    /// 全部账号 proxy 指向的池条目 id 集合（去重）。
+    ///
+    /// 判据是 `proxy.source == "pool"`（**落库的原始形态**，`normalize_account_proxy`
+    /// 的产出 —— `{source:'pool', proxyId}`；`config` 包装是 `describe_account_proxy`
+    /// 之后的展示形态，落库前不存在 —— 但老版本写入的记录可能整份带着展示形态，
+    /// 两种都认）。解析失败的引用（条目已被删等）同样统计得到 —— 那正是最需要
+    /// 提醒「有账号还挂着它」的情况。消费方是内核的 lazy listeners
+    /// （`sub_kernel::runtime` 只给被引用的订阅节点开监听器，见
+    /// `proxy_pool::subscription_node_keys`），这里不做启用状态过滤：
+    /// 禁用账号的引用也算「在用」—— 重新启用不该再付一次内核重启的等待。
+    ///
+    /// ── 这里读错形态的代价（实测踩过）──────────────────────────
+    /// 曾经按 `proxy.config.source` 判 —— 那是**展示形态**，落库的原始记录上
+    /// 没有这个键，引用集合恒为空：内核侧「账号引用」那一半从未生效，lazy
+    /// listeners 只剩「测试钉住」在撑，统一测试口上线、pinned 退役后暴露
+    /// （所有被引用的节点都拿不到监听端口，地址列全红）。
+    ///
+    /// ── 轮询档（rotate）怎么算 ──────────────────────────────────
+    /// 它引用的条目**随时可能被取用**，所以整个候选集合都算「在用」：
+    /// `all: true` 时把池里全部启用条目的 id 都返回（轮询的语义就是「池里每个
+    /// 启用的出口都可能轮到」，漏掉的那部分会在取用时因「未分配端口」被跳过，
+    /// 等于轮询范围被悄悄缩小）；指定档返回它列出的 id（不存在的条目查不出
+    /// 节点，天然跳过）。这一条判据实现复用 `proxy_rotate::candidate_ids` ——
+    /// 「哪些条目可能被用到」在取用与预建监听器两处必须是同一个答案。
+    pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
+        let _guard = self.guard();
+        let state = self.load(&_guard);
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for record in &state.accounts {
+            let proxy = record.proxy();
+            // 原始形态优先；带 `config` 包装的（老版本落库的展示形态）取里层
+            let config = proxy
+                .get("config")
+                .filter(|value| value.is_object())
+                .unwrap_or(&proxy);
+            if config.get("source").and_then(Value::as_str) == Some("pool") {
+                if let Some(id) = config
+                    .get("proxyId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    ids.insert(id.to_string());
+                }
+            }
+            if crate::server::core::proxies::is_rotate_config(config) {
+                ids.extend(crate::server::core::proxy_rotate::candidate_ids(config));
+            }
+        }
+        ids
     }
 
     /// 账号 id → 该记录最近一次改动的时刻（`max(addedAt, updatedAt)`，毫秒）。
@@ -303,6 +355,12 @@ impl AccountStore {
             // 之类与它无关的空字段，而「刷新 Token」按钮靠的 hasRefreshToken
             // 只是**恰好**在兜底形状里也算得出来 —— 那不是设计，是巧合。
             self.to_officeace_public_account(record)
+        } else if record.provider() == super::orcaterm_accounts::ORCATERM_PROVIDER_ID {
+            // OrcaTerm（腾讯云遨驰终端桌面客户端）：单一入口（粘贴 accessToken /
+            // 导入桌面端登录态），公开形态带 uid(=userId) / loginName(=昵称) /
+            // tokenTail / tokenExpireAt（续期是否在工作可被肉眼校验，见
+            // `orcaterm_accounts.rs`）
+            self.to_orcaterm_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -391,6 +449,16 @@ impl AccountStore {
                 fields.insert(
                     "limiters".to_string(),
                     crate::server::core::limiter::effective_rules_json_in(record.fields()),
+                );
+                // 跨家统一注入的**账号展示名**：与前端 `displayNameOf` 同口径的
+                // 唯一后端实现（规则见本文件底部的 `display_name_of`）。
+                // 恒为非空字符串（`displayName` 全兜底失效时退 id），请求日志 /
+                // 运行日志 / 选路面板 / 签到台账等后端文案一律读它 —— 账号页
+                // 显示什么，日志里就是什么，不再出现「账号页邮箱、日志昵称」
+                // 这种两套口径的错位（issue #249）。
+                fields.insert(
+                    "displayName".to_string(),
+                    Value::String(display_name_of(&fields, &record.id().to_string())),
                 );
                 Value::Object(fields)
             }
@@ -494,6 +562,22 @@ impl AccountStore {
         if let Some(base_url) = fields.get("baseUrl") {
             public.insert("baseUrl".to_string(), base_url.clone());
         }
+        // ── 余额查询配置（`balanceQuery`）────────────────────────────
+        // **只在提供商登记了余额方案时出现**（预置卡写入的 `balanceScheme`，
+        // 见 `providers::custom::balance`）。前端据「有没有这个键」决定渲染
+        // 「查询设置」段、方案说明与余额按钮 —— 与后端 `supports_usage` 同一
+        // 判据（两处都问 `balance_scheme_of`，不会各漂一份）。
+        //
+        // 三个密字段（`accessToken` / `password` / `token`）与商汤的缓存登录票
+        // **绝不透出**，只给 `has*` 标记（输入框的占位文案与「清除」按钮要用）；
+        // 两个非密字段（`userId` / `username`）原样回显 —— 与 apiKey 的
+        // 「值与尾号两条管道分开」同一条纪律（见 `custom_credential_by_id`）。
+        if let Some(scheme) = custom_providers::balance_scheme_of(&record.provider()) {
+            public.insert(
+                "balanceQuery".to_string(),
+                balance_query_public(fields, &scheme),
+            );
+        }
         public.insert("source".to_string(), Value::String(record.source()));
         public.insert("priority".to_string(), Value::from(record.priority()));
         public.insert("enabled".to_string(), Value::Bool(record.enabled()));
@@ -511,6 +595,33 @@ impl AccountStore {
         );
         Value::Object(public)
     }
+}
+
+/// 记录上的 `balanceQuery` → 公开形态（方案 id + 两个非密字段 + 三个密字段的
+/// `has*` 标记；**值本身绝不透出**）。
+///
+/// 形状恒为对象（没有 `balanceQuery` 键时两个非密字段给空串、`has*` 给 false），
+/// 前端不必判「键缺失」——「这一家有没有余额查询」由**外层那个键在不在**回答
+/// （只有登记了方案的家才有），与「凭证配没配」是两件事。
+fn balance_query_public(fields: &Map<String, Value>, scheme: &str) -> Value {
+    let query = fields.get("balanceQuery").and_then(Value::as_object);
+    let text_of = |key: &str| {
+        query
+            .and_then(|map| map.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    let configured = |key: &str| !text_of(key).is_empty();
+    json!({
+        "scheme": scheme,
+        "userId": text_of("userId"),
+        "username": text_of("username"),
+        "hasAccessToken": configured("accessToken"),
+        "hasPassword": configured("password"),
+        "hasToken": configured("token"),
+    })
 }
 
 /// 记录上的 `usageQuery` → 公开形态的规范化形状（恒为对象）。
@@ -562,5 +673,115 @@ fn low_balance_public(provider: &str, value: Option<&Value>) -> Value {
         "skip" => json!({ "mode": "skip", "threshold": threshold }),
         "disable" => json!({ "mode": "disable", "threshold": threshold }),
         _ => json!({ "mode": "off", "threshold": 0.0 }),
+    }
+}
+
+/// 公开形态字段 → 账号展示名（`displayName`，恒为非空字符串）。
+///
+/// 这是前端 `displayNameOf`（ui-islands accounts-domain.ts）的**唯一后端口径**，
+/// 两条线与它逐条对齐：
+///   1. 用户显式设置过备注名（`nameCustom`）→ 备注名恒为主名；
+///   2. 未打标 → 「以邮箱报名字」的三家（Qoder 两地 / AutoClaw 国际版 / Accio
+///      两地）**邮箱优先** —— 这是历史约定：这四家登录拿到的是邮箱、昵称往往
+///      缺失或不可读（issue #249 的 Qoder 国版正是「账号页邮箱、日志昵称」的
+///      错位来自两套口径）；其余家昵称优先，再退 name / 标识 / id。
+/// 前端 displayNameOf 的兜底链是 `nickname || name || identifierOf || id`，
+/// 这里 `identifier` 按各家的能力表逐家写死（与前端 `identifier` 列同一份口径，
+/// 后端没有那张表，家数有限不值得再抄一份）。
+///
+/// **消费方只读公开形态**（选路快照 / 签到台账 / telemetry），所以入参就是
+/// 公开形态字段本身（`name` / `nickname` / `email` / `nameCustom` / `provider`），
+/// 不再回读记录。
+fn display_name_of(public: &Map<String, Value>, id: &str) -> String {
+    let text = |key: &str| -> String {
+        public
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let name = text("name");
+    // 用户显式设置过备注名（update_account 真正改到 name 时打的标）→ 备注名恒为主名
+    if public.get("nameCustom").map(js_truthy).unwrap_or(false) && !name.is_empty() {
+        return name;
+    }
+    let email = text("email");
+    let provider = text("provider");
+    // 「以邮箱报名字」的三家：与前端 emailAsName 列一致 ——
+    // Qoder 两个地区 / AutoClaw 国际版 / Accio 两个地区
+    let email_as_name = super::is_qoder_family(&provider)
+        || provider == super::AUTOCLAW_INTL_PROVIDER_ID
+        || super::is_accio_family(&provider);
+    if email_as_name && !email.is_empty() {
+        return email;
+    }
+    let nickname = text("nickname");
+    let identifier = identifier_key_of(&provider).map(text).unwrap_or_default();
+    let fallback = [nickname, name, identifier]
+        .into_iter()
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| id.to_string());
+    fallback
+}
+
+/// 各家公开形态上的「账号标识」字段键（与前端能力表 `identifier` 列同一份口径；
+/// 未登记的家按 userId 兜底 —— 与前端 GENERIC_FEATURES 一致）。
+fn identifier_key_of(provider: &str) -> Option<&'static str> {
+    match provider {
+        "workbuddy" | "workbuddy-intl" | "catpaw" | "trae" | "kuku" => Some("uid"),
+        "cline-free" | "cline-pass" => Some("account"),
+        "officeace" => Some("id"),
+        _ => Some("userId"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::display_name_of;
+
+    fn fields(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn qoder_shows_email_like_the_accounts_page() {
+        // issue #249：Qoder 国版账号页显示邮箱、请求日志显示昵称 —— 统一后
+        // 「以邮箱报名字」的家在后端同样邮箱优先
+        let value = fields(json!({
+            "provider": "qoder", "name": "昵称", "email": "a@b.com", "userId": "u1",
+        }));
+        assert_eq!(display_name_of(&value, "id-1"), "a@b.com");
+        let intl = fields(json!({
+            "provider": "qoder-intl", "email": "c@d.com", "userId": "u2",
+        }));
+        assert_eq!(display_name_of(&intl, "id-2"), "c@d.com");
+    }
+
+    #[test]
+    fn custom_note_wins_over_email() {
+        let value = fields(json!({
+            "provider": "qoder", "name": "备注名", "nameCustom": true,
+            "email": "a@b.com", "userId": "u1",
+        }));
+        assert_eq!(display_name_of(&value, "id-1"), "备注名");
+    }
+
+    #[test]
+    fn other_providers_prefer_nickname() {
+        let value = fields(json!({
+            "provider": "workbuddy", "nickname": "昵称", "name": "种子名", "uid": "uid-9",
+        }));
+        assert_eq!(display_name_of(&value, "id-1"), "昵称");
+    }
+
+    #[test]
+    fn falls_back_to_identifier_then_id() {
+        let value = fields(json!({ "provider": "raccoon", "userId": "u-77" }));
+        assert_eq!(display_name_of(&value, "id-1"), "u-77");
+        let empty = fields(json!({ "provider": "raccoon" }));
+        assert_eq!(display_name_of(&empty, "id-9"), "id-9");
     }
 }
