@@ -1,6 +1,7 @@
 name: build-usage-fix
 on:
-  workflow_dispatch:
+  push:
+    branches: [fix-usage-310]
 jobs:
   image:
     runs-on: ubuntu-latest
