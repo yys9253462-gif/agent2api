@@ -793,7 +793,9 @@ impl AnthropicStream {
             "message_delta",
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                "usage": { "output_tokens": self.output_tokens() },
+                // 上游 Chat 的 usage 在最后一帧才到，那时 message_start 早已带着 0 发出；
+                // 收尾这里补上 input_tokens，客户端（Claude Code 等）才能算出上下文占用。
+                "usage": { "input_tokens": self.input_tokens, "output_tokens": self.output_tokens() },
             }),
         ));
         out.push(self.event("message_stop", json!({})));
