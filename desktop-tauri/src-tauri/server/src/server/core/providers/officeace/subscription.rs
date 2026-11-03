@@ -127,13 +127,31 @@ async fn call(
         ));
     }
     if status != 200 {
+        // Huawei API Gateway reports an expired temporary STS token as HTTP
+        // 400 + APIG.0602, not as 401. Normalize that exact business code to
+        // 401 so the shared usage orchestrator refreshes once and retries.
+        // Match the parsed field, never localized prose or a loose substring.
+        let effective_status = if status == 400 && expired_security_token(&text) {
+            401
+        } else {
+            i32::from(status)
+        };
         return Err(GatewayError::with_status(
-            i32::from(status),
+            effective_status,
             format!("OfficeAce 订阅接口返回 HTTP {status}：{}", excerpt(&text)),
         ));
     }
     serde_json::from_str::<Value>(&text)
         .map_err(|_| GatewayError::with_status(502, "OfficeAce 订阅接口响应不是合法 JSON"))
+}
+
+/// True only for the structured API Gateway code used by an expired temporary
+/// security token. Invalid JSON and unrelated 400 responses must stay 400.
+fn expired_security_token(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|body| body.get("error_code").and_then(Value::as_str).map(str::to_string))
+        .is_some_and(|code| code == "APIG.0602")
 }
 
 /// 读订阅快照（套餐 + 积分账本 + 奖励活动）。
@@ -570,5 +588,26 @@ mod tests {
         assert_eq!(3.0, bonuses[0].remaining());
         assert_eq!("新用户专属福利", bonuses[1].activity_id);
         assert_eq!(4000.0, bonuses[1].total, "字符串数字要解析出来");
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::expired_security_token;
+
+    #[test]
+    fn recognizes_the_structured_expired_sts_code() {
+        assert!(expired_security_token(
+            r#"{"error_msg":"Bad request: the security token has expired","error_code":"APIG.0602"}"#,
+        ));
+    }
+
+    #[test]
+    fn does_not_reclassify_other_bad_requests_or_prose() {
+        assert!(!expired_security_token(
+            r#"{"error_msg":"security token has expired","error_code":"OTHER.0602"}"#,
+        ));
+        assert!(!expired_security_token("APIG.0602"));
+        assert!(!expired_security_token(r#"{"error_code":6002}"#));
     }
 }
