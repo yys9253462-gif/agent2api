@@ -34,6 +34,8 @@ import * as React from 'react'
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
+  IMAGE_COMPRESS_ENABLED_KEY,
+  IMAGE_COMPRESS_FIELDS,
   NO_RETRY_CODES_KEY,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -54,13 +56,18 @@ import {
   shared,
   toast,
   type AppSettings,
+  type CaptchaSetting,
   type ClineHeadersData,
   type GatewayBlocks,
   type ModelsDevState,
   type NumberField,
   type PromptPatch,
 } from './settings-model'
+import {
+  INITIAL_SANITIZE, sanitizeStateFrom, type SanitizePatch, type SanitizeState,
+} from './settings-sanitize-model'
 import { t } from '../i18n'
+import { retentionSavedMessage, retentionShrinkHead, type RetentionField } from './settings-retention-model'
 
 /* ─── 快照类型 ─────────────────────────────── */
 
@@ -79,12 +86,14 @@ export type BusyScope =
   | 'codes'
   | 'timeouts'
   | 'queue'
+  | 'imageCompress'
   | 'captchaPool'
   | 'routing'
   | 'debug'
   | 'sanitize'
   | 'developerRoleCompat'
   | 'clineHeaders'
+  | 'zcodeVersion'
   | 'cors'
   | 'prompt'
   | 'captcha'
@@ -149,10 +158,19 @@ export type DebugState = {
   limit: number | null
 }
 
-export type SanitizeState = { status: LoadStatus; on: boolean }
-
-/** 开发者角色兼容开关；与 SanitizeState 同形 */
+/** 开发者角色兼容开关 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
+
+/**
+ * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
+ * 时三个输入框保持禁用；`enabled` 在读到之前按关显示（与 developerRoleCompat
+ * 同款降级口径）。
+ */
+export type ImageCompressState = {
+  status: LoadStatus
+  enabled: boolean
+  values: Record<string, number> | null
+}
 
 /** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
 export type ClineHeadersState = {
@@ -162,8 +180,22 @@ export type ClineHeadersState = {
   effective: Record<string, string>
 }
 
-/** 网关面（/v1/*）跨域访问开关；与 SanitizeState 同形 */
+/** 网关面（/v1/*）跨域访问开关 */
 export type CorsState = { status: LoadStatus; on: boolean }
+
+/**
+ * ZCode 客户端版本号（`/api/zcode/version`）。
+ *
+ * `version` 是**设置里存的值**，空串 = 用插件内置默认值。
+ * `envOverride` 非空时说明环境变量 `ZCODE_APP_VERSION` 正压着它 ——
+ * 界面要如实说出「这里填的值此刻不生效」，否则用户会对着一个改了没反应的
+ * 输入框反复重试。
+ */
+export type ZcodeVersionState = {
+  status: LoadStatus
+  version: string
+  envOverride: string
+}
 
 /**
  * models.dev 模型元数据：开关 + 「这份数据是什么时候的、有多少条」。
@@ -213,16 +245,14 @@ export type ProviderPromptState = {
   fileError: string
   /** 这一家的**网关自带提示词**是否装上（缺省 true；只有带 `gatewayNote` 的家有意义） */
   gateway: boolean
-  /** 是否**单独配过**（false = 这一行是按「有网关自带提示词」补出来的，各项跟随全局） */
+  /** 是否配过模式 / 文件 / 正文；只有网关开关覆盖时，客户端提示词仍跟随全局。 */
   configured: boolean
 }
 
 /**
  * 可配置的家。
  *
- * `gatewayNote` 非空 = 这家有一段**网关自带**的提示词（ZCode 活动套餐通道的
- * 官方三段）。它同时决定这一家**默认就出现在列表里** —— 有开关可拨的家不该
- * 藏在一个「添加提供商…」后面。
+ * `gatewayNote` 非空 = 这家有网关提示词装配；手动添加或已有覆盖时显示其开关。
  * `gatewayChars` 是那段装配的字符数（只读子行的「约 N 字符」；0 / 缺失不显示）。
  * `gatewayBlocks` 是那段装配的**正文模板**（三段，Environment 段带占位符）：
  * 编辑器拿它当初始值，也是「恢复官方原文」的目标 —— 资源坏了时是 null，
@@ -242,12 +272,13 @@ export type StorageState = {
   available: boolean
   file: string
   bytes: number
-  /** 五个计数：null = 后端没给可用的数（展示「—」） */
+  /** null 表示后端未提供可用读数。 */
   accounts: number | null
   logs: number | null
   requests: number | null
   dailyDays: number | null
-  debug: number | null
+  downstreamRaw: number | null
+  upstreamRaw: number | null
 }
 
 /** 导入失败明细（只列前 3 条，more 表示还有更多） */
@@ -267,6 +298,8 @@ export type SettingsSnapshot = {
   retryCodes: number[] | null
   timeouts: NumericState
   queue: NumericState
+  /** 会话图片压缩：开关 + 三项参数（长边 / 质量 / 阈值） */
+  imageCompress: ImageCompressState
   captchaPool: NumericState
   /** 账号路由：策略 + 会话粘性（「路由」分类） */
   routing: RoutingState
@@ -274,10 +307,31 @@ export type SettingsSnapshot = {
   sanitize: SanitizeState
   developerRoleCompat: DeveloperRoleCompatState
   clineHeaders: ClineHeadersState
+  zcodeVersion: ZcodeVersionState
   cors: CorsState
   prompt: PromptState
   storage: StorageState
-  captcha: { available: boolean; enabled: boolean }
+  /**
+   * 机器人校验（ALTCHA）：两端各一个开关，`localPanel` 标出本进程是哪一端
+   * （桌面壳 true / 网页端 false），界面据此把「正在用的这一端」标出来。
+   *
+   * `available = false` 表示读不到后端状态（端点不可用），两张开关都置灰 ——
+   * 与 retention / cors 的降级口径一致。
+   */
+  captcha: { available: boolean; desktop: boolean; web: boolean; localPanel: boolean }
+  /**
+   * 面板账户（设置页「账户」分类）。
+   *
+   * `registered = false` 表示这台机器还没注册管理员 —— 此时面板不需要登录，
+   * 界面照常可用，只是没有「改密码」可改。`username` 只用于展示。
+   */
+  account: {
+    status: 'loading' | 'ready' | 'unavailable'
+    registered: boolean
+    username: string
+    /** 改密码弹窗（非空 = 开着；busy 时按钮转圈，error 非空显示红字） */
+    password: { busy: boolean; error: string } | null
+  }
   /**
    * models.dev 模型元数据（能力位与逐模型思考档位）。
    *
@@ -294,6 +348,7 @@ export type SettingsSnapshot = {
    * `dbBackupConfirm` 非空 = 恢复确认弹窗开着（记录的是确认时要执行的参数集）。
    */
   dbIncludeLogs: boolean
+  dbExportConfirm: boolean
   dbBackupConfirm: { includeLogs: boolean } | null
   /**
    * 整库恢复返回的密钥警告原文（`DatabaseImportResult.warning`；null = 没有警告）。
@@ -304,6 +359,14 @@ export type SettingsSnapshot = {
    * 下一次恢复开始时清掉。
    */
   dbWarning: string | null
+  /**
+   * 整库恢复的进度 / 结果（非空 = 那个**不可关闭**的弹窗开着）。
+   *
+   * 恢复是替换语义、中途不能停，所以弹窗没有关闭按钮：进行中不给关，
+   * 完成 / 失败后只给一个「知道了」。进度由后端给（见 `db::backup` 的
+   * `RestoreProgress`），前端每 500ms 拉一次。
+   */
+  dbRestore: DbRestoreProgress | null
   /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
   lanConfirm: LanConfirm
   /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
@@ -317,6 +380,32 @@ export type SettingsSnapshot = {
  * 可能接注册步）；`panel` 是「网页面板」子开关的目标值（mode 为 panel 时）。
  */
 export type LanConfirm = { mode: 'enable' | 'disable' | 'panel'; panel: boolean } | null
+
+/** 整库恢复的进度与结果（弹窗读它） */
+export type DbRestoreProgress = {
+  /** 正在跑（此时弹窗不给关） */
+  active: boolean
+  /** 成功收口 */
+  done: boolean
+  /** 失败收口 */
+  failed: boolean
+  /** 当前阶段的可读文案（后端给，前端只显示） */
+  phase: string
+  /** 大致百分比（只增不减） */
+  percent: number
+  /** 失败原因（`failed` 时才有） */
+  error: string
+  /** 恢复了多少张表（`done` 时才有） */
+  tables: number
+  /** 替换前自动备份的文件名（`done` 时才有） */
+  safetyBackup: string
+  /** 密钥指纹不匹配的警告原文（`done` 时可能有） */
+  warning: string
+  reencryptedSecrets: number
+  localKeysPreserved: boolean
+  startedAt: number
+  finishedAt: number
+}
 
 /** 注册步的状态：busy 时按钮转圈，error 非空时红字显示在表单里 */
 export type LanRegister = { busy: boolean; error: string } | null
@@ -349,12 +438,14 @@ const INITIAL: SettingsSnapshot = {
   retryCodes: null,
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
+  imageCompress: { status: 'loading', enabled: true, values: null },
   captchaPool: { status: 'loading', values: null },
   routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   debug: { status: 'loading', on: false, count: null, limit: null },
-  sanitize: { status: 'loading', on: false },
+  sanitize: INITIAL_SANITIZE,
   developerRoleCompat: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
+  zcodeVersion: { status: 'loading', version: '', envOverride: '' },
   cors: { status: 'loading', on: false },
   prompt: {
     status: 'loading',
@@ -380,16 +471,20 @@ const INITIAL: SettingsSnapshot = {
     logs: null,
     requests: null,
     dailyDays: null,
-    debug: null,
+    downstreamRaw: null,
+    upstreamRaw: null,
   },
-  captcha: { available: true, enabled: false },
+  captcha: { available: true, desktop: false, web: false, localPanel: false },
+  account: { status: 'loading', registered: false, username: '', password: null },
   modelsDev: { status: 'loading', enabled: true, source: '', updatedAt: 0, count: 0 },
   ioFailure: null,
   retentionConfirm: null,
   // 整库备份：默认包含日志与调试报文（完整备份）；恢复确认弹窗默认关闭
   dbIncludeLogs: true,
+  dbExportConfirm: false,
   dbBackupConfirm: null,
   dbWarning: null,
+  dbRestore: null,
   lanConfirm: null,
   lanRegister: null,
   panelLogin: false,
@@ -508,7 +603,7 @@ export function renderUnits(): void {
 export function applyUnits(on: boolean): void {
   shared().wbUnits?.setChinese?.(on)
   renderUnits()
-  toast(on ? t('✅ 已改用本地量级词（万 / 亿式）') : t('✅ 已改用 k / M 缩写'))
+  toast(on ? t('✅ 已改用本地量级词（万 / 亿式）') : t('✅ 已改用 k / M / B 缩写'))
 }
 
 /* ─── 启动与托盘 ───────────────────────────── */
@@ -816,23 +911,33 @@ export function toggleDbIncludeLogs(on: boolean): void {
 }
 
 /**
- * 整库备份：后端把整库导出为 SQL 文件直写到壳选的路径（文件不过壳中转）。
- * 桌面端专属（web shim 没有这个方法），导出没有「空库不导」分支。
+ * 整库备份：桌面端由后端直写到壳选的路径（文件不过壳中转），网页端由浏览器
+ * 下载附件（见 web_shim.rs），两侧返回值同形。导出没有「空库不导」分支。
  */
-export async function exportDatabase(): Promise<void> {
-  if (busyScope) return
+export function confirmDbExport(): void {
+  if (busyScope || snapshot.dbRestore?.active) return
+  publish({ dbExportConfirm: true })
+}
+
+export function cancelDbExport(): void {
+  publish({ dbExportConfirm: false })
+}
+
+export async function exportDatabase(password: string): Promise<void> {
+  if (busyScope || snapshot.dbRestore?.active) return
+  publish({ dbExportConfirm: false })
   beginBusy('dbExport')
   try {
     const api = shared().workbuddyDesktop
     if (!api?.exportDatabase) {
-      toast(t('当前环境不支持整库备份（仅桌面端可用）'), 'err')
+      toast(t('当前环境不支持整库备份'), 'err')
       return
     }
-    const result = await api.exportDatabase(snapshot.dbIncludeLogs)
+    const result = await api.exportDatabase(snapshot.dbIncludeLogs, password)
     if (result?.canceled) { toast(t('已取消导出')); return }
     const size = Number(result?.bytes) || 0
     const tables = Array.isArray(result?.tables) ? result.tables.length : 0
-    toast(t('✅ 已备份 {n} 张表（{size}）到 {file}', {
+    toast(t('✅ 已加密备份 {n} 张表（{size}），包含恢复密钥：{file}', {
       n: tables,
       size: formatBytes(size),
       file: result?.file || '',
@@ -846,55 +951,320 @@ export async function exportDatabase(): Promise<void> {
 
 /** 点「恢复」：先弹确认框（整库恢复是替换语义，二次确认后才开始） */
 export function confirmDbRestore(): void {
-  if (busyScope) return
+  if (busyScope || snapshot.dbRestore?.active) return
   publish({ dbBackupConfirm: { includeLogs: snapshot.dbIncludeLogs } })
 }
 
 /** 确认框出口（与 resolveRetentionConfirm 同形）：确认后才执行恢复 */
-export function resolveDbBackupConfirm(accepted: boolean): void {
+export function resolveDbBackupConfirm(accepted: boolean, password = ''): void {
   publish({ dbBackupConfirm: null })
-  if (accepted) void proceedDbRestore()
+  if (accepted) void proceedDbRestore(password)
 }
 
 /**
- * 整库恢复本体。成功后**重拉整页设置与存储概况** —— 配置、桌面设置、账号、
- * 日志全被替换成备份的状态，任何一块旧快照都不能再用；主界面同样刷新
- * （账号列表、分组与模型清单都会变）。面板短效令牌由后端在恢复后清空，
- * 浏览器下一次请求会自然落到重新登录。
+ * 整库恢复本体。
+ *
+ * ── 为什么整段包在一个「不可关闭的进度弹窗」里 ──────────────
+ * 恢复是**替换语义**：主库被整体覆盖。它一旦开始就不能停 —— 中途退出会留下
+ * 一个既不是旧库也不是新库的现场（暂存库执行到一半、主库覆盖到一半）。所以：
+ *   · 弹窗**没有关闭按钮**，Esc / 点遮罩 / 点空白都不关（`onOpenChange` 忽略）；
+ *   · 进度由后端给（`GET /api/backup/progress`，见 `db::backup` 的说明），
+ *     前端每 500ms 拉一次 —— 这样即使用户中途刷新页面，重进设置页也能接上
+ *     同一次恢复（弹窗按快照重建，而不是靠事件流）。
+ *
+ * ── 结果也显示在这个弹窗里 ──────────────────────────────────
+ * 成功给「恢复了 N 张表」+ 安全备份文件名；失败给原因。密钥指纹不匹配的警告
+ * 同时写进 `dbWarning`（面板里常驻），因为用户关掉弹窗之后仍需要看到它。
  */
-async function proceedDbRestore(): Promise<void> {
+async function proceedDbRestore(password: string): Promise<void> {
   if (busyScope) return
   const api = shared().workbuddyDesktop
   if (!api?.importDatabase) {
-    toast(t('当前环境不支持整库恢复（仅桌面端可用）'), 'err')
+    toast(t('当前环境不支持整库恢复'), 'err')
     return
   }
   beginBusy('dbImport')
   // 结果区只反映最近一次操作：上一次恢复留下的密钥警告先清掉（与 ioFailure 同一约定）
+  //
+  // ── 为什么这里不先把弹窗挂上 ──────────────────────────────
+  // `importDatabase()` 是「弹系统文件框 → 选完 → 后端开始恢复」的一体调用，
+  // 中间那段可能停很久（用户在文件框里翻目录）。如果这时就把弹窗挂出来，
+  // 用户会看到一个「正在读取备份文件…」的进度条 —— 而他连文件都还没选。
+  // 所以弹窗由**后端进度**驱动：轮询第一次看到 `active: true` 才显示。
   publish({ dbWarning: null })
+  // 本次尝试的起点：后端 `startedAt` 一定晚于它。用来把「上一次恢复留下的
+  // 已完成快照」和「这一次的结果」区分开（文件对话框可能要开很久，这期间
+  // 后端读到的仍是上一次的 Done）。
+  const attemptStartedAt = Date.now()
+  const stop = watchRestoreProgress(attemptStartedAt)
   try {
-    const result = await api.importDatabase()
+    const result = await api.importDatabase(password)
+    // 取消（桌面壳的文件框 / 网页端的文件选择器都回 {canceled:true}）：
+    // 不是失败也不是「恢复了 0 张表」，静默收场即可
+    if (result?.canceled) {
+      stop()
+      publish({ dbRestore: null })
+      toast(t('已取消恢复'))
+      return
+    }
     const tables = Array.isArray(result?.tables) ? result.tables.length : 0
-    const note = result?.safetyBackup
-      ? t('，替换前的数据已备份为 {name}', { name: result.safetyBackup })
-      : ''
-    toast(t('✅ 已恢复 {n} 张表{note}', { n: tables, note }))
     // 密钥指纹不匹配的警告（账号将无法解密）：后端把文案给全了，这里只负责让它
-    // 在面板里**常驻**显示 —— 光靠上面那条 3.5 秒的 toast，用户错过后只会对着
-    // 空账号列表发懵，不知道「为什么账号都没了」
+    // 在面板里**常驻**显示 —— 光靠弹窗里那一段，用户关掉之后只会对着空账号列表
+    // 发懵，不知道「为什么账号都没了」
     const warning = typeof result?.warning === 'string' ? result.warning.trim() : ''
     if (warning) publish({ dbWarning: warning })
-    // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）
-    await load()
-    await shared().wbApp?.refresh?.()
+    stop()
+    // 弹窗留在「完成」态，等用户点「知道了」—— 结果要让人看完再走
+    publish({
+      dbRestore: {
+        active: false,
+        done: true,
+        failed: false,
+        phase: t('恢复完成'),
+        percent: 100,
+        error: '',
+        tables,
+        safetyBackup: typeof result?.safetyBackup === 'string' ? result.safetyBackup : '',
+        warning,
+        reencryptedSecrets: Number(result?.reencryptedSecrets) || 0,
+        localKeysPreserved: result?.localKeysPreserved === true,
+        startedAt: snapshot.dbRestore?.startedAt ?? Date.now(),
+        finishedAt: Date.now(),
+      },
+    })
+    // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）。
+    //
+    // ── 这里的失败**不能**当成恢复失败 ────────────────────────
+    // 恢复的最后一件事是清空面板短效令牌（`access::clear_access_tokens`），
+    // 所以紧接着的 `load()` 很可能拿到 401 —— 那是「要重新登录」，不是「恢复
+    // 没成功」。早先这段在 try 里，令牌一清就把一次成功的恢复报成红色失败。
+    // 现在两件事分开：恢复结果以上面的 publish 为准，刷新的失败只静默。
+    try {
+      await load()
+      await shared().wbApp?.refresh?.()
+    } catch {
+      /* 刷新失败不影响恢复结果；用户下一次操作会自然重拉 */
+    }
   } catch (error) {
-    toast(t('恢复失败：{message}', { message: errorMessage(error) }), 'err')
+    const message = errorMessage(error)
+    if (snapshot.dbRestore?.done) {
+      stop()
+      return
+    }
+    // ── 先别急着报失败 ────────────────────────────────────────
+    // 恢复是一次长调用：壳侧的 HTTP 预算、浏览器的 fetch 都可能先于后端收尾
+    // 而断开（实测 61 秒撞上 60 秒预算）。那时后端照旧在跑，主库正被替换 ——
+    // 报一条「恢复失败」既不是事实，也会诱使用户再点一次恢复，把同一个替换
+    // 叠第二次。所以断开后去问一次后端进度：**还在跑就不收口**，把后续交给
+    // 仍在跑的那个轮询（它会等到后端自己写下 Done / Failed）。
+    if (await restoreStillRunning(api)) {
+      publish({
+        dbRestore: {
+          ...EMPTY_RESTORE,
+          ...snapshot.dbRestore,
+          active: true,
+          done: false,
+          failed: false,
+          phase: t('恢复仍在进行中…'),
+          startedAt: snapshot.dbRestore?.startedAt || Date.now(),
+        },
+      })
+      toast(t('请求已断开，但恢复仍在后台进行 —— 请等待进度弹窗给出结果'))
+      return
+    }
+    stop()
+    publish({
+      dbRestore: {
+        active: false,
+        done: false,
+        failed: true,
+        phase: t('恢复失败'),
+        percent: 100,
+        error: message,
+        tables: 0,
+        safetyBackup: '',
+        warning: '',
+        reencryptedSecrets: 0,
+        localKeysPreserved: false,
+        startedAt: snapshot.dbRestore?.startedAt ?? Date.now(),
+        finishedAt: Date.now(),
+      },
+    })
   } finally {
     endBusy()
   }
 }
 
-/* ─── 数据保留（事件日志保留天数） ─────────────── */
+/** 后端此刻是否仍在恢复（查不到进度就按「没有」处理，让失败照常上报） */
+async function restoreStillRunning(api: ReturnType<typeof shared>['workbuddyDesktop']): Promise<boolean> {
+  try {
+    const data = await api?.getBackupProgress?.()
+    return data?.active === true
+  } catch {
+    return false
+  }
+}
+
+/** 进度快照的初值（`dbRestore` 为 null 表示「没有恢复在跑」） */
+const EMPTY_RESTORE: DbRestoreProgress = {
+  active: false,
+  done: false,
+  failed: false,
+  phase: '',
+  percent: 0,
+  error: '',
+  tables: 0,
+  safetyBackup: '',
+  warning: '',
+  reencryptedSecrets: 0,
+  localKeysPreserved: false,
+  startedAt: 0,
+  finishedAt: 0,
+}
+
+/** 进度轮询间隔：500ms。恢复各阶段的耗时以秒计，再快只是白打接口 */
+const RESTORE_POLL_MS = 500
+
+/**
+ * 轮询的总时长上限：40 分钟。
+ *
+ * 比壳侧的请求预算（`commands.rs` 的 `BACKUP_TRANSFER_TIMEOUT_MS`，30 分钟）
+ * 多留 10 分钟 —— 壳先断开时后端往往还在跑，轮询要继续等到它写结局。
+ */
+const RESTORE_POLL_MAX_MS = 40 * 60 * 1000
+
+/**
+ * 开始轮询恢复进度，返回「停止」函数。
+ *
+ * ── 为什么要容忍拉取失败 ────────────────────────────────────
+ * 恢复的最后一件事是 `config::reload()` 与令牌清空，紧接着界面会重拉整页 ——
+ * 这中间有一小段请求可能拿到 401 / 连接被拒。那不是恢复失败，只是「界面还没
+ * 跟上」，所以轮询里**静默忽略**错误，以 `importDatabase` 的返回值为准。
+ */
+function watchRestoreProgress(attemptStartedAt: number): () => void {
+  let stopped = false
+  let querying = false
+  // 上限：壳侧预算已放宽到 30 分钟，这里再多给一段余量。到点还等不到收口
+  // 就不再轮询（重建时页面本来也会重来）—— 免得一个没有终点的 interval
+  // 一直挂在后台打接口。
+  const deadline = Date.now() + RESTORE_POLL_MAX_MS
+  let timer = 0
+  const tick = async () => {
+    if (stopped) return
+    if (Date.now() > deadline) {
+      stopped = true
+      window.clearInterval(timer)
+      return
+    }
+    if (querying) return
+    querying = true
+    try {
+      const data = await shared().workbuddyDesktop?.getBackupProgress?.()
+      if (stopped || !data) return
+      const startedAt = Number(data.startedAt) || 0
+      // 上一次恢复留下的快照（`startedAt` 早于本次尝试）：不是这次的结果，
+      // 一律无视 —— 否则用户还在文件框里挑文件，弹窗就已经显示「恢复完成」了。
+      if (startedAt && startedAt < attemptStartedAt) return
+      if (!startedAt) return
+      const current = snapshot.dbRestore
+      // ── 后端已收口：由轮询直接写结果 ──────────────────────────
+      // 正常情况下 `importDatabase()` 的返回值也会写同一份结果，两条路径谁先到
+      // 都一样（字段一致）。但**请求断线**时只有这里能收口 —— 壳侧超时之后
+      // 后端仍在跑，靠这一次轮询才能等到真正的结局，否则弹窗会永远停在
+      // 「恢复仍在进行中…」。
+      if (data.active !== true) {
+        const body = (data.result ?? {}) as { tables?: unknown; warning?: unknown; safetyBackup?: unknown; reencryptedSecrets?: unknown; localKeysPreserved?: unknown }
+        const tables = Array.isArray(body.tables) ? body.tables.length : 0
+        const warning = typeof body.warning === 'string' ? body.warning.trim() : ''
+        const failed = data.failed === true
+        if (!failed && data.done !== true) return
+        if (failed && !(typeof data.error === 'string' && data.error.trim())) {
+          // 既没收口理由、也不在跑：多半是刚开始就被打断，等下一次轮询
+          return
+        }
+        publish({
+          dbRestore: {
+            ...EMPTY_RESTORE,
+            ...current,
+            active: false,
+            done: !failed,
+            failed,
+            phase: failed ? t('恢复失败') : t('恢复完成'),
+            percent: 100,
+            error: failed ? String(data.error ?? '') : '',
+            tables,
+            safetyBackup: typeof body.safetyBackup === 'string' ? body.safetyBackup : '',
+            warning,
+            reencryptedSecrets: Number(body.reencryptedSecrets) || 0,
+            localKeysPreserved: body.localKeysPreserved === true,
+            startedAt: startedAt || current?.startedAt || attemptStartedAt,
+            finishedAt: Number(data.finishedAt) || Date.now(),
+          },
+        })
+        if (warning) publish({ dbWarning: warning })
+        // 已收口：停表。随后成功的那次还要重拉整页 —— 数据库被整体换掉了，
+        // 配置、账号、保留期等每一块旧快照都失效。
+        //
+        // 只在「外层已经不再等这条请求」时刷（`busyScope` 已清）：正常成功路径
+        // 上外层紧接着自己会 `load()`，这里再刷一遍是同一件事做两次。断线的
+        // 场景则相反 —— 外层早已收场，只有这里能补上这次刷新。
+        stopped = true
+        window.clearInterval(timer)
+        if (!failed && !busyScope) {
+          try {
+            await load()
+            await shared().wbApp?.refresh?.()
+          } catch {
+            /* 刷新失败不影响恢复结果（理由见 `proceedDbRestore` 的成功分支） */
+          }
+        }
+        return
+      }
+      // 第一次看到后端在跑 = 用户选完文件、恢复真的开始了 → 这时才挂弹窗
+      publish({
+        dbRestore: {
+          ...EMPTY_RESTORE,
+          ...current,
+          active: true,
+          done: false,
+          failed: false,
+          phase: typeof data.phase === 'string' && data.phase ? data.phase : (current?.phase ?? t('正在恢复…')),
+          // 进度只增不减：后端给的百分比是阶段起点，这里再兜一层，避免抖动
+          percent: Math.max(current?.percent ?? 0, Number(data.percent) || 0),
+          startedAt: startedAt || current?.startedAt || Date.now(),
+        },
+      })
+    } catch {
+      /* 静默：见函数头的说明 */
+    } finally {
+      querying = false
+    }
+  }
+  void tick()
+  timer = window.setInterval(() => void tick(), RESTORE_POLL_MS)
+  return () => {
+    stopped = true
+    window.clearInterval(timer)
+  }
+}
+
+async function reconnectDbRestore(): Promise<void> {
+  if (busyScope || snapshot.dbRestore) return
+  try {
+    const progress = await shared().workbuddyDesktop?.getBackupProgress?.()
+    if (progress?.active) watchRestoreProgress(Number(progress.startedAt) || Date.now())
+  } catch {
+    /* 恢复进度不可用不影响其他设置加载。 */
+  }
+}
+
+/** 关掉恢复结果弹窗（只在 `done` / `failed` 之后可调） */
+export function dismissDbRestore(): void {
+  if (snapshot.dbRestore?.active) return
+  publish({ dbRestore: null })
+}
+
+/* ─── 数据保留 ──────────────────────────── */
 
 export function renderRetention(data?: unknown): void {
   if (data === undefined) return
@@ -933,27 +1303,18 @@ function askRetentionShrink(head: string): Promise<boolean> {
   })
 }
 
-/** 改小保留期会立即删数据，文案必须点名「删的是哪一档」（泛化：选项来自 RETENTION_FIELDS） */
-function shrinkPromptHead(field: NumberField, previous: number | null, days: number): string {
-  return previous === null
-    ? t('没能读到「{label}」的当前值，改为 {days} 天可能会删除超出的历史数据。', {
-      label: field.label, days,
-    })
-    : t('「{label}」将从 {previous} 天改为 {days} 天。', { label: field.label, previous, days })
-}
-
 /**
  * 单个输入框的提交流程：校验 → （改小时）确认 → 提交。任一步失败都不写快照，
  * 视图层把草稿收掉，显示回到生效值（旧实现是显式 revert）。
  */
-export async function saveRetentionField(field: NumberField, raw: string): Promise<void> {
+export async function saveRetentionField(field: RetentionField, raw: string): Promise<void> {
   if (busyScope) return
   // 确认框开着时不再受理新的编辑：一次只问一个问题，否则第二个问题会把第一个顶掉
   // （resolver 只能存一个），那个输入框就会在没人点过「取消」的情况下被回滚。
   // 遮罩已经挡住了页面，走到这里只剩键盘 Tab 之类的少数路径，挡一下成本极低。
   if (snapshot.retentionConfirm) return
 
-  const parsed = parseInteger(raw, field.min, field.max, t('天数'))
+  const parsed = parseInteger(raw, field.min, field.max, field.kind === 'count' ? t('条数') : t('天数'))
   if (!parsed.ok) { toast(parsed.message, 'err'); return }
 
   const known = snapshot.retention.values?.[field.key]
@@ -964,17 +1325,13 @@ export async function saveRetentionField(field: NumberField, raw: string): Promi
   // 读不到旧值时无从判断是否改小 —— 只有改小才会删数据，所以这里宁可多问一次：
   // 白弹一次确认的代价，远小于静默删掉用户的历史数据
   const shrinking = previous === null || parsed.value < previous
-  if (shrinking && !await askRetentionShrink(shrinkPromptHead(field, previous, parsed.value))) return
+  if (shrinking && !await askRetentionShrink(retentionShrinkHead(field, previous, parsed.value))) return
 
   await commitRetention(field, parsed.value, shrinking)
 }
 
-/**
- * 提交一项保留期：只传变化的那一个字段 —— 后端支持部分字段（未出现的项保持原值），
- * 整份回传会把另外两项也卷进「是否改小」的确认范围，白白多弹一次窗。
- * shrinking 表示这次是改小（后端会顺手清理），决定提示语要不要提「已清理」。
- */
-async function commitRetention(field: NumberField, days: number, shrinking: boolean): Promise<void> {
+/** 只提交变化的字段，避免覆盖其他保留设置。 */
+async function commitRetention(field: RetentionField, value: number, shrinking: boolean): Promise<void> {
   if (busyScope) return
   beginBusy('retention')
   // 乐观写入待保存的值，再禁用输入框（视图按 busy === 'retention' 禁用）。理由：Chromium 里
@@ -982,26 +1339,18 @@ async function commitRetention(field: NumberField, days: number, shrinking: bool
   // 提交会走忙碌分支早退；不先记新值，用户就会看到「刚改的数字闪回旧值、过一下又变回来」。
   // 真失败了下面的 catch 会重读后端覆盖，所以这个乐观值不会被留在界面上。
   const optimistic = snapshot.retention.values
-  if (optimistic) publish({ retention: { status: 'ready', values: { ...optimistic, [field.key]: days } } })
+  if (optimistic) publish({ retention: { status: 'ready', values: { ...optimistic, [field.key]: value } } })
   try {
-    const saved = await shared().workbuddyDesktop?.saveRetention({ [field.key]: days })
-    // PUT 契约上返回生效后的**三项**值，正常情况下用响应刷新即可，不必再跑一趟 GET
+    const saved = await shared().workbuddyDesktop?.saveRetention({ [field.key]: value })
     renderRetention(saved)
     const values = snapshot.retention.values
     if (RETENTION_FIELDS.every(item => Number.isInteger(values?.[item.key]))) {
-      const applied = values?.[field.key] ?? days
-      toast(shrinking
-        ? t('✅ 已保留 {days} 天，超出部分已清理', { days: applied })
-        : t('✅ 已保留 {days} 天', { days: applied }))
+      toast(retentionSavedMessage(field, values?.[field.key] ?? value, shrinking))
       return
     }
-    // 响应里三项没齐（换壳后接口形状变了之类）：退回一次 GET 补齐，
-    // 宁可多跑一趟，也不能停在「界面说改了、其实没读到真值」的状态
+    // 响应不完整时重新读取，避免把未确认的值当成已生效设置。
     await loadRetention()
-    // 这里提示用户填的值：GET 也没读到真值时，报后端返回的值反而更让人困惑
-    toast(shrinking
-      ? t('✅ 已保留 {days} 天，超出部分已清理', { days })
-      : t('✅ 已保留 {days} 天', { days }))
+    toast(retentionSavedMessage(field, snapshot.retention.values?.[field.key] ?? value, shrinking))
   } catch (error) {
     // 400 的 message（点名哪个字段、超出多少）比自造一句更指向具体问题
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
@@ -1023,7 +1372,7 @@ async function commitRetention(field: NumberField, days: number, shrinking: bool
  * 直接换号」名单）由各自的代码实现，在数据到达 / 不可用时被回调一次。
  */
 type NumericPanel = {
-  scope: 'retry' | 'timeouts' | 'queue' | 'captchaPool'
+  scope: 'retry' | 'timeouts' | 'queue' | 'imageCompress' | 'captchaPool'
   fields: NumberField[]
   consoleLabel: string
   /** 取数 / 写回：桥不在时给 undefined（各调用点按「读不到」处理） */
@@ -1105,6 +1454,64 @@ export async function loadQueue(): Promise<void> {
 
 export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
   await saveNumericField(queuePanel, field, raw)
+}
+
+/* ─── 会话图片压缩（开关 + 三项参数）────────────── */
+
+/** 从响应里读开关（非对象 / 字段不是字面 true 都算关，与后端「只认字面 true」一致） */
+function imageCompressEnabledFlag(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false
+  return (data as Record<string, unknown>)[IMAGE_COMPRESS_ENABLED_KEY] === true
+}
+
+/**
+ * 图片压缩面板：三项数字复用数字面板的取数 / 写入 / 回滚流程；开关另走一条
+ * 只改一个布尔值的保存路径（与 developerRoleCompat 同款）。两者共用同一条
+ * `/api/image-compress` 端点，响应里同时带开关与三项参数。
+ */
+const imageCompressPanel: NumericPanel = {
+  scope: 'imageCompress',
+  fields: IMAGE_COMPRESS_FIELDS,
+  consoleLabel: '读取会话图片压缩设置',
+  get: () => shared().workbuddyDesktop?.getImageCompress(),
+  save: patch => shared().workbuddyDesktop?.saveImageCompress(patch),
+  read: () => ({ status: snapshot.imageCompress.status, values: snapshot.imageCompress.values }),
+  write: state => publish({
+    imageCompress: { ...snapshot.imageCompress, status: state.status, values: state.values },
+  }),
+  // 同一份响应里还带开关；数字面板不认布尔值，这里顺手回写
+  syncExtras: data => {
+    publish({ imageCompress: { ...snapshot.imageCompress, enabled: imageCompressEnabledFlag(data) } })
+  },
+}
+
+export function renderImageCompress(data?: unknown): void {
+  renderNumericPanel(imageCompressPanel, data)
+}
+
+export async function loadImageCompress(): Promise<void> {
+  await loadNumericPanel(imageCompressPanel)
+}
+
+export async function saveImageCompressField(field: NumberField, raw: string): Promise<void> {
+  await saveNumericField(imageCompressPanel, field, raw)
+}
+
+/** 开关的保存路径（只改一个布尔值；失败回滚到后端真实值） */
+export async function saveImageCompressEnabled(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('imageCompress')
+  publish({ imageCompress: { ...snapshot.imageCompress, enabled: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveImageCompress({ [IMAGE_COMPRESS_ENABLED_KEY]: next })
+    renderImageCompress(saved)
+    toast(next ? t('✅ 会话图片压缩已开启') : t('已关闭会话图片压缩'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadImageCompress() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
 }
 
 /* ─── 验证码令牌池 ─────────────────────────── */
@@ -1331,7 +1738,7 @@ export async function saveTimeoutField(field: NumberField, raw: string): Promise
   await saveNumericField(timeoutsPanel, field, raw)
 }
 
-/* ─── 调试模式 / 指纹脱敏（两个同构的全局布尔开关）── */
+/* ─── 调试模式 / 指纹脱敏 ── */
 
 export function renderDebug(data?: unknown): void {
   if (data === undefined) return
@@ -1380,12 +1787,7 @@ export async function saveDebug(next: boolean): Promise<void> {
 
 export function renderSanitize(data?: unknown): void {
   if (data === undefined) return
-  if (!data || typeof data !== 'object') {
-    publish({ sanitize: { status: 'unavailable', on: false } })
-    return
-  }
-  const record = data as Record<string, unknown>
-  publish({ sanitize: { status: 'ready', on: record.sanitizeBlacklistFingerprints === true } })
+  publish({ sanitize: sanitizeStateFrom(data, snapshot.sanitize) })
 }
 
 async function loadSanitize(): Promise<void> {
@@ -1398,16 +1800,32 @@ async function loadSanitize(): Promise<void> {
 }
 
 export async function saveSanitize(next: boolean): Promise<void> {
-  if (busyScope) { repaint(); return }
+  await saveSanitizeConfig({ sanitizeBlacklistFingerprints: next }, next
+    ? t('✅ 出站指纹脱敏已开启') : t('已关闭出站指纹脱敏'))
+}
+
+export async function saveSanitizeConfig(patch: SanitizePatch, message?: string): Promise<boolean> {
+  if (busyScope) { repaint(); return false }
   beginBusy('sanitize')
-  publish({ sanitize: { status: 'ready', on: next } })
   try {
-    const saved = await shared().workbuddyDesktop?.saveSanitize(next)
-    renderSanitize(saved)
-    toast(next ? t('✅ 出站指纹脱敏已开启') : t('已关闭出站指纹脱敏'))
+    const api = shared().workbuddyDesktop
+    if (!api?.saveSanitize) throw new Error(t('主进程桥不可用'))
+    const request = !snapshot.sanitize.editable && typeof patch.sanitizeBlacklistFingerprints === 'boolean'
+      ? patch.sanitizeBlacklistFingerprints : patch
+    const data = await api.saveSanitize(request)
+    const state = sanitizeStateFrom(data, snapshot.sanitize)
+    if (state.status !== 'ready') throw new Error(t('未能读取保存后的指纹脱敏设置'))
+    publish({ sanitize: state })
+    toast(
+      state.saved
+        ? message ?? t('✅ 指纹脱敏设置已保存')
+        : t('指纹脱敏设置仅本次运行生效，写入数据库失败，请检查配置目录'),
+      state.saved ? 'ok' : 'err',
+    )
+    return true
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
-    await loadSanitize() // 回滚到后端的真实值
+    return false
   } finally {
     endBusy()
   }
@@ -1513,6 +1931,61 @@ export async function saveClineHeaders(overrides: Record<string, string>): Promi
   }
 }
 
+/* ─── ZCode 客户端版本号（上游按它决定活动套餐下不下发）── */
+
+export function renderZcodeVersion(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ zcodeVersion: { status: 'unavailable', version: '', envOverride: '' } })
+    return
+  }
+  const source = data as { version?: unknown; envOverride?: unknown }
+  publish({
+    zcodeVersion: {
+      status: 'ready',
+      version: typeof source.version === 'string' ? source.version : '',
+      // null / 缺失统一成空串：视图层只需判「非空 = 环境变量压着」
+      envOverride: typeof source.envOverride === 'string' ? source.envOverride : '',
+    },
+  })
+}
+
+async function loadZcodeVersion(): Promise<void> {
+  try {
+    renderZcodeVersion(await shared().workbuddyDesktop?.getZcodeVersion())
+  } catch (error) {
+    console.warn('读取 ZCode 客户端版本号失败:', errorMessage(error))
+    renderZcodeVersion(null)
+  }
+}
+
+export async function refreshZcodeVersion(): Promise<void> {
+  await loadZcodeVersion()
+  toast(t('ZCode 版本号已刷新'))
+}
+
+/**
+ * 保存版本号（空串 = 清空覆盖、回落插件内置默认值）。
+ *
+ * 后端只校验长度与字符集，**不校验「这个版本存在」** —— 上游的版本号对我们
+ * 是黑盒。填错的表现是「还是探不到套餐」，所以保存后如实回读后端值，
+ * 让用户看到落库的到底是什么。
+ */
+export async function saveZcodeVersion(version: string): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('zcodeVersion')
+  try {
+    const saved = await shared().workbuddyDesktop?.saveZcodeVersion(version)
+    renderZcodeVersion(saved)
+    toast(version.trim() ? t('✅ ZCode 版本号已保存') : t('已清空，回落插件内置默认值'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadZcodeVersion() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── 网关面跨域访问（/v1/* 的 CORS，默认关）── */
 
 export function renderCors(data?: unknown): void {
@@ -1550,32 +2023,116 @@ export async function saveCors(next: boolean): Promise<void> {
   }
 }
 
-/* ─── 机器人校验（面板登录 / 注册的 ALTCHA 开关）── */
+/* ─── 机器人校验（面板登录 / 注册的 ALTCHA 开关，分两端）── */
+
+/** 把 `/api/captcha` 的响应折成快照（读与写后的回读共用一份解析） */
+function captchaState(state: CaptchaSetting | null | undefined): SettingsSnapshot['captcha'] {
+  if (!state || typeof state !== 'object') {
+    return { available: false, desktop: false, web: false, localPanel: false }
+  }
+  return {
+    available: true,
+    desktop: state.captchaDesktop === true,
+    web: state.captchaWeb === true,
+    localPanel: state.localPanel === true,
+  }
+}
 
 async function loadCaptcha(): Promise<void> {
   try {
     const state = await shared().workbuddyDesktop?.getCaptchaSetting()
-    publish({ captcha: { available: true, enabled: state?.captchaEnabled === true } })
+    publish({ captcha: captchaState(state) })
   } catch (error) {
     // 读失败降级禁用开关（照 retention 的模式）
-    publish({ captcha: { available: false, enabled: false } })
+    publish({ captcha: captchaState(null) })
     console.warn('读取机器人校验设置失败:', errorMessage(error))
   }
 }
 
-export async function saveCaptcha(next: boolean): Promise<void> {
+/** 拨动某一端的开关（`side` 决定写哪个字段，另一端原样不动） */
+export async function saveCaptcha(side: 'desktop' | 'web', next: boolean): Promise<void> {
   if (busyScope) { repaint(); return }
   beginBusy('captcha')
-  publish({ captcha: { ...snapshot.captcha, enabled: next } })
+  // 乐观更新：只改拨动的那一端
+  publish({ captcha: { ...snapshot.captcha, [side]: next } })
+  const label = side === 'desktop' ? t('桌面端') : t('网页端')
   try {
-    const state = await shared().workbuddyDesktop?.saveCaptchaSetting(next)
-    publish({ captcha: { available: true, enabled: state?.captchaEnabled === true } })
-    toast(next ? t('✅ 机器人校验已开启') : t('⚠️ 机器人校验已关闭'))
+    const state = await shared().workbuddyDesktop?.saveCaptchaSetting(
+      side === 'desktop' ? { captchaDesktop: next } : { captchaWeb: next },
+    )
+    publish({ captcha: captchaState(state) })
+    toast(next ? t('✅ 已开启「{label}」的机器人校验', { label }) : t('⚠️ 已关闭「{label}」的机器人校验', { label }))
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
     await loadCaptcha()
   } finally {
     endBusy()
+  }
+}
+
+/* ─── 面板账户（设置页「账户」分类）── */
+
+async function loadAccount(): Promise<void> {
+  try {
+    const state = await shared().workbuddyDesktop?.getPanelAccount()
+    publish({
+      account: {
+        status: 'ready',
+        registered: state?.registered === true,
+        username: typeof state?.username === 'string' ? state.username : '',
+        password: snapshot.account.password,
+      },
+    })
+  } catch (error) {
+    publish({ account: { ...snapshot.account, status: 'unavailable' } })
+    console.warn('读取面板账户失败:', errorMessage(error))
+  }
+}
+
+/** 打开改密码弹窗（表单值由弹窗自己持有，这里只管开关与忙碌态） */
+export function openPasswordDialog(): void {
+  if (!snapshot.account.registered) return
+  publish({ account: { ...snapshot.account, password: { busy: false, error: '' } } })
+}
+
+/** 关闭改密码弹窗（忙碌中不允许关 —— 请求还在路上，关掉就看不到结果） */
+export function closePasswordDialog(): void {
+  if (snapshot.account.password?.busy) return
+  publish({ account: { ...snapshot.account, password: null } })
+}
+
+/**
+ * 提交改密码。校验口径与后端一致（新密码至少 8 位、不能与旧密码相同），
+ * 前端先挡一道只是为了少一次往返；真正的判据在 `panel_change_password`。
+ */
+export async function submitPasswordChange(oldPassword: string, newPassword: string): Promise<void> {
+  const current = snapshot.account.password
+  if (!current || current.busy) return
+  if (!oldPassword) {
+    publish({ account: { ...snapshot.account, password: { busy: false, error: t('请输入当前密码') } } })
+    return
+  }
+  if (newPassword.length < 8) {
+    publish({ account: { ...snapshot.account, password: { busy: false, error: t('新密码至少 8 位') } } })
+    return
+  }
+  if (newPassword === oldPassword) {
+    publish({ account: { ...snapshot.account, password: { busy: false, error: t('新密码不能与当前密码相同') } } })
+    return
+  }
+  publish({ account: { ...snapshot.account, password: { busy: true, error: '' } } })
+  try {
+    await shared().workbuddyDesktop?.changePanelPassword(oldPassword, newPassword)
+    // 其他会话已被后端撤销，本机这条仍然有效 —— 关掉弹窗、提示即可
+    publish({ account: { ...snapshot.account, password: null } })
+    toast(t('✅ 密码已修改，其他设备的登录已失效'))
+  } catch (error) {
+    publish({
+      account: {
+        ...snapshot.account,
+        password: { busy: false, error: errorMessage(error) },
+      },
+    })
   }
 }
 
@@ -1890,11 +2447,8 @@ async function saveProviderPrompt(
  * 一个值时，另一个若不带就落到「内置默认」—— 一次改动，两个后果，第二个还看不见
  * （`saveProviderPromptMode` 早先就为这件事这么做了）。
  *
- * **正文**只在一种情况下一起落：这一行原本跟随全局、且全局那份正文本身就是
- * 「界面里编辑的」。否则给空串（= 这一家没有自己的正文）：它自己的文件 / 内置默认
- * 接管，渲染出来的仍是屏幕上那段文本（文件路径刚被一起落下来了）。反过来，若无条件
- * 把屏幕上的文本落成这一家的正文，就会把**文件内容复制进配置** —— 之后改文件不再生效，
- * 而配置里多出几百行看不出缘由的文本。
+ * 正文保留已有的界面覆盖（含透传模式下存着但未生效的文本）；跟随全局时同理。
+ * 文件内容与内置默认不复制进配置，否则后续改文件会被这份副本遮住。
  */
 function providerPatch(
   prompt: PromptState,
@@ -1904,7 +2458,8 @@ function providerPatch(
   return {
     promptMode: item.mode,
     promptFile: item.file,
-    promptText: followGlobal && prompt.source === 'inline' ? prompt.text : '',
+    promptText: item.source === 'inline' || item.mode === 'passthrough' ? item.text
+      : followGlobal && (prompt.source === 'inline' || prompt.mode === 'passthrough') ? prompt.text : '',
   }
 }
 
@@ -2075,13 +2630,14 @@ export async function clearDegrade(): Promise<void> {
 
 /** 数值归一：非有限数一律 null（视图据此显示「—」） */
 function finiteOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
   const num = Number(value)
   return Number.isFinite(num) ? num : null
 }
 
 /**
  * 渲染概况。形状是后端的**单库语义**：
- * `{ configDir, database: { file, bytes, available, accounts, logs, requests, dailyDays, debug } }`。
+ * `{ configDir, database: { file, bytes, available, accounts, logs, requests, dailyDays, downstreamRaw, upstreamRaw } }`。
  * 后端起不来（网络 / 桥失败）与库打不开是两件事，但对这一页的结论相同：读不到存储概况就
  * 展示「不可用」而不是一排看着正常的 0。
  */
@@ -2105,7 +2661,8 @@ export function renderStorage(data?: unknown): void {
       logs: finiteOrNull(record.logs),
       requests: finiteOrNull(record.requests),
       dailyDays: finiteOrNull(record.dailyDays),
-      debug: finiteOrNull(record.debug),
+      downstreamRaw: finiteOrNull(record.downstreamRaw),
+      upstreamRaw: finiteOrNull(record.upstreamRaw ?? record.debug),
     },
   })
 }
@@ -2128,7 +2685,14 @@ async function loadStorage(): Promise<void> {
 export async function panelLogout(): Promise<boolean> {
   try {
     await shared().workbuddyDesktop?.panelLogout()
-    window.location.href = '/login'
+    // 桌面壳里壳自己也存着一份令牌（panel_session），必须一并清掉 ——
+    // 只撤销服务端会话而不清本地，下次启动壳仍会拿着死令牌去试，
+    // 表现为「每次开机都要多绕一次登录页」。
+    await shared().workbuddyDesktop?.panelSessionClear?.()
+    // 桌面窗口的页面来自 tauri://，站内路径 `/login` 不存在（那是 headless
+    // 静态托管的路径）。两种形态各回各的登录页。
+    const desktop = shared().workbuddyDesktop?.platform !== 'web'
+    window.location.href = desktop ? 'login.html' : '/login'
     return true
   } catch (error) {
     toast(t('退出失败：{message}', { message: errorMessage(error) }), 'err')
@@ -2146,6 +2710,7 @@ export async function load(): Promise<void> {
   restoreCategory()
   renderUnits()
   publish({ panelLogin: readPanelLogin() })
+  window.dispatchEvent(new Event('wb:settings-load'))
   await Promise.all([
     loadSettings(),
     loadLanExtras(),
@@ -2153,19 +2718,25 @@ export async function load(): Promise<void> {
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
+    loadImageCompress(),
     loadCaptchaPool(),
-    loadRouting(),
     loadDebug(),
     loadSanitize(),
     loadDeveloperRoleCompat(),
     loadClineHeaders(),
+    loadZcodeVersion(),
     loadCors(),
     loadPrompt(),
     loadStorage(),
     loadCaptcha(),
+    loadAccount(),
     loadModelsDev(),
+    reconnectDbRestore(),
     // 软件更新面板是另一个岛（update-panel.tsx），切进设置页时让它自己刷新一次
     shared().wbUpdatePanel?.load?.(),
+    // 「版本信息」也是独立岛（system-info-pane.tsx）：同样在切进设置页时重拉 ——
+    // 版本 / 运行时长 / 在途请求这些读数会随时间变，缓存一份旧的没有意义
+    shared().wbSystemInfoPane?.load?.(),
   ])
 }
 
@@ -2173,7 +2744,7 @@ export async function load(): Promise<void> {
 
 export async function refreshRetention(): Promise<void> {
   await loadRetention()
-  toast(t('保留天数已刷新'))
+  toast(t('数据保留设置已刷新'))
 }
 
 export async function refreshRetry(): Promise<void> {
@@ -2189,6 +2760,11 @@ export async function refreshTimeouts(): Promise<void> {
 export async function refreshQueue(): Promise<void> {
   await loadQueue()
   toast(t('排队等待设置已刷新'))
+}
+
+export async function refreshImageCompress(): Promise<void> {
+  await loadImageCompress()
+  toast(t('会话图片压缩设置已刷新'))
 }
 
 export async function refreshCaptchaPool(): Promise<void> {

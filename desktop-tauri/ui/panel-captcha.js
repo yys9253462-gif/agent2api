@@ -31,12 +31,6 @@
   /** 题目寿命：服务端 10 分钟过期，提前 30 秒重领，避免踩线提交拿到「已过期」 */
   var REFRESH_MS = 9.5 * 60 * 1000
 
-  var TEXT = {
-    idle: wbI18n.t('我不是机器人'),
-    verifying: wbI18n.t('验证中…'),
-    verified: wbI18n.t('验证成功'),
-    error: wbI18n.t('验证失败，请重试'),
-  }
 
   /* ── SHA-256：`crypto.subtle` 不可用时的兜底实现 ──────────────
      标准 FIPS 180-4 实现，一次处理整块输入（题面只有几十字节，够用）。
@@ -127,7 +121,7 @@
     }
 
     connectedCallback() {
-      if (!this.box) this.render()
+      this.setAttribute('state', this.state)
       this.addEventListener('click', this.onClick)
       // 页面一加载就领题求解（与迁移前的 widget 同观感：进来就是「验证中…」）
       void this.start()
@@ -214,21 +208,8 @@
     setState(state) {
       this.state = state
       this.setAttribute('state', state)
-      if (this.label) this.label.textContent = TEXT[state] || TEXT.idle
     }
 
-    render() {
-      // 浅色 DOM（不用 shadow）：样式留在 login.html 的页面样式里，与迁移前
-      // 官方 widget 的处理方式一致（那套 CSS 也是从页面层调它的内部 DOM）
-      this.innerHTML =
-        '<span class="pc-box"><span class="pc-indicator" aria-hidden="true"></span>'
-        + '<span class="pc-label"></span></span>'
-      this.box = this.querySelector('.pc-box')
-      this.label = this.querySelector('.pc-label')
-      this.setAttribute('role', 'button')
-      this.setAttribute('tabindex', '0')
-      this.setState(this.state)
-    }
   }
 
   customElements.define('panel-captcha', PanelCaptcha)

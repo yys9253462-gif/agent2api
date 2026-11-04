@@ -93,7 +93,7 @@
    * 业务结果（成功 / `already_claimed` / 其它失败）都走 `reportOutcome` 播报，
    * 并把后端那份结果送回调用方。
    */
-  async function claim(accountId, planId) {
+  async function claim(accountId, planId, signal, onPhase) {
     const api = bridge();
     const id = String(accountId || '');
     if (!id) {
@@ -105,22 +105,32 @@
       return null;
     }
     const target = String(planId || '');
+    const requireActive = () => {
+      if (signal?.aborted) throw new DOMException('请求已取消', 'AbortError');
+    };
+    requireActive();
+    onPhase?.('preparing');
 
-    let captchaConfig = { enabled: false };
+    let captchaConfig;
     try {
-      captchaConfig = await api.zcodeClaimCaptchaConfig(id) || { enabled: false };
+      captchaConfig = await api.zcodeClaimCaptchaConfig(id);
+      requireActive();
     } catch (error) {
-      // 取配置失败不等于不能领：按「不需要验证码」试一次，上游要的话会回
-      // 3007，那时再如实告诉用户「验证码校验未通过」
-      window.wbApp.toast(wbI18n.t('获取风控配置失败，将直接尝试领取：{message}', { message: describeError(error) }), 'warn');
+      if (signal?.aborted) return null;
+      window.wbApp.toast(wbI18n.t('获取风控配置失败：{message}', { message: describeError(error) }), 'warn');
+      return null;
     }
 
-    const callClaim = captchaVerifyParam => api.zcodeClaim(
-      id,
-      target,
-      captchaVerifyParam || '',
-      captchaConfig.region || '',
-    );
+    if (!captchaConfig || typeof captchaConfig.enabled !== 'boolean') {
+      window.wbApp.toast(wbI18n.t('风控验证配置不完整，请稍后重试'), 'warn');
+      return null;
+    }
+
+    const callClaim = captchaVerifyParam => {
+      requireActive();
+      onPhase?.('submitting');
+      return api.zcodeClaim(id, target, captchaVerifyParam || '', captchaConfig?.region || '');
+    };
 
     // 不需要验证码：一次请求就完事
     if (!captchaConfig?.enabled) {
@@ -147,19 +157,20 @@
     try {
       outcome = await captcha.solve(
         {
-          region: captchaConfig.region || 'ga',
+          region: captchaConfig.region || 'cn',
           prefix: captchaConfig.prefix,
           sceneId: captchaConfig.sceneId,
         },
         async captchaVerifyParam => {
           const result = await callClaim(captchaVerifyParam);
-          // 业务结果借返回值带回上层（`solve` 会原样 resolve 它）
-          return { captchaResult: true, bizResult: true, result };
+          return { captchaResult: result?.failure !== 'captcha', bizResult: Boolean(result?.ok), result };
         },
+        signal,
+        { protocol: 'v3', onPhase },
       );
     } catch (error) {
       // 用户主动取消验证码不算失败（与 AutoClaw 登录那边同一处置）
-      if (error instanceof captcha.CaptchaCancelledError) {
+      if (error instanceof captcha.CaptchaCancelledError || error?.name === 'AbortError') {
         window.wbApp.toast(wbI18n.t('已取消领取'));
         return null;
       }
@@ -206,8 +217,8 @@
     return result;
   }
 
-  // 「这个账号有没有领取能力」的判据**不在这里** —— 它走账号页的能力表
-  // （accounts-domain.ts 的 `claim` 位 + 后端给的 `canClaim`，见 `supportsClaim`）。
+  // 「这个账号有没有领取能力」的判据**不在这里** —— 入口由签到中心的「活动福利」卡
+  // 给出（判据是后端插件申报的 `plans` 位，见 api::checkin_center）。
   // 本模块只负责「探测一次」与「领一份」。
   window.wbZcodeClaim = { preview, claim };
 })();

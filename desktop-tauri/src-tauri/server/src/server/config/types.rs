@@ -46,6 +46,8 @@ pub const KEY_LOG_RETENTION_DAYS: &str = "logRetentionDays";
 pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestLogRetentionDays";
 /// 按天聚合（统一库的 `request_daily` 表）保留天数（改名理由同上）
 pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyAggregateRetentionDays";
+pub const KEY_LOG_RETENTION_COUNT: &str = "logRetentionCount";
+pub const KEY_REQUEST_RETENTION_COUNT: &str = "requestLogRetentionCount";
 
 /// 事件日志的保存目录（config.json 键）。
 ///
@@ -67,44 +69,11 @@ pub const KEY_DEBUG_DIR: &str = "debugDir";
 /// `resolve_account_proxy`），这里只存取。
 pub const KEY_UPDATE_PROXY: &str = "updateProxy";
 
-/// 「加入 beta 版」开关（config.json 键，**缺省 = 关**）。
+/// 「关注 beta 版更新」开关（config.json 键，缺省关）。
 ///
-/// 开启后「检查更新」改问 GitHub 的 Release **列表**，把预发布版（beta）一并
-/// 纳入候选、取版本号最高的一个；关闭时仍问 `/releases/latest`（GitHub 自己
-/// 排除预发布与草稿）。检查结果同时喂给面板、侧栏徽标与下载安装包三条路，
-/// 所以拨一下开关不用重启，下一次检查就换通道（含定时任务）。
-///
-/// **默认关**：beta 版由 beta 分支构建、可能不稳定，只有明确想尝鲜的人才会打开
-/// （与 `debugMode` 同一取向 —— 默认关的代价只是「功能对没打开的人不存在」）。
-///
-/// 与之配套的一条约定：**beta 版的版本号必须与 tag 一致**（tag `v3.1.0-beta.1`
-/// 就要把应用版本写成 `3.1.0-beta.1`），否则版本比较会把「当前 beta」判成比
-/// 「待装的 beta」新，通道打开也收不到更新 —— 比较规则见
-/// `core::update::version` 的预发布段处理。
+/// 与 `updateStable` 共同筛选 Release，当前安装版本不改变关注范围。
+/// beta 版本号必须与 tag 的语义化版本一致，否则无法判断更新先后。
 pub const KEY_UPDATE_BETA: &str = "updateBeta";
-
-/// 代理内核（mihomo）的**存放目录**（config.json 键）。
-///
-/// 值是**绝对路径**；缺省 / 空串 / 相对路径（读侧视为写坏）都回落
-/// `{config_dir}/proxy-kernel` —— 与 `logDir` 那几个键同一口径。
-/// 目录由内核下载弹窗选择（「网络代理」页 →「下载内核」），里面放二进制、
-/// `config.yaml`、`kernel-state.json`（节点 → 端口映射）与 provider 缓存，
-/// **整份都跟着这个键走**：改目录 = 换一整套内核数据的位置。
-/// 所以它只在「未安装」时可改（弹窗只在此时出现）—— 已装之后改键会让
-/// `installed()` 指向一个空目录，界面上看着像「内核没装」而旧文件仍在原处。
-pub const KEY_KERNEL_DIR: &str = "kernelDir";
-
-/// 代理内核的**下载出网线路**（config.json 键，缺省 = 默认链）。
-///
-/// 形状与 `updateProxy` 完全相同（归一后的账号代理配置对象 / null），
-/// 归一与解析复用同一套实现。**与 `updateProxy` 是两个独立的键**：下载内核
-/// 走哪条线路与「软件更新」走哪条线路是两件事（前者是订阅功能的前置条件，
-/// 后者是壳自己的更新），互不覆盖。
-///
-/// 缺省（未设置 / null）= 默认链：直连失败自动借 Clash 混合端口重试一次
-/// （见 `core::sub_kernel::download` 的出口候选）。**显式选定后只走选的那条**
-/// —— 用户专门选了出口，静默改走别的（尤其改走直连）会让失败信息变得不可信。
-pub const KEY_KERNEL_PROXY: &str = "kernelProxy";
 
 /// GitHub 令牌的密文信封（config.json 键，**存的不是明文**）。
 ///
@@ -208,7 +177,24 @@ pub const KEY_STRIP_NEWLINE_KEEPALIVE: &str = "stripNewlineKeepalive";
 /// `parse::env_captcha_enabled`）—— Docker 想从第一次启动就关掉校验的，
 /// 在 compose / `.env` 里设它即可；设置页改过一次之后以库里的值为准
 /// （优先级「配置里的值 > 环境变量」）。
+///
+/// ── 分端（2026-10 起）──────────────────────────────────────
+/// 本键是**旧版的单开关**，现在只作为两端的共同默认值：读取时优先看
+/// [`KEY_CAPTCHA_DESKTOP`] / [`KEY_CAPTCHA_WEB`]，两者都没有才回落它。
+/// 升级时两个分端键缺省即回落旧值 —— 老用户改过的开关状态不会丢。
 pub const KEY_CAPTCHA_ENABLED: &str = "captchaEnabled";
+
+/// 桌面端（Tauri 壳）的机器人校验开关。
+///
+/// 桌面形态默认**开启**（与旧单开关一致）：登录 / 注册端点对局域网里的
+/// 其他设备同样开放，ALTCHA 是同一道门槛。用户可在设置里单独关掉 ——
+/// 本机访问而嫌算力开销时，关掉只影响桌面形态。
+pub const KEY_CAPTCHA_DESKTOP: &str = "captchaDesktop";
+
+/// 网页端（headless / Docker / 浏览器面板）的机器人校验开关。
+///
+/// headless 形态默认**开启**：这是暴露在真实网络上的登录页，暴破成本最低。
+pub const KEY_CAPTCHA_WEB: &str = "captchaWeb";
 
 /// models.dev 模型元数据开关的键（config.json 键，见 `core::model_meta`）。
 ///
@@ -302,6 +288,22 @@ pub const KEY_PROMPT_GATEWAY: &str = "promptGateway";
 ///
 /// 删掉某家 = 把这个键从对象里去掉（接口侧传 `null`）= 回到官方原文。
 pub const KEY_PROMPT_GATEWAY_TEXT: &str = "promptGatewayText";
+
+/// 插件侧读「网关自带提示词开关」时用的**约定键名**（`settings.get` 的 `key`）。
+///
+/// ── 为什么插件不能直接读 `KEY_PROMPT_GATEWAY` ────────────────
+/// `settings.get` 的默认口径是「读 `plugin.<provider>.<key>` 这条**插件私有**
+/// 配置」，而提示词开关是网关自己的用户配置（存在顶层 `promptGateway` 表里、
+/// 按 provider id 索引）。给这两个键名开一条专用回答，插件就能读到同一份用户
+/// 配置 —— 否则界面上拨了开关、实际发出去的请求不变。
+pub const PLUGIN_SETTING_GATEWAY_PROMPT: &str = "gatewayPrompt";
+
+/// 插件侧读「网关自带提示词正文覆盖」时用的约定键名（与
+/// [`PLUGIN_SETTING_GATEWAY_PROMPT`] 同一处置）。
+///
+/// 回答的形状是 `{identity, stable, dynamic}`（只含用户改过的段，缺的段回
+/// `Null` 表示「用官方原文」）。
+pub const PLUGIN_SETTING_GATEWAY_PROMPT_TEXT: &str = "gatewayPromptText";
 
 /// 写入**某一家**的提示词覆盖时的载荷（`set_prompt_provider` 的入参）。
 ///
@@ -403,6 +405,10 @@ pub struct ProviderPrompt {
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
 pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 99999;
 pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 99999;
+pub const DEFAULT_LOG_RETENTION_COUNT: i64 = 10_000;
+pub const DEFAULT_REQUEST_RETENTION_COUNT: i64 = 1_000_000;
+pub const RETENTION_MIN_COUNT: i64 = 1;
+pub const RETENTION_MAX_COUNT: i64 = 100_000_000;
 
 /// **历史**路由优先级键：`{"workbuddy": 10, "raccoon": 20}`。
 ///
@@ -416,26 +422,23 @@ pub const KEY_PROVIDER_ROUTE: &str = "providerRoute";
 /// 上限即「近似无限」的默认值 99999 天 —— 再往上没有语义（99999 天已约 274 年），
 /// 又能防手改 config.json 写个天文数字让裁剪逻辑空转。
 ///
-/// **写侧（`stats_api::parse_days`）与读侧（`days_field`）共用这两个常量**：
+/// **写侧（`stats_api::parse_retention_value`）与读侧（`days_field`）共用这两个常量**：
 /// 若两边各写一套数字，手改文件与走接口设值就会出现两套口径
 /// （比如接口拒绝 5000 而读侧接受它）。两侧的处理方式不同是有意的：
 /// 走接口的非法值给 400（用户当场能改），手改文件的非法值回落到默认（不打扰）。
 pub const RETENTION_MIN_DAYS: i64 = 1;
 pub const RETENTION_MAX_DAYS: i64 = 99999;
 
-/// 三档保留天数（设置页「数据保留」区域）。
-///
-/// 请求日志与按天聚合的默认 99999 天是**故意的近似无限**：默认行为与
-/// 「全量保留」一致，但用户随时可以把某一项改小 —— 保存后立即裁剪
-/// （`stats_api::put_retention`），不用去各页面手动清。事件日志维持 30 天默认
-/// 不变。保留结构而不直接摊成三个函数：GET / PUT 与日志存储的回调都按
-/// 「一份 `Copy` 值」的形状传，将来若再加保留项，调用方不必跟着改签名。
+/// 数据保留设置。日志与请求明细同时受天数和数量限制，按天聚合只按天数保留。
+/// 保存后立即裁剪；缩减请求明细不会重算或删除按天聚合。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSettings {
     /// 事件日志保留天数
     pub log_days: i64,
+    pub log_count: i64,
     /// 请求日志保留天数
     pub request_days: i64,
+    pub request_count: i64,
     /// 按天聚合保留天数
     pub daily_days: i64,
 }
@@ -444,7 +447,9 @@ impl Default for RetentionSettings {
     fn default() -> Self {
         Self {
             log_days: DEFAULT_LOG_RETENTION_DAYS,
+            log_count: DEFAULT_LOG_RETENTION_COUNT,
             request_days: DEFAULT_REQUEST_RETENTION_DAYS,
+            request_count: DEFAULT_REQUEST_RETENTION_COUNT,
             daily_days: DEFAULT_DAILY_RETENTION_DAYS,
         }
     }
@@ -455,7 +460,9 @@ impl Default for RetentionSettings {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RetentionPatch {
     pub log_days: Option<i64>,
+    pub log_count: Option<i64>,
     pub request_days: Option<i64>,
+    pub request_count: Option<i64>,
     pub daily_days: Option<i64>,
 }
 
@@ -969,6 +976,96 @@ pub struct CaptchaPoolPatch {
     pub target: Option<i64>,
     pub poll_ms: Option<i64>,
     pub max_per_round: Option<i64>,
+}
+
+// ─── 会话图片压缩（转发前把内嵌 base64 大图压小，设置页「网关 → 图片压缩」）──
+
+/// 图片压缩总开关（`imageCompressEnabled`，**默认开**）。
+///
+/// 解析口径：**只有字面 `false` 才算关**（见 `parse::image_compress_from`），
+/// 键缺失或写成别的值都按开 —— 于是升级上来的老配置（没有这个键）一启动就是
+/// 开启状态。
+///
+/// 为什么默认开：它改的是**发给上游的字节**，收益（更小的请求体、更低的上游
+/// 计费）对绝大多数对话都成立，属于「默认就该有」的能力；本项目有「自定义
+/// 提供商透传」这类把请求体原样送出的家，压过之后未必符合每个用户的预期，
+/// 所以把它做成**默认开、可一键关**的开关，关掉即回到「请求体一个字节都不动」。
+pub const KEY_IMAGE_COMPRESS_ENABLED: &str = "imageCompressEnabled";
+/// 图片长边像素上限（`imageCompressMaxEdge`）：超过则等比缩小。
+pub const KEY_IMAGE_COMPRESS_MAX_EDGE: &str = "imageCompressMaxEdge";
+/// JPEG 重编码质量（`imageCompressQuality`，40~95）。
+pub const KEY_IMAGE_COMPRESS_QUALITY: &str = "imageCompressQuality";
+/// 触发阈值 KB（`imageCompressThresholdKb`）：解码后小于它保持原样（0 = 全部处理）。
+pub const KEY_IMAGE_COMPRESS_THRESHOLD_KB: &str = "imageCompressThresholdKb";
+
+/// 长边上限默认值：2048（**照抄 OmniProxy 的默认值**）。
+///
+/// 多数视觉模型推荐的长边上限量级；默认取值口径与 OmniProxy 逐字一致，
+/// 用户要更省流量可在设置页调小（参考 CatPaw 上游限制用的 1568）。
+pub const DEFAULT_IMAGE_COMPRESS_MAX_EDGE: i64 = 2048;
+/// 重编码质量默认值：80（照抄 OmniProxy）。
+pub const DEFAULT_IMAGE_COMPRESS_QUALITY: i64 = 80;
+/// 触发阈值默认值：512 KB（照抄 OmniProxy）—— 解码后小于 512KB 的图不处理。
+pub const DEFAULT_IMAGE_COMPRESS_THRESHOLD_KB: i64 = 512;
+
+/// 长边上限的合法范围 256~8192：下限以下缩得连图看不清，上限以上等于不缩。
+pub const IMAGE_COMPRESS_MIN_MAX_EDGE: i64 = 256;
+pub const IMAGE_COMPRESS_MAX_MAX_EDGE: i64 = 8192;
+/// 质量范围 40~95：低于 40 画面明显劣化，高于 95 体积收益几乎为零。
+pub const IMAGE_COMPRESS_MIN_QUALITY: i64 = 40;
+pub const IMAGE_COMPRESS_MAX_QUALITY: i64 = 95;
+/// 触发阈值范围 0~10240 KB：0 = 不设阈值、全部候选图都过一遍。
+pub const IMAGE_COMPRESS_MIN_THRESHOLD_KB: i64 = 0;
+pub const IMAGE_COMPRESS_MAX_THRESHOLD_KB: i64 = 10240;
+
+/// 会话图片压缩设置（设置页「网关 → 图片压缩」区域）。
+///
+/// 与 `QueueSettings` 同一取舍：四个值总是一起用（每次发送前取一份快照），
+/// 打包成一个 `Copy` 值让调用方一次拿到 —— 转发链把这份快照随请求借下去。
+///
+/// ── 它作用在哪 ──────────────────────────────────────────────
+/// 只在**对话链路**（chat / responses / anthropic 三个入口归一后的 Chat 请求体）
+/// 生效；生图与图片编辑走独立分支，在 `send_body` 里提前返回，天然不经过这里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageCompressSettings {
+    /// 总开关（关 = 出站请求体一个字节都不动）
+    pub enabled: bool,
+    /// 长边像素上限（超过等比缩小，不放大）
+    pub max_edge: i64,
+    /// JPEG 重编码质量
+    pub quality: i64,
+    /// 触发阈值（KB，解码后小于它保持原样）
+    pub threshold_kb: i64,
+}
+
+impl Default for ImageCompressSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_edge: DEFAULT_IMAGE_COMPRESS_MAX_EDGE,
+            quality: DEFAULT_IMAGE_COMPRESS_QUALITY,
+            threshold_kb: DEFAULT_IMAGE_COMPRESS_THRESHOLD_KB,
+        }
+    }
+}
+
+/// 会话图片压缩的**部分**更新入参（`None` = 该项不动）。
+///
+/// 形状与 `AutoContinuePatch` 相同（开关 + 若干有界整数一起写），理由也一样：
+/// **一次 PUT 只落一次盘**，避免出现「开关开了、参数还是旧的」半套状态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageCompressPatch {
+    /// 开关（`None` = 该项不动）
+    pub enabled: Option<bool>,
+    /// 长边上限（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_MAX_EDGE..=IMAGE_COMPRESS_MAX_MAX_EDGE` 校验过。
+    pub max_edge: Option<i64>,
+    /// 质量（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_QUALITY..=IMAGE_COMPRESS_MAX_QUALITY` 校验过。
+    pub quality: Option<i64>,
+    /// 触发阈值 KB（`None` = 该项不动）。调用方须先按
+    /// `IMAGE_COMPRESS_MIN_THRESHOLD_KB..=IMAGE_COMPRESS_MAX_THRESHOLD_KB` 校验过。
+    pub threshold_kb: Option<i64>,
 }
 
 // ─── 账号路由（策略 / 会话粘性 / 失败退避 / 限流垫底 / 熔断）─────────

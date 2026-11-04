@@ -1,277 +1,13 @@
-/* ─────────────────────────────────────────────
-   Agent2API · 设计令牌
-   全站统一使用 oklch 色板，浅色 / 深色两套变量都在这里定义。
-   组件与页面只引用变量，不再各自写死颜色。
-   ───────────────────────────────────────────── */
-
 :root {
-  color-scheme: light;
-
-  --font-sans: "Segoe UI", "Microsoft YaHei", "Microsoft YaHei UI", system-ui, sans-serif;
-  --font-mono: Consolas, "Cascadia Mono", "Courier New", monospace;
-
-  /* 导航、工作区、内容表面分别配色；表格不再单独压暗。 */
-  /* --bg 是工作区画布（body）：比内容卡片浅一档，卡片靠描边与投影浮在上面 */
-  --bg: oklch(0.978 0.00265 286.35);
-  --surface: oklch(1 0 0);
-  --surface-2: oklch(0.97670 0.00265 286.35);
-  --surface-3: oklch(0.95 0 0);
-  /* 浮层（下拉、菜单、提示气泡）：坐在控件之上，取承载面同色 + 大投影 */
-  --surface-raised: oklch(1 0 0);
-  /* 内嵌凹槽：卡片里那些「凹下去」的小块（表单块、切换卡、代码块、明细面板）。
-     它是卡内的一小块，不是整块内容表面，所以仍比卡片深一档。 */
-  --surface-inset: oklch(0.93517 0.00535 286.30);
-  /* 列表区底：与所在卡片同色（表格不再自成一层暗底）。
-     行与行靠 1px 分隔线区分，不再靠明度反差。 */
-  --table-bg: var(--surface);
-  /* 表头必须不透明（行要从它下面滚过），但只与表体同色 ——
-     它与表体的分界交给底部那条 1px 描边，不另起一条色带。 */
-  --table-head-bg: var(--surface);
-  /* 行悬浮：比表面深（浅色）/ 亮（深色）一档的薄底，同一表达式两套主题都成立 */
-  --row-hover: var(--surface-2);
-  --border: oklch(0.145 0 0 / 10%);
-  --border-strong: oklch(0.145 0 0 / 20%);
-  --hairline: oklch(0.145 0 0 / 8%);
-
-  /* 控件填充与描边：与承载面分开，于是表面提亮后按钮、输入框依然立得住，
-     不必再靠压暗整块内容来衬托它们。 */
-  --control-bg: oklch(0.95815 0 0);
-  --control-hover: oklch(0.93214 0.00536 286.30);
-  --control-border: oklch(0.145 0 0 / 14%);
-  --control-border-hover: oklch(0.145 0 0 / 24%);
-
-  /* 侧栏：全站唯一「退后一层」的大面积底色，深浅两套都取中性灰。 */
-  --sidebar-bg: oklch(0.92123 0.00460 258.33);
-  /* 「模型管理」页左栏（.prov-rail）：比侧栏浅一档 —— 它是面板内的一段
-     内嵌导航，不是侧栏的延伸（与侧栏同色会被读成同一块区域）。 */
-  --rail-bg: oklch(0.955 0.004 286);
-  --sidebar-border: oklch(0.145 0 0 / 16%);
-  --sidebar-fg: oklch(0.43287 0.01676 258.37);
-  --sidebar-muted: oklch(0.51200 0.02088 261.29);
-  --nav-hover: oklch(0.145 0 0 / 5%);
-  --nav-selected-bg: oklch(0.89318 0.04237 253.82);
-  --nav-selected-border: oklch(0.83311 0.05788 254.15);
-  --nav-selected-fg: oklch(0.42649 0.12275 255.60);
-  --nav-count-bg: oklch(0.84405 0.05294 251.09);
-
-  /* 文本三档 */
-  --text: oklch(0.145 0 0);
-  --text-2: oklch(0.37 0 0);
-  --text-3: oklch(0.49 0 0);
-
-  /* 品牌 */
-  --primary: oklch(0.603 0.218 257.3);
-  --primary-hover: oklch(0.543 0.218 257.3);
-  --primary-soft: color-mix(in srgb, var(--primary) 10%, white);
-  --primary-bd: color-mix(in srgb, var(--primary) 28%, white);
-  --primary-fg: oklch(0.48 0.2 257.3);
-
-  /* 语义色 */
-  --ok: oklch(0.596 0.145 163.225);
-  --ok-soft: color-mix(in srgb, var(--ok) 10%, white);
-  --ok-bd: color-mix(in srgb, var(--ok) 28%, white);
-  --warn: oklch(0.681 0.162 75.834);
-  --warn-soft: color-mix(in srgb, var(--warn) 10%, white);
-  --warn-bd: color-mix(in srgb, var(--warn) 28%, white);
-  --danger: oklch(0.577 0.245 27.325);
-  --danger-soft: color-mix(in srgb, var(--danger) 10%, white);
-  --danger-bd: color-mix(in srgb, var(--danger) 28%, white);
-  --info: oklch(0.588 0.158 241.966);
-  --info-soft: color-mix(in srgb, var(--info) 10%, white);
-  --info-bd: color-mix(in srgb, var(--info) 28%, white);
-
-  /* 版本标签 */
-  --cn: oklch(0.577 0.245 27.325);
-  --cn-soft: color-mix(in srgb, var(--cn) 10%, white);
-  --cn-bd: color-mix(in srgb, var(--cn) 28%, white);
-  --intl: oklch(0.52 0.16 268);
-  --intl-soft: color-mix(in srgb, var(--intl) 10%, white);
-  --intl-bd: color-mix(in srgb, var(--intl) 28%, white);
-
-  /* 形状：所有圆角都由 --radius 派生，改一个值即可整体缩放 */
-  --radius: 1rem;
-  --r-xs: calc(var(--radius) * 0.5);
-  --r-sm: calc(var(--radius) * 0.6);
-  --r-md: calc(var(--radius) * 0.8);
-  --r-lg: var(--radius);
-  --r-xl: calc(var(--radius) * 1.4);
-  --r-pill: 999px;
-
-  /* 阴影 */
-  --shadow-1: 0 1px 2px oklch(0.145 0 0 / 5%);
-  --shadow-2: 0 1px 3px oklch(0.145 0 0 / 6%), 0 10px 26px -16px oklch(0.145 0 0 / 20%);
-  --shadow-3: 0 2px 8px oklch(0.145 0 0 / 7%), 0 22px 54px -22px oklch(0.145 0 0 / 26%);
-  --glow: 0 1px 2px oklch(0.145 0 0 / 6%), 0 10px 22px -12px color-mix(in srgb, var(--primary) 45%, transparent);
-  --ring: 0 0 0 3px color-mix(in srgb, var(--primary) 25%, transparent);
-
-  /* 尺寸 */
   --sidebar-w: 216px;
   --topbar-h: 50px;
-  /* 自定义标题栏高度（桌面端）：主窗口去掉了系统装饰（src-tauri 建窗处
-     decorations(false)），界面自绘 32px 标题条补上三键与拖动区（titlebar.js）。
-     网页端不创建标题栏，该变量只在 body.has-titlebar 的规则里被引用。 */
   --titlebar-h: 32px;
   --pad: 20px;
-  /* 内容区最大宽度（不含侧边栏）。用 vw 而不是 %：
-     % 相对的是「已排除侧边栏和内边距」的可用宽度，那样任何窗口下都会被限制成 80%，
-     内容永远占不满；vw 相对整个窗口，于是窗口 ≤1280px 时内容占满、
-     更宽时才收在这个值上并居中。
-     值不要往 90vw 以上调：侧边栏吃掉约 13% 的窗口宽度后，92vw 在 3200px 以下
-     永远碰不到，限宽等于失效 —— 宽屏上各页直接铺到窗口边，版心就没了。80vw 才是
-     「各页都收在版心里、左右都有留白」的那个口径。
-     这个变量只描述内容区的限宽，全站所有页面一律用它，不存在按页面的覆盖
-     （账号页曾自带一条 max-width: 1400px，已删：它比那张表自身的下限还窄，
-     只换来「横滚条常驻 + 比别的页窄一截」，见 page-accounts.css）。 */
   --content-max: 80vw;
-  --sb-w: 11px;          /* 滚动条宽度：表头对齐要靠它补偿 */
-}
-
-:root[data-theme="dark"] {
-  color-scheme: dark;
-
-  --bg: oklch(0 0 0);
-  --surface: oklch(0.19212 0.00399 286.02);
-  --surface-2: oklch(0.28254 0.00726 285.93);
-  --surface-3: oklch(0.32737 0.01050 285.81);
-  --surface-raised: oklch(0.30 0.005 286);
-  /* 内嵌凹槽：比卡片（0.2615）深一档；列表区与表面同色，见 --table-bg */
-  --surface-inset: oklch(0.215 0.005 286);
-  --table-bg: var(--surface);
-  --table-head-bg: var(--surface);
-  --row-hover: var(--surface-2);
-  --border: oklch(1 0 0 / 10%);
-  --border-strong: oklch(1 0 0 / 20%);
-  --hairline: oklch(1 0 0 / 9%);
-
-  --control-bg: oklch(0.36572 0.00850 285.97);
-  --control-hover: oklch(0.40758 0.00993 285.95);
-  --control-border: oklch(1 0 0 / 15%);
-  --control-border-hover: oklch(1 0 0 / 25%);
-
-  --sidebar-bg: oklch(0.19212 0.00399 286.02);
-  /* 与浅色块同义：比侧栏亮一档（深色主题下「浅」= 亮度更高） */
-  --rail-bg: oklch(0.24 0.005 286);
-  --sidebar-border: oklch(1 0 0 / 13%);
-  --sidebar-fg: oklch(0.79794 0.01342 266.68);
-  --sidebar-muted: oklch(0.67832 0.01760 262.73);
-  --nav-hover: oklch(1 0 0 / 6%);
-  --nav-selected-bg: oklch(0.34658 0.05986 253.12);
-  --nav-selected-border: oklch(0.46337 0.07464 249.11);
-  --nav-selected-fg: oklch(0.93281 0.03331 250.99);
-  --nav-count-bg: oklch(0.43273 0.06483 250.27);
-
-  --text: oklch(0.965 0 0);
-  --text-2: oklch(0.85 0 0);
-  --text-3: oklch(0.78 0 0);
-
-  --primary: oklch(0.623 0.206 255.3);
-  --primary-hover: oklch(0.68 0.206 255.3);
-  --primary-soft: oklch(0.623 0.206 255.3 / 15%);
-  --primary-bd: oklch(0.623 0.206 255.3 / 38%);
-  --primary-fg: oklch(0.75 0.12 255.3);
-
-  --ok: oklch(0.696 0.17 162.48);
-  --ok-soft: oklch(0.696 0.17 162.48 / 14%);
-  --ok-bd: oklch(0.696 0.17 162.48 / 32%);
-  --warn: oklch(0.769 0.188 70.08);
-  --warn-soft: oklch(0.769 0.188 70.08 / 14%);
-  --warn-bd: oklch(0.769 0.188 70.08 / 32%);
-  --danger: oklch(0.704 0.191 22.216);
-  --danger-soft: oklch(0.704 0.191 22.216 / 14%);
-  --danger-bd: oklch(0.704 0.191 22.216 / 32%);
-  --info: oklch(0.613 0.14 239.919);
-  --info-soft: oklch(0.613 0.14 239.919 / 14%);
-  --info-bd: oklch(0.613 0.14 239.919 / 32%);
-
-  --cn: oklch(0.704 0.191 22.216);
-  --cn-soft: oklch(0.704 0.191 22.216 / 14%);
-  --cn-bd: oklch(0.704 0.191 22.216 / 32%);
-  --intl: oklch(0.68 0.14 268);
-  --intl-soft: oklch(0.68 0.14 268 / 14%);
-  --intl-bd: oklch(0.68 0.14 268 / 32%);
-
-  --shadow-1: 0 1px 2px oklch(0 0 0 / 40%);
-  --shadow-2: 0 1px 2px oklch(0 0 0 / 40%), 0 12px 28px -18px oklch(0 0 0 / 80%);
-  --shadow-3: 0 2px 10px oklch(0 0 0 / 45%), 0 26px 60px -24px oklch(0 0 0 / 85%);
-  --glow: 0 1px 2px oklch(0 0 0 / 40%), 0 10px 22px -14px oklch(0.623 0.206 255.3 / 50%);
-  --ring: 0 0 0 3px oklch(0.623 0.206 255.3 / 30%);
-}
-
-/* system 模式跟随系统深浅 */
-@media (prefers-color-scheme: dark) {
-  :root[data-theme="system"] {
-    color-scheme: dark;
-
-    --bg: oklch(0 0 0);
-    --surface: oklch(0.19212 0.00399 286.02);
-    --surface-2: oklch(0.28254 0.00726 285.93);
-    --surface-3: oklch(0.32737 0.01050 285.81);
-    --surface-raised: oklch(0.30 0.005 286);
-    --surface-inset: oklch(0.215 0.005 286);
-    --table-bg: var(--surface);
-    --table-head-bg: var(--surface);
-    --row-hover: var(--surface-2);
-    --border: oklch(1 0 0 / 10%);
-    --border-strong: oklch(1 0 0 / 20%);
-    --hairline: oklch(1 0 0 / 9%);
-
-    --control-bg: oklch(0.36572 0.00850 285.97);
-    --control-hover: oklch(0.40758 0.00993 285.95);
-    --control-border: oklch(1 0 0 / 15%);
-    --control-border-hover: oklch(1 0 0 / 25%);
-
-    --sidebar-bg: oklch(0.19212 0.00399 286.02);
-    /* 与浅色块同义：比侧栏亮一档（深色主题下「浅」= 亮度更高） */
-    --rail-bg: oklch(0.24 0.005 286);
-    --sidebar-border: oklch(1 0 0 / 13%);
-    --sidebar-fg: oklch(0.79794 0.01342 266.68);
-    --sidebar-muted: oklch(0.67832 0.01760 262.73);
-    --nav-hover: oklch(1 0 0 / 6%);
-    --nav-selected-bg: oklch(0.34658 0.05986 253.12);
-    --nav-selected-border: oklch(0.46337 0.07464 249.11);
-    --nav-selected-fg: oklch(0.93281 0.03331 250.99);
-    --nav-count-bg: oklch(0.43273 0.06483 250.27);
-
-    --text: oklch(0.965 0 0);
-    --text-2: oklch(0.85 0 0);
-    --text-3: oklch(0.78 0 0);
-
-    --primary: oklch(0.623 0.206 255.3);
-    --primary-hover: oklch(0.68 0.206 255.3);
-    --primary-soft: oklch(0.623 0.206 255.3 / 15%);
-    --primary-bd: oklch(0.623 0.206 255.3 / 38%);
-    --primary-fg: oklch(0.75 0.12 255.3);
-
-    --ok: oklch(0.696 0.17 162.48);
-    --ok-soft: oklch(0.696 0.17 162.48 / 14%);
-    --ok-bd: oklch(0.696 0.17 162.48 / 32%);
-    --warn: oklch(0.769 0.188 70.08);
-    --warn-soft: oklch(0.769 0.188 70.08 / 14%);
-    --warn-bd: oklch(0.769 0.188 70.08 / 32%);
-    --danger: oklch(0.704 0.191 22.216);
-    --danger-soft: oklch(0.704 0.191 22.216 / 14%);
-    --danger-bd: oklch(0.704 0.191 22.216 / 32%);
-    --info: oklch(0.613 0.14 239.919);
-    --info-soft: oklch(0.613 0.14 239.919 / 14%);
-    --info-bd: oklch(0.613 0.14 239.919 / 32%);
-
-    --cn: oklch(0.704 0.191 22.216);
-    --cn-soft: oklch(0.704 0.191 22.216 / 14%);
-    --cn-bd: oklch(0.704 0.191 22.216 / 32%);
-    --intl: oklch(0.68 0.14 268);
-    --intl-soft: oklch(0.68 0.14 268 / 14%);
-    --intl-bd: oklch(0.68 0.14 268 / 32%);
-
-    --shadow-1: 0 1px 2px oklch(0 0 0 / 40%);
-    --shadow-2: 0 1px 2px oklch(0 0 0 / 40%), 0 12px 28px -18px oklch(0 0 0 / 80%);
-    --shadow-3: 0 2px 10px oklch(0 0 0 / 45%), 0 26px 60px -24px oklch(0 0 0 / 85%);
-    --glow: 0 1px 2px oklch(0 0 0 / 40%), 0 10px 22px -14px oklch(0.623 0.206 255.3 / 50%);
-    --ring: 0 0 0 3px oklch(0.623 0.206 255.3 / 30%);
-  }
+  --sb-w: 11px;
 }
 
 /* ─── 基础重置 ─── */
-* { box-sizing: border-box; }
 
 html, body { height: 100%; }
 
@@ -297,30 +33,26 @@ body {
   body { min-width: 0; }
 }
 
-/* ─── 移动端：从「app-shell 固定视口」切成「正常文档流」───
-   桌面端 body 不滚（height:100% + overflow:hidden），滚动发生在 .page.active 里；
-   但这个结构在手机上会把用户困在容器里 —— 滚到底后惯性滚动被 .content 的
-   overflow:hidden 截断，外面的页脚 / 顶栏永远滑不到。改成正常文档流后 body
-   自己滚，所有页面内容按内容高度自然生长，用户想滑多远就滑多远。
-   侧栏 / 顶栏 / 面板头保持原样（侧栏本来就是 position:fixed，不受影响）。 */
+/* ─── 移动端：保持「固定视口 + 内容区自己滚」 ───
+   曾经为了让手机能滚动，这里把 html/body 放成 height:auto + 正常文档流，
+   代价是**顶栏跟着滚走**：往下翻账号时「账号」标题与汉堡按钮会消失，
+   回顶部只能反向滑很久。手机上顶栏应当常驻。
+   现在改回固定视口（与桌面同一套骨架），滚动交给 .page.active：
+     .shell(100dvh) -> .main(flex列) -> .topbar(固定) + .content(撑满) -> .page.active(滚)
+   100dvh 而不是 100vh：移动浏览器地址栏收起/展开时 100vh 会算进被遮住的那段，
+   内容底部会被顶出可视区；dvh 跟随动态视口，收起地址栏后不跳。
+   旧浏览器不认 dvh 时前面的 100vh 兜底（layout.css 里已有）。
+   注意：不再给 body 设 overflow —— 固定视口下它本来就滚不动，
+   设了反而会在个别 WebView 里多出一条橡皮筋。 */
 @media (max-width: 767px) {
-  html, body { height: auto; overflow: visible; }
-  body { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  html, body { height: 100%; overflow: hidden; }
+  .shell { height: 100dvh; }
 }
 
 h1, h2, h3, h4, p { margin: 0; }
 
-button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 code, kbd { font-family: var(--font-mono); font-size: .93em; }
-
-/* hidden 属性必须压过组件自身 display，否则弹窗 / 进度块会默认露出来。
-   注意：组件库产物（islands/ui.css）的工具类是分层 + !important 的，分层里的
-   重要声明反压未分层的重要声明 —— 那里需要同层压制的规则写在组件库自己的
-   globals.css（见 [data-slot='dialog-content'][hidden]）。 */
-[hidden] { display: none !important; }
-
-:focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--r-sm); }
 
 ::selection { background: var(--primary-soft); color: var(--text); }
 

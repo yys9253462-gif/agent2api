@@ -17,6 +17,9 @@ import { cn } from './lib/cn'
  */
 
 function Input({ className, type, ref, ...props }: React.ComponentProps<'input'>) {
+  if (type === 'file' || type === 'hidden') {
+    return <input ref={ref} type={type} data-slot='input' className={cn(className)} {...props} />
+  }
   return (
     <InputPrimitive
       ref={ref as React.Ref<HTMLElement>}
@@ -24,7 +27,7 @@ function Input({ className, type, ref, ...props }: React.ComponentProps<'input'>
       data-slot='input'
       className={cn(
         'h-[30px] w-full min-w-0 rounded-md border border-control-border bg-control px-2.5',
-        'text-[12.5px] text-foreground outline-none',
+        'text-[12.5px] text-foreground outline-none max-[767px]:h-10 max-[767px]:text-base',
         'transition-[border-color,box-shadow] duration-150 ease-out',
         'placeholder:text-muted-foreground',
         'hover:border-control-border-hover',

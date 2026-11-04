@@ -1,19 +1,24 @@
 //! Cline 伪装头：`GET/PUT /api/cline/headers`。
 //!
 //! ── 这个端点管什么 ──────────────────────────────────────────
-//! Cline 上游请求的伪装头（`X-CLIENT-TYPE: cline-sdk`、平台标识、版本号等）
-//! 的**逐键覆盖**。默认值硬编码在 `core::providers::cline::headers`（与官方
-//! 客户端形态对齐的那一套，上游收紧时跟着版本走），配置里只存用户改过的键
-//! （`config::KEY_CLINE_UPSTREAM_HEADERS`），适配器每次构造上游请求都读快照
-//! —— 改完下一个请求立即生效，不重启进程。
+//! Cline 上游请求的伪装头的**逐键覆盖**。网关这边只持有**用户改过的键**
+//! （`config::KEY_CLINE_UPSTREAM_HEADERS`，纯配置）；默认伪装头与「默认 ∪
+//! 覆盖」的合并语义都在**提供商插件**里 —— 那套头之所以长那样，是因为要
+//! 贴合官方 CLI 的形态才不被上游 403，属于协议知识，按项目的风险隔离要求
+//! 不留在主仓库。
 //!
 //! ── 接口形状 ────────────────────────────────────────────────
 //! GET 返回 `{overrides, defaults, effective}`：第一份是用户改过的键（原样
-//! 回显，界面据此标出哪些行被改过），第二份是代码里的默认值（界面用它区分
-//! 「改回了默认」与「本来就没改」），第三份是合并后的生效值。
+//! 回显，界面据此标出哪些行被改过），第二份与第三份问插件要
+//! （`admin.action` 的 `headers.preview`，见下）—— 界面用 `defaults` 区分
+//! 「改回了默认」与「本来就没改」，`effective` 是真正会发出去的那份。
 //! PUT 收 `{overrides: {...}}` **整体替换**覆盖表：非空值按键覆盖/新增，
 //! 空串 = 这个头不发；把某个键从覆盖表里删掉 = 回落默认值。固定头
 //! （见 [`FIXED_HEADERS`]）与非法头名/头值一律 400 拒绝，不落库。
+//!
+//! ── 插件不在时怎么办 ────────────────────────────────────────
+//! `defaults` / `effective` 返回空表，`overrides` 照常返回（用户配置不丢）。
+//! 界面据此显示「不可用」而不是编一份默认值 —— 网关手里确实没有那份知识。
 
 use std::collections::BTreeMap;
 
@@ -24,7 +29,7 @@ use axum::response::Response;
 use serde_json::{json, Map, Value};
 
 use crate::server::config;
-use crate::server::core::providers::cline::headers;
+use crate::server::core::providers::adapter;
 use crate::server::errors;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
@@ -41,15 +46,15 @@ const MAX_VALUE_LEN: usize = 4096;
 /// （`Authorization` 带账号 token、`X-Task-ID` 与 body 的 `session_id` 同值），
 /// 覆盖表里出现它们一律 400。
 ///
-/// 与 `core::providers::cline::headers::DEFAULT_HEADERS` 的**缺席项**一一对应
-/// ——那里是执行侧（这些头由适配器固定构造），这里是配置侧（用户不该能改）。
-/// 必须拦在配置侧：覆盖表里写一个 `Authorization` 会经适配器的覆盖合并顶掉
-/// 真正的凭证，写 `X-Task-ID` 会让它与 body 的 `session_id` 不再同值。
+/// 与插件侧默认清单的**缺席项**一一对应 —— 那里是执行侧（这些头由插件固定
+/// 构造），这里是配置侧（用户不该能改）。必须拦在配置侧：覆盖表里写一个
+/// `Authorization` 会经插件的覆盖合并顶掉真正的凭证，写 `X-Task-ID` 会让它与
+/// body 的 `session_id` 不再同值。
 const FIXED_HEADERS: [&str; 4] = ["Authorization", "Content-Type", "Accept", "X-Task-ID"];
 
 /// GET /api/cline/headers —— 当前覆盖表 + 默认值 + 合并后的生效值
-pub async fn get_cline_headers(State(_state): State<ServerState>) -> Response {
-    ok_json(headers_json())
+pub async fn get_cline_headers(State(state): State<ServerState>) -> Response {
+    ok_json(headers_json(&state).await)
 }
 
 /// PUT /api/cline/headers —— body `{overrides: {"User-Agent": "...", ...}}`
@@ -57,7 +62,7 @@ pub async fn get_cline_headers(State(_state): State<ServerState>) -> Response {
 /// 整体替换覆盖表（不是增量 merge：界面按「编辑后的整张表」提交，删除某行
 /// 就是把它从表里去掉）。校验见 [`validated_overrides`]：形状、规模、固定头、
 /// 头名与头值的字符合法性；非法项直接 400，不做静默修正。
-pub async fn put_cline_headers(State(_state): State<ServerState>, body: Bytes) -> Response {
+pub async fn put_cline_headers(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return errors::management_error(400, error.message),
@@ -79,7 +84,7 @@ pub async fn put_cline_headers(State(_state): State<ServerState>, body: Bytes) -
         logging::log("[Config]", "⚠️  Cline 伪装头写入失败，本次运行内仍生效");
     }
     logging::log("[Config]", "Cline 伪装头覆盖表已更新（下一个 Cline 请求生效）");
-    ok_json(headers_json())
+    ok_json(headers_json(&state).await)
 }
 
 /// 覆盖表的校验与归一（PUT 的本体，单测直接喂 JSON 对象）。
@@ -124,25 +129,60 @@ fn validated_overrides(entries: &Map<String, Value>) -> Result<BTreeMap<String, 
     Ok(overrides)
 }
 
-/// 响应形状（GET 与 PUT 共用，前端直接用响应刷新界面）
+/// 响应形状（GET 与 PUT 共用，前端直接用响应刷新界面）。
 ///
-/// `defaults` 一并给出：界面要把「用户把值改回了默认」与「本来就没改」区分开
+/// `overrides` 是网关本地配置，**不依赖插件**；`defaults` / `effective` 问插件
+/// 要（`admin.action` 的 `headers.preview`）。插件不在时那两份给空表 ——
+/// 网关手里没有默认伪装头这份知识，编一份出来只会是过时的猜测。
+///
+/// `defaults` 必须给出：界面要把「用户把值改回了默认」与「本来就没改」区分开
 /// （前者是一份覆盖、后者不该出现在覆盖表里），没有默认值就做不到这个判断。
-fn headers_json() -> Value {
-    let overrides: BTreeMap<String, String> = config::cline_upstream_overrides().into_iter().collect();
-    let defaults: Map<String, Value> = headers::DEFAULT_HEADERS
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string())))
-        .collect();
-    let effective: Map<String, Value> = headers::effective_headers()
-        .into_iter()
-        .map(|(key, value)| (key, Value::String(value)))
-        .collect();
+async fn headers_json(state: &ServerState) -> Value {
+    let overrides: BTreeMap<String, String> =
+        config::cline_upstream_overrides().into_iter().collect();
+    let (defaults, effective) = plugin_header_tables(state).await;
     json!({
         "overrides": overrides,
         "defaults": defaults,
         "effective": effective,
     })
+}
+
+/// 问插件要 `{defaults, effective}`（任一家的实例都行：两池共用同一套头）。
+///
+/// 失败 / 插件不在时返回两份空表：这条端点是**只读展示**，不该因为插件没装
+/// 就整页报错 —— `overrides` 仍要能读能改（那是网关自己的配置）。
+async fn plugin_header_tables(state: &ServerState) -> (Map<String, Value>, Map<String, Value>) {
+    let provider = crate::server::core::providers::kind_id(
+        crate::server::core::providers::ProviderKind::ClineFree,
+    );
+    let Some(adapter) = adapter::adapter_by_id(provider) else {
+        return (Map::new(), Map::new());
+    };
+    match adapter
+        .admin_action(state.store(), "", "headers.preview", &Value::Null)
+        .await
+    {
+        Ok(value) => (
+            value
+                .get("defaults")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            value
+                .get("effective")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+        ),
+        Err(error) => {
+            logging::verbose(
+                "[Config]",
+                &format!("读取 Cline 伪装头默认值失败（界面显示为空）：{}", error.message),
+            );
+            (Map::new(), Map::new())
+        }
+    }
 }
 
 #[cfg(test)]

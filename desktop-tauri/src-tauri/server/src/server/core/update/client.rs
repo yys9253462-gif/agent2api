@@ -1,25 +1,4 @@
-//! GitHub 出网：候选出口解析 + 请求头 + 带出口重试的 fetch。
-//!
-//! 对照 Node 版 workbuddy-update.mjs 的 `resolveEgressCandidates` /
-//! `fetchWithEgress` / `githubHeaders` 三块。
-//!
-//! ─── 候选顺序（设置的出口优先，直连次之，Clash 兜底）──────────
-//! 设置页更新面板可以指定出网线路（`updateProxy` 配置键）：
-//!   · 指定了出口 → 候选只有它一个 ——「选定出口」的语义就是「走这条线路」，
-//!     不再暗中回落直连（回退会让用户以为流量走了所选线路）；
-//!   · 未指定（默认）/ 指定但解析失败 → `[{label:'直连', proxy:null}]`，
-//!     若 `resolveAccountProxy({source:'clash', listenerUid: CLASH_MIXED_UID})`
-//!     成功且没 error、有 port，就再追加一个候选。
-//!     解析失败（出口被删 / 被禁 / 数据坏）回退默认候选并留 verbose，
-//!     与账号转发「代理不可用回退直连」同一取向：可用性优先，原因留在日志。
-//!     Rust 侧走 `core::proxies::resolve_account_proxy` 的同一条路（account_store 里
-//!     组会话用的也是它），因此「Clash 未安装/未启用混合端口时只有一个候选」
-//!     的行为与 Node 完全一致。
-//!
-//! ─── 只有网络层失败才换出口 ─────────────────────────────────
-//! HTTP 状态码类错误（404 仓库没 Release、403 限额）直接交给调用方判断，
-//! 否则 404 会被误当成「需要换代理」而白试一轮。这里 `fetch_with_egress`
-//! 只在 `send()` 返回 Err（DNS/TLS/连接/超时）时切下一个候选。
+//! GitHub 请求在源切换时保留选定的出网代理；失效代理不能静默改走直连。
 
 use std::time::Duration;
 
@@ -27,9 +6,12 @@ use serde_json::{json, Value};
 
 use crate::server::config;
 use crate::server::core::egress;
-use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution, ResolvedProxy, CLASH_MIXED_UID};
+use crate::server::core::proxies::{
+    resolve_account_proxy, ProxyResolution, ResolvedProxy, CLASH_MIXED_UID,
+};
 use crate::server::logging;
 
+use super::source::{self, Candidate, Source};
 use super::token;
 use super::version::UpdateError;
 use super::USER_AGENT;
@@ -42,7 +24,10 @@ use super::USER_AGENT;
 /// WorkBuddy 网关时）与后来的两套写法，按同一惯例兼容读。
 pub fn github_headers() -> Vec<(String, String)> {
     let mut headers = vec![
-        ("Accept".to_string(), "application/vnd.github+json".to_string()),
+        (
+            "Accept".to_string(),
+            "application/vnd.github+json".to_string(),
+        ),
         // UA 与下载走同一个常量（mod.rs 的 USER_AGENT）：项目改名时只改一处
         ("User-Agent".to_string(), USER_AGENT.to_string()),
         ("X-GitHub-Api-Version".to_string(), "2022-11-28".to_string()),
@@ -57,7 +42,7 @@ pub fn github_headers() -> Vec<(String, String)> {
 ///
 /// 对应 Node 版 resolveEgressCandidates —— Clash 配置不可读时只有一个候选，
 /// 行为与纯直连一致（这里不吞掉整条链路：探测失败只在 verbose 里留痕）。
-fn resolve_egress_candidates() -> Vec<(String, Option<ResolvedProxy>)> {
+fn resolve_egress_candidates() -> Result<Vec<(String, Option<ResolvedProxy>)>, String> {
     // 设置里指定了更新出口：只用它（理由见模块头「候选顺序」）
     if let Some(configured) = config::update_proxy() {
         match resolve_account_proxy(Some(&configured)) {
@@ -67,17 +52,12 @@ fn resolve_egress_candidates() -> Vec<(String, Option<ResolvedProxy>)> {
                 } else {
                     proxy.label.clone()
                 };
-                return vec![(label, Some(proxy))];
+                return Ok(vec![(label, Some(proxy))]);
             }
             Some(ProxyResolution::Failed(reason)) => {
-                logging::verbose(
-                    "[Update]",
-                    &format!("指定的更新出口不可用（{reason}），回退默认出口"),
-                );
+                return Err(format!("指定的更新出口不可用（{reason}）"));
             }
-            // Resolved 但端口缺失：数据坏了（手工改库写出非法端口），
-            // 与解析失败同路 —— 回退默认候选，不去连一个连不上的出口
-            _ => {}
+            _ => return Err("指定的更新出口没有可用端口".to_string()),
         }
     }
     let mut candidates = vec![("直连".to_string(), None)];
@@ -98,42 +78,220 @@ fn resolve_egress_candidates() -> Vec<(String, Option<ResolvedProxy>)> {
                 }
             } else if let Some(error) = resolution.error() {
                 // Node 在这条分支上静默（try/catch 吞掉），这里留 verbose 便于排障
-                logging::verbose("[Update]", &format!("Clash 出口不可用（{error}），仅用直连"));
+                logging::verbose(
+                    "[Update]",
+                    &format!("Clash 出口不可用（{error}），仅用直连"),
+                );
             }
         }
         None => {}
     }
-    candidates
+    Ok(candidates)
 }
 
-/// 依次尝试各出口，返回第一个**连得上**的响应（HTTP 状态码交给调用方判断）。
-///
-/// 全部出口都在网络层失败时返回 502「无法连接 GitHub：<错误链>」
-/// （文案照抄 Node 的 `无法连接 GitHub：${proxyErrorDetail(lastError)}`）。
-pub async fn fetch_with_egress(
+pub struct JsonResponse {
+    pub value: Value,
+    pub status: reqwest::StatusCode,
+    pub headers: reqwest::header::HeaderMap,
+    pub official: bool,
+}
+
+pub async fn fetch_json(
+    url: &str,
+    headers: &[(String, String)],
+    timeout_ms: u64,
+    validate: impl Fn(&Value) -> bool,
+) -> Result<JsonResponse, UpdateError> {
+    let candidates = source::candidates(url, true);
+    let mut last_error = UpdateError::new("没有可用的 GitHub 源");
+    for candidate in &candidates {
+        if let Some(message) = candidate.cooling_message(headers) {
+            return Err(UpdateError::new(message));
+        }
+        let response = match fetch_candidate(candidate, headers, Some(timeout_ms)).await {
+            Ok(response) => response,
+            Err(error) => {
+                candidate.forget();
+                last_error = UpdateError::new(error);
+                continue;
+            }
+        };
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let official = candidate.source == Source::Official && source::is_resource(url);
+        if source::should_switch(candidate, status) {
+            candidate.forget();
+            last_error = UpdateError::new(format!(
+                "{}返回 HTTP {}",
+                candidate.label(),
+                status.as_u16()
+            ));
+            continue;
+        }
+        if !status.is_success() {
+            return Ok(JsonResponse {
+                value: Value::Null,
+                status,
+                headers: response_headers,
+                official,
+            });
+        }
+        match response.json::<Value>().await {
+            Ok(value) if validate(&value) => {
+                candidate.remember();
+                return Ok(JsonResponse {
+                    value,
+                    status,
+                    headers: response_headers,
+                    official,
+                });
+            }
+            Ok(_) => {
+                candidate.forget();
+                last_error = UpdateError::new(format!("{}返回的数据格式无效", candidate.label()));
+            }
+            Err(error) => {
+                candidate.forget();
+                last_error =
+                    UpdateError::new(format!("{}返回的 JSON 无效：{error}", candidate.label()));
+            }
+        }
+    }
+    Err(last_error)
+}
+
+pub async fn fetch_official(
     url: &str,
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, UpdateError> {
-    fetch_via_candidates("[Update]", url, headers, timeout_ms)
+    fetch_github(url, headers, timeout_ms, false)
         .await
-        .map_err(|detail| UpdateError::new(format!("无法连接 GitHub：{detail}")))
+        .map_err(UpdateError::new)
 }
 
-/// 非 GitHub 的**公网**端点出网（目前只有 models.dev 模型元数据用它）。
-///
-/// 与 [`fetch_with_egress`] 是同一份候选出口实现、同一套「只有网络层失败才换
-/// 出口」的判定，唯一差别在失败文案：那条链路的所有调用方都是 GitHub，文案写死
-/// 了「无法连接 GitHub」；这里从 URL 取主机名 —— 对着 models.dev 报「无法连接
-/// GitHub」会把排查方向直接带偏。日志标签也换成调用方的（`[Models]`）。
-///
-/// 沿用 `updateProxy` / Clash / 直连这条既有链路而不是新加一个配置键：它回答的
-/// 问题就是「这台机器的公网怎么出去」，与具体访问哪个公网站点无关。
+async fn fetch_github(
+    url: &str,
+    headers: &[(String, String)],
+    timeout_ms: Option<u64>,
+    allow_mirror: bool,
+) -> Result<reqwest::Response, String> {
+    let candidates = source::candidates(url, allow_mirror);
+    let mut last_error = String::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if let Some(message) = candidate.cooling_message(headers) {
+            return Err(message);
+        }
+        let response = match fetch_candidate(candidate, headers, timeout_ms).await {
+            Ok(response) => response,
+            Err(error) => {
+                candidate.forget();
+                last_error = error;
+                continue;
+            }
+        };
+        if source::should_switch(candidate, response.status()) && index + 1 < candidates.len() {
+            candidate.forget();
+            last_error = format!(
+                "{}返回 HTTP {}",
+                candidate.label(),
+                response.status().as_u16()
+            );
+            continue;
+        }
+        if response.status().is_success() {
+            candidate.remember();
+        }
+        return Ok(response);
+    }
+    Err(last_error)
+}
+
+pub async fn fetch_candidate(
+    candidate: &Candidate,
+    headers: &[(String, String)],
+    timeout_ms: Option<u64>,
+) -> Result<reqwest::Response, String> {
+    if let Some(message) = candidate.cooling_message(headers) {
+        return Err(message);
+    }
+    let mut last_error = String::new();
+    for (label, proxy) in resolve_egress_candidates()? {
+        let client = egress::client_for_github(proxy.as_ref())?;
+        let request = async {
+            let mut current = url::Url::parse(&candidate.url).map_err(|error| error.to_string())?;
+            for _ in 0..10 {
+                let mut builder = client.get(current.clone());
+                if let Some(ms) = timeout_ms {
+                    builder = builder.timeout(Duration::from_millis(ms));
+                }
+                let attempt_ms = timeout_ms.map(|ms| ms.min(8_000)).unwrap_or(8_000);
+                for (name, value) in headers {
+                    if name.eq_ignore_ascii_case("authorization")
+                        && (candidate.source != Source::Official
+                            || !source::is_official_api(current.as_str()))
+                    {
+                        continue;
+                    }
+                    builder = builder.header(name.as_str(), value.as_str());
+                }
+                let response =
+                    tokio::time::timeout(Duration::from_millis(attempt_ms), builder.send())
+                        .await
+                        .map_err(|_| "连接 GitHub 源超时".to_string())?
+                        .map_err(|error| egress::describe_error_detail(&error))?;
+                if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                    return Ok(response);
+                }
+                if !response.status().is_redirection() {
+                    candidate.record_rate_limit(headers, &response);
+                    return Ok(response);
+                }
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| "重定向缺少 Location".to_string())?;
+                let next = current.join(location).map_err(|error| error.to_string())?;
+                if !candidate.allows_redirect(&next) {
+                    return Err("GitHub 源重定向到未允许的地址，已拒绝访问".to_string());
+                }
+                current = next;
+            }
+            Err("GitHub 源重定向次数过多".to_string())
+        };
+        let outcome = if let Some(ms) = timeout_ms {
+            tokio::time::timeout(Duration::from_millis(ms.min(8_000)), request)
+                .await
+                .unwrap_or_else(|_| Err("连接 GitHub 源超时".to_string()))
+        } else {
+            tokio::time::timeout(Duration::from_secs(12), request)
+                .await
+                .unwrap_or_else(|_| Err("连接 GitHub 源超时".to_string()))
+        };
+        match outcome {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                logging::verbose(
+                    "[Update]",
+                    &format!("经 {label} 访问{}失败：{error}", candidate.label()),
+                );
+                last_error = error;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+/// 非 GitHub 公网端点只复用出网代理，不改写地址或发送 GitHub 凭证。
 pub async fn fetch_public(
     url: &str,
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, String> {
+    if source::is_resource(url) {
+        return fetch_github(url, headers, timeout_ms, true).await;
+    }
     let host = url::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string))
@@ -151,7 +309,7 @@ async fn fetch_via_candidates(
     headers: &[(String, String)],
     timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, String> {
-    let candidates = resolve_egress_candidates();
+    let candidates = resolve_egress_candidates()?;
     let multiple = candidates.len() > 1;
     let mut last_error: Option<reqwest::Error> = None;
     for (label, proxy) in &candidates {
@@ -176,7 +334,10 @@ async fn fetch_via_candidates(
             Err(error) => {
                 logging::verbose(
                     tag,
-                    &format!("经 {label} 访问失败: {}", egress::describe_error_detail(&error)),
+                    &format!(
+                        "经 {label} 访问失败: {}",
+                        egress::describe_error_detail(&error)
+                    ),
                 );
                 last_error = Some(error);
             }
@@ -193,7 +354,11 @@ async fn fetch_via_candidates(
 /// （Node 侧为内部细节，这里作为排障口暴露，保留）。
 #[allow(dead_code)]
 pub fn describe_candidates() -> Value {
-    let list: Vec<Value> = resolve_egress_candidates()
+    let candidates = match resolve_egress_candidates() {
+        Ok(candidates) => candidates,
+        Err(error) => return json!({ "error": error }),
+    };
+    let list: Vec<Value> = candidates
         .into_iter()
         .map(|(label, proxy)| {
             json!({

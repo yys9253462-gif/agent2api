@@ -11,15 +11,16 @@
 //! 那条接口服务旧的 ↑/↓ 箭头：只换两行的号。分组模式下界面不再用它（组序由整组
 //! 拖动表达），但接口保留 —— 别的客户端/入口还在用，语义没变。新界面一律走这里。
 //!
-//! ── 校验：必须是**全部账号的一个排列** ───────────────────────
-//! 少了账号 → 那条账号的号会被别人顶掉、从队列里消失；多了/重复 → 撞号。两种情况
-//! 都直接 400 报明原因（不是 500：这是调用方的输入问题），并且**一行都不写**。
+//! ── 校验：全部账号或全部可见账号的一个排列 ────────────────────
+//! 管理界面看不到缺少插件的账号，提交可见队列时隐藏账号保留原位。
+//! 少了可见账号、多了或重复账号都直接 400，并且一行都不写。
 
 use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::sql;
+use crate::server::core::account_store::store_view::{account_visible, Visibility};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 
 impl AccountStore {
@@ -29,14 +30,16 @@ impl AccountStore {
     /// 要不要提示「已保存」），`list` 是重排后的账号列表（形状同 `GET /api/accounts`，
     /// 与 `move_account` / `promote_to_front` 的回包一致）。
     ///
-    /// 入参的**组连续性由调用方保证**（界面按分组渲染，拖出来的顺序天然连续）；
-    /// 这里只校验「是不是全部账号的一个排列」——队列的真实语义（谁先谁后）由
-    /// `priority` 承载，重编号就是把调用方给的顺序固化下来。
+    /// 接受完整队列或完整可见队列；后者只替换可见账号的席位，隐藏账号不移动。
+    /// 入参的组连续性由调用方保证，队列的真实顺序仍由 `priority` 承载。
     pub fn reorder_accounts(&self, ids: &[String]) -> Result<Value, AccountStoreError> {
         let guard = self.guard();
         let state = self.load(&guard);
 
         let known: HashSet<&str> = state.accounts.iter().map(|record| record.id()).collect();
+        let visible: HashSet<&str> = state.accounts.iter()
+            .filter(|record| account_visible(&record.provider()))
+            .map(|record| record.id()).collect();
         let mut seen: HashSet<&str> = HashSet::with_capacity(ids.len());
         for id in ids {
             let id = id.as_str();
@@ -51,16 +54,28 @@ impl AccountStore {
                 )));
             }
         }
-        if seen.len() != known.len() {
+        let ordered_ids = if seen.len() == known.len() {
+            ids.to_vec()
+        } else if seen == visible {
+            let mut records: Vec<_> = state.accounts.iter().collect();
+            records.sort_by_key(|record| record.order_key());
+            let mut replacements = ids.iter();
+            records.into_iter().map(|record| {
+                if visible.contains(record.id()) {
+                    replacements.next().cloned().unwrap_or_else(|| record.id().to_string())
+                } else {
+                    record.id().to_string()
+                }
+            }).collect()
+        } else {
             return Err(AccountStoreError::bad_request(format!(
-                "队列不完整：全部账号 {} 个，队列里只有 {} 个",
-                known.len(),
-                seen.len()
+                "队列不完整：可见账号 {} 个，全部账号 {} 个，队列里只有 {} 个",
+                visible.len(), known.len(), seen.len()
             )));
-        }
+        };
 
         // 按给定顺序编号（0、1、2…）；只写真的变了号的行（见 `sql::apply_priorities`）
-        let updates: Vec<(String, i64)> = ids
+        let updates: Vec<(String, i64)> = ordered_ids
             .iter()
             .enumerate()
             .map(|(index, id)| (id.clone(), index as i64))
@@ -76,14 +91,14 @@ impl AccountStore {
         // 不必再读一次库
         let mut state = state;
         for record in state.accounts.iter_mut() {
-            if let Some(index) = ids.iter().position(|id| id == record.id()) {
+            if let Some(index) = ordered_ids.iter().position(|id| id == record.id()) {
                 record.set_priority(index as i64);
             }
         }
         Ok(json!({
             "ok": true,
             "changed": changed,
-            "list": self.snapshot(&state),
+            "list": self.snapshot(&state, Visibility::UserFacing),
         }))
     }
 }

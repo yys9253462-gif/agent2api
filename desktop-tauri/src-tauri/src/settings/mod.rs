@@ -88,7 +88,11 @@ pub(crate) fn legacy_file_path() -> PathBuf {
 ///
 /// `default` 用在结构体上（而非逐字段）：这样后续新增字段时，**旧设置记录里
 /// 缺这个键不会导致整份设置反序列化失败**——缺的字段各自取 Default。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 不再派生 `Copy`：`panel_session` 里是两个字符串（密文），这份结构从「几个
+/// 布尔与一个 u16」变成了带堆数据的类型。所有调用点本来就按值传 / 按引用读，
+/// 去掉 `Copy` 后 clone 是显式的 —— 也正好提醒「这份设置现在包含凭据密文」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     /// 关闭窗口时最小化到托盘而不是退出
@@ -130,13 +134,43 @@ pub struct AppSettings {
     /// 兑现。代价同上（令牌池在打开窗口前不补货）。
     /// 默认 false。
     pub lightweight_mode: bool,
+    /// 旧版保存的网页会话；保留字段以兼容已有设置，本机壳不再读取它。
+    #[serde(default)]
+    pub panel_session: PanelSession,
+}
+
+/// 面板会话的持久化形态（两者都是 `enc1:` 信封；空串 = 没有）。
+///
+/// 分开存而不是打包成一个 JSON：access 会频繁轮换（每 2 小时），refresh 只在
+/// 轮换时更新 —— 两个字段各自替换，读侧不必解析一层嵌套。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PanelSession {
+    /// 长效 refresh（30 天）的密文
+    pub refresh: String,
+    /// 短效 access（2 小时）的密文
+    pub access: String,
+    /// access 的到期时刻（Unix 毫秒；0 = 不知道）。
+    ///
+    /// 明文存即可：它不是凭据，只回答「这个请求发出前要不要先续期」。
+    /// `serde(default)` 让升级前的设置（没有这个字段）按「不知道」读入 ——
+    /// 那种情况退回「401 → 续期」的老路径，行为与改造前一致。
+    pub expires_at: i64,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         // 关闭到托盘默认开启：网关的价值在于后台持续转发，
         // 用户点关闭通常只是想收起界面，而不是让转发中断
-        Self { close_to_tray: true, autostart: false, proxy_port: 0, lan_access: false, lan_panel: false, lightweight_mode: false }
+        Self {
+            close_to_tray: true,
+            autostart: false,
+            proxy_port: 0,
+            lan_access: false,
+            lan_panel: false,
+            lightweight_mode: false,
+            panel_session: PanelSession::default(),
+        }
     }
 }
 

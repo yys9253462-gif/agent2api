@@ -1,8 +1,8 @@
 /* ─────────────────────────────────────────────
    签到中心页（page-checkin.css）
 
-   页内三个标签页（SegmentedControl 切换）：签到中心（总览卡 + 三块任务面板）、
-   定时签到（总开关 + 条目列表 + 保活模型链）、签到记录（每账号明细表）。
+   页内四个标签页：签到中心、定时签到、定时补签、签到记录。
+   定时签到与定时补签的页面布局在 page-checkin-schedule.css 中维护。
    页面骨架类名全部以 .ck- 前缀自持；控件（Badge / Button / Checkbox / Input /
    Progress / SegmentedControl / Select / Spinner / Switch / Pager）来自组件库，
    不在这里画。
@@ -19,15 +19,11 @@
 /* ── 总览卡条 ── */
 .ck-stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 14px;
 }
 .ck-stat {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-1);
   padding: 13px 16px;
   min-width: 0;
 }
@@ -48,7 +44,11 @@
 .ck-stat-foot { margin-top: 4px; font-size: 12px; color: var(--text-3); }
 .ck-stat .ck-stat-bar { margin-top: 8px; }
 /* 无数据（还没读到快照）时的占位灰 */
+/* 数据还没到：显示灰色 `—` / `无` 而不是伪造一个 0。
+   两种写法都要有 —— 直接挂在 `.ck-stat-value` 上（整值缺失），
+   以及它内部的一个 span（值里只有一部分没到，例如「— / 9」）。 */
 .ck-stat-value.ck-pending { color: var(--text-3); }
+.ck-stat-value .ck-pending { color: var(--text-3); }
 
 /* ── 任务面板列（签到中心 tab；单列，三块面板纵向排）── */
 .ck-main { min-width: 0; display: grid; gap: 0; }
@@ -57,37 +57,42 @@
 .ck-main > .panel { margin-bottom: 0; }
 .ck-main > .panel + .panel { margin-top: 14px; }
 
+/* ── 两块地区专属面板并排（定时签到 tab）──
+   保活模型链（国际版）与猫猫旅行排程（国内版）由插件申报的 adminPanels 决定，
+   两块同时存在时收进这一行 —— 各自独占整行时卡片有一半宽度是空的（模型链
+   只有一列清单，旅行排程只有两行设置项）。
+
+   ── 为什么用 auto-fit 而不是定死两列 ──────────────────────
+   iframe 之外的宿主内容区限宽 `--content-max: 80vw`，实际可用宽度随窗口与
+   侧栏（216px / 折叠后 68px）变化，用视口断点判断不准。`auto-fit` + 最小
+   420px 让「放得下两列就两列、放不下就一列」由**容器的真实宽度**决定。
+   420 是这两张卡的舒适下限：再窄「时刻框 + 保存」「输入框 + 添加模型」会
+   开始互相挤压。`min()` 兜住比 420px 还窄的极端窗口，避免撑出横向滚动。
+   两侧面板各自 `min-width: 0`（见下）—— 否则模型名的等宽长串会按内容宽度
+   把列顶宽。 */
+.ck-region-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+  /* 两张卡各按自己的内容高度，不互相拉伸：模型链的条数随用户增删变化，
+     拉伸后短的那张（旅行排程）会拖着大片空白停在同一高度。 */
+  align-items: start;
+  gap: 14px;
+  margin-top: 14px;
+  /* 它是 `.ck-main` 的 grid 项，同样要放开内容最小宽度 */
+  min-width: 0;
+}
+/* `.panel` 自带 margin-bottom，这两块现在是这一层的子节点，上面那条
+   `.ck-main > .panel` 选不到它们 —— 间距全部交给 grid 的 gap。 */
+.ck-region-row > .panel { margin-bottom: 0; min-width: 0; }
+
 @media (max-width: 1080px) {
-  .ck-stats { grid-template-columns: repeat(2, 1fr); }
+  .ck-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
-/* ── 每日签到：提供商行 ── */
-.ck-prov-row { border-bottom: 1px solid var(--hairline); }
-.ck-prov-row:last-child { border-bottom: 0; }
-.ck-prov-main {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 11px 16px;
-  cursor: pointer;
-  user-select: none;
-}
-.ck-prov-main:hover { background: var(--row-hover); }
-.ck-prov-logo {
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  font-size: 12px;
-  font-weight: 700;
-  color: #fff;
-  background: var(--control-bg);
-  color: var(--text-2);
-  overflow: hidden;
-}
-.ck-prov-logo img { width: 100%; height: 100%; object-fit: contain; }
+/* ── 行内三段文字（定时条目行在用）──
+   `.ck-row-*` 与 `.ck-prov-*` 是同一套形态的两个名字：前者给「可展开的行」
+   （每日签到 / 新手福利），后者给「开关 + 三段文字 + 右侧操作」（定时条目）。
+   行外壳 `.ck-row` / `.ck-row-main` 见文件末尾的页面骨架那一段。 */
 .ck-prov-info { flex: 1; min-width: 0; }
 .ck-prov-name {
   font-weight: 600;
@@ -99,11 +104,6 @@
 }
 .ck-prov-desc { font-size: 12px; color: var(--text-3); margin-top: 2px; }
 .ck-prov-right { display: flex; align-items: center; gap: 10px; flex: none; }
-.ck-prov-count { font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
-.ck-chev { color: var(--text-3); transition: transform 0.15s; flex: none; }
-.ck-prov-row.open .ck-chev { transform: rotate(90deg); }
-.ck-prov-detail { display: none; padding: 2px 16px 12px 58px; }
-.ck-prov-row.open .ck-prov-detail { display: block; }
 /* 范围外账号的折叠说明（每日签到卡底部） */
 .ck-fold-note {
   padding: 9px 16px;
@@ -167,6 +167,18 @@
 }
 .ck-welfare-row:last-child { border-bottom: 0; }
 
+/* 成长任务展开区底部的三个动作（开学季 / 抽奖 / 猫猫旅行）：
+   它们不属于任务树，所以不从 `ck-task-line` 拼，单独给一行 */
+.ck-grow-extra {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--hairline);
+}
+
 /* ── 自动签到设置卡 ── */
 .ck-set-line {
   display: flex;
@@ -196,8 +208,11 @@
    变成「拖走一行」（与账号页顺序拖拽同一取舍）。 */
 
 /* 面板本身收成半幅：里面只有一列短清单，拉满整行时那排灰条会长得没有内容。
-   再给个上限 —— 2K / 4K 上「半幅」又够宽到把清单拉回一条长带，白收。 */
+   再给个上限 —— 2K / 4K 上「半幅」又够宽到把清单拉回一条长带，白收。
+   并排时（`.ck-region-row` 里）列宽已由网格定好，这两个值要归位，
+   否则会在这个格子里再乘一次 50%。 */
 .ck-chain-panel { width: 50%; max-width: 640px; }
+.ck-region-row > .ck-chain-panel { width: auto; max-width: none; }
 
 .ck-chain { display: flex; flex-direction: column; gap: 4px; }
 .ck-chain-row {
@@ -348,43 +363,38 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
 .ck-mini-warn { margin-top: 6px; font-size: 11.5px; color: var(--warn); }
 
 /* ── 签到记录：明细表 ── */
-.ck-records-filters {
+.page.active[data-page="checkin"]:has(.ck-page-records) {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--hairline);
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: var(--pad);
 }
-/* 筛选行：时间档位 / 结果 / 提供商在左，关键词与读数在右（中间的 .spacer 把两侧顶开）。
-   除搜索框外一律不压缩（分段控件与下拉被挤扁就没法读了）—— 弹性只留给搜索框，
-   它的宽度与收缩下限写在 JSX 的工具类上（组件库 Input 自带 w-full，且工具类是分层
-   + !important 的，页面 CSS 里的 width / flex-basis 压不过它，见 checkin-records-tab.tsx
-   那处注释）；这条 `> *` 只是给不支持工具类那几个控件的兜底，两处不冲突 */
-.ck-records-filters > * { flex-shrink: 0; }
-/* 读数在换行后也靠右（一行放得下时由 .spacer 顶开，两者不冲突） */
-.ck-records-filters > .panel-sub { margin-left: auto; }
-.ck-records-scroll { overflow-x: auto; }
+.ck-page-records,
+.ck-page-records > .ck-records-main,
+.ck-records-main > .ck-records-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.ck-page-records > .ck-tabs,
+.ck-records-panel > .panel-head,
+.ck-records-panel > .ck-filters,
+.ck-records-panel > .ck-fold-note,
+.ck-records-panel > .panel-foot { flex: none; }
+.ck-records-scroll { flex: 1; min-height: 0; overflow: auto; }
 
-/* 列宽。table-layout: fixed 下按 colgroup 分配：时间列是**定宽 px**（它装的是
-   formatTime 的完整输出，宽窄窗口都要一行放下），其余五列按百分数吃掉剩余宽度
-   （合计 100%）。没拖过的列走这里的默认值；拖过的列由 table-columns.js 把覆盖
-   宽度写成 <col> 的 inline width，优先于这里的默认值。改默认列宽时与
-   checkin-records-tab.tsx 的 RECORD_COLUMNS 一起看（那边是列的集合与顺序） */
-.ck-records-table { table-layout: fixed; }
+.ck-records-table { table-layout: fixed; overflow: visible; }
 .ck-records-table col.ck-col-time { width: 160px; }
 .ck-records-table col.ck-col-account { width: 18%; }
 .ck-records-table col.ck-col-provider { width: 10%; }
 .ck-records-table col.ck-col-source { width: 11%; }
 .ck-records-table col.ck-col-outcome { width: 13%; }
 .ck-records-table col.ck-col-detail { width: 48%; }
-/* 表头格是列宽把手的定位锚（.col-grip 绝对定位挂在它的右缘，见 components.css） */
-.ck-records-table thead th { position: relative; }
-/* 内容超出列宽就裁掉，不压到相邻列上：列宽可以拖，要看全就把这一列拖宽
-   （定宽列与弹性列的取舍口径见 table-columns.js 的模块头） */
-.ck-records-table td { overflow: hidden; }
-/* 时间列定宽：时间与北京日期两行都不换行 */
-.ck-records-table .ck-col-time { white-space: nowrap; }
+.ck-records-table thead th { position: sticky; top: 0; }
+.ck-records-table td { overflow: hidden; overflow-wrap: anywhere; }
+.ck-records-table .ck-record-time { white-space: nowrap; }
 .ck-record-date {
   display: block;
   font-size: 11px;
@@ -419,4 +429,163 @@ body.ck-chain-dragging { cursor: grabbing; user-select: none; }
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+/* ─────────────────────────────────────────────
+   下面这一组是**页面骨架**：行、徽标、输入框尺寸、说明块。
+
+   早先它们住在插件页自己的 `page.css` 里（iframe 形态下那份样式进不来，
+   只能随页面一起打包）。页面迁回客户端之后，这些类与其它页的 `.panel`
+   / `.panel-head` 是同一层的东西，所以回到 `ui/css/` 里 —— 于是整页的
+   行高、间距、字色与账号页、模型管理页逐字相同。
+   ───────────────────────────────────────────── */
+
+/* 页面容器：不额外加左右留白（`.content` 已经给了），只兜住内部间距 */
+.ck-page { min-width: 0; }
+.ck-main { min-width: 0; display: grid; gap: 0; }
+/* `.panel` 自带 margin-bottom，用相邻选择器统一成 14px，避免叠成 28px */
+.ck-main > .panel { margin-bottom: 0; }
+.ck-main > .panel + .panel { margin-top: 14px; }
+
+.ck-tabs-spacer { flex: 1; }
+/* 顶栏刷新：与其它页顶栏的文字按钮同一档（不高过 SegmentedControl 的 24px 太多） */
+.ck-refresh {
+  padding: 0 8px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ck-refresh:hover { background: var(--control-hover); color: var(--text); }
+
+/* 错误条里的「重试」：文字按钮，与页面里其它次要动作同一档 */
+.ck-error-retry {
+  padding: 0 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ── 可展开的行 ── */
+.ck-row { border-bottom: 1px solid var(--hairline); }
+.ck-row:last-child { border-bottom: 0; }
+.ck-row-header { display: flex; align-items: center; }
+.ck-row.open > .ck-row-header { background: var(--row-hover); }
+.ck-row-main { flex: 1; min-width: 0; }
+.ck-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding-right: 16px;
+}
+.ck-row-info { flex: 1; min-width: 0; }
+.ck-row-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.ck-row-desc { margin-top: 2px; font-size: 12px; color: var(--text-3); }
+.ck-row-right { display: flex; align-items: center; gap: 10px; flex: none; }
+.ck-row-count { font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.ck-row-detail { padding: 2px 16px 12px 58px; }
+
+/* 展开箭头：展开时转 90°（与账号页同一观感） */
+.ck-chev {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-3);
+  transition: transform .15s;
+}
+.ck-chev.open { transform: rotate(90deg); }
+/* ── 设置行（标签 + 内容）── */
+.ck-sub { font-size: 11.5px; color: var(--text-3); }
+.ck-inline { display: inline-flex; align-items: center; gap: 2px; }
+.ck-right { text-align: right; }
+/* 内容要横排的行自己加这个类（`.ck-set-v` 默认是块级，见旧实现） */
+.ck-set-row { display: flex; align-items: center; gap: 8px; }
+/* 卡内正文留白（旧实现用 Tailwind 的 p-4 = 16px） */
+.ck-panel-pad { padding: 16px; }
+.ck-sched-name { max-width: 220px; }
+.ck-sched-time-input { max-width: 96px; }
+.ck-sched-num { max-width: 72px; }
+/* ── 逐家时刻（条目编辑器里的一格一行）── */
+.ck-ptimes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.ck-ptime-row { display: flex; align-items: center; gap: 8px; }
+.ck-ptime-name {
+  min-width: 150px;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ck-ptime-tag {
+  font-size: 11.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.ck-chain-input { max-width: 260px; }
+.ck-travel-times { max-width: 320px; }
+.ck-input-search { flex: 1; min-width: 140px; max-width: 260px; }
+/* ── 记录页的筛选条与分页 ── */
+.ck-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+.ck-filters > * { flex-shrink: 0; }
+.ck-filters-count { margin-left: auto; font-size: 11.5px; color: var(--text-3); }
+
+/* ── 空态 ── */
+.ck-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 24px 16px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.ck-empty-state p { margin: 0; line-height: 1.7; }
+.ck-empty-actions { display: flex; gap: 8px; }
+
+/* ── 任务行（新手福利明细）── */
+.ck-task-title { flex: 1; min-width: 0; }
+.ck-task-pts { font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 767px) {
+  .ck-tabs { flex-wrap: wrap; gap: 8px; }
+  .ck-row-header { flex-wrap: wrap; }
+  .ck-row-actions { flex-wrap: wrap; justify-content: flex-end; width: 100%; padding: 0 16px 10px 58px; }
+  .ck-row-right { flex-direction: column; align-items: flex-end; gap: 4px; }
+  .ck-row-detail { padding-left: 16px; overflow-x: auto; }
+  .ck-task-line { flex-wrap: wrap; }
+  .ck-welfare-row { flex-wrap: wrap; }
+}
+
+@media (max-width: 420px) {
+  .ck-stats { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ck-chev { transition: none; }
 }

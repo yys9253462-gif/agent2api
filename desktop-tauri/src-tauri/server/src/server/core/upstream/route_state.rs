@@ -85,8 +85,7 @@ pub(super) struct RouteState {
     /// 「A 模型的第 2 位」错误地决定 B 模型从谁开始。空模型（客户端没点名）
     /// 用空串键，全局一条。
     cursors: Mutex<HashMap<String, usize>>,
-    /// 会话粘性：会话键 → (账号 id, 最近一次使用时刻)
-    sticky: Mutex<HashMap<String, (String, i64)>>,
+    sticky: super::route_sticky::StickySessions,
     /// 失败退避：账号 id → 休息记录
     backoff: Mutex<HashMap<String, BackoffEntry>>,
     /// 限流垫底：账号 id → 沉底时刻（还有额度时被 429 的；超 [`SINK_TTL_MS`] 自动失效）
@@ -325,32 +324,46 @@ impl RouteState {
                 .all(|(part, len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
     }
 
-    /// 取粘性命中的账号（命中即刷新最近使用时刻；过期的顺手清掉）。
-    pub(super) fn sticky_lookup(&self, key: &str, now: i64, ttl_ms: i64) -> Option<String> {
-        if key.is_empty() || ttl_ms <= 0 {
-            return None;
-        }
-        let mut table = self.sticky.lock().ok()?;
-        // 顺手清过期项：表规模 = 活跃会话数，一次线性扫描可接受；
-        // 不在后台起清扫线程 —— 网关没有「会话结束」的信号，惰性清理最省事。
-        table.retain(|_, (_, last_seen)| now - *last_seen <= ttl_ms * 8);
-        let entry = table.get_mut(key)?;
-        if now - entry.1 > ttl_ms {
-            table.remove(key);
-            return None;
-        }
-        entry.1 = now;
-        Some(entry.0.clone())
+    pub(super) fn sticky_generation(&self) -> u64 {
+        self.sticky.generation()
     }
 
-    /// 绑定会话 → 账号（成功转发后调用；只对新账号改写）
-    pub(super) fn sticky_bind(&self, key: &str, account_id: &str, now: i64) {
-        if key.is_empty() || account_id.is_empty() {
-            return;
+    pub(super) fn sticky_bind(
+        &self, key: &str, model: &str, account_id: &str, source: &str,
+        now: i64, ttl_ms: i64, generation: u64,
+    ) {
+        self.sticky.bind(key, model, account_id, source, now, ttl_ms, generation);
+    }
+
+    pub(super) fn sticky_list(&self, model: Option<&str>, now: i64) -> Vec<serde_json::Value> {
+        let (profiles, base) = crate::server::config::routing_snapshot();
+        self.sticky.list(model, now, |name| profiles.settings_for(name, base).sticky.ttl_ms().unwrap_or(0))
+    }
+
+    pub(super) fn sticky_clear(&self, id: Option<&str>, model: Option<&str>) -> usize {
+        self.sticky.clear(id, model)
+    }
+
+    pub(super) fn conversation_source(headers: &HeaderMap, body: &serde_json::Value) -> &'static str {
+        if Self::explicit_conversation_id(headers, body)
+            .is_none_or(|value| value.chars().count() > Self::EXPLICIT_ID_MAX_CHARS)
+        {
+            return "content-hash";
         }
-        if let Ok(mut table) = self.sticky.lock() {
-            table.insert(key.to_string(), (account_id.to_string(), now));
+        for (name, label) in [
+            ("ah-thread-id", "AH-Thread-Id"),
+            ("x-opencode-session", "X-Opencode-Session"),
+            ("x-session-id", "X-Session-Id"),
+            ("x-session-affinity", "X-Session-Affinity"),
+        ] {
+            if Self::header_text(headers, name).is_some() { return label; }
         }
+        if body.get("prompt_cache_key").and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.trim().is_empty()) { return "prompt_cache_key"; }
+        if body.pointer("/metadata/user_id").and_then(serde_json::Value::as_str)
+            .and_then(Self::parse_claude_code_user_id).is_some() { return "Claude Code"; }
+        if Self::explicit_conversation_id(headers, body).is_some() { return "Codex"; }
+        "content-hash"
     }
 
     /// 取轮转游标并前进一格，返回**计数** —— 取模交给调用方做。
@@ -493,7 +506,11 @@ impl RouteState {
 
     /// 选路快照：粘性命中 + 沉底 / 休息 / 熔断三张表（一次取齐）。
     pub(super) fn snapshot(&self, conv_key: &str, now: i64, ttl_ms: i64) -> RouteSnapshot {
-        let sticky_hit = self.sticky_lookup(conv_key, now, ttl_ms);
+        self.snapshot_for_model(conv_key, "", now, ttl_ms)
+    }
+
+    pub(super) fn snapshot_for_model(&self, conv_key: &str, model: &str, now: i64, ttl_ms: i64) -> RouteSnapshot {
+        let sticky_hit = self.sticky.lookup(conv_key, model, now, ttl_ms);
         // 垫底按 [`SINK_TTL_MS`] 过滤 —— 与下面 resting / open 同款。
         // 上游原实现是整张表原样克隆（没有时间判定），于是垫底永不失效；
         // 唯一的解除路径是「该账号成功转发一次」，而它正排在队尾 —— 自锁。

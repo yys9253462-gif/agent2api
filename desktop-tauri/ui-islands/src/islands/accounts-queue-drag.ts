@@ -18,10 +18,8 @@
  * 拼不出完整队列，而重排接口要求「全部账号的一个排列」（见 store_order.rs）。
  *
  * ── 什么时候不给拖（分粒度）──────────────────────────────────
- * **组顺位**（拖分组带）：筛选 / 搜索 / 分页把别家的组整组裁掉了 —— 渲染出来的
- * 组只是完整队列的一小段，「插到第几个可见组之前」仍可换算，但**被裁掉的组**用户
- * 根本看不见，落点完全凭想象，所以整组拖动保持锁定，回调 onLockedAttempt 让页面
- * 提示一次。
+ * **组顺位**（拖分组带）：未筛选或仅筛“启用 / 禁用”时允许拖动；落点按移除被拖组后的
+ * 可见组计数，由页面换算回完整分组队列。其他筛选、搜索、分页下锁定并提示。
  * **组内顺位**（拖行把手）：筛选裁的是**组内的行**，落点仍按「渲染出来的行」中点
  * 比出（= 插到哪个可见行之前），再由调用方按锚点换算回完整 members —— 可见与全量
  * 的映射是确定的，拖动不会错位，因此**不锁**。
@@ -33,10 +31,18 @@ export type QueueDrop =
   | { kind: 'row'; provider: string; accountId: string; index: number }
 
 export type QueueDragHandlers = {
-  /** 组顺位是否被锁住（筛选 / 搜索 / 分页进行中；组内行不受它限制） */
+  /** 整组拖动的锁定状态由页面按筛选与分页判断；组内行不受它限制。 */
   isLocked(): boolean
   /** 组顺位锁着的时候用户还是按下了把手：给一次提示（由页面决定怎么说） */
   onLockedAttempt(): void
+  /**
+   * 这一组是否开着排序规则（组内顺位被规则接管）。**只有组内把手会问它**：
+   * 规则生效时拖出来的顺序松手就会被排回去，所以先拦住并给一次说明。
+   * 缺省（不实现）= 永不因排序规则锁定，与引入这条判据之前的行为一致。
+   */
+  isRowLocked?(provider: string): boolean
+  /** 组内把手被排序规则拦下：给一次提示 */
+  onRowLockedAttempt?(provider: string): void
   /** 拖完了：把新位置交回去，顺序怎么写由调用方决定 */
   onDrop(drop: QueueDrop): void
 }
@@ -168,6 +174,12 @@ export function bindQueueDrag(host: HTMLElement | null, handlers: QueueDragHandl
     const provider = item.dataset.provider
       || item.closest<HTMLElement>('tbody.acct-group')?.dataset.provider
       || ''
+    // 组内排序规则生效时，组内把手被规则接管（拖了也会被排回去）：拦在起拖这一刻，
+    // 而不是让用户白拖一次再发现顺序没变
+    if (kind === 'row' && provider && handlers.isRowLocked?.(provider)) {
+      handlers.onRowLockedAttempt?.(provider)
+      return
+    }
     const accountId = item.dataset.id || ''
     if (kind === 'row' && !accountId) return
     const items = siblingsOf(item, kind)

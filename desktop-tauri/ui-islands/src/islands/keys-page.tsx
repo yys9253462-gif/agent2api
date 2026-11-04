@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import {
   Badge,
@@ -15,7 +16,7 @@ import {
   MultiSelect,
   Switch,
   type MultiSelectOption,
-} from '@ui'
+  Card, CardHeader, Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import { t } from '../i18n'
 
@@ -82,6 +83,7 @@ type ProviderOption = { id: string; label?: string }
 type KeysPayload = {
   keys?: KeyEntry[]
   authRequired?: boolean
+  usableKeyCount?: number
   providers?: ProviderOption[]
   /** 每家 → 对外名清单，模型候选的**唯一**数据源（按当前勾选的提供商取并集） */
   modelsByProvider?: Record<string, string[]>
@@ -743,11 +745,11 @@ function KeysPage() {
   const paging = useClientPaging(keys.length, 'keys')
   const list = paging.paged ? paging.slice(keys) : keys
   const columns = visibleColumns()
-  const authRequired = data?.authRequired === true
-  const enabledCount = list.filter(item => item.enabled).length
-  const badgeText = authRequired
+  const enabledCount = data?.usableKeyCount ?? keys.filter(item => item.enabled).length
+  const hasUsableKey = enabledCount > 0
+  const badgeText = hasUsableKey
     ? t('已启用鉴权 · {n} 把 Key 生效', { n: enabledCount })
-    : t('未启用鉴权')
+    : t('没有可用的 API Key，请先在「网关 Key」页创建并启用')
 
   /** 一个单元格的内容（不含 <td> 外壳）；「某一列长什么样」只有这一处实现 */
   function cell(columnKey: string, k: KeyEntry, busyRow: boolean): React.ReactNode {
@@ -800,13 +802,13 @@ function KeysPage() {
   }
 
   return (
-    <section className='panel'>
-      <div className='panel-head'>
+    <Card render={<section />} className='panel'>
+      <CardHeader className='panel-head'>
         <h2>{t('API Key 列表')}</h2>
         {/* id 与 data-tone 保留：app.js 的 renderTopbarStatus 按 id 镜像这枚徽标的文案
             与配色（data-tone 有值走它，不去拆组件库 Badge 那串 Tailwind 类名） */}
-        <Badge id='keys-status' variant={authRequired ? 'success' : 'warning'}
-          data-tone={authRequired ? 'ok' : 'warn'}>
+        <Badge id='keys-status' variant={hasUsableKey ? 'success' : 'warning'}
+          data-tone={hasUsableKey ? 'ok' : 'warn'}>
           {badgeText}
         </Badge>
         <div className='head-actions'>
@@ -816,10 +818,10 @@ function KeysPage() {
             {t('＋ 新建 Key')}
           </Button>
         </div>
-      </div>
+      </CardHeader>
 
       <div className='models-table-wrap'>
-        <table className='models-table keys-table'>
+        <Table container={false} className='models-table keys-table'>
           {/* colgroup / thead 由本文件渲染，但 data-col 一个不少：列设置的就地重排
               （syncStaticHead）与列宽层（table-columns.js）都按它定位列 */}
           <colgroup>
@@ -829,39 +831,39 @@ function KeysPage() {
             <col className='k-state' data-col='state' />
             <col className='k-act' data-col='act' />
           </colgroup>
-          <thead>
-            <tr>
-              <th data-col='name'>{t('名称')}</th>
+          <TableHeader>
+            <TableRow>
+              <TableHead data-col='name'>{t('名称')}</TableHead>
               {/* 「Key」是产品固定叫法（无中文），不进词典 */}
-              <th data-col='key'>Key</th>
-              <th data-col='time'>{t('创建时间')}</th>
-              <th data-col='state'>{t('启用')}</th>
-              <th className='r' data-col='act'>{t('操作')}</th>
-            </tr>
-          </thead>
-          <tbody>
+              <TableHead data-col='key'>Key</TableHead>
+              <TableHead data-col='time'>{t('创建时间')}</TableHead>
+              <TableHead data-col='state'>{t('启用')}</TableHead>
+              <TableHead className='r' data-col='act'>{t('操作')}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {list.length ? list.map(k => {
               const busyRow = pending.has(k.id)
               return (
-                <tr key={k.id} className={k.enabled ? '' : 'off'} data-id={k.id}>
+                <TableRow key={k.id} className={k.enabled ? '' : 'off'} data-id={k.id}>
                   {columns.map(column => (
-                    <td key={column.key} className={`${CELL_CLASS[column.key] ?? ''} ta-${column.align}`}>
+                    <TableCell key={column.key} className={`${CELL_CLASS[column.key] ?? ''} ta-${column.align}`}>
                       {cell(column.key, k, busyRow)}
-                    </td>
+                    </TableCell>
                   ))}
-                </tr>
+                </TableRow>
               )
             }) : (
               // 空态的 colspan 跟着可见列数走：写死 5 之后藏起两列，这一格会比表体宽出
               // 两格，把整张表顶出横向滚动
-              <tr>
-                <td colSpan={columns.length} className='empty'>
-                  {data ? t('还没有 Key，当前不鉴权') : t('加载中…')}
-                </td>
-              </tr>
+              <TableRow>
+                <TableCell colSpan={columns.length} className='empty'>
+                  {data ? t('没有可用的 API Key，请先在「网关 Key」页创建并启用') : t('加载中…')}
+                </TableCell>
+              </TableRow>
             )}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </div>
 
       <TableFooter
@@ -873,7 +875,7 @@ function KeysPage() {
             <code>{'Authorization: Bearer <key>'}</code>
             {t(' 或 ')}
             <code>{'x-api-key: <key>'}</code>
-            {t('； 修改后立即生效，本程序自身会自动使用第一把启用的 Key。每把 Key 可单独限制')}
+            {t('；修改后立即生效。模型测试、助手和日活保活必须选择 Key，受限 Key 不能访问管理接口。每把 Key 可单独限制')}
             <b>{t('可用提供商')}</b>
             {t('与')}
             <b>{t('可用模型')}</b>
@@ -901,7 +903,7 @@ function KeysPage() {
           }}
         />
       ) : null}
-    </section>
+    </Card>
   )
 }
 
@@ -923,10 +925,8 @@ function mount(): void {
   createRoot(section).render(<KeysPage />)
 }
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(SECTION)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('keys', SECTION, mount)
 
 declare global {
   interface Window {

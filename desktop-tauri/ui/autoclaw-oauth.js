@@ -264,7 +264,7 @@
         }
         // 换地址失败（风控没过 / 上游拒绝）：滑块面板还停在「验证中」，作废实例
         // 让它收起 —— 否则面板与报错同时在场，用户不知道该信哪一个
-        invalidateInitialization();
+        cancelCaptcha();
         const reason = describeError(error);
         setHint(wbI18n.t('登录失败：{message}', { message: reason }));
         window.wbApp.toast(wbI18n.t('登录失败：{message}', { message: reason }), 'err');

@@ -12,8 +12,12 @@
  * 首次提交必须同步（flushSync）：脚本是紧随本岛之后的经典脚本，求值时就要拿到
  * 这些节点（`widget.addEventListener` 拿到 null 会直接抛错，整段脚本作废、点登录
  * 毫无反应）；而 createRoot().render() 默认交给调度器异步提交，同步脚本会跑在提交
- * 之前、拿到空 DOM。代价是本页的 `<script src="islands/ui.js">` 必须排在 #login-app
- * 之后，且不能加 defer/async —— 加了顺序就散了。
+ * 之前、拿到空 DOM。代价是本页的 `<script src="islands/login.js">` 必须排在
+ * #login-app 之后，且不能加 defer/async —— 加了顺序就散了。
+ *
+ * 这个岛**不在主面板的 island 注册表里**：它单独构建成 ui/islands/login.js
+ * （入口 src/login-entry.tsx，见 vite.login.config.ts），否则登录页为了显示
+ * 一张卡片也要下载整份 2.3 MB 的 islands/ui.js。
  *
  * 视觉上不再自己硬编码一套深色变量：颜色一律走组件库令牌（ui.css 的 --ui-*，
  * 跟随 `<html data-theme="dark">`），布局尺寸用 Tailwind 工具类还原原样式。
@@ -23,7 +27,7 @@
 import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
-import { Button, Input, Label } from '@ui'
+import { Button, Card, Input, Label, Verification } from '@ui'
 import { t } from '../i18n'
 
 /** 挂载点 id：login.html 里唯一的岛容器 */
@@ -38,7 +42,26 @@ const HOST_ID = 'login-app'
  * 自家自定义元素去扩全局 JSX 命名空间会波及其他岛（也可能与并行迁移的文件撞车）。
  * 元素只认 id：领题端点、文案、事件都在组件内部，这里不传任何属性。
  */
-const captchaWidget = React.createElement('panel-captcha', { id: 'captcha' })
+type CaptchaElement = HTMLElement & { state?: 'idle' | 'verifying' | 'verified' | 'error'; start?(): Promise<void> }
+
+function CaptchaControl() {
+  const [state, setState] = React.useState<'idle' | 'verifying' | 'verified' | 'error'>('idle')
+  const ref = React.useRef<CaptchaElement | null>(null)
+  React.useEffect(() => {
+    const element = ref.current
+    if (!element) return
+    const sync = () => setState(element.getAttribute('state') as typeof state || 'idle')
+    const observer = new MutationObserver(sync)
+    observer.observe(element, { attributes: true, attributeFilter: ['state'] })
+    sync()
+    return () => observer.disconnect()
+  }, [])
+  return React.createElement('panel-captcha', { id: 'captcha', ref },
+    <Verification state={state} className='mx-auto mt-5' onClick={() => { void ref.current?.start?.() }}>
+      {state === 'verifying' ? t('验证中…') : state === 'verified' ? t('验证成功') : state === 'error' ? t('验证失败，请重试') : t('我不是机器人')}
+    </Verification>,
+  )
+}
 
 /**
  * 卡片外壳与其中的表单。
@@ -48,14 +71,14 @@ const captchaWidget = React.createElement('panel-captcha', { id: 'captcha' })
  */
 function LoginPage() {
   return (
-    <div className='w-[min(400px,100%)] rounded-lg border border-border bg-card p-[36px_34px_30px] shadow-3'>
+    <Card className='w-[min(400px,100%)] p-[36px_34px_30px] shadow-3'>
       {/* 品牌标与桌面端 / 面板侧栏同一造型（icons.js 的 brand 项），底色是品牌色常量而非主题令牌 */}
       <div className='mb-[26px] flex flex-col items-center gap-3 text-center'>
         <svg
           viewBox='0 0 24 24'
           role='img'
           aria-label='Agent2API'
-          className='size-[52px] rounded-[12px] shadow-[0_6px_18px_rgba(0,122,255,0.35)]'
+          className='size-[52px] rounded-lg shadow-[0_6px_18px_rgba(0,122,255,0.35)]'
         >
           <rect width='24' height='24' rx='5.4' fill='#007AFF' />
           <g fill='none' stroke='#fff' strokeWidth='2.2' strokeLinecap='round' strokeLinejoin='round'>
@@ -83,7 +106,7 @@ function LoginPage() {
         </Label>
         <Input id='password' type='password' autoComplete='new-password' placeholder={t('至少 8 位')} />
         {/* 领题求解放后台跑 → 绿勾已验证（组件见 ui/panel-captcha.js） */}
-        {captchaWidget}
+        <CaptchaControl />
         {/* type='submit' 必须显式给：Base UI 的 useButton 会给原生 button 补一个
             type="button"，只有显式传入（合并时外部 props 优先）才盖得掉 */}
         <Button id='submit' type='submit' size='lg' className='w-full'>
@@ -95,13 +118,14 @@ function LoginPage() {
       <div className='mt-[22px] text-center text-[12px] text-muted-foreground'>
         {t('登录后可在「网关 Key」页为 API 客户端创建密钥')}
       </div>
-    </div>
+    </Card>
   )
 }
 
 /**
- * 挂载。主面板里没有 #login-app（岛随同一个 bundle 一起加载），直接跳过 ——
- * 这是预期行为，不是漏挂。
+ * 挂载。本文件由独立的 login.js 引入，正常只在登录页执行；保留 #login-app
+ * 存在性判断是为了防止将来有人把 login.js 误引到其它页面 —— 那种情况下
+ * 静默跳过即可，不该报错。
  */
 function mount(): void {
   const host = document.getElementById(HOST_ID)

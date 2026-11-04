@@ -1,0 +1,83 @@
+.page.active[data-page="routing"] {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding-bottom: var(--pad);
+  gap: 14px;
+}
+.routing-page-error { display: flex; align-items: center; gap: 8px; flex: none; padding: 9px 12px; border: 1px solid var(--danger-bd); background: var(--danger-soft); color: var(--danger); border-radius: var(--r-sm); }
+.routing-page-error > span:nth-child(2) { flex: 1; }
+
+/* 配置页与旧弹窗共用的基础件 */
+.routing-provider-mark { width: 28px; height: 28px; object-fit: contain; flex: none; border-radius: var(--r-sm); }
+.routing-letter { display: flex; justify-content: center; align-items: center; border: 1px solid var(--hairline); background: var(--surface-3); color: var(--text-2); font-size: 13px; font-weight: 650; }
+.routing-provider-name { flex: 1; min-width: 0; }
+.routing-provider-name > b { display: block; font-size: 12.5px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.routing-provider-name > span { display: block; margin-top: 2px; color: var(--text-3); font-size: 10px; }
+.routing-icon-button { width: 24px; height: 24px; flex: none; padding: 0; border-radius: var(--r-xs); color: var(--text-3); }
+.routing-grip { touch-action: none; cursor: grab; color: var(--text-3); width: 22px; height: 26px; padding: 0; border-radius: var(--r-xs); flex: none; }
+.routing-grip:active { cursor: grabbing; }
+.routing-grip:disabled { cursor: default; }
+.routing-grip.is-locked, .routing-grip.is-locked:active { cursor: not-allowed; opacity: .45; }
+.routing-account-rank { font-size: 10px; color: var(--text-3); width: 16px; text-align: center; flex: none; font-variant-numeric: tabular-nums; }
+.routing-account-avatar { width: 27px; height: 27px; display: flex; align-items: center; justify-content: center; border-radius: var(--r-sm); border: 1px solid var(--hairline); background: var(--surface-2); color: var(--text-2); flex: none; font-size: 12px; font-weight: 600; }
+
+/* 请求日志里的单条回放弹窗 */
+.routing-replay-dialog { width: min(1120px, calc(100vw - 48px)); height: min(750px, calc(100vh - 48px)); }
+.routing-replay-body { display: flex; flex-direction: row; gap: 0; padding: 0; overflow: hidden; min-height: 0; flex: 1; }
+.routing-replay-sidebar { display: flex; flex-direction: column; min-height: 0; width: 288px; border-right: 1px solid var(--hairline); background: var(--rail-bg); flex: none; }
+.routing-replay-list { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; }
+.routing-replay-row { display: flex; flex-direction: column; align-items: stretch; gap: 5px; width: 100%; min-height: 83px; height: auto; padding: 11px; text-align: left; border: 1px solid transparent; border-radius: var(--r-md); margin-bottom: 6px; color: var(--text-2); }
+.routing-replay-row > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.routing-replay-row b { font-weight: 600; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; }
+.routing-replay-row > span { font-size: 10.5px; font-weight: 400; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.routing-replay-row.is-selected { background: var(--primary-soft); border-color: var(--primary-bd); }
+.routing-replay-body > .routing-replay-main { flex: 1; overflow-y: auto; padding: 20px; min-width: 0; }
+.routing-replay-detail { display: flex; flex-direction: column; gap: 15px; }
+.routing-replay-detail-title { display: flex; align-items: center; gap: 10px; }
+.routing-replay-detail-title h3 { font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+.routing-replay-metadata { display: flex; flex-wrap: wrap; gap: 7px 12px; color: var(--text-3); font-size: 10.5px; }
+.routing-replay-metadata code { width: 100%; font-size: 10px; overflow-wrap: anywhere; }
+.routing-replay-facts { display: flex; flex-direction: column; gap: 12px; font-size: 11.5px; }
+.routing-replay-facts h4, .routing-replay-attempts h4 { font-size: 11.5px; color: var(--text-2); margin-bottom: 8px; font-weight: 650; }
+.routing-replay-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.routing-replay-note { color: var(--text-3); font-size: 10.5px; line-height: 1.7; }
+.routing-replay-queue { display: flex; flex-direction: column; gap: 5px; padding: 0; margin: 0; list-style: none; }
+.routing-replay-queue > li { display: flex; align-items: start; gap: 9px; padding: 10px; border: 1px solid var(--hairline); border-radius: var(--r-sm); background: var(--surface-2); }
+.routing-replay-queue > li.is-picked { background: var(--primary-soft); border-color: var(--primary-bd); }
+.routing-replay-rank { display: flex; justify-content: center; align-items: center; width: 22px; height: 22px; border: 1px solid var(--hairline); background: var(--surface); color: var(--text-3); border-radius: var(--r-xs); font-size: 10px; font-weight: 650; flex: none; font-variant-numeric: tabular-nums; }
+.routing-replay-entry { flex: 1; min-width: 0; }
+.routing-replay-entry > span { color: var(--text-3); margin-left: 8px; font-size: 10.5px; }
+.routing-replay-entry > p { margin-top: 5px; color: var(--text-3); font-size: 10.5px; }
+.routing-replay-blocked { display: flex; flex-direction: column; gap: 5px; }
+.routing-replay-blocked > div { border: 1px dashed var(--border); border-radius: var(--r-sm); padding: 9px 10px; }
+.routing-replay-blocked b { margin-left: 8px; font-weight: 500; }
+.routing-replay-blocked p { color: var(--text-3); font-size: 10.5px; margin-top: 5px; }
+.routing-replay-picked { display: flex; align-items: center; gap: 8px; padding: 11px; background: var(--primary-soft); color: var(--primary-fg); border: 1px solid var(--primary-bd); border-radius: var(--r-sm); font-weight: 600; }
+.routing-replay-error { padding: 10px 12px; color: var(--danger); background: var(--danger-soft); border: 1px solid var(--danger-bd); border-radius: var(--r-sm); font-size: 11.5px; overflow-wrap: anywhere; }
+.routing-replay-attempts > div { display: flex; align-items: start; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--hairline); }
+.routing-replay-attempts > div > div { flex: 1; font-size: 11px; }
+.routing-replay-attempts p { color: var(--text-3); margin-top: 4px; overflow-wrap: anywhere; }
+.routing-replay-facts.is-compact { gap: 8px; }
+.routing-replay-facts.is-compact .routing-replay-queue > li { padding: 6px 8px; }
+
+/* 会话粘滞弹窗 */
+.routing-sticky-list { display: flex; flex-direction: column; }
+.routing-sticky-row { display: flex; align-items: center; gap: 12px; padding: 13px 0; border-bottom: 1px solid var(--hairline); }
+.routing-sticky-mark { display: flex; align-items: center; justify-content: center; background: var(--primary-soft); color: var(--primary-fg); width: 36px; height: 36px; border-radius: var(--r-md); flex: none; }
+.routing-sticky-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.routing-sticky-info > b { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.routing-sticky-info > span { color: var(--text-3); font-size: 10.5px; }
+.routing-sticky-info > div { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: 10px; flex-wrap: wrap; }
+.routing-sticky-time { text-align: right; flex: none; }
+.routing-sticky-time b { font-size: 12px; color: var(--text-2); font-family: var(--font-mono); font-weight: 500; }
+.routing-sticky-time span { display: block; margin-top: 3px; font-size: 10px; color: var(--text-3); }
+
+@media (max-width: 767px) {
+  .page.active[data-page="routing"] { gap: 10px; padding-bottom: 10px; }
+  .routing-replay-sidebar { width: 205px; }
+  .routing-replay-body > .routing-replay-main { padding: 12px; }
+  .routing-sticky-mark { display: none; }
+  .routing-sticky-row { gap: 8px; }
+}

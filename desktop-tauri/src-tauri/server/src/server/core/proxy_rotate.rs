@@ -1,38 +1,5 @@
-//! 出网代理的**轮询档**（按请求轮换出口 = 换 IP）。
-//!
-//! ── 为什么要有它（唯一允许的对象是 OpenCode Zen）──────────────
-//! OpenCode Zen 免费档不用 API Key，限流按 **IP** 判：某个 IP 的免费额度用完，
-//! 上游对它的后续请求一律 429。同一个出口死磕只会一直 429，而把出口摊开到多个
-//! IP 上，每条请求都从还有额度的 IP 出去 —— 这就是轮询档的全部目的。
-//! 别的家（订阅制 / 按 Key 计费）不按 IP 限流，轮换出口只会让上游看到一串
-//! 互不相关的 IP（风控上反而是坏事），所以写入侧有一道闸门：只有 OpenCode Zen
-//! 账号能存下这个形状（见 `account_store::store_crud::apply_patch`）。
-//!
-//! ── 存储形状（账号 proxy 字段，见 `core::proxies` 的模块头）──────
-//! ```json
-//! { "source": "rotate", "all": true }                     // 轮询池里全部启用的出口
-//! { "source": "rotate", "all": false, "proxyIds": ["px_…"] }  // 轮询指定的几条
-//! ```
-//! `all: true` 的含义是「**此刻**池里全部启用的出口」：池里增删条目后候选集合
-//! 自然跟着变，不必回写账号记录（用户加了一个新节点就自动进轮询）。
-//!
-//! ── 游标：进程级、按账号各一条 ───────────────────────────────
-//! 轮询状态不落库：它的作用只是「让相邻两次请求落到不同出口」，重启后从头开始
-//! 完全不影响正确性（落库反而要处理「条目被删后游标指向不存在的条目」这类
-//! 无意义的持久状态）。键是账号 id —— 每条账号各转各的（多条 Zen 账号共用一个
-//! 池时，各自从自己的进度往后走）。
-//!
-//! 取用是**先取号再解析**：号取到了但那条解析失败（条目被禁用 / 订阅节点还没
-//! 分配端口）就顺延下一条，最多绕一圈。这样「池里有一条坏的」不会让轮询停在
-//! 坏条目上，也不会让请求直接失败 —— 坏条目只是被跳过。
-//!
-//! ── 与代理池的关系 ──────────────────────────────────────────
-//! 候选只来自「网络代理」页的池条目（`core::proxy_pool`），按 id 引用；解析复用
-//! `proxy_pool::resolve_reference`，于是失败文案（条目不存在 / 已禁用 / Clash
-//! 监听器没了）与单条引用档逐字一致，界面上与排障时只有一套说法。
-//! 与池的**反向**依赖（池的条目解析走 `core::proxies`）不构成递归：池里不可能
-//! 出现 rotate 形状的条目（`proxy_pool::normalize_item` 只产出 manual，同步只
-//! 产出 clash / subscription）。
+//! 账号出网代理轮询，候选来自手动地址与 Clash Verge 端点。
+//! 游标按账号存于进程内；展示只读取候选，不推进游标。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -139,26 +106,22 @@ pub fn candidate_ids(config: &Value) -> Vec<String> {
         .collect()
 }
 
-/// 条目的**廉价**可用性（不查 Clash 快照、不发网络）：用于展示摘要里的
+/// 条目的**廉价**可用性（不发网络）：用于展示摘要里的
 /// 「可用 N 条」。真正的取用判定在解析那一步（`proxy_pool::resolve_reference`）。
 fn entry_ready(item: &Value) -> Result<(), String> {
-    match text_of(item, "source").as_str() {
-        "subscription" => {
-            if item.get("port").and_then(Value::as_u64).is_none() {
-                return Err("订阅节点还没有分配监听端口".to_string());
-            }
-            Ok(())
-        }
-        "clash" => Ok(()),
-        _ => {
-            let host = text_of(item, "host");
-            let port = item.get("port").and_then(Value::as_u64).unwrap_or(0);
-            if host.is_empty() || port == 0 {
-                return Err("条目地址不完整".to_string());
-            }
-            Ok(())
-        }
+    if item.get("source").and_then(Value::as_str) == Some("clash") {
+        return match crate::server::core::proxy_pool::resolve_item(item) {
+            Some(crate::server::core::proxies::ProxyResolution::Resolved(_)) => Ok(()),
+            Some(crate::server::core::proxies::ProxyResolution::Failed(reason)) => Err(reason),
+            None => Err("条目地址不完整".to_string()),
+        };
     }
+    let host = text_of(item, "host");
+    let port = item.get("port").and_then(Value::as_u64).unwrap_or(0);
+    if host.is_empty() || !(1..=65535).contains(&port) {
+        return Err("条目地址不完整".to_string());
+    }
+    Ok(())
 }
 
 // ─── 取用 ───────────────────────────────────────────────────
@@ -232,7 +195,7 @@ pub struct Summary {
     pub error: Option<String>,
 }
 
-/// 算一份摘要（读一次池，不做网络与 Clash 快照）。
+/// 算一份摘要（读一次池，不做网络请求）。
 pub fn summary(config: &Value) -> Summary {
     let all = is_all(config);
     let items = crate::server::core::proxy_pool::raw_items();

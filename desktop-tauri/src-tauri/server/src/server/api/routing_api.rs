@@ -141,13 +141,17 @@ pub async fn put_routing(State(_state): State<ServerState>, body: Bytes) -> Resp
         Ok(value) => value,
         Err(response) => return response,
     };
+    let previous_sticky = config::routing_settings().sticky;
     if !config::set_routing(patch) {
         return errors::management_error(500, "路由设置落盘失败");
+    }
+    if previous_sticky != config::routing_settings().sticky {
+        _state.upstream().clear_route_sticky(None, None);
     }
     ok_json(routing_json(config::routing_settings()))
 }
 
-fn routing_json(settings: RoutingSettings) -> Value {
+pub(crate) fn routing_json(settings: RoutingSettings) -> Value {
     json!({
         config::KEY_ROUTING_STRATEGY: settings.strategy.as_str(),
         config::KEY_ROUTING_STICKY: settings.sticky.as_str(),
@@ -170,9 +174,16 @@ pub async fn get_routing_queue(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    ok_json(queue_json(&state, model))
+}
+
+pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
+    let accounts = routing::accounts_of(&state.store().list_visible_accounts());
+    queue_for_accounts(state, model, &accounts)
+}
+
+pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, accounts: &[Value]) -> Value {
     let snapshot = config::current();
-    let accounts_value = state.store().list_accounts();
-    let accounts = routing::accounts_of(&accounts_value);
     // 候选收窄：点名了模型 → 只留「清单里有它的家」（与转发同一张家清单，
     // `route_for_forward`）；没点名 → 全部账号。与 session.rs 的 ★ 推算同一取材。
     let providers: Vec<String> = match &model {
@@ -180,14 +191,18 @@ pub async fn get_routing_queue(
         None => Vec::new(),
     };
     let scoped: Vec<Value> = match model.as_deref() {
-        Some(_) if providers.is_empty() => accounts.clone(),
-        Some(_) => accounts
-            .iter()
+        Some(_) => accounts.iter()
             .filter(|account| providers.contains(&routing::provider_of(account).to_string()))
-            .cloned()
-            .collect(),
-        None => accounts.clone(),
+            .cloned().collect(),
+        None => accounts.to_vec(),
     };
+    let scoped = crate::server::core::routing_scope::apply_accounts(
+        &scoped, model.as_deref().unwrap_or(""),
+    );
+    let routable: Vec<Value> = scoped.iter()
+        .filter(|account| !crate::server::core::providers::readiness::gated(routing::provider_of(account)))
+        .cloned().collect();
+    let scoped = if routable.is_empty() { scoped } else { routable };
     let now = crate::server::logging::now_ms();
     let counts: HashMap<String, usize> = state
         .upstream()
@@ -198,17 +213,16 @@ pub async fn get_routing_queue(
     let keys = routing::CooldownKeys::new(model.as_deref().unwrap_or(""));
     // 限制器软跳过与转发的选路同一判据（被拦的账号在面板上也是「跳过」，
     // 原因写明是限制器而不是限流 —— 两回事）
-    let facts = crate::server::core::usage_records::balance_facts();
-    let token_facts = crate::server::core::limiter::token_facts();
+    let facts = crate::server::core::limiter::sources::facts();
+    let limiter_counts = crate::server::core::limiter::counter::facts();
     let limiter_blocked: HashSet<String> = scoped
         .iter()
-        .filter(|account| {
-            crate::server::core::usage_records::balance_blocked(account, &facts)
-                || crate::server::core::limiter::token_skip_blocked(account, &token_facts, now)
-        })
+        .filter(|account| crate::server::core::limiter::evaluate::blocked(
+            account, &keys.for_account(account), &facts, &limiter_counts, now,
+        ))
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
-    let settings = config::routing_settings();
+    let settings = config::routing_settings_for_model(model.as_deref().unwrap_or(""));
     // 面板只**看**当前状态，不做粘性查找、不前进轮转游标 —— 预演不该刷新
     // 任何会话的计时，也不该消耗下一次轮转。家内轮询的各家游标同理，所以
     // 两种轮转策略都传 `None`：面板看到的是「各家都从第 0 位起」的静态序。
@@ -229,22 +243,21 @@ pub async fn get_routing_queue(
             "id": entry.id,
             "name": entry.name,
             "provider": entry.provider,
-            "providerLabel": crate::server::core::providers::kind_from_id(&entry.provider)
-                .map(|kind| crate::server::core::providers::meta(kind).label.to_string())
-                .unwrap_or_else(|| entry.provider.clone()),
+            "providerLabel": crate::server::core::providers::label_of(&entry.provider),
             "state": entry.state,
             "reason": entry.reason,
             "resetAt": if entry.reset_at > 0 { Value::from(entry.reset_at) } else { Value::Null },
             "priority": entry.account.get("priority").cloned().unwrap_or(Value::Null),
         })
     };
-    ok_json(json!({
+    json!({
         "strategy": settings.strategy.as_str(),
         "sticky": settings.sticky.as_str(),
         "model": model.clone().map(Value::String).unwrap_or(Value::Null),
+        "modelKnown": model.as_ref().map(|_| !providers.is_empty()),
         "lastRequestModel": snapshot.last_request_model(),
         "pickedId": plan.ordered.first().map(|entry| entry.id.clone()).unwrap_or_default(),
         "ordered": plan.ordered.iter().map(entry_json).collect::<Vec<_>>(),
         "blocked": plan.blocked.iter().map(entry_json).collect::<Vec<_>>(),
-    }))
+    })
 }

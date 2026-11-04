@@ -85,7 +85,8 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
     }
     // 两个模态位先取成局部量：下面的 `input_modalities` 必须与它们**同源**
     // —— 同一批生效值（含用户覆盖）、同一套真值判定，两处声明才不会漂移
-    let images = model.get("supportsImages").map(js_truthy).unwrap_or(false);
+    let images = model.get("supportsImages").map(js_truthy).unwrap_or(false)
+        || crate::server::core::providers::images::provider_model_supports_editing(provider_id, model);
     let video = model.get("supportsVideo").map(js_truthy).unwrap_or(false);
     item.insert(
         "supports_tool_call".to_string(),
@@ -103,7 +104,8 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
     // `supports_images` / `supports_video` 是**同一件事的两套说法** —— 一批
     // 客户端只认前者，另一批只认后者，所以两套都得给，且必须同源。
     //
-    // `text` 恒在（本网关只代理对话模型，`kind` 恒为 chat）；模态位为真时
+    // `text` 恒在；图片输入与图片输出分别由模态位和 kind 表达。
+    // 模态位为真时
     // 追加对应的那一项。取值用生态通用的小写字符串，不是自有键名的复刻：
     // 上游清单里没有的模态（audio / file）不猜，宁可不说。
     let mut modalities = vec![Value::String("text".to_string())];
@@ -114,17 +116,44 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
         modalities.push(Value::String("video".to_string()));
     }
     item.insert("input_modalities".to_string(), Value::Array(modalities));
+    let image_generation = crate::server::core::providers::images::model_is_image(model);
+    item.insert("supports_image_generation".to_string(), Value::Bool(
+        crate::server::core::providers::images::provider_model_supports_generation(provider_id, model),
+    ));
+    item.insert("supports_image_editing".to_string(), Value::Bool(
+        crate::server::core::providers::images::provider_model_supports_editing(provider_id, model),
+    ));
+    if let Some(output) = model.get("output_modalities").filter(|value| value.is_array()) {
+        item.insert("output_modalities".to_string(), output.clone());
+    } else if image_generation {
+        item.insert("output_modalities".to_string(), serde_json::json!(["image"]));
+    }
     item.insert(
         "is_default".to_string(),
-        Value::Bool(model.get("isDefault").map(js_truthy).unwrap_or(false)),
+        Value::Bool(!image_generation && model.get("isDefault").map(js_truthy).unwrap_or(false)),
     );
     item.insert(
         "kind".to_string(),
         match model.get("kind") {
+            _ if image_generation => Value::String("image".to_string()),
             Some(value) if js_truthy(value) => value.clone(),
             _ => Value::String("chat".to_string()),
         },
     );
+    for (source, target) in [
+        ("reasoningLevels", "reasoning_efforts"),
+        ("reasoningDefaultLevel", "reasoning_default_effort"),
+        ("reasoningFixedLevel", "reasoning_fixed_effort"),
+        ("reasoningBindingSupported", "reasoning_binding_supported"),
+        ("reasoningSource", "reasoning_source"),
+    ] {
+        if let Some(value) = model.get(source).filter(|value| !value.is_null()) {
+            item.insert(target.to_string(), value.clone());
+        }
+    }
+    if let Some(status) = model.get("upstreamStatus").filter(|value| value.is_string()) {
+        item.insert("upstream_status".to_string(), status.clone());
+    }
     Value::Object(item)
 }
 

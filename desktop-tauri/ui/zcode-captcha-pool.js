@@ -1,235 +1,108 @@
-/* Agent2API · ZCode 活动套餐通道的**验证码令牌池守卫**
-
-   ── 它解决的是什么（一句话）───────────────────────────────────
-   ZCode 的「活动套餐」额度只从 `POST /api/v1/zcode-plan/anthropic/v1/messages`
-   花得出去，而那个端点**每条请求都要一个当次铸的阿里云验证码令牌**：少它一律
-   `400 {"code":3007,"msg":"captcha verify failed"}`（实测不是偶发挑战，是常规门禁）。
-   Rust 侧铸不出来（要跑阿里云 SDK），所以由这个跑在 WebView 里的守卫铸：
-   静默无痕验证 → 推给网关 → 转发层按请求取一个。
-
-   ── 节奏（不铸多、不空窗）─────────────────────────────────────
-   每轮问网关 `GET /api/zcode/captcha`（间隔与单轮产量都是网关下发的设置，
-   见「节奏参数」段）：
-     · `needsTokens: true`（有账号走活动套餐，且库存低于目标）→ 补到目标；
-     · `needsTokens: false` → 什么都不做（**没有账号用这条路时一个都不铸** ——
-       阿里云对铸造频率有风控，白铸纯属烧配额，见参考实现的熔断那一段）；
-     · 上游刚回过 3007（`rejected` 计数变大）→ 立刻补一轮，不等下一个周期。
-   令牌寿命两分钟（网关那侧定的），每次只铸到目标（默认 3 个）：
-   「够下一条请求立刻有得用」即可。三项节奏可在设置页「网关 → 验证码
-   令牌池」调（config 键 zcodeCaptchaPool*），随每轮 stats 下发热生效。
-
-   ── 为什么不做成用户可见的按钮 ───────────────────────────────
-   转发是后台发生的（用户在别的工具里发请求），没有人会在每条请求前点一次验证。
-   这与「领套餐」的滑块不是一回事：那个是**用户动作**，必须让用户看见、确认；
-   这个是**机器对机器的门禁令牌**，无痕模式本来就是为这种场景设计的。
-
-   ── 失败时怎么办（如实，不装死）───────────────────────────────
-   铸造失败（SDK 加载不出来、网络不通、阿里云限流）只写控制台并退让到下一个
-   周期：令牌池空了，转发层会如实回一句「活动套餐通道需要人机验证令牌…」，
-   用户知道去哪儿看。**不要**在这里弹 toast —— 它是后台循环，弹一次就会有
-   第二次、第三次。
-
-   依赖：`ui/aliyun-captcha.js` 的 `window.wbAliyunCaptcha.mintTraceless`
-   （脚本顺序：本文件必须排在它之后）与桥接层 `zcodeCaptchaStats` /
-   `pushZcodeCaptchaTokens`（deploy 的两种形态各有一份实现：桌面端
-   desktop-tauri/src-tauri/src/bridge.rs，headless 面板
-   server/src/web_shim.rs —— 两份都给才谈得上「同一份界面代码两种部署通用」，
-   早先在 headless 缺这两条，于是铸造器每轮都退让、池子永远是空的，
-   见 Issue #163）。 */
-
+/* 套餐池状态守卫只轮询；验证码只能由用户主动发起。 */
 (() => {
-  /** 轮询间隔的**回退默认**（毫秒）：网关没给 `pollMs` 时才用。正式值是
-     设置页「网关 → 验证码令牌池」的设置项，随每轮 stats 下发（见 pollMsOf） */
   const POLL_MS = 2500;
-  /** 单轮铸造上限的**回退默认**：网关没给 `maxPerRound` 时才用。1 = 单实例
-     单次铸造，避免并发冲突与 DOM 重建竞态（见 maxPerRoundOf） */
-  const MAX_PER_ROUND = 1;
-  /** 节奏参数的合法范围（与后端 config 的范围常量同源：zcodeCaptchaPool*）。
-     网关写侧已按这个范围校验过，这里的夹取只是防御响应被改坏 */
-  const POLL_MIN_MS = 1000;
-  const POLL_MAX_MS = 30000;
-  const PER_ROUND_MIN = 1;
-  const PER_ROUND_MAX = 5;
-
-  /** 本轮的轮询间隔：网关设置说了算，缺失 / 非法回落默认并夹进合法范围 */
-  function pollMsOf(stats) {
-    const value = Number(stats.pollMs);
-    if (!Number.isFinite(value) || value <= 0) return POLL_MS;
-    return Math.min(POLL_MAX_MS, Math.max(POLL_MIN_MS, Math.round(value)));
-  }
-
-  /** 本轮的单轮铸造上限：同上 */
-  function maxPerRoundOf(stats) {
-    const value = Number(stats.maxPerRound);
-    if (!Number.isFinite(value) || value <= 0) return MAX_PER_ROUND;
-    return Math.min(PER_ROUND_MAX, Math.max(PER_ROUND_MIN, Math.round(value)));
-  }
-  /** 失败后的退让（毫秒）：失败时轻度退让，并在连续失败时重置铸造实例 */
-  const BACKOFF_MIN_MS = 3000;
-  const BACKOFF_MAX_MS = 15000;
-
+  const IDLE_POLL_MS = 15000;
   let timer = 0;
-  let running = false;
   let stopped = false;
-  /** 上一轮看到的 3007 计数（变大 = 上游刚拒了令牌，立刻补货） */
-  let lastRejected = 0;
-  /** 连续失败次数（退让用） */
-  let failures = 0;
+  let running = false;
+  let verifying = false;
+  let stats = null;
+  let status = { state: 'idle', error: '' };
 
-  const api = () => window.workbuddyDesktop || null;
-
-  function log(message, ...args) {
-    console.log(`[ZCodeCaptcha] ${message}`, ...args);
-    if (window.wbApp?.debug) window.wbApp.debug(`[ZCodeCaptcha] ${message}`);
+  function publish(state, error = '') {
+    const message = String(error || '');
+    if (status.state === state && status.error === message) return;
+    status = { state, error: message };
+    window.dispatchEvent(new CustomEvent('zcode-captcha-status', { detail: { ...status } }));
   }
 
-  function warn(message, ...args) {
-    console.warn(`[ZCodeCaptcha] ${message}`, ...args);
-    if (window.wbApp?.debug) window.wbApp.debug(`[ZCodeCaptcha] [WARN] ${message}`);
+  function schedule(delay) {
+    window.clearTimeout(timer);
+    if (!stopped) timer = window.setTimeout(() => void check(), delay);
   }
 
-  /** 拿一次池子概况；桥接方法缺失（界面被别的宿主打开、脚本没就位）时返回 null，循环安静地退让 */
-  async function fetchStats() {
-    const bridge = api();
-    if (!bridge?.zcodeCaptchaStats) return null;
-    try {
-      return await bridge.zcodeCaptchaStats();
-    } catch (error) {
-      log(`读取令牌池概况失败：${error?.message || error}`);
-      return null;
-    }
+  async function readStats() {
+    const bridge = window.workbuddyDesktop;
+    if (!bridge?.zcodeCaptchaStats) throw new Error(wbI18n.t('验证码令牌池接口不可用'));
+    const value = await bridge.zcodeCaptchaStats();
+    if (value?.error) throw new Error(String(value.error));
+    if (!value) throw new Error(wbI18n.t('验证码令牌池未返回状态'));
+    stats = value;
+    return value;
   }
 
-  async function pushTokens(tokens) {
-    const bridge = api();
-    if (!bridge?.pushZcodeCaptchaTokens || tokens.length === 0) return false;
-    try {
-      await bridge.pushZcodeCaptchaTokens(tokens);
-      return true;
-    } catch (error) {
-      log(`令牌入池失败：${error?.message || error}`);
-      return false;
-    }
+  function stateOf(value) {
+    if (value.configError) return publish('error', value.configError);
+    if (value.required === false) return publish('disabled');
+    if (!Number(value.startPlanAccounts)) return publish('idle');
+    if (value.needsTokens === true) return publish('needs_verification');
+    return publish('idle');
   }
 
-  /** 铸一个（走无痕验证；`wbAliyunCaptcha` 未就绪或正忙时返回 null） */
-  async function mintOne(config) {
-    const captcha = window.wbAliyunCaptcha;
-    if (!captcha?.mintTraceless) return null;
-    // 用户正在拖滑块（领套餐 / 添加账号）时让路：两条流程共用 SDK 的同一个实例
-    if (captcha.isBusy?.()) return null;
-    try {
-      return await captcha.mintTraceless(config);
-    } catch (error) {
-      log(`铸造失败：${error?.message || error}`);
-      return null;
-    }
-  }
-
-  /** 一轮：读概况 → 需要就补 → 排下一次 */
-  async function round() {
+  async function check() {
     if (running || stopped) return;
+    // 令牌池只服务账号页的「套餐」列：人不在账号页时既不需要读状态，也不需要
+    // 每 15 秒打一发管理接口。留在定时器上保持节拍，切回账号页时由 wb:page
+    // 事件立即催一次。
+    if ((window.wbApp?.currentPage || '') !== 'accounts') {
+      schedule(IDLE_POLL_MS);
+      return;
+    }
     running = true;
     try {
-      const stats = await fetchStats();
-      if (!stats) {
-        schedule(BACKOFF_MIN_MS);
-        return;
-      }
-      // 上游刚拒过令牌（3007）：库存即使「够」也不可信了，也补一轮
-      const rejectedNow = Number(stats.rejected) || 0;
-      const challenged = rejectedNow > lastRejected;
-      lastRejected = rejectedNow;
-      const want = stats.needsTokens === true || challenged;
-      // 「需要铸造」的三样前提缺一不可：有账号走活动套餐、库存不足、风控配置拿得到
-      if (!want) {
-        schedule(pollMsOf(stats));
-        return;
-      }
-      // 风控配置只在真要铸的时候才去取（带 5 分钟缓存；上游那份配置很少变）
-      const config = await fetchCaptchaConfig(stats);
-      if (!config) {
-        schedule(BACKOFF_MIN_MS);
-        return;
-      }
-      const target = Math.max(1, Number(stats.target) || 1);
-      const ready = Number(stats.ready) || 0;
-      const need = Math.min(maxPerRoundOf(stats), Math.max(0, target - ready));
-      const tokens = [];
-      for (let index = 0; index < need; index += 1) {
-        const param = await mintOne(config);
-        if (!param) break;
-        tokens.push({ param, region: config.region || '' });
-        // 连续铸造之间留一点间隔：SDK 的同一个实例连着跑两轮会互相干扰
-        await new Promise(resolve => window.setTimeout(resolve, 500));
-      }
-      if (tokens.length === 0) {
-        // 一个都没铸出来（SDK 不可用 / 正忙）—— 退让，别原地空转
-        failures += 1;
-        if (failures >= 2) {
-          try { window.wbAliyunCaptcha?.resetMint?.(); } catch {}
-        }
-        const delay = Math.min(BACKOFF_MIN_MS * failures, BACKOFF_MAX_MS);
-        warn(`本轮未能铸出令牌（连续失败 ${failures} 次），将在 ${delay}ms 后重试`);
-        schedule(delay);
-        return;
-      }
-      await pushTokens(tokens);
-      failures = 0;
-      schedule(pollMsOf(stats));
+      const value = await readStats();
+      if (!verifying && !['paused', 'error'].includes(status.state)) stateOf(value);
+      const poll = Number(value.pollMs) || POLL_MS;
+      schedule(value.demandActive === true ? Math.min(30000, Math.max(1000, poll)) : IDLE_POLL_MS);
     } catch (error) {
-      failures += 1;
-      if (failures >= 2) {
-        try { window.wbAliyunCaptcha?.resetMint?.(); } catch {}
-      }
-      warn(`本轮异常：${error?.message || error}`);
-      schedule(Math.min(BACKOFF_MIN_MS * failures, BACKOFF_MAX_MS));
+      if (!verifying) publish('error', error?.message || error);
+      schedule(IDLE_POLL_MS);
     } finally {
       running = false;
     }
   }
 
-  /** 风控配置的缓存（上游那份配置一天也不会变几次，每轮都问纯属浪费） */
-  let configCache = { value: null, expiresAt: 0 };
-  const CONFIG_TTL_MS = 5 * 60000;
-
-  /**
-   * 取阿里云风控配置（`{enabled, prefix, sceneId, region}`）。
-   *
-   * 与「领套餐」走的是**同一份**上游配置（`GET /api/v1/client/configs` 的
-   * `configs.captcha`，见 `api::zcode_claim::captcha_config`）。账号 id 由网关
-   * 给（`captchaAccountId`，它挑的是走活动套餐的那个）—— 界面不必自己读账号表。
-   */
-  async function fetchCaptchaConfig(stats) {
-    if (configCache.value && configCache.expiresAt > Date.now()) return configCache.value;
-    const bridge = api();
-    const accountId = String(stats.captchaAccountId || '');
-    if (!bridge?.zcodeClaimCaptchaConfig || !accountId) return null;
+  async function verify(accountId, signal, onPhase) {
+    if (verifying) throw new Error(wbI18n.t('已有验证码流程正在进行，请先完成或取消'));
+    const bridge = window.workbuddyDesktop;
+    if (!accountId || !bridge?.zcodeClaimCaptchaConfig || !bridge?.pushZcodeCaptchaTokens) {
+      throw new Error(wbI18n.t('验证码令牌入池接口不可用'));
+    }
+    verifying = true;
+    publish('verifying');
     try {
-      const config = await bridge.zcodeClaimCaptchaConfig(accountId);
-      if (!config?.enabled || !config.sceneId) {
-        // 上游此刻不要验证码（或配置不完整）：按「不铸造」处理，下一轮再问
-        log('上游风控配置未启用（enabled:false）——不铸造');
-        return null;
-      }
-      configCache = {
-        value: { sceneId: config.sceneId, prefix: config.prefix, region: config.region },
-        expiresAt: Date.now() + CONFIG_TTL_MS,
+      const requireActive = () => {
+        if (signal?.aborted) throw new DOMException('请求已取消', 'AbortError');
       };
-      return configCache.value;
+      requireActive();
+      onPhase?.('preparing');
+      const config = await bridge.zcodeClaimCaptchaConfig(accountId);
+      requireActive();
+      const currentStats = await readStats();
+      requireActive();
+      if (currentStats.required === false) {
+        stateOf(currentStats);
+        return false;
+      }
+      const captcha = window.wbAliyunCaptcha;
+      if (!captcha?.requestToken) throw new Error(wbI18n.t('验证码组件未加载，请重启应用后重试'));
+      const token = await captcha.requestToken(config, signal, { onPhase });
+      requireActive();
+      onPhase?.('submitting');
+      const outcome = await bridge.pushZcodeCaptchaTokens([{ param: token.param, region: config.region || '' }]);
+      if (Number(outcome?.accepted) !== 1) throw new Error(wbI18n.t('验证码令牌未全部入池'));
+      stats = outcome;
+      publish('idle');
+      return true;
     } catch (error) {
-      log(`取风控配置失败：${error?.message || error}`);
-      return null;
+      const cancelled = error?.name === 'AbortError' || error?.name === 'CaptchaCancelledError';
+      publish(cancelled ? 'paused' : 'error', cancelled ? '' : error?.message || error);
+      throw error;
+    } finally {
+      verifying = false;
     }
   }
 
-  function schedule(delay) {
-    window.clearTimeout(timer);
-    if (stopped) return;
-    timer = window.setTimeout(() => void round(), delay);
-  }
-
-  /** 起来（应用启动时调一次；重复调只是重置计时器） */
   function start() {
     stopped = false;
     schedule(1500);
@@ -240,14 +113,13 @@
     window.clearTimeout(timer);
   }
 
-  window.wbZcodeCaptchaPool = { start, stop };
-
-  // 自启：界面加载完就开始守着（桌面端与 headless 面板都走这里 —— 两种部署的
-  // 桥接方法都由各自的实现提供，见文件头）。桥接方法真缺失时循环安静退让，
-  // 不会有报错刷屏（见 fetchStats 的返回 null 分支）
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start, { once: true });
-  } else {
-    start();
-  }
+  window.wbZcodeCaptchaPool = { start, stop, verify, refresh: readStats, status: () => ({ ...status }), stats: () => stats };
+  // 切到账号页时立刻补一次：页面首次打开或从别的页切回来都走这一条。
+  window.addEventListener('wb:page', event => {
+    if (event.detail === 'accounts' && !stopped) schedule(0);
+  });
+  window.addEventListener('pagehide', stop);
+  window.addEventListener('pageshow', start);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
 })();

@@ -217,9 +217,10 @@ pub(super) fn summarize(
 /// 进行中行 —— 没有它，重算会把一条「还没跑完」的请求凭空加进当天请求数
 /// （token 还是 0），日报与明细口径立刻分裂。
 pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
-    if item.status == 0 {
+    if item.status == 0 || item.is_test {
         return;
     }
+    super::source_report::fold_sources(day, item);
     let success = item.is_success();
     day.requests += 1;
     if success {

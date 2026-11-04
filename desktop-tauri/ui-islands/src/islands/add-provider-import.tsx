@@ -25,6 +25,8 @@ import { Button, Checkbox } from '@ui'
 
 import { shared, toast } from './add-account-bridge'
 import { t } from '../i18n'
+import { Badge } from '@ui'
+import { Empty } from '@ui'
 
 type ImportProvider = {
   id: string | number
@@ -250,12 +252,12 @@ export function ImportPanel({ segmentOn }: { segmentOn: boolean }): React.ReactE
     <div id='add-import-panel' style={style}>
       <div id='add-import-status'>
         {!scan || !scan.available ? (
-          <div className='add-import-empty'>
+          <Empty className='add-import-empty'>
             <p>{scan?.reason || t('未能读取 cc-switch 数据')}</p>
             <Button variant='outline' size='sm' onClick={() => { void runScan({ force: true }) }}>
               {t('重新扫描')}
             </Button>
-          </div>
+          </Empty>
         ) : (
           <div className='add-import-head'>
             <span>
@@ -312,7 +314,7 @@ export function ImportPanel({ segmentOn }: { segmentOn: boolean }): React.ReactE
                 <span className='add-import-name'>
                   {String(item.name || id)}
                   {canImport ? (
-                    <span className='add-import-badge'>{protocolLabel(item.protocol)}</span>
+                    <Badge variant='outline' shape='tag' className='add-import-badge'>{protocolLabel(item.protocol)}</Badge>
                   ) : null}
                 </span>
                 <span className='add-import-meta'>{meta}</span>

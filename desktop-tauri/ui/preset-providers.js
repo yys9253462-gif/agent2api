@@ -1,7 +1,7 @@
 /* Agent2API · 自定义提供商的预置目录（preset） */
 
 /**
- * 「添加账号 → 自定义」分段下的预置提供商清单：名称 / 图标 / 默认协议 / Base URL
+ * 「添加账号 → API 模板」分段下的预填清单：名称 / 图标 / 默认协议 / Base URL
  * 抄自 9Router（Acankao/9router）的 open-sse/providers/registry 注册表 —— 那边每家
  * 存的是完整端点 URL（如 https://api.openai.com/v1/chat/completions），这里按本网关
  * 自定义提供商的 Base URL 语义折算（chat_completions 拼 {baseUrl}/chat/completions，
@@ -9,8 +9,8 @@
  *
  * 预置只是**新建自定义提供商表单的预填模板**：选中某一家时把名称 / 协议 / Base URL
  * 填进表单（都可改），提交仍走 POST /api/custom-providers，落库后就是一条普通的
- * 自定义提供商（custom- 前缀），与手动新建的没有任何区别。因此这里不需要知道
- * 「哪家已建过」—— 那是账号页 / 弹窗第 1 步按 customList 现算的事。
+ * 自定义提供商（custom- 前缀），账号归属只认提供商 ID。模板 key 保存为
+ * presetKey，用于图标与类型标签，不用于合并或寻找已建提供商。
  *
  * ── 默认协议怎么取 ─────────────────────────────────────────
  * 按该家在 9Router 注册表里的主力端点格式：主打 Claude Code 的 coding 套餐
@@ -27,9 +27,7 @@
   /**
    * 预置清单。字段：
    *   key      卡片的稳定标记（data-provider="preset:<key>"），也是图标文件名
-   *   name     展示名（预填进「名称」输入框，可改）。**不包 t()**：品牌名，且
-   *            同时被 add-provider-pick 的「同名家是否已建」判重与 models-page
-   *            的图标回match当字面量用，包了会跨语言失配（见任务报告）
+   *   name     模板展示名（有固定端点时预填名称，可改；自建站点名称由用户填写）。
    *   icon     assets/providers/ 下的图标文件；没有收录的用首字母徽章
    *   protocol 预填协议（下拉仍可改）
    *   baseUrl  预填基址（按本网关的拼接语义，见文件头）
@@ -261,7 +259,7 @@
     // ── 自建聚合面板与商汤日日新（随余额查询一起接入）─────────────
     // 这三家排在末尾：既有的卡片顺序不动（用户对第 1 步的网格已有肌肉记忆），
     // 新卡按「后到居后」追加。sub2api / NewAPI 是**自建**面板，没有固定
-    // baseUrl —— 预置卡只预填名称 / 协议，地址由用户自己填（`placeholder`
+    // baseUrl —— 预置卡只预填协议，站点名称与地址由用户自己填（`placeholder`
     // 是给那个输入框的提示，见 add-custom-provider 的预填逻辑）。
     // 三家的 `balance.scheme` 见文件头的字段说明。
     // 图标出处：sub2api 取官方仓库（Wei-Shaw/sub2api）的 assets/logo.svg 栅格化；

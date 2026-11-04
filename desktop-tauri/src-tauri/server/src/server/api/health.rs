@@ -2,10 +2,14 @@
 //!
 //! shape 逐字段对齐 Node 版 server.mjs handleHealth（562-584 行）：
 //!   status 按「上游是否配置」（configured 才 ok，否则 degraded）/
-//!   upstreamBaseUrl / authApiBase / chatApiUrl / authSource / currentAccountId /
+//!   upstreamBaseUrl / authSource / currentAccountId /
 //!   tokenExpiresAt / canRefresh 全来自 `auth.get_config_summary()`；
 //!   login 为 `auth.get_status()` 的完整形态（已登录/未登录两分支）；
-//!   authRequired 按是否配置了 API Key / defaultModel / models 数量。
+//!   authRequired 表示模型调用始终需要网关 Key / defaultModel / models 数量。
+//!
+//! `authApiBase` / `chatApiUrl` 两栏已删除（2026-10 拆家）：它们是**上游端点**，
+//! 随「怎么打上游」的知识一起搬到了提供商插件，网关不再持有。字段整体移除
+//! 而不是给 null —— 消费方（壳侧探针、前端）都不读它们。
 //!
 //! 注意 /health 返回**裸对象**（不是 `{success,data}` 信封）—— Node 版这里
 //! 用的是 sendJson 直接发对象，与 /api/* 不同。
@@ -57,8 +61,6 @@ pub async fn handle(State(state): State<ServerState>) -> Response {
         "product": "WorkBuddy",
         "upstreamConfigured": healthy,
         "upstreamBaseUrl": summary.get("baseUrl").cloned().unwrap_or(Value::Null),
-        "authApiBase": summary.get("authApiBase").cloned().unwrap_or(Value::Null),
-        "chatApiUrl": summary.get("chatApiUrl").cloned().unwrap_or(Value::Null),
         "authSource": summary.get("authSource").cloned().unwrap_or(Value::Null),
         "currentAccountId": summary.get("currentAccountId").cloned().unwrap_or(Value::Null),
         "tokenExpiresAt": summary.get("tokenExpiresAt").cloned().unwrap_or(Value::Null),
@@ -72,13 +74,16 @@ pub async fn handle(State(state): State<ServerState>) -> Response {
                 .cloned()
                 .unwrap_or_else(|| Value::String(UNCONFIGURED_REASON.to_string()))
         },
-        "authRequired": snapshot.api_key_set(),
+        "authRequired": true,
         "defaultModel": snapshot.default_model(),
-        // 模型目录条数（对照 Node 的 `models: modelCatalog.list().length`）——
-        // 切片 4 起是真值：目录未刷新过时是内置清单条数，刷新后是远程清单条数。
-        // **只算国内版**：本字段是「唯一上游时代」的契约读数（Node 只有一个
-        // workbuddy 目录），而拆家后国际版是独立 provider、有自己的一份清单 ——
-        // 完整的可用清单看 `/v1/models`（聚合视图），这里保持旧口径不变。
-        "models": state.models().count(),
+        // 模型目录条数（对照 Node 的 `models: modelCatalog.list().length`）。
+        // 本字段是「唯一上游时代」的契约读数：那时进程里只有 workbuddy 一份
+        // 目录。现在目录由各家适配器在读取时聚合（见 `core::providers::catalog`），
+        // 这里报**国内版**那一家的条数 —— 与旧口径对齐（同一时刻的同一份清单）。
+        // 完整的可用清单看 `/v1/models`（聚合视图）。
+        "models": crate::server::core::providers::catalog::manifest_for(
+            crate::server::core::providers::ProviderKind::WorkBuddy,
+        )
+        .len(),
     }))
 }

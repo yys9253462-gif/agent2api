@@ -1,17 +1,39 @@
 import * as React from 'react'
+import { Button } from './button'
 import { cva, type VariantProps } from 'class-variance-authority'
+import { useRender } from '@base-ui/react/use-render'
+import { useSelectionIndicator } from './lib/selection-indicator'
 import { cn } from './lib/cn'
+
+const NavListContext = React.createContext(false)
+
+function NavList({ className, render, children, ...props }: useRender.ComponentProps<'div'>) {
+  const { containerRef, indicator } = useSelectionIndicator(
+    '[data-slot="nav-item"]', '[data-slot="nav-item"][data-active]',
+  )
+  const element = useRender({
+    defaultTagName: 'div', render, ref: containerRef,
+    props: {
+      ...props,
+      'data-slot': 'nav-list',
+      className: cn('relative isolate flex min-h-0 flex-col gap-0.5', className),
+      children: <>
+        <span data-slot='nav-list-indicator' aria-hidden='true' {...indicator} />
+        {children}
+      </>,
+    },
+  })
+  return <NavListContext.Provider value>{element}</NavListContext.Provider>
+}
 
 /**
  * 导航 / 列表项（项目扩展，shadcn 标准里没有对应件）。
  *
- * 为什么需要它：左栏那种「一列可点的条目」用 Button 做不了 —— Button 的
- * 工具类带 `!important` 且分层，会把 `.pv.on` 那类**选中态底色整个盖掉**
- * （组件库的 utilities 优先于 ui/css 的未分层规则），于是要么放弃选中态、
- * 要么把选中态写成一长串内联工具类散落在调用点。封成组件后选中态只有一处定义。
+ * 用 Button 承接交互，集中维护导航选中态、图标与计数的布局。
  *
  * 形态取自侧边栏的 `.nav-item` 与模型管理页左栏的 `.pv`（两者本来就是同一形态）：
- * 行高由 padding 撑、圆角 --r-sm、左侧可选图标、右侧可选计数。
+ * 行高由 padding 撑、圆角 --r-md —— 条目是 30px 高，与同样 30px 高的普通按钮
+ * 取同一档，用户说的「侧栏和按钮圆角不一样」就是这两处（阶梯见 styles/theme.css）。
  *
  * 三种变体：
  *   · default  普通条目（可选中）
@@ -25,11 +47,8 @@ import { cn } from './lib/cn'
 
 const navItemVariants = cva(
   [
-    'relative flex w-full items-center gap-2.5 text-left',
-    'border border-transparent rounded-sm',
-    // 显式清掉投影：ui/css/components.css 的通用 `button { box-shadow: var(--shadow-1) }`
-    // 会漏到本组件上（深色主题下那道 40% 黑在平铺的导航列表里很显眼）。
-    // 既有的 .nav-item / .pv 都在 CSS 里各清过一次，组件库这一层清掉就不必每个调用点再写。
+    'relative flex h-auto w-full items-center justify-start gap-2.5 whitespace-normal text-left active:translate-y-0',
+    'border border-transparent rounded-md',
     'shadow-none',
     'transition-[background-color,border-color,color] duration-150 ease-out',
     'outline-none focus-visible:shadow-focus',
@@ -43,8 +62,10 @@ const navItemVariants = cva(
           'cursor-pointer px-2.5 py-2',
           'text-[12.5px] font-medium text-sidebar-fg',
           'hover:bg-nav-hover hover:text-foreground',
-          // 选中态：底色 + 描边 + 字重三件套（与分段控件、导航项的选中态同一套观感）
-          'data-[active]:border-nav-selected-border data-[active]:bg-nav-selected-bg data-[active]:font-semibold data-[active]:text-nav-selected-fg',
+          // 选中态：主色实心块（底色 / 描边 / 文字色三个取值统一在
+          // styles/nav.css 与 theme.css 的 --ui-nav-selected-* 里，见那里的说明）。
+          // 字重只从 400 到 500：再加粗会让整行宽度跳一档。
+          'data-[active]:border-nav-selected-border data-[active]:bg-nav-selected-bg data-[active]:font-medium data-[active]:text-nav-selected-fg',
         ],
         add: [
           'cursor-pointer justify-center px-2 py-1.5',
@@ -81,13 +102,16 @@ function NavItem({
   children,
   ...props
 }: NavItemProps) {
+  const sliding = React.useContext(NavListContext)
   return (
-    <button
+    <Button
       type='button'
+      variant='ghost'
       data-slot='nav-item'
       data-active={active ? '' : undefined}
+      data-sliding={sliding ? '' : undefined}
       aria-current={active ? 'true' : undefined}
-      className={cn(navItemVariants({ variant }), className)}
+      className={cn(navItemVariants({ variant }), sliding && 'data-[active]:border-transparent data-[active]:bg-transparent data-[active]:hover:bg-transparent', className)}
       {...props}
     >
       {icon}
@@ -107,8 +131,8 @@ function NavItem({
           {count}
         </span>
       )}
-    </button>
+    </Button>
   )
 }
 
-export { NavItem, navItemVariants, type NavItemProps }
+export { NavList, NavItem, navItemVariants, type NavItemProps }

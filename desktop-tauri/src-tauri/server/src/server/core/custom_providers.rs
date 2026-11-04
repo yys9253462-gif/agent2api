@@ -69,6 +69,7 @@
 //! 保存，转发时报 400（见 `providers::custom::forward` 的分派骨架）。
 
 mod bindings;
+mod presets;
 /// 自定义提供商**定义**的导入合并（账号导出文件里的 `customProviders` 段）。
 ///
 /// `pub(crate)`：调用方是 `account_transfer::import_accounts` —— 账号导入的
@@ -85,6 +86,8 @@ use crate::server::config;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::capability;
 use crate::server::core::egress;
+use crate::server::core::models::model_id;
+use crate::server::errors::GatewayError;
 use crate::server::logging;
 
 /// kv 键名：配置里这份数组的存放位置。
@@ -126,8 +129,12 @@ const MAX_REASONING_CHARS: usize = 32;
 /// ── per-provider 特判字段（预置目录带来的上游修正）的长度上限 ──
 /// urlSuffix（查询串，如 "?beta=true"）：查询串一般十几个字符，128 已宽容
 const MAX_URL_SUFFIX_CHARS: usize = 128;
-/// 静态额外头的条数上限：特判用不到几条（Anthropic-Beta / Referer 类），8 足够
-const MAX_HEADER_ENTRIES: usize = 8;
+/// 静态额外头的条数上限。多数家只需要一两条（Anthropic-Beta / Referer 类），
+/// 但**客户端形态伪装**的家要整包复刻官方客户端的头族：Cline Pass 预置卡就是
+/// 9 条（与 `providers/cline/headers.rs` 的 DEFAULT_HEADERS 同一套，缺一条
+/// 上游按客户端形态校验就会 403）。取 16 —— 容得下「整包复刻 + 几条自定义」，
+/// 又仍然拦得住把 headers 当配置文件乱塞的手改数据。
+const MAX_HEADER_ENTRIES: usize = 16;
 /// 静态额外头的键 / 值长度上限：头名 RFC 形态几十字符、值（Anthropic-Beta 的
 /// beta 清单）可能上百字符，512 不拦正常值、只拦把文档粘进来的手改数据
 const MAX_HEADER_NAME_CHARS: usize = 64;
@@ -266,15 +273,18 @@ fn item_of(object: &Map<String, Value>) -> Value {
             .unwrap_or(""),
         client_emulation == CLIENT_EMULATION_OPENCODE,
     );
-    json!({
+    let mut models = model_entries_of(object.get("models"));
+    let mut mappings = mapping_entries_of(object.get("mappings"));
+    bindings::normalize(&mut models, &mut mappings);
+    let mut item = json!({
         "id": id,
         "name": name,
         "protocol": protocol,
         "baseUrl": base_url,
         "enabled": object.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         "createdAt": object.get("createdAt").and_then(Value::as_i64).unwrap_or(0),
-        "models": model_entries_of(object.get("models")),
-        "mappings": mapping_entries_of(object.get("mappings")),
+        "models": models,
+        "mappings": mappings,
         // per-provider 特判字段：读侧容错归一（坏值按缺省丢弃，与 models 同一口径）。
         // 缺省即「无特判」—— 老记录没有这几个键，转发侧按缺省走。
         "urlSuffix": url_suffix_of(object.get("urlSuffix")),
@@ -284,7 +294,9 @@ fn item_of(object: &Map<String, Value>) -> Value {
         // 余额查询方案：**读侧也会按 baseUrl 兜底识别**（存量记录没有这个键，
         // 见 BALANCE_SCHEMES 的说明），所以这里给的不是原始值而是归一结果
         "balanceScheme": balance_scheme_of_record(object),
-    })
+    });
+    presets::write_key(&mut item, presets::key_of_record(object));
+    item
 }
 
 /// 读侧归一：余额查询方案。优先用记录里的键（只认七个合法值），
@@ -484,6 +496,9 @@ fn model_entries_of(value: Option<&Value>) -> Vec<Value> {
         if id.is_empty() {
             continue;
         }
+        if entries.iter().any(|model| model_id(model).eq_ignore_ascii_case(&id)) {
+            continue;
+        }
         let mut entry = json!({
             "id": id,
             "enabled": object.get("enabled").and_then(Value::as_bool).unwrap_or(true),
@@ -530,6 +545,10 @@ fn mapping_entries_of(value: Option<&Value>) -> Vec<Value> {
         if alias.is_empty() || target.is_empty() {
             continue;
         }
+        if entries.iter().any(|mapping| mapping.get("alias").and_then(Value::as_str)
+            .is_some_and(|id| id.eq_ignore_ascii_case(&alias))
+            && mapping.get("target").and_then(Value::as_str).is_some_and(|id| id.eq_ignore_ascii_case(&target)))
+        { continue; }
         entries.push(json!({
             "alias": alias,
             "target": target,
@@ -652,8 +671,9 @@ pub fn create(payload: &Value) -> Result<Value, String> {
             .and_then(Value::as_str)
             .unwrap_or(""),
     )?;
+    let preset_key = presets::validate(object.get("presetKey"))?;
     let id = new_provider_id()?;
-    let item = json!({
+    let mut item = json!({
         "id": id,
         "name": name,
         "protocol": protocol,
@@ -670,6 +690,7 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         // 余额查询方案（预置卡片提交，见 BALANCE_SCHEMES 的说明）
         "balanceScheme": validate_balance_scheme(object.get("balanceScheme"))?,
     });
+    presets::write_key(&mut item, preset_key);
     let mut items = read_items();
     items.push(item.clone());
     if !write_items(&items) {
@@ -831,36 +852,26 @@ pub fn mappings_of(id: &str) -> Vec<Value> {
 /// 没生效」比一条明确的错误难排查得多。
 ///
 /// 返回更新后的**完整记录**（响应契约 `{provider: ...}` 直接透传给前端重绘）。
-pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, String> {
+pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, GatewayError> {
     let id = id.trim();
     if id.is_empty() {
-        return Err("缺少提供商 id".to_string());
+        return Err(GatewayError::bad_request("缺少提供商 id"));
     }
-    let models_raw = models
-        .as_array()
-        .ok_or_else(|| "models 必须是数组".to_string())?;
-    let mappings_raw = mappings
-        .as_array()
-        .ok_or_else(|| "mappings 必须是数组".to_string())?;
-    let models = validate_model_entries(models_raw)?;
-    let mappings = validate_mapping_entries(mappings_raw)?;
-    let mut items = read_items();
-    let Some(index) = items
-        .iter()
-        .position(|item| item.get("id").and_then(Value::as_str) == Some(id))
-    else {
-        return Err(format!("自定义提供商不存在: {id}"));
-    };
-    // 从既有记录的键表出发整体写回：除 models/mappings 外的键原样保留
-    let mut merged = items[index].as_object().cloned().unwrap_or_default();
-    merged.insert("models".to_string(), Value::Array(models));
-    merged.insert("mappings".to_string(), Value::Array(mappings));
-    let updated = Value::Object(merged);
-    items[index] = updated.clone();
-    if !write_items(&items) {
-        return Err("保存失败：配置写入未成功（请检查磁盘空间与配置目录权限）".to_string());
-    }
-    Ok(updated)
+    let models_raw = models.as_array().ok_or_else(|| GatewayError::bad_request("models 必须是数组"))?;
+    let mappings_raw = mappings.as_array().ok_or_else(|| GatewayError::bad_request("mappings 必须是数组"))?;
+    let models = validate_model_entries(models_raw).map_err(GatewayError::bad_request)?;
+    let mappings = validate_mapping_entries(mappings_raw).map_err(GatewayError::bad_request)?;
+    config::try_update_raw_field(KEY_CUSTOM_PROVIDERS, |value| {
+        let items = value.as_array_mut().ok_or_else(|| GatewayError::with_status(404, format!("自定义提供商不存在: {id}")))?;
+        let stored = items.iter_mut().find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or_else(|| GatewayError::with_status(404, format!("自定义提供商不存在: {id}")))?;
+        let previous = stored.as_object().map(item_of).unwrap_or(Value::Null);
+        bindings::validate_change(&previous, &models, &mappings)?;
+        let map = stored.as_object_mut().ok_or_else(|| GatewayError::bad_request("自定义提供商记录损坏"))?;
+        map.insert("models".to_string(), Value::Array(models.clone()));
+        map.insert("mappings".to_string(), Value::Array(mappings.clone()));
+        Ok(item_of(map))
+    }, || GatewayError::new("保存失败：配置写入未成功，本次修改未生效；请检查磁盘空间与配置目录权限"))
 }
 
 /// 「这个名字由哪些自定义家提供」（`catalog::providers_for_model` 的自定义段）。
@@ -992,10 +1003,7 @@ pub async fn fetch_upstream_models(
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
     if !response_ok(status) {
-        // 摘要取前 200 字符：够定位（大多数错误体一两行），又不至于把
-        // 一整页 HTML 灌进错误提示
-        let summary: String = text.trim().chars().take(200).collect();
-        return Err(format!("上游返回 {status}: {summary}"));
+        return Err(format!("上游返回 {status}: {text}"));
     }
     let payload: Value = serde_json::from_str(&text)
         .map_err(|error| format!("上游响应不是合法 JSON: {error}"))?;
@@ -1023,13 +1031,7 @@ fn response_ok(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
-/// `set_models` 的模型条目校验与归一：id 非空 ≤128、reasoning ≤32、同 id 去重。
-///
-/// 与读取路径（[`model_entries_of`]）的分工：那边是**容错**（脏数据截断/丢弃，
-/// 保证读侧能用），这边是**门禁**（用户刚提交的值必须原样合法，报错把问题
-/// 指回表单）。去重是「同 id 只留一条」（忽略大小写、先到的赢）—— 重复登记
-/// 通常来自「获取模型」导入 + 手工添加的叠加，留谁对转发无差（名字相同），
-/// 保留先出现的那条让「列表顺序 = 用户整理的顺序」成立。
+/// 写入校验：模型 ID、开关与能力必须合法，重复 ID（忽略大小写）直接报错。
 fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
     let mut entries: Vec<Value> = Vec::new();
     for (position, item) in raw.iter().enumerate() {
@@ -1054,10 +1056,11 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
         // **必须原样带回**的字段：前端草稿漏了它，用户填过的能力就会被一次
         // 「切开关」的提交顺手清掉。
         let capabilities = validate_capabilities(object.get("capabilities"), position + 1)?;
-        let enabled = object
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let enabled = match object.get("enabled") {
+            None => true,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => return Err(format!("models 第 {} 项的 enabled 必须是布尔值", position + 1)),
+        };
         let duplicated = entries.iter().any(|known| {
             known
                 .get("id")
@@ -1065,7 +1068,7 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
                 .is_some_and(|text| text.eq_ignore_ascii_case(id))
         });
         if duplicated {
-            continue;
+            return Err(format!("模型 ID「{id}」已存在，请勿重复登记"));
         }
         let mut entry = json!({
             "id": id,
@@ -1082,11 +1085,7 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
     Ok(entries)
 }
 
-/// `set_models` 的映射条目校验与归一：alias/target 非空（≤128）、
-/// reasoning ≤32、同 (alias, target) 去重。
-///
-/// 去重判据是**成对**的：同一 alias 指向不同 target 是合法的主备用法
-/// （与 `model_rules` 的映射语义一致），只 dedup「完全相同」的两条。
+/// 同一 (alias, target) 不重复登记；同名的不同 target 可以保存，但只允许启用一条。
 fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
     let mut entries: Vec<Value> = Vec::new();
     for (position, item) in raw.iter().enumerate() {
@@ -1118,10 +1117,11 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             ));
         }
         let reasoning = validate_reasoning(object.get("reasoning"))?;
-        let enabled = object
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let enabled = match object.get("enabled") {
+            None => true,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => return Err(format!("mappings 第 {} 项的 enabled 必须是布尔值", position + 1)),
+        };
         let duplicated = entries.iter().any(|known| {
             known.get("alias").and_then(Value::as_str)
                 .is_some_and(|text| text.eq_ignore_ascii_case(alias))
@@ -1129,7 +1129,7 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
                     .is_some_and(|text| text.eq_ignore_ascii_case(target))
         });
         if duplicated {
-            continue;
+            return Err(format!("映射「{alias} → {target}」已存在，请勿重复添加"));
         }
         entries.push(json!({
             "alias": alias,

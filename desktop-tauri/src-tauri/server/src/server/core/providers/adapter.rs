@@ -37,10 +37,10 @@
 //!      默认实现直接转调 `ensure_access_token`，provider 需要区分时再覆盖。
 //!   3. `allows_anonymous_default_session`：本 provider 是否允许「一个账号
 //!      都没有时用环境变量凭证/默认登录态转发」。workbuddy 有这条旁路
-//!      （`WORKBUDDY_TOKEN`），小浣熊也有（`RACCOON_TOKEN`，见 `raccoon/mod.rs`）。
+//!      （`WORKBUDDY_TOKEN`），小浣熊也有（`RACCOON_TOKEN`，实现在插件里）。
 //!   4. `sse_model_rewrite`（W3-T4 追加）：SSE 透传**要不要把下发帧的 `model`
 //!      改写成客户端请求的那个名字**。小浣熊上游网关会回自己的内部模型名
-//!      （源实现 `raccoon-sse-pipe.mjs` 的 `pipeSseWithModelRewrite` 专门处理），
+//!      （这类上游会把 chunk 里的 `model` 换成内部名，客户端认自己请求的那个），
 //!      而 workbuddy 上游原样回显。帧改写发生在 `upstream::ForwardStream`
 //!      内部（那里就是 SSE 逐帧下发的唯一出口），所以这里只回答「要不要写」，
 //!      通用层不出现任何 provider 分支 —— 与 `retry_advice` 同一分工。
@@ -53,15 +53,11 @@
 //!      —— 写死一个名字就会让别家的账号永远被判成「无需刷新」。
 //!      契约：**判不出来就返回 false**（没有过期信息 / 账号不存在），
 //!      宁可漏刷也不要凭猜测去打上游。
-//!   6. `is_stateful` + `forward_conversation`（W4a 加钩子，W5-T-d4 接上消费方，
-//!      架构文档 §4.2.1）：本 provider 的上游是不是**多步会话协议**
-//!      （CatPaw 是：round → turn → 工具循环 → completed）。默认 false；
-//!      覆写成 true 的是走会话式转发（`forward_conversation`）的家（CatPaw /
-//!      Qoder / Accio / CodeArts / Trae / Kuku / MonkeyCode，见各自 `mod.rs`
-//!      的模块头）。`forward_conversation` 是
-//!      会话式转发的入口（默认 503，只有有状态 provider 覆写），编排层的
-//!      `provider_loop` 按 `is_stateful` 分流到它 —— 分流落地后本文件不再需要
-//!      任何死代码抑制。
+//!   6. `is_stateful` + `forward_conversation`（W4a 加钩子）：本 provider 的
+//!      上游是不是**多步会话协议**（round → turn → 工具循环 → completed）。
+//!      默认 false；由插件侧那些走会话式转发的家覆写。`forward_conversation`
+//!      是会话式转发的入口（默认 503），编排层的 `provider_loop` 按
+//!      `is_stateful` 分流到它。
 //!   7. `supports_web_login` + `build_login_url` + `exchange_login_code`
 //!      （「网页登录」）：拉起官方登录页 → 用户完成登录 → 回调里带回一次性 code
 //!      → 网关用 code 换凭证并**落进账号库**。
@@ -115,24 +111,28 @@
 //!      上游会不会发"，开关回答"这台机器要不要为它改字节"，两者相与，且开关只能
 //!      收窄不能扩张（见 `upstream::sse::FramePolicy::assembled`）。
 //!
-//! ── 未注册的 provider 怎么办 ────────────────────────────────
-//! 各家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
-//! 加新 kind 时编译器强制在这里给出分支，「注册了 provider 却忘了接线」的
-//! 情形在编译期就被拦住。过渡期曾用它返回一个占位适配器
-//! （`pending::PendingAdapter`，W4a–W5 期间 CatPaw / AutoClaw 借它顶着，
-//! 两家分别在 W5-T-d4 / W4b-T-c2 换成真身；W6 收尾时该文件已随「四家全部
-//! 接上真身」而删除）。空清单 + 503 的语义保留在 `catalog` / `accounts` 的
-//! 校验里：`/v1/models` 不会广告清单为空的那家。
+//! ── 现在谁实现这些方法 ──────────────────────────────────────
+//! 一家都没有：29 个 `ProviderKind` 的实现**全部**搬到了提供商插件
+//! （`agent2api-workers` 形态的独立子进程，不随本仓库发布）。[`adapter_for`]
+//! 因此对任何 kind 都返回 `missing_plugin::placeholder` —— 如实报「需安装
+//! 插件」，而不是在网关里留一份会随时间漂移的旁路实现。
+//!
+//! 本 trait 仍然存在的理由：它是**插件宿主的转发接口形状**（`plugin_host` 的
+//! `PluginAdapter` 逐方法实现它），编排层因此不需要知道「这次是插件还是内置」。
+//! 空清单 + 503 的语义保留在 `catalog` / `accounts` 的校验里：`/v1/models`
+//! 不会广告清单为空的那家。
 
 use axum::http::HeaderMap;
 use serde_json::Value;
 
+pub use super::retry::RetryDecision;
+
+use std::sync::Arc;
+
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
-use super::qoder;
-use super::raccoon;
-use super::{catalog_cache, ProviderKind};
+use super::ProviderKind;
 
 /// 转发前对「账号 + 请求体」的完整构造计划（架构文档 §4.2 的 ChatRequestPlan）。
 ///
@@ -151,6 +151,9 @@ pub struct ChatRequestPlan {
     pub body: Value,
     /// 上游**响应**说的是哪套协议（默认 [`UpstreamResponse::Chat`]）
     pub response: UpstreamResponse,
+    /// 插件出站归一后的档位；外层 None 为未提供，Some(None) 为明确无档位。
+    pub reasoning: Option<Option<String>>,
+    pub policy: super::policy::ChatPolicy,
 }
 
 impl ChatRequestPlan {
@@ -158,7 +161,7 @@ impl ChatRequestPlan {
     ///
     /// 绝大多数内置上游（以及自定义家）都是这一种；三处例外各有一个专用
     /// 构造器：ZCode 的活动套餐通道说 Anthropic（[`UpstreamResponse::Anthropic`]）、
-    /// Command Code 说 NDJSON（[`UpstreamResponse::CommandCodeNdjson`]）、
+    /// 插件家说 AI SDK NDJSON（[`UpstreamResponse::AiSdkNdjson`]）、
     /// Antigravity 说 Gemini v1internal 信封
     /// （[`UpstreamResponse::AntigravityGemini`]）。写成构造器而不是
     /// 让各家手写字段，是为了「响应协议」这一个新字段不给各处调用点各留一次
@@ -169,15 +172,17 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::Chat,
+            reasoning: None,
+            policy: super::policy::ChatPolicy::default(),
         }
     }
 
-    /// Command Code 形态：请求体是自有信封（`config` / `params` 那套），
-    /// 响应是 NDJSON（见 [`UpstreamResponse::CommandCodeNdjson`]）。
+    /// AI SDK v5 NDJSON 形态：请求体是各家自己的信封（由插件构造），响应是
+    /// NDJSON（见 [`UpstreamResponse::AiSdkNdjson`]）。
     ///
     /// 与 [`Self::chat`] 同一动机：调用点只回答「响应是哪套协议」，
     /// 不自己拼 `ChatRequestPlan` 的字段。
-    pub fn commandcode_ndjson(
+    pub fn ai_sdk_ndjson(
         url: String,
         headers: Vec<(String, String)>,
         body: Value,
@@ -186,7 +191,9 @@ impl ChatRequestPlan {
             url,
             headers,
             body,
-            response: UpstreamResponse::CommandCodeNdjson,
+            response: UpstreamResponse::AiSdkNdjson,
+            reasoning: None,
+            policy: super::policy::ChatPolicy::default(),
         }
     }
 
@@ -208,6 +215,8 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::AntigravityGemini,
+            reasoning: None,
+            policy: super::policy::ChatPolicy::default(),
         }
     }
 }
@@ -230,13 +239,16 @@ pub enum UpstreamResponse {
     Chat,
     /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
     Anthropic,
-    /// Command Code 的 **NDJSON**（`application/x-ndjson`）：一行一个 JSON 事件、
+    /// **AI SDK v5 风格 NDJSON**（`application/x-ndjson`）：一行一个 JSON 事件、
     /// **HTTP 恒 200**、错误以流内 `{"type":"error"}` 表达，因此连接的成败与
     /// 「这一轮生成成没成」是两件事。下发前折回标准 chat SSE
-    /// （见 `upstream::translate` 与 `protocol::commandcode_outbound`）——
+    /// （见 `upstream::translate` 与 `protocol::ai_sdk_ndjson`）——
     /// 走翻译层的理由与 Anthropic 那条逐字相同：账号轮换、限额冷却、退避重试、
     /// usage 记账与取消处理全部留在编排层，只有字节形态在翻译器里变。
-    CommandCodeNdjson,
+    ///
+    /// 这是**公开格式**而不是某一家的私有协议：网关只认事件词表，
+    /// 「谁在用这套格式、请求体长什么样」由插件声明。
+    AiSdkNdjson,
     /// Antigravity 的 **Gemini v1internal 信封 + SSE**：上游是 Google Cloud Code
     /// Assist 的 `:streamGenerateContent?alt=sse`，每帧是 `data: {json}`，且真正的
     /// Gemini 响应在 `response` 键下（缺省回退顶层，见规格 §4.2）。
@@ -247,6 +259,22 @@ pub enum UpstreamResponse {
     /// 走翻译层的理由同上：账号轮换、限额冷却、退避重试、usage 记账与取消处理
     /// 全部留在编排层，只有字节形态在翻译器里变。
     AntigravityGemini,
+    /// Images 端点的 JSON 或 Gemini inlineData 输出，不走 Chat 翻译器。
+    Images(super::images::ImageResponseKind),
+    /// 智谱清言的 **SSE 混合帧**：帧是 SSE（`data: {json}`）没错，但一轮回答里
+    /// 混着两种语义 —— `part.status == "init"` 的帧给的是**本拍新增的一小段**，
+    /// 带 finish 的帧给的是**整段全文快照**。而 OpenAI 要的是统一口径的 delta：
+    /// 全文快照直接透传会让下游把整段回答拼两遍（实测故障），
+    /// 把增量帧当快照差分则会丢内容。
+    /// 因此另开一台**按帧语义差分**的状态机（`upstream::translate` 的
+    /// `ChatglmToChatStream` ← `protocol::chatglm_stream`）。
+    ///
+    /// 它与另外三台的一处关键差别：本家的**业务失败走 HTTP 200 +
+    /// `application/json`**（`-1001 剩余积分不足`），不进这台翻译机 ——
+    /// 那一档由插件侧的 `is_error_response` 在编排层拦下（网关「先问插件，
+    /// 插件不说话才按自身判据」，见 `plugin_host::rpc`），
+    /// 走既有的错误分类与账号轮换（与 ZCode 同一处置）。
+    ChatglmSnapshot,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -366,6 +394,24 @@ pub trait ProviderAdapter: Send + Sync {
     /// 本适配器对应的 provider
     fn kind(&self) -> ProviderKind;
 
+    /// 本适配器的 provider id（`&'static str`）。
+    ///
+    /// ── 为什么内置家不能靠 `kind_id(kind())` 推 ─────────────────
+    /// 插件家的 `kind()` 只是占位（第三方 provider 没有枚举值），真正的
+    /// 身份是 id 字符串。内置家的默认实现走 [`kind_id`]；`RpcAdapter`
+    /// 覆写成自己的 id。新代码一律用这个方法，别写 `kind_id(adapter.kind())`。
+    fn provider_id(&self) -> &'static str {
+        super::kind_id(self.kind())
+    }
+
+    /// 展示名（日志、错误文案、界面）。
+    ///
+    /// 默认从内置注册表取；插件家覆写成握手带回来的 `label`（leak 成
+    /// `&'static`，理由与拒绝标记相同 —— 见 `RpcAdapter` 的字段说明）。
+    fn label(&self) -> &'static str {
+        super::meta(self.kind()).label
+    }
+
     /// 该 provider 的模型清单（供聚合目录 / 路由判定）。
     ///
     /// 返回的是**上游原始形态**的记录数组（字段名与 `/v3/config` 或
@@ -434,6 +480,54 @@ pub trait ProviderAdapter: Send + Sync {
         client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError>;
 
+    /// [`Self::build_chat_request`] 的异步形态（插件架构新增）。
+    ///
+    /// ── 为什么需要两个方法 ──────────────────────────────────────
+    /// 编译期内置的 21 家实现是纯计算（拼 URL / 头 / body），同步就够；
+    /// 而插件实现在另一个进程里，只能异步问。把它们统一成异步会逼着 21 家
+    /// 全部改签名，并且给每个调用点套一层 `Box::pin` —— 那是纯噪音。
+    ///
+    /// 所以：**默认实现直接转调同步版**，只有跨进程的实现（`RpcAdapter`）
+    /// 覆写它。编排层一律调这个异步版（见 `upstream::provider_loop`）——
+    /// 于是「内置家走同步、插件家走 RPC」这件事对编排层完全透明。
+    ///
+    /// ── 覆写者必须让两者语义一致 ────────────────────────────────
+    /// 同步版在插件实现里应当返回「不支持」（它被调到就说明调用链坏了），
+    /// 而不是返回一份与异步版不同的结果 —— 两份实现分叉的下场是「有的
+    /// 路径用 A、有的路径用 B」，而那种错误没有任何日志会提示。
+    fn build_chat_request_async<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.build_chat_request(account, body, client_headers) })
+    }
+
+    fn supports_image_generation(&self) -> bool {
+        false
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        false
+    }
+
+    fn build_image_request_async<'a>(
+        &'a self,
+        _account: &'a Value,
+        _body: &'a Value,
+        _client_headers: &'a HeaderMap,
+        _operation: super::images::ImageOperation,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Err(GatewayError::with_status(501, "当前提供商插件尚未接入图片生成，请更新插件"))
+        })
+    }
+
     /// 把「映射上绑的思考等级」翻译成本家上游认识的字段与取值（模块头扩展 10）。
     ///
     /// ── 调用时机与调用者 ────────────────────────────────────────
@@ -457,19 +551,11 @@ pub trait ProviderAdapter: Send + Sync {
     ///   - `model_rules::reasoning_rank(level)`：通用 6 档的强弱序号
     ///     （0 = minimal … 5 = max），表外的自定义等级返回 None。
     ///     CatPaw 拿它 `rank / 2` 折成自己的三档（见那家适配器的实现）；
-    ///     自定义等级一律 `Skip` —— 用户可能填了任何东西，而错值在 CatPaw 是
-    ///     当场 400，在别家是未知参数，都不如不注入。
+    ///     表外值没有通用强弱序；只有本家目录明确声明支持时才可注入。
     ///
     /// ── 为什么默认是「不接」而不是「透传一个通用字段」────────────
-    /// 默认实现返回 `Skip`，且**所有没覆写的家都应当保持它**。理由是本项目的
-    /// 一条既有事实：多数家（workbuddy / 小浣熊 / Cline 等）的
-    /// `build_chat_request` 是 `body.clone()` 原样透传，需要翻译档位的家
-    /// 各有各的现算路径（见各适配器对 [`Self::reasoning_patch`] 的覆写）——
-    /// **没有任何证据**表明它们认识一个通用档位
-    /// 字段。给上游塞一个它不认识的键不叫「让绑定生效」，只是把未知参数推过去：
-    /// 好一点的情况是被忽略（用户以为生效了，其实没有），坏一点是 400。
-    /// 所以接一家要有一家的证据（上游枚举、实测、上游自己的 resolver 认这个键），
-    /// 并在这里覆写；「看起来应该支持」不是证据。
+    /// 默认实现返回 `Skip`。字段名和模型档位范围必须由实现确认，不能仅凭
+    /// supportsReasoning 推断可调；WorkBuddy 的判定与归一在提供商插件内。
     ///
     /// ── 实现必须自己判的第三条：客户端是不是已经指定了 ──────────────
     /// 客户端在请求体里显式传了档位（CatPaw 的 `reasoning_effort` /
@@ -494,6 +580,21 @@ pub trait ProviderAdapter: Send + Sync {
         ReasoningPatch::Skip {
             reason: "该提供商不支持思考等级绑定（上游无对应字段）",
         }
+    }
+
+    /// [`Self::reasoning_patch`] 的异步形态（插件架构新增，理由同
+    /// [`Self::build_chat_request_async`]）。
+    ///
+    /// ── 默认转调同步版 ──────────────────────────────────────────
+    /// 内置家只查本地的枚举表，同步就够；插件家要回子进程问（各家的字段名
+    /// 与档位取值表都在插件里）。
+    fn reasoning_patch_async<'a>(
+        &'a self,
+        level: &'a str,
+        model: &'a str,
+        body: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ReasoningPatch> + Send + 'a>> {
+        Box::pin(async move { self.reasoning_patch(level, model, body) })
     }
 
     /// 从**即将发给本家的**发送体里读出随行的思考等级（请求日志「上游等级」
@@ -534,6 +635,14 @@ pub trait ProviderAdapter: Send + Sync {
         !(200..300).contains(&status)
     }
 
+    fn is_error_response_async<'a>(
+        &'a self,
+        status: u16,
+        headers: &'a HeaderMap,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.is_error_response(status, headers)) })
+    }
+
     /// 判定上游错误类型（status + 已解析的错误体）。
     ///
     /// `error_body` 是**已归一化**的错误对象：至少含 `code`（上游业务码，
@@ -542,6 +651,34 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::request::read_upstream_error`），因为「怎么读一个 HTTP 错误体」
     /// 是协议层的事、与哪一家无关。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass;
+
+    /// [`Self::classify_error`] 的异步形态（插件架构新增，理由同
+    /// [`Self::build_chat_request_async`]）。
+    ///
+    /// ── 默认转调同步版 ──────────────────────────────────────────
+    /// 内置家的分类是纯函数（看状态码与文案），同步就够。插件家的分类要
+    /// 回子进程问（各家的判据差异极大，不能搬进网关）。
+    ///
+    /// ── 覆写者注意：这条在错误路径上 ────────────────────────────
+    /// 每次上游报错都会走一次。插件侧必须快速返回（不做网络请求）——
+    /// 那正是「分类是纯函数」这条既有约定的延续。
+    fn classify_error_async<'a>(
+        &'a self,
+        status: u16,
+        error_body: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = UpstreamErrorClass> + Send + 'a>,
+    > {
+        Box::pin(async move { self.classify_error(status, error_body) })
+    }
+
+    fn error_policy_async<'a>(
+        &'a self,
+        _status: u16,
+        _body: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = super::policy::ErrorPolicy> + Send + 'a>> {
+        Box::pin(async { super::policy::ErrorPolicy::default() })
+    }
 
     /// 会话式转发（`attempt_stateful`）失败后的分类。
     ///
@@ -709,7 +846,7 @@ pub trait ProviderAdapter: Send + Sync {
         self.ensure_access_token(store, account_id)
     }
 
-    /// 「可退避重试的错误」的建议（模块头扩展 1）；None = 不重试。
+    /// 「可退避重试的错误」的建议；None = 无专属建议，允许通用规则。
     ///
     /// `attempt` 是**已经重试过**的次数（0 表示首次失败、还没重试过）。
     ///
@@ -719,6 +856,40 @@ pub trait ProviderAdapter: Send + Sync {
     /// 「哪一档管什么」这条规则就会漏进每个适配器里各实现一遍。
     fn retry_advice(&self, _error_body: &Value, _attempt: usize, _budget: usize) -> Option<RetryAdvice> {
         None
+    }
+
+    /// [`Self::retry_advice`] 的异步伴生方法（插件家走 RPC）。
+    ///
+    /// ── 为什么需要它 ──────────────────────────────────────────
+    /// 同步签名没法 await，而插件家在另一个进程里 —— 没有这条伴生方法，
+    /// 插件永远给不出 provider 专属的退避建议（workbuddy 的 11-128 那类），
+    /// 只能吃到编排层的两档通用兜底。内置家转调同步实现，零成本。
+    fn retry_advice_async<'a>(
+        &'a self,
+        error_body: &'a Value,
+        attempt: usize,
+        budget: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RetryAdvice>> + Send + 'a>> {
+        Box::pin(async move { self.retry_advice(error_body, attempt, budget) })
+    }
+
+    /// 可选的重试决定；Stop 终止本次请求，Default 才允许通用兜底。
+    fn retry_decision_async<'a>(
+        &'a self,
+        _status: u16,
+        error_body: &'a Value,
+        attempt: usize,
+        budget: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RetryDecision> + Send + 'a>> {
+        Box::pin(async move {
+            match self.retry_advice_async(error_body, attempt, budget).await {
+                Some(advice) => RetryDecision::Retry {
+                    delay_ms: advice.delay_ms,
+                    reason: advice.reason,
+                },
+                None => RetryDecision::Default,
+            }
+        })
     }
 
     /// 哪些 `finish_reason` 表示**上游拒答**（HTTP 200 的假成功），默认空 = 不认。
@@ -743,6 +914,30 @@ pub trait ProviderAdapter: Send + Sync {
     /// ⚠️ 别把这里的值写成「上游偶发会回的任意值」：`length`（预算截断）是**正常**
     /// 收尾，不该换家；只有「上游明确不给你这次答复」的取值才属于本表。
     fn stream_refusal_finishes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 本家的「**正文**拒绝标记」：上游把拒绝写成正文时，用来识别它的固定子串。
+    ///
+    /// ── 为什么还要一条按正文判的钩子 ────────────────────────────
+    /// 有些上游的拒绝**不在 `finish_reason` 上**：它回 `200` + 一条正常的 SSE
+    /// 内容帧（正文是写死的话术），`finish_reason` 干脆不存在，然后 `[DONE]`。
+    /// 实测：AtomCode 的 CodingPlan 用量窗口耗尽后就是这样（2026-10-18 在 dev 上
+    /// 复现，客户端侧 426 字节，正文
+    /// 「模型「xxx」在当前 CodingPlan 用量窗口内已达上限。当前滚动窗口约在当日
+    /// HH:MM 结束并重置额度，请稍后重试。」）。只看状态码与 `finish_reason` 的话，
+    /// 这既不是失败也不算拒答 —— 于是一次**配额耗尽**被当成一次成功答复，
+    /// 账号不冷却、不换家，下一发还打它。
+    ///
+    /// ── 命中后的处置与 `finish_reason` 那条**不同**（别混）───────
+    /// `stream_refusal_finishes` 判的是**内容策略**拒绝：那是内容问题、换谁都会拒，
+    /// 所以处置是「不罚账号、换家」。
+    /// 本方法判的是**本账号的额度**问题：必须**罚账号**（按上游给的窗口重置时刻
+    /// 写冷却，见 `rotate::mark_account_limited` 的文本兜底）+ 换家。
+    ///
+    /// 取值是**逐字固定子串**（大小写敏感、按字节比对）——只写实测见过的那句，
+    /// 别写「可能出现的措辞」。默认空 = 不认任何正文标记，别家逐字节不变。
+    fn stream_refusal_markers(&self) -> &'static [&'static str] {
         &[]
     }
 
@@ -779,6 +974,23 @@ pub trait ProviderAdapter: Send + Sync {
     /// 真正的网络动作由 [`Self::refresh_access_token`] 在锁外做。
     fn credentials_expiring(&self, _store: &AccountStore, _account_id: &str) -> bool {
         false
+    }
+
+    /// [`Self::credentials_expiring`] 的异步形态（插件架构新增，理由同
+    /// [`Self::build_chat_request_async`]）。
+    ///
+    /// ── 默认转调同步版 ──────────────────────────────────────────
+    /// 内置家读本地凭证字段即返回；插件家的凭证在它自己的存储视图里，要问。
+    ///
+    /// ── 「判不出来就 false」这条不变 ────────────────────────────
+    /// 覆写者同样必须遵守：无从判断就说「需要刷新」会让维护任务每轮白跑一趟
+    /// 并灌失败日志（见同步版的说明）。
+    fn credentials_expiring_async<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.credentials_expiring(store, account_id) })
     }
 
     /// 本 provider 是否允许「一个账号都没有时用默认登录态转发」
@@ -834,7 +1046,7 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// 默认 false（workbuddy 上游原样回显客户端给的模型名）。小浣熊上游会回自己
     /// 的内部名，因此它的适配器覆盖成 true —— 见 `upstream::sse` 的
-    /// `model_rewrite` 参数与 `raccoon::mod` 的说明。
+    /// `model_rewrite` 参数与插件侧小浣熊实现的说明。
     fn sse_model_rewrite(&self) -> bool {
         false
     }
@@ -941,6 +1153,137 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// [`Self::build_login_url`] 的异步形态（插件架构新增）。
+    ///
+    /// ── 为什么需要它 ────────────────────────────────────────────
+    /// 插件家拼授权地址要走一次 RPC（`login.start`），而同步签名不能 await。
+    /// 与 [`Self::build_chat_request_async`] 同一处置：默认转调同步版
+    /// （内置家零改动），只有跨进程的实现覆写它。
+    fn build_login_url_async<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.build_login_url() })
+    }
+
+    /// 完整的登录启动信息（**含流程形态**，插件架构新增）。
+    ///
+    /// ── 为什么需要它，而不是复用 `build_login_url_async` ──────────
+    /// `(url, state)` 这个二元组把「怎么等结果」这件事丢掉了。登录有两种形态：
+    ///   - **回调型**：授权页跳回本机（或跳自定义协议、由壳抓下来转给网关），
+    ///     网关等 `login.callback` 到达（`poll_interval_ms == 0`）；
+    ///   - **轮询型**：授权回调在上游域名终结、**永不回到本机**（AtomCode /
+    ///     OfficeAce / ZCode 这三家），网关只能自己按间隔问上游「完成了没」
+    ///     （`poll_interval_ms > 0`）。
+    ///
+    /// 丢掉这个位之后，轮询型插件家的登录会「地址出来了、界面一直挂着等一个
+    /// 永远不到的跳转」—— 这是最难查的一类失败（没有任何报错）。
+    ///
+    /// 默认实现从 `(url, state)` 合成一个**回调型**结果，所以内置家与
+    /// 已实现 `build_login_url_async` 的插件家零改动。
+    fn login_start_async<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<agent2api_provider_protocol::LoginStart>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let (url, state) = self.build_login_url_async().await?;
+            Some(
+                agent2api_provider_protocol::LoginStart {
+                    flow: state,
+                    url,
+                    instructions: String::new(),
+                    // 0 = 回调型（网关等 `login.callback` 到达）
+                    poll_interval_ms: 0,
+                    external_browser: false,
+                    allowed_hosts: Vec::new(),
+                },
+            )
+        })
+    }
+
+    /// 动态登录方式的可选元数据通道（不新增协议类型）。
+    /// 只读 `auth.methods`：旧插件返回 404 / 501 时给 None，旧登录入口不依赖它。
+    /// 返回值仍不可信；管理路由必须投影成纯文本字段，不能透出 HTML 或凭证值。
+    fn login_methods_metadata<'a>(
+        &'a self,
+        store: &'a AccountStore,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Value>, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match self.admin_action(store, "", "auth.methods", &serde_json::json!({})).await {
+                Ok(metadata) => Ok(Some(metadata)),
+                Err(error) if matches!(error.status_code, 404 | 501) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// 参数化登录启动：options 是已校验的 `{methodIndex, inputs, proxy}`。
+    /// 默认委托旧入口；跨进程实现把整份 options 放进 `login.start.payload`，
+    /// 因为旧 SDK 不会把顶层 methodIndex / inputs / proxy 传给 provider。
+    fn build_login_flow_with_options<'a>(
+        &'a self,
+        _options: Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginStart>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(self.login_start_async().await) })
+    }
+
+    /// 轮询一次登录进度（**轮询型流程用**，插件架构新增）。
+    ///
+    /// 只有平台把 `poll_interval_ms` 报成 `> 0` 时才会被调用。默认返回错误：
+    /// 走到默认实现说明分流坏了（一家声称是轮询型却没实现轮询）—— 报错比
+    /// 静默返回 pending 到一个 5 分钟超时好。
+    fn login_poll_async<'a>(
+        &'a self,
+        _flow: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<agent2api_provider_protocol::LoginPoll, GatewayError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(GatewayError::with_status(
+                501,
+                "该提供商没有实现登录轮询：这是内部契约错误，请检查 poll_interval_ms 的分流",
+            ))
+        })
+    }
+
+    /// 把一条已换好的账号落进账号库，返回账号 id。
+    ///
+    /// ── 为什么单独一个方法（而不是让调用方自己落库）───────────────
+    /// 落库规则是**这家自己的**：id 取插件的 identity 还是时间戳、名字取
+    /// `public.name` 还是 label、记录进 `pluginSecret` 还是内置家的强类型字段
+    /// —— 只有实现知道。轮询型登录拿到 `NormalizedAccount` 之后必须走这条路，
+    /// 否则它会与回调型那条慢慢分叉（回调型走 [`Self::exchange_login_code`]，
+    /// 里面已经落过库了）。
+    ///
+    /// 默认 501：内置家的登录都自己落库，不会走到这里。
+    fn persist_login_account(
+        &self,
+        _account: &agent2api_provider_protocol::NormalizedAccount,
+    ) -> Result<String, GatewayError> {
+        Err(GatewayError::with_status(
+            501,
+            "该提供商不支持直接落库登录结果：这是内部契约错误",
+        ))
+    }
+
     /// 用回调里的一次性 `code` 换取凭证并**存入账号库**，成功返回账号 id
     /// （模块头扩展 7）。
     ///
@@ -972,6 +1315,33 @@ pub trait ProviderAdapter: Send + Sync {
                 ),
             ))
         })
+    }
+
+    /// 不落库的回调入口：保留完整 URL、授权码与 Pending 语义。
+    /// 默认 None 表示继续走既有 `exchange_login_code`；插件覆写后只在 Done 时
+    /// 由登录服务调用 `persist_login_account`，Pending 只表示已接受、继续等待。
+    fn login_callback_poll_async<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _callback: agent2api_provider_protocol::LoginCallback,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginPoll>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// 取消插件侧登录流程（释放监听端口及暂存凭证），不删除已落库账号。
+    /// 默认无操作以兼容旧适配器；网关任务仍须先被取消，避免迟到 Done 落库。
+    fn login_cancel_async<'a>(
+        &'a self,
+        _flow: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(()) })
     }
 
     /// 本 provider 是否支持**余额 / 积分查询**（模块头扩展 8）。
@@ -1049,6 +1419,169 @@ pub trait ProviderAdapter: Send + Sync {
             ))
         })
     }
+
+    /// 把一份「添加账号」的输入规范化成一条可落库的账号（插件架构新增）。
+    ///
+    /// ── 为什么是插件架构才有的方法 ──────────────────────────────
+    /// 内置家的添加路径是 `account_store::add_*_account` 那些**强类型**入口
+    /// （网关知道每一家的凭证形状），因此 trait 上从来不需要这个。插件家的
+    /// 凭证是不透明 JSON，只有插件知道怎么解析、怎么算稳定身份、要不要出网
+    /// 探活 —— 于是规范化必须回到插件里做。
+    ///
+    /// ── 默认实现返回 501 ────────────────────────────────────────
+    /// 内置家不该被调到（`api::accounts` 按「枚举里有没有」分流）；真被调到
+    /// 说明分流坏了，报错比返回一条形状不对的账号安全。
+    fn normalize_account<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _input: agent2api_provider_protocol::NormalizeInput,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<agent2api_provider_protocol::NormalizedAccount, GatewayError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let label = self.label();
+        Box::pin(async move {
+            Err(GatewayError::with_status(
+                501,
+                format!("{label}不支持通过网关添加账号：这是内部契约错误，请检查分流"),
+            ))
+        })
+    }
+
+    /// 每日签到 / 每日活跃领取（插件架构新增的异步入口）。
+    ///
+    /// ── 与内置家分派的分工 ────────────────────────────────────
+    /// 内置家的签到分派在 `core::billing::checkin::checkin_for`（一大串
+    /// `match provider_id`，每家一条上游链路）。插件家的执行体在插件里，
+    /// 那条 match 不该再长出 21 个分支 —— 所以插件家走这个方法。
+    ///
+    /// ── 返回形状为什么是 `{success, msg}` ────────────────────────
+    /// 与内置家各 `claim_*` 的返回**逐字一致**（`billing::checkin` 的
+    /// `claim_result` 只认这两个字段）。插件把 `CheckinReport` 翻成这个形状
+    /// （`RpcAdapter` 负责），上层因此不必区分「内置 / 插件」。
+    ///
+    /// 默认 501：内置家走自己的分派，真被调到说明分流坏了。
+    fn checkin_claim<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        let label = self.label();
+        Box::pin(async move {
+            Err(GatewayError::with_status(
+                501,
+                format!("{label}不支持插件签到入口：这是内部契约错误，请检查分流"),
+            ))
+        })
+    }
+
+    fn checkin_claim_with_options<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        _manual: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        self.checkin_claim(store, account_id)
+    }
+
+    fn plugin_account_view<'a>(
+        &'a self,
+        _secret: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(GatewayError::with_status(501, "不支持插件账号视图")) })
+    }
+
+    /// 领取类活动（新手任务 / 限时套餐）。
+    ///
+    /// `claim` 是活动标识（各家自己命名；空串 = 一键领取全部可领项）。
+    /// 返回形状由插件决定，与内置家各 `claim_all` 同形（`api::onboarding`
+    /// 直接透给前端）。
+    fn claim<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+        _claim: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        let label = self.label();
+        Box::pin(async move {
+            Err(GatewayError::with_status(
+                501,
+                format!("{label}不支持领取入口：这是内部契约错误，请检查分流"),
+            ))
+        })
+    }
+
+    /// 领取类活动的**只读**状态（`api::onboarding::status` 的插件家入口）。
+    ///
+    /// `refresh = true` 是用户手动点了「查询任务」（跳过本地结算记忆实查一次）。
+    /// 默认 502 而不是 501：调用方在插件家上会拿它当「这家没有新手任务」处理，
+    /// 报一个明确的「不支持」比返回一份空任务表更不容易被误读成「都领完了」。
+    fn claim_status<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+        _refresh: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        let label = self.label();
+        Box::pin(async move {
+            Err(GatewayError::with_status(502, format!("{label}没有新手任务")))
+        })
+    }
+
+    /// 插件家的「有每日签到」能力位（`None` = 内置家，走既有分派）。
+    ///
+    /// ── 为什么返回 `Option<bool>` 而不是 `bool` ────────────────
+    /// 内置家是否有签到**不是**适配器的事：它由 `auto_checkin::CHECKIN_PROVIDERS`
+    /// 与 `billing::checkin::supports_checkin` 那套（含 edition / isGuest 等
+    /// 账号级判据）共同决定。给内置家返回 `false` 会让那套判据被短路。
+    /// 插件家没有那些账号级判据，能力位就在握手里 —— 所以只有它们给 `Some`。
+    fn plugin_checkin_capability(&self) -> Option<bool> {
+        None
+    }
+
+    /// **厂商专属的管理动作**（成长任务 / 每日活跃保活 / 平台福利 / 套餐领取…）。
+    ///
+    /// ── 为什么是一条通道 ────────────────────────────────────────
+    /// 这些动作彼此没有共性（有的是任务树、有的是运营活动、有的是套餐激活），
+    /// 参数与返回形状只有厂商自己知道。给每个都开一个 trait 方法，trait 会随
+    /// 长尾动作无限膨胀，而网关本来就不该理解它们 —— 它只负责透传。
+    /// 完整动机见协议侧 `methods::gateway::ADMIN_ACTION` 的说明。
+    ///
+    /// ── 默认实现给 501 ──────────────────────────────────────────
+    /// 与 `claim_status` 的 502 不同：那是「这家概念上就没有新手任务」，
+    /// 而这里多半是**插件版本旧了**（新网关 + 老插件）—— 501 让调用方能区分
+    /// 「这家没这个能力」与「这个动作没被实现」。
+    fn admin_action<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+        action: &'a str,
+        _payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        let label = self.label();
+        Box::pin(async move {
+            Err(GatewayError::with_status(
+                501,
+                format!("{label}没有实现管理动作「{action}」（可能需要更新提供商插件）"),
+            ))
+        })
+    }
 }
 
 /// 「该账号没有配置余额查询凭证」的**机器可识别标记**（`GatewayError::code`）。
@@ -1085,173 +1618,537 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 
 /// 注册表：provider → 适配器实现。
 ///
-/// **各家都已实现**：各自返回自己的静态实例。这个 match 是穷举的：加新 kind 时
-/// 编译器会强制在这里给出一个分支，于是「注册了 provider 却忘了接线」这种事在
-/// 编译期就被拦住。
+/// ── 这里现在只有一件事：返回占位 ──────────────────────────────
+/// 29 个 `ProviderKind` 的实现**全部**搬到了提供商插件（`agent2api-providers`，
+/// 不随本仓库发布）。网关没有任何内置转发 / 账号解析实现可返回，所以本函数
+/// 对任何 kind 都返回 [`missing_plugin::placeholder`] —— 它如实报「需安装
+/// 插件」，而不是在网关里留一份会随时间漂移的旁路实现。
 ///
-/// 过渡期这里对未实现的 provider 返回过 `pending::PendingAdapter` 的占位实例
-/// （空清单 + 503 错误）；随着 CatPaw（W5-T-d4）与 AutoClaw（W4b-T-c2）先后
-/// 接上真身，占位实现失去全部调用点，W6 收尾时连同 `pending.rs` 一起删除 ——
-/// 接线真身时只改这里的一行，其余调用点一行都不用动。
+/// 保留这个函数（而不是让调用点直接拿占位）是因为它是适配器层的**唯一入口**：
+/// 将来若真要接回某个内置实现，改动只在这里；反过来，任何人想往网关里塞
+/// 「怎么打某个上游」的代码，都必须先改这里 —— review 时一眼能看见。
+///
+/// 硬约束：**不要**在这里加任何真实现。插件缺失时如实报错是产品语义的一部分
+/// （见 `missing_plugin` 的模块头），不是待补的坑。
 pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
-    match kind {
-        ProviderKind::WorkBuddy => &super::workbuddy::WORKBUDDY_ADAPTER,
-        // WorkBuddy 的两个地区是两个 provider、两个实例（同一份实现的按地区
-        // 参数化，见 `workbuddy::region` 与 `workbuddy::adapter` 的模块头）
-        ProviderKind::WorkBuddyIntl => &super::workbuddy::WORKBUDDY_INTL_ADAPTER,
-        ProviderKind::Raccoon => &super::raccoon::RACCOON_ADAPTER,
-        ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
-        ProviderKind::AutoClaw => &super::autoclaw::AUTOCLAW_ADAPTER,
-        // AutoClaw 的两个地区是两个 provider、两个实例（同一份实现的按地区
-        // 参数化，见 `autoclaw::adapter` 与 `autoclaw::region` 的模块头）
-        ProviderKind::AutoClawIntl => &super::autoclaw::AUTOCLAW_INTL_ADAPTER,
-        ProviderKind::Qoder => &super::qoder::QODER_ADAPTER,
-        // Qoder 的两个地区是两个 provider、两个实例（同一份实现的按地区
-        // 参数化，见 `qoder::endpoints::Region` 与 `qoder::mod` 的模块头）
-        ProviderKind::QoderIntl => &super::qoder::QODER_INTL_ADAPTER,
-        ProviderKind::CodeArts => &super::codearts::CODEARTS_ADAPTER,
-        // Cline 的两个额度池是两个 provider、两个实例（同一份实现的按池
-        // 参数化，见 `cline::adapter` 的模块头）
-        ProviderKind::ClineFree => &super::cline::CLINE_FREE_ADAPTER,
-        ProviderKind::ClinePass => &super::cline::CLINE_PASS_ADAPTER,
-        // Accio 的两个地区是两个 provider、两个实例（同一份实现的按地区
-        // 参数化，见 `accio::endpoints::Region` 与 `accio::mod` 的模块头）
-        ProviderKind::Accio => &super::accio::ACCIO_ADAPTER,
-        ProviderKind::AccioCn => &super::accio::ACCIO_CN_ADAPTER,
-        // ZCode 的两个地区是两个 provider、两个实例（同一份实现按地区参数化，
-        // 见 `zcode::adapter` 与 `zcode::region` 的模块头）
-        ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
-        ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
-        ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
-        // Loomy（讯飞）：无状态 OpenAI 兼容转发（token + Bearer 双头鉴权），
-        // 账号管理走手机号验证码登录（见 `loomy/mod.rs` 的模块头）
-        ProviderKind::Loomy => &super::loomy::LOOMY_ADAPTER,
-        // KukuAI（百度文库库库 AI）：有状态转发（请求内三步时序：建会话 →
-        // 分配算力 → SSE），账号管理走粘贴 Cookie / 导入本机登录态
-        // （见 `kuku/mod.rs` 的模块头）
-        ProviderKind::Kuku => &super::kuku::KUKU_ADAPTER,
-        // MonkeyCode（长亭科技）：账号管理（粘贴 session）+ 模型目录 + 会话转发
-        // 全部已接通（建任务 → WebSocket 任务流 → ACP 事件翻译，`is_stateful`
-        // 为 true，见 `monkeycode/mod.rs` 与 `monkeycode/adapter.rs` 的模块头）。
-        // 两个站点是两个 provider、两个实例（同一份实现按地区参数化）
-        ProviderKind::MonkeyCode => &super::monkeycode::MONKEYCODE_ADAPTER,
-        ProviderKind::MonkeyCodeIntl => &super::monkeycode::MONKEYCODE_INTL_ADAPTER,
-        // Command Code（`api.commandcode.ai`）：无状态（一次 HTTP 请求 = 一次
-        // 生成）、粘贴 `user_` API Key、响应是 NDJSON（`UpstreamResponse::
-        // CommandCodeNdjson`，见 `commandcode/mod.rs` 的模块头）
-        ProviderKind::CommandCode => &super::commandcode::COMMANDCODE_ADAPTER,
-        // Antigravity（Google 的 AI IDE）：账号 / token 刷新 / 模型目录 / 会话转发
-        // 全部已接通（转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层，
-        // 见 `antigravity/mod.rs` 与 `antigravity/adapter.rs`）
-        ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
-        // OfficeAce（华为云果办 / OfficeClaw）：无状态 OpenAI 兼容转发
-        // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
-        // `officeace/mod.rs` 的模块头）
-        ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
-        // OrcaTerm（腾讯云遨驰终端桌面客户端）：账号 / OAuth 续期 / 会话转发 /
-        // 余额全部已接通（建会话 → assistant SSE，`is_stateful` 为 true，
-        // 见 `orcaterm/mod.rs` 与 `orcaterm/adapter.rs` 的模块头）
-        ProviderKind::OrcaTerm => &super::orcaterm::ORCATERM_ADAPTER,
+    crate::server::core::providers::missing_plugin::placeholder(kind)
+}
+
+/// 运行时注册表：provider id → 适配器（插件架构新增）。
+///
+/// ── 与 [`adapter_for`] 的分工 ───────────────────────────────
+/// `adapter_for` 按**编译期枚举**查内置家，返回 `&'static`，O(1) 且永不失败。
+/// 插件家没有 `ProviderKind`（第三方 provider 的 id 是运行期才知道的），
+/// 只能按字符串查这张表。
+///
+/// ── 为什么返回值是 `Option` ────────────────────────────────
+/// 插件是**用户安装**的：没装那个包、或者包被停用，provider 就不存在。
+/// 这是真实状态，必须表达出来 —— 不能像内置家那样假装「一定有」。
+///
+/// ── 优先级：插件 → 旧 Kind 占位 ─────────────────────────────
+/// 一个 id 同时被内置家与插件声明时，插件赢。三条理由：
+///   1. 迁移已经完成：21 家全部有插件实现，内置那份只剩「卸载插件后的
+///      兜底」这一个用途 —— 让兜底赢等于让插件永远不生效；
+///   2. 用户装了新版插件包就该用新版（发版节奏与网关解耦，那正是插件的
+///      收益之一）；内置赢会让「升级插件」这个动作静默无效；
+///   3. 回退路径仍然成立：卸载 / 停用插件包后 `lookup` 返回 `None`，自然
+///      落回内置实现（账号数据也由
+///      `account_store::plugin_accounts` 的镜像保证两边都能读）。
+///
+/// ── 但内置实现仍然要能被**显式**拿到 ──────────────────────────
+/// 所以另开 [`builtin_adapter_by_id`]：需要「一定走内置那份」的调用点
+/// （迁移期对照、插件实现出问题时的诊断入口）用它，而不是依赖这里的优先级。
+pub fn adapter_by_id(id: &str) -> Option<Arc<dyn ProviderAdapter>> {
+    if super::availability::is_suspended(id) { return None; }
+    // 插件家优先（见上面第 3 条：没装/停用时自然落到内置）
+    if let Some(adapter) = crate::server::core::plugin_host::lookup(id) {
+        return Some(adapter);
+    }
+    // 内置家兜底
+    super::kind_from_id(id).map(Into::into)
+}
+
+pub async fn adapter_by_id_ready(id: &str) -> Result<Option<Arc<dyn ProviderAdapter>>, GatewayError> {
+    if super::availability::is_suspended(id) { return Ok(None); }
+    if let Some(adapter) = crate::server::core::plugin_host::lookup_ready(id).await? {
+        return Ok(Some(adapter));
+    }
+    Ok(super::kind_from_id(id).map(Into::into))
+}
+
+/// **只**查内置实现（跳过插件注册表）。
+///
+/// ── 什么时候该用它 ──────────────────────────────────────────
+/// 需要「内置那份一定在」的场合：迁移期的差分验证、插件实现疑似出问题时的
+/// 诊断对照、以及任何「想知道这家有没有编译进网关」的判定。
+/// 生产转发路径一律用 [`adapter_by_id`]（插件优先）。
+pub fn builtin_adapter_by_id(id: &str) -> Option<Arc<dyn ProviderAdapter>> {
+    super::kind_from_id(id).map(Into::into)
+}
+
+/// 内置家的 `Arc` 包装（让 `adapter_by_id` 的返回类型统一）。
+///
+/// ── 为什么需要这层包装 ──────────────────────────────────────
+/// `adapter_for` 返回 `&'static dyn`，而插件家返回 `Arc<dyn>`。要让两者
+/// 装进同一个返回类型，只能把前者也包成 `Arc` —— 这个包装不复制任何状态，
+/// 只转发每个方法到静态实例（每次转发是一次 match + 一次虚调用，与直接
+/// 调 `adapter_for` 同量级）。
+struct BuiltinAdapter(ProviderKind);
+
+impl From<ProviderKind> for Arc<dyn ProviderAdapter> {
+    fn from(kind: ProviderKind) -> Self {
+        Arc::new(BuiltinAdapter(kind))
+    }
+}
+
+impl ProviderAdapter for BuiltinAdapter {
+    // ── 为什么用宏而不是手写 34 个转发 ──────────────────────────
+    // 手写 34 个方法的转发既冗长又容易漏（漏一个就会落到 trait 的默认实现，
+    // 行为静默变化）。宏把「调用目标」与「参数列表」分开写，加方法时只改
+    // 一处签名。
+    fn kind(&self) -> ProviderKind {
+        self.0
+    }
+
+    fn list_models(&self) -> Vec<Value> {
+        adapter_for(self.0).list_models()
+    }
+
+    fn advertise_models(&self, store: &AccountStore, manifest: Vec<Value>) -> Vec<Value> {
+        adapter_for(self.0).advertise_models(store, manifest)
+    }
+
+    fn build_chat_request(
+        &self,
+        account: &Value,
+        body: &Value,
+        client_headers: &HeaderMap,
+    ) -> Result<ChatRequestPlan, GatewayError> {
+        adapter_for(self.0).build_chat_request(account, body, client_headers)
+    }
+
+    fn build_chat_request_async<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).build_chat_request_async(account, body, client_headers)
+    }
+
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value) -> ReasoningPatch {
+        adapter_for(self.0).reasoning_patch(level, model, body)
+    }
+
+    fn reasoning_patch_async<'a>(
+        &'a self,
+        level: &'a str,
+        model: &'a str,
+        body: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ReasoningPatch> + Send + 'a>> {
+        adapter_for(self.0).reasoning_patch_async(level, model, body)
+    }
+
+    fn outbound_reasoning(&self, body: &Value) -> Option<String> {
+        adapter_for(self.0).outbound_reasoning(body)
+    }
+
+    fn is_error_response(&self, status: u16, headers: &HeaderMap) -> bool {
+        adapter_for(self.0).is_error_response(status, headers)
+    }
+
+    fn is_error_response_async<'a>(
+        &'a self,
+        status: u16,
+        headers: &'a HeaderMap,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        adapter_for(self.0).is_error_response_async(status, headers)
+    }
+
+    fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
+        adapter_for(self.0).classify_error(status, error_body)
+    }
+
+    fn classify_error_async<'a>(
+        &'a self,
+        status: u16,
+        error_body: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = UpstreamErrorClass> + Send + 'a>> {
+        adapter_for(self.0).classify_error_async(status, error_body)
+    }
+
+    fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
+        adapter_for(self.0).classify_conversation_error(error)
+    }
+
+    fn quota_cooldown_models(&self, account_id: &str, wire_model: &str) -> Vec<String> {
+        adapter_for(self.0).quota_cooldown_models(account_id, wire_model)
+    }
+
+    fn ensure_access_token<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).ensure_access_token(store, account_id)
+    }
+
+    fn refresh_models<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        force: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
+        adapter_for(self.0).refresh_models(store, account_id, force)
+    }
+
+    fn refresh_uses_account(&self) -> bool {
+        adapter_for(self.0).refresh_uses_account()
+    }
+
+    fn supports_chat(&self) -> bool {
+        adapter_for(self.0).supports_chat()
+    }
+
+    fn supports_image_generation(&self) -> bool {
+        adapter_for(self.0).supports_image_generation()
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        adapter_for(self.0).supports_image_editing()
+    }
+
+    fn build_image_request_async<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+        operation: super::images::ImageOperation,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).build_image_request_async(account, body, client_headers, operation)
+    }
+
+    fn supports_model_refresh(&self) -> bool {
+        adapter_for(self.0).supports_model_refresh()
+    }
+
+    fn refresh_access_token<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).refresh_access_token(store, account_id)
+    }
+
+    fn retry_advice(&self, error_body: &Value, attempt: usize, budget: usize) -> Option<RetryAdvice> {
+        adapter_for(self.0).retry_advice(error_body, attempt, budget)
+    }
+
+    fn retry_advice_async<'a>(
+        &'a self,
+        error_body: &'a Value,
+        attempt: usize,
+        budget: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RetryAdvice>> + Send + 'a>> {
+        adapter_for(self.0).retry_advice_async(error_body, attempt, budget)
+    }
+
+    fn retry_decision_async<'a>(
+        &'a self,
+        status: u16,
+        error_body: &'a Value,
+        attempt: usize,
+        budget: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RetryDecision> + Send + 'a>> {
+        adapter_for(self.0).retry_decision_async(status, error_body, attempt, budget)
+    }
+
+    fn stream_refusal_finishes(&self) -> &'static [&'static str] {
+        adapter_for(self.0).stream_refusal_finishes()
+    }
+
+    fn stream_refusal_markers(&self) -> &'static [&'static str] {
+        adapter_for(self.0).stream_refusal_markers()
+    }
+
+    fn supports_refresh(&self) -> bool {
+        adapter_for(self.0).supports_refresh()
+    }
+
+    fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
+        adapter_for(self.0).credentials_expiring(store, account_id)
+    }
+
+    fn credentials_expiring_async<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        adapter_for(self.0).credentials_expiring_async(store, account_id)
+    }
+
+    fn allows_anonymous_default_session(&self) -> bool {
+        adapter_for(self.0).allows_anonymous_default_session()
+    }
+
+    fn system_proxy_when_unset(&self) -> bool {
+        adapter_for(self.0).system_proxy_when_unset()
+    }
+
+    fn env_credentials_present(&self) -> bool {
+        adapter_for(self.0).env_credentials_present()
+    }
+
+    fn supports_default_model(&self) -> bool {
+        adapter_for(self.0).supports_default_model()
+    }
+
+    fn sse_model_rewrite(&self) -> bool {
+        adapter_for(self.0).sse_model_rewrite()
+    }
+
+    fn sse_strip_newline_chunks(&self) -> bool {
+        adapter_for(self.0).sse_strip_newline_chunks()
+    }
+
+    fn is_stateful(&self) -> bool {
+        adapter_for(self.0).is_stateful()
+    }
+
+    fn forward_conversation<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+        proxy: Option<crate::server::core::proxies::ResolvedProxy>,
+        stream: bool,
+        telemetry: &'a std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::server::core::upstream::ForwardOutcome, GatewayError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        adapter_for(self.0).forward_conversation(
+            store,
+            account_id,
+            body,
+            client_headers,
+            proxy,
+            stream,
+            telemetry,
+        )
+    }
+
+    fn supports_web_login(&self) -> bool {
+        adapter_for(self.0).supports_web_login()
+    }
+
+    fn build_login_url(&self) -> Option<(String, String)> {
+        adapter_for(self.0).build_login_url()
+    }
+
+    fn build_login_url_async<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + 'a>,
+    > {
+        adapter_for(self.0).build_login_url_async()
+    }
+
+    fn login_start_async<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<agent2api_provider_protocol::LoginStart>>
+                + Send
+                + 'a,
+        >,
+    > {
+        adapter_for(self.0).login_start_async()
+    }
+
+    fn login_methods_metadata<'a>(
+        &'a self,
+        store: &'a AccountStore,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Value>, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).login_methods_metadata(store)
+    }
+
+    fn build_login_flow_with_options<'a>(
+        &'a self,
+        options: Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginStart>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        adapter_for(self.0).build_login_flow_with_options(options)
+    }
+
+    fn login_callback_poll_async<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        callback: agent2api_provider_protocol::LoginCallback,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginPoll>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        adapter_for(self.0).login_callback_poll_async(store, callback)
+    }
+
+    fn login_cancel_async<'a>(
+        &'a self,
+        flow: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).login_cancel_async(flow)
+    }
+
+    fn login_poll_async<'a>(
+        &'a self,
+        flow: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<agent2api_provider_protocol::LoginPoll, GatewayError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        adapter_for(self.0).login_poll_async(flow)
+    }
+
+    fn persist_login_account(
+        &self,
+        account: &agent2api_provider_protocol::NormalizedAccount,
+    ) -> Result<String, GatewayError> {
+        // 内置家的登录都在自己的 `start_*_login` 里落库，走不到这里
+        adapter_for(self.0).persist_login_account(account)
+    }
+
+    fn normalize_account<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        input: agent2api_provider_protocol::NormalizeInput,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<agent2api_provider_protocol::NormalizedAccount, GatewayError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        adapter_for(self.0).normalize_account(store, input)
+    }
+
+    fn exchange_login_code<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        code: &'a str,
+        state: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).exchange_login_code(store, code, state)
+    }
+
+    fn checkin_claim<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).checkin_claim(store, account_id)
+    }
+
+    fn claim<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        claim: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).claim(store, account_id, claim)
+    }
+
+    fn claim_status<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        refresh: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).claim_status(store, account_id, refresh)
+    }
+
+    fn plugin_checkin_capability(&self) -> Option<bool> {
+        adapter_for(self.0).plugin_checkin_capability()
+    }
+
+    fn admin_action<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        action: &'a str,
+        payload: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).admin_action(store, account_id, action, payload)
+    }
+
+    fn supports_usage(&self) -> bool {
+        adapter_for(self.0).supports_usage()
+    }
+
+    fn query_usage<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).query_usage(store, account_id)
     }
 }
 
 /// 已**完整实现**的适配器对应的 kind 列表（顺序 = 注册表顺序）。
 ///
-/// ── 口径（W4a 明确，两种读法会得到不同结果，必须写清）──────────
-/// 这是「已完整实现」而不是「已注册」：AutoClaw 曾在 W4a–W4b 之间处于「身份与
-/// 注册表项都在、但适配器是占位」的中间态，那时它**不在本列表里**；
-/// W4b-T-c2 接上真身（`autoclaw::adapter::AUTOCLAW_ADAPTER`）后列入本表 ——
-/// 与 CatPaw 在 W5-T-d4 走过的路径相同。Qoder 也走过同一条路：接入推理转发
-/// 之前它只有账号管理能力，本波次接上真身后列入。**现在注册表里的各家全部在
-/// 列表里**，与 `PROVIDERS` 的 id 集合一一对应
-/// （过渡期的占位实现已在 W6 随 `pending.rs` 删除）。
+/// ── 现在恒为空，且这是**终点状态** ────────────────────────────
+/// 这个函数回答的问题是「网关编译进去的执行体还剩哪几家」。全部提供商的转发与
+/// 账号实现都已搬到独立的提供商插件（`agent2api-providers`，不随本仓库发布），
+/// 所以答案就是「一家都不剩」。
 ///
-/// Cline 算两家（`ClineFree` / `ClinePass`）：它们是两个 provider、两份清单，
-/// 刷新时各刷各的 —— 尽管底层那次远程请求是同一个接口（`cline::models::refresh`
-/// 一次拉回两池，缓存共用），两次调用是幂等的。
+/// 保留空实现而不是删掉函数：它的两个消费方（`catalog_refresh` 的逐家刷新与
+/// `reschedule`）都是「遍历内置家」的形状，删掉函数会让那两处改写成
+/// `if false` 之类的形状，反而不如一张空表读得明白。**不要往这张表里加东西**
+/// —— 往里加一家，等于把该家的实现重新带回网关，正是拆家要消除的东西。
 ///
-/// AutoClaw 同理算两家（`AutoClaw` / `AutoClawIntl`）：两个站点的模型目录
-/// **是两份独立数据**（各自的 `autoclaw-model-config`，缓存也各占一格），
-/// 刷新必须分别打各自的站点 —— 与 Cline 那次「同一个接口、两次幂等调用」
-/// 不同，这里两次调用是真的两次上游请求。
-///
-/// 为什么这份列表必须排除占位实现（当时的口径）：它的消费方是后台目录刷新
-/// （`refresh_implemented` ← `api::chat::spawn_catalog_refresh` 与
-/// `ServerState::bootstrap`）。对占位实例调 `refresh_models` 是空操作 ——
-/// 列进去不会出错，但会让「implemented」这个词失去信息量：将来
-/// 「这家的清单为什么刷新不了」之类的排障会从这份列表读起，
-/// 一份混着占位实现的名字列表只会误导。
-///
-/// 注意这**不是** `/v1/models` 的「可用 provider」判据：那个走
-/// `catalog::active_manifests`（清单非空 + 有可用登录态）—— 两处的口径各自
-/// 成立、互不依赖。
+/// 插件家不走这里：`catalog_refresh` 另有基于 `plugin_host::installed_ids()` 的
+/// 第二段循环，与内置家共用同一套「支持才刷」的判据。
 pub fn implemented_kinds() -> Vec<ProviderKind> {
-    vec![
-        ProviderKind::WorkBuddy,
-        // WorkBuddy 国际版算一家：与国内版各自一份模型清单（`/v3/config` 打
-        // 各自的站点）、各自的缓存槽与刷新排期 —— 两家都必须在本列表里，
-        // 否则国际版的目录刷新永远不会被调度（症状是「国际版账号加了、
-        // 模型列表一直是内置兜底」）。
-        ProviderKind::WorkBuddyIntl,
-        ProviderKind::Raccoon,
-        ProviderKind::CatPaw,
-        ProviderKind::AutoClaw,
-        ProviderKind::AutoClawIntl,
-        ProviderKind::Qoder,
-        // Qoder 国际版算一家：与国内版各自一份模型清单、各自的缓存槽与刷新
-        // 排期（拆家后的既定口径，与 WorkBuddy 两个地区同一理由）—— 不在的
-        // 话国际版的目录刷新永远不会被调度。
-        ProviderKind::QoderIntl,
-        ProviderKind::ClineFree,
-        ProviderKind::ClinePass,
-        // Accio 的两个地区各算一家（同一份实现、两套账号与目录缓存）
-        ProviderKind::Accio,
-        ProviderKind::AccioCn,
-        // ZCode 的两个地区各算一家（同一份实现、两套账号）。
-        // 它**在**本列表里是因为适配器已接真身、能参与目录刷新调度；
-        // 但 `supports_model_refresh()` 为 false（静态清单，见 `zcode::models`），
-        // 所以刷新循环对它是空操作 —— 这不影响「已实现」这个判定：
-        // 本列表回答的是「这家接线了没有」，不是「这家的目录能不能远程刷」。
-        ProviderKind::Zcode,
-        ProviderKind::ZcodeIntl,
-        // CodeArts 在本列表里 = 适配器已接线（登录 / 凭据 / 目录 / 转发 / 余额
-        // / 每日福利）、可参与目录刷新调度。
-        ProviderKind::CodeArts,
-        // Trae 已接真身（登录 / 凭据 / 目录 / 转发），并且**真有**远程目录
-        // （`supports_model_refresh()` 为 true），所以它必须在本列表里 ——
-        // 不在的话刷新循环根本不会问它，症状是"界面上点了刷新、日志里
-        // 一句 trae 都没有"（与"刷了但没取到"是两种完全不同的故障）。
-        ProviderKind::Trae,
-        // Loomy 已接真身（登录 / 凭据 / 目录 / 转发 / 余额 / 每日积分刷新），
-        // 且有远程目录（`GET {网关}/api/v1/models`）—— 必须在列表里，
-        // 否则目录刷新循环不会问它。
-        ProviderKind::Loomy,
-        // KukuAI 已接真身（凭据 / 目录 / 转发 / 余额），且有远程目录
-        // （`/wenchain/genflowpro/model_list`）—— 必须在列表里，否则刷新循环
-        // 不会问它（与 Trae 同一理由）。
-        ProviderKind::Kuku,
-        // MonkeyCode 的两个站点各算一家：适配器已接线（账号 / 目录 / 会话转发
-        // 全部已通），且有远程目录（`GET /api/v1/users/models`）—— 必须在
-        // 列表里，否则目录刷新循环不会问它。
-        ProviderKind::MonkeyCode,
-        ProviderKind::MonkeyCodeIntl,
-        // Command Code 已接真身（账号 / 目录 / 转发），且有远程目录
-        // （`GET /provider/v1/models`，失败回落内置 26 项清单）—— 必须在列表里，
-        // 否则目录刷新循环不会问它。
-        ProviderKind::CommandCode,
-        // Antigravity 已接真身（账号 / token 刷新 / 目录 / 转发），且有远程目录
-        // （`POST {base}:fetchAvailableModels`）—— 必须在列表里，否则目录刷新
-        // 循环不会问它。转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层
-        // （Gemini v1internal 信封 + SSE），`build_chat_request` 已接真身。
-        ProviderKind::Antigravity,
-        // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
-        // 进本列表才会被后台目录刷新调度
-        ProviderKind::OfficeAce,
-        // OrcaTerm：适配器已接线（账号 / 续期 / 转发 / 余额），但**没有**
-        // 远程模型目录（静态清单，`supports_model_refresh()` 为 false）——
-        // 进本列表只代表「已实现」（与 Zcode 同一口径：刷新循环对它是空操作）。
-        ProviderKind::OrcaTerm,
-    ]
+    Vec::new()
 }
 
 /// 一次模型目录刷新的结果（模块头扩展 9）。
@@ -1299,28 +2196,18 @@ impl ModelRefreshOutcome {
     }
 }
 
-/// 对**当前缓存清单**里的小浣熊模型补一次默认规则种子
-/// （`raccoon-<hex>` 内部模型默认禁用 / `sn-` 前缀默认加去前缀映射，
-/// 见 `model_rules::seed_raccoon_defaults`）。
+/// 对**当前缓存清单**里的模型补一次默认规则种子（各家一条）。
 ///
-/// 为什么不在 `raccoon::models::refresh` 一处就够了：刷新可能因 TTL 早退、
-/// 上游失败而不落地新清单 —— 那条路径上没有种子可挂。启动后 / 首次请求前的
-/// 缓存清单（升级用户的管理页第一次打开）也要有同样的默认值，所以在编排入口
-/// 先按「现在手上的清单」补一次。幂等：种过的 id 不会再动。
-fn seed_current_raccoon_defaults() {
-    let ids: Vec<String> = raccoon::models::list()
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    if let Some(summary) = crate::server::core::model_rules::seed_raccoon_defaults(&ids) {
-        crate::server::logging::log("[Models]", &summary);
-    }
-}
-
+/// ── 小浣熊的这一手已经不需要了 ──────────────────────────────
+/// 它的 `raccoon-<hex>` 默认禁用与 `sn-` 去前缀映射，依赖「网关手里有这家的
+/// 清单」。目录已随实现搬到插件，网关只拿插件返回的成品清单（其中已带
+/// `visibility`），默认规则改由插件在 `models.refresh` 里自己申报 ——
+/// 网关这边再种一次只会与插件打架（两处都在写同一批 `seeded` 记账）。
+///
 /// 对**当前缓存清单**里的 WorkBuddy 模型补一次默认规则种子（默认只启用白名单
 /// 内的模型，见 `model_rules::seed_workbuddy_defaults`）。
 ///
-/// 与 `seed_current_raccoon_defaults` 同理：刷新可能因失败 / 无登录态而不落地
+/// 与 `seed_current_qoder_defaults` 同理：刷新可能因失败 / 无登录态而不落地
 /// 新清单 —— 那条路径上没有种子可挂，启动后手里的这份清单（内置或旧缓存）
 /// 也要有同样的默认值。幂等：种过的 id 不会再动。
 ///
@@ -1328,9 +2215,15 @@ fn seed_current_raccoon_defaults() {
 /// `(provider, id)` 记账，只种国内版会让国际版的新模型停在全开状态，
 /// 而两家的模型名很可能同名。
 fn seed_current_workbuddy_defaults() {
+    // 一次性迁移：解开旧白名单（hy3 / hy4-preview-f / deepseek-v4.1-flash 之外
+    // 全关）误关的那批模型。必须在可见性种子之前，理由与 Qoder 那边相同。
+    if let Some(summary) = crate::server::core::model_rules::migrate_workbuddy_default_enabled() {
+        crate::server::logging::log("[Models]", &summary);
+    }
     for region in super::workbuddy::Region::ALL {
-        let ids: Vec<String> = crate::server::core::models::global_catalog(region)
-            .list()
+        let ids: Vec<String> = super::adapter::adapter_by_id(region.provider_id())
+            .map(|adapter| adapter.list_models())
+            .unwrap_or_default()
             .iter()
             .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
             .collect();
@@ -1346,13 +2239,49 @@ fn seed_current_workbuddy_defaults() {
 /// 对**当前缓存清单**里的 Qoder 模型补一次默认规则种子（默认只启用白名单内的
 /// 模型，见 `model_rules::seed_qoder_defaults`）。
 ///
-/// 委托给 `qoder::models::seed_default_rules` —— 那边按地区各取各的清单、各按
-/// 各的 provider id 种（拆家后两家是两套 `(provider, id)` 命名空间），与刷新
-/// 落地时种的是同一份口径。要这一手补种的理由与 WorkBuddy 相同：Qoder 在
-/// 没有账号 / 远程刷新失败时手里只剩静态兜底清单，而**升级用户**的清单正是
-/// 那份兜底 —— 不补种的话，他们打开管理页看到的仍是旧的全开状态。
+/// 清单来自插件缓存（`rpc_cache`：握手带回的内置兜底或上一次刷新的结果），
+/// 按地区各取各的、各按各的 provider id 种（拆家后两家是两套
+/// `(provider, id)` 命名空间）。要这一手补种的理由与 WorkBuddy 相同：Qoder 在
+/// 没有账号 / 远程刷新失败时手里只剩插件带来的兜底清单，而**升级用户**的清单
+/// 正是那份兜底 —— 不补种的话，他们打开管理页看到的仍是旧的全开状态。
 fn seed_current_qoder_defaults() {
-    qoder::models::seed_default_rules();
+    // 先跑一次性迁移：把旧白名单（只留 `Qwen3.8-Flash`）误关的那批模型重新
+    // 打开。必须在可见性种子**之前** —— 否则 visibility 种子会把它们记成
+    // 「已经处理过」，迁移再来解就晚了（虽然结果一样，但日志顺序会看不懂）。
+    if let Some(summary) = crate::server::core::model_rules::migrate_qoder_default_enabled() {
+        crate::server::logging::log("[Models]", &summary);
+    }
+    seed_qoder_defaults_from_catalog();
+}
+
+/// 按地区把当前清单里的 id 交给 `model_rules::seed_qoder_defaults`。
+///
+/// 清单从**插件缓存**取（`adapter_by_id(provider).list_models()`）：网关不再
+/// 持有 Qoder 的目录实现，而种子必须按 `(provider, id)` 记账 —— 两个地区各
+/// 种各的。
+fn seed_qoder_defaults_from_catalog() {
+    for region in super::qoder::endpoints::Region::ALL {
+        let provider = region.provider_id();
+        let ids: Vec<String> = match super::adapter::adapter_by_id(provider) {
+            Some(adapter) => adapter
+                .list_models()
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect(),
+            None => Vec::new(),
+        };
+        if ids.is_empty() {
+            continue;
+        }
+        if let Some(summary) = crate::server::core::model_rules::seed_qoder_defaults(
+            provider,
+            &format!("Qoder {}", region.label()),
+            &ids,
+        ) {
+            crate::server::logging::log("[Models]", &summary);
+        }
+    }
 }
 
 /// 对**当前清单**里的 Cline 模型补一次默认映射种子（带池前缀的模型自动获得
@@ -1375,7 +2304,85 @@ fn seed_current_qoder_defaults() {
 /// 遗留），现在池是身份，两家的种子各按各的清单跑。
 fn seed_current_cline_defaults() {
     for pool in super::cline::models::Pool::ALL {
-        if let Some(summary) = super::cline::adapter::seed_defaults(pool) {
+        // 清单来自插件缓存（`rpc_cache`）：握手带回的内置兜底或上一次刷新的结果。
+        let provider = pool.provider_id();
+        let ids: Vec<String> = super::adapter::adapter_by_id(provider)
+            .map(|adapter| {
+                adapter
+                    .list_models()
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            continue;
+        }
+        if let Some(summary) =
+            crate::server::core::model_rules::seed_cline_defaults(provider, &ids)
+        {
+            crate::server::logging::log("[Models]", &summary);
+        }
+    }
+}
+
+/// 对**当前清单**里「上游说有、官方客户端不展示」的模型补一次默认禁用种子。
+///
+/// ── 为什么单列一个函数（而不并进上面那几个）──────────────────
+/// 上面几个走的是**白名单制**（由人挑几个「装上就能用」的），本函数走
+/// **可见性制**：判据来自各家 `models.rs` 算出的 `visibility` 字段（Antigravity
+/// 按世代、Qoder 读上游 `enable`、CodeArts 读
+/// `display_enabled`）。判据在谁手里，就在谁那里算 —— 聚合层只负责读。
+///
+/// ── 为什么「默认关闭」= 真正不可用 ─────────────────────────
+/// 本仓的路由门是「默认绑定关掉 = 这个名字调不动」
+/// （`catalog::builtin_target` 先过 `default_enabled`，不过就返回 `None`），
+/// 所以关掉默认绑定同时达到两个效果：不出现在 `/v1/models`，也不接受点名调用。
+/// 只隐藏列表不关绑定会留下「列表里没有、但点名能用」的矛盾状态。
+///
+/// 只对**有判据的四家**生效（其余家的清单没有 `visibility` 键，这里自然跳过）：
+/// 别的家目前没有可靠判据，按「没依据就不藏」处理（见
+/// `officeace/probe.rs` 的同一纪律）。
+pub(crate) fn seed_hidden_visibility_defaults() {
+    for kind in [
+        super::ProviderKind::WorkBuddy,
+        super::ProviderKind::WorkBuddyIntl,
+        super::ProviderKind::Antigravity,
+        super::ProviderKind::Qoder,
+        super::ProviderKind::QoderIntl,
+    ] {
+        let provider = crate::server::core::providers::kind_id(kind);
+        let Some(adapter) = adapter_by_id(provider) else { continue };
+        let entries: Vec<(String, &str)> = adapter
+            .list_models()
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id").and_then(Value::as_str)?.trim().to_string();
+                if id.is_empty() {
+                    return None;
+                }
+                // 没有可见性判据的条目直接跳过（不给种子记账 —— 将来这家补上
+                // 判据时还能正常种）
+                let visibility = item.get("visibility").and_then(Value::as_str)?;
+                // `'static` 生命周期：这里把三种取值转成常量字符串，
+                // 免得把 Json 值借给 `seed_hidden_disabled` 活过本次循环
+                let owned: &'static str = match visibility {
+                    "hidden" => "hidden",
+                    "shown" => "shown",
+                    _ => "undeclared",
+                };
+                Some((id, owned))
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        if let Some(summary) = crate::server::core::model_rules::seed_hidden_disabled(
+            provider,
+            &crate::server::core::providers::label_of(provider),
+            &entries,
+        ) {
             crate::server::logging::log("[Models]", &summary);
         }
     }
@@ -1395,59 +2402,32 @@ fn seed_current_cline_defaults() {
 /// 各家自身的缓存/TTL 仍然生效（`force = false`）：排期说「可以刷了」之后，
 /// 由各家决定这次是否真的打网络。手动按钮走 [`refresh_implemented_forced`]。
 pub async fn refresh_implemented(store: &AccountStore) -> Vec<Value> {
-    seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
+    seed_hidden_visibility_defaults();
     let results = super::catalog_refresh::refresh(store, &serde_json::Map::new(), None, false).await;
     // 刷新落地后补种一次：新增的带前缀 / 别名模型在这一刻才出现在清单里
     // （与开头那次同一件事 —— 那时种的是缓存恢复的清单）
     seed_current_cline_defaults();
+    // 可见性种子必须在**刷新之后**再跑一次：远程清单一落地，「上游说有但官方
+    // 不展示」的那批 id 才第一次出现（缓存恢复时它们可能还不存在）。
+    seed_hidden_visibility_defaults();
     results
 }
 
-/// 启动时恢复各家的持久化清单缓存（`ServerState::bootstrap` 在库句柄就绪后
-/// 调用一次，见 `providers::catalog_cache` 的模块头）。
-///
-/// ── 为什么必须显式跑一次 ────────────────────────────────────
-/// 各家的目录句柄是 `OnceLock` **懒初始化**，而持久化缓存只能在首次初始化时
-/// 读回（那正是各家 `restored_state` / `restored_cache` 的位置）。若某个更早的
-/// 调用点先碰到了句柄（那时 `catalog_cache::install` 还没跑），句柄就固化在
-/// 「没有缓存」的空状态上，缓存再也读不回来 —— 症状恰恰是本切片要消灭的那个
-/// （重启后回落到内置清单）。这里显式预热一次，把「首次初始化」钉在库就绪之后。
-///
-/// 顺带补一次默认规则种子：缓存恢复的清单与远程刷新落地的是同一批 id，
-/// 种子该在它们第一次可见时就位（与 [`refresh_implemented`] 开头那几行同一件事，
-/// 只是启动这一刻还没有任何刷新跑过）。
+/// 缓存装入后的目录预热与规则种子。插件缓存由装配时的 `set_defaults` 恢复，
+/// 这里在库就绪及插件装配完成后均调用，保证恢复的模型默认规则已经就位。
 pub fn restore_cached_catalogs() {
-    // 逐家触发一次 `list_models`（workbuddy 的目录也在这条路上：它的适配器
-    // 直接读 `core::models::global_catalog()`）——返回值丢弃，这里要的只是
-    // 「让各家的句柄初始化一次」这个副作用
     for kind in implemented_kinds() {
         let _ = adapter_for(kind).list_models();
     }
-    seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
-    // 留痕：哪些家的清单是从持久化缓存恢复的、各是什么时候拉的。没有这条
-    // 日志，「这次的清单是刚拉的还是上次的」在排障时只能靠翻数据库回答。
-    let restored = catalog_cache::cached_scopes();
-    if !restored.is_empty() {
-        let detail = restored
-            .iter()
-            .map(|(scope, at)| format!("{scope}（{}）", catalog_cache::age_text(*at)))
-            .collect::<Vec<_>>()
-            .join("、");
-        crate::server::logging::log(
-            "[Models]",
-            &format!(
-                "📦 已从缓存恢复 {} 份模型清单（{}）——各家的刷新会在拉到新清单后覆盖",
-                restored.len(),
-                detail
-            ),
-        );
-    }
+    // 启动这一刻手里是缓存恢复的清单（或内置兜底）：可见性种子要跟着就位，
+    // 否则「重启后不可见模型又变成可用了」。
+    seed_hidden_visibility_defaults();
 }
 
 /// **手动**刷新模型清单：只刷「支持刷新」的家，且强制绕过缓存。
@@ -1510,12 +2490,14 @@ pub async fn refresh_implemented_forced(
     accounts: &serde_json::Map<String, Value>,
     providers: Option<&[String]>,
 ) -> Vec<Value> {
-    seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
+    seed_hidden_visibility_defaults();
     let results = super::catalog_refresh::refresh(store, accounts, providers, true).await;
     seed_current_cline_defaults();
+    // 手动刷新落地的新清单里可能第一次出现「不可见」的条目，种子要跟上
+    seed_hidden_visibility_defaults();
     results
 }
 

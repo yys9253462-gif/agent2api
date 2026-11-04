@@ -4,8 +4,12 @@
 //! 上游把历史回放里的 `functionCall` 签名当**硬性要求**：不带直接 400（实测
 //! 文案「Function call is missing a thought_signature in functionCall parts」）；
 //! 带一个伪造的同样 400（「Corrupted thought signature」—— 签名本体被校验，
-//! 「发明默认签名 / 哨兵值」的路走不通，Manager 的
-//! `skip_thought_signature_validator` 字面量本仓拿不到，不猜）。
+//! 「发明默认签名」的路走不通）。
+//! ── 插件调用 ────────────────────────────────────────────────
+//! 响应翻译与出站回填在网关进程使用同一份缓存。读取按会话 + 调用 id
+//! 精确匹配，避免不同客户端重复使用 call_1 时串签名；没有缓存时保留插件
+//! 补入的官方哨兵。客户端回传的真实签名永远不被覆盖。
+//!
 //! 网关把签名放在 `tool_calls[].extra_content.google.thought_signature`
 //! （Google 自家 OpenAI 兼容端点的字段位置）随响应带出 —— 但那是非标字段，
 //! 多数 OpenAI 兼容客户端下一轮会把它丢掉，于是「模型调工具 → 客户端回传
@@ -21,7 +25,7 @@
 //!     签名仍最优先（那是最忠实的一份），缓存只是客户端没带时的回填。
 //!
 //! ── 两档键 ──────────────────────────────────────────────────
-//!   1. `call_id → signature`（主键）：上游给 functionCall 的 id，OpenAI 形态
+//!   1. `sessionId + call_id → signature`（主键）：上游给 functionCall 的 id，OpenAI 形态
 //!      的客户端必须原样引用（`tool_calls[].id` / `tool_call_id` 要配对），
 //!      回放历史里就在手上 —— 绝大多数客户端命中这一档；
 //!   2. `sessionId + 函数名 → signature`（兜底）：个别框架会重排 / 重生成 id，
@@ -69,12 +73,12 @@ const CALL_PREFIX: &str = "c|";
 /// 键前缀：会话 + 函数名档
 const SESSION_PREFIX: &str = "s|";
 
-/// 记一个「call id → 签名」（响应侧：tool_call 带签名下发时调用）。
-pub fn remember_call(call_id: &str, signature: &str) {
-    if call_id.is_empty() || signature.is_empty() {
+/// 记一个「会话 + call id → 签名」（响应侧：tool_call 带签名下发时调用）。
+pub fn remember_call(session: &str, call_id: &str, signature: &str) {
+    if session.is_empty() || call_id.is_empty() || signature.is_empty() {
         return;
     }
-    insert(format!("{CALL_PREFIX}{call_id}"), signature.to_string());
+    insert(format!("{CALL_PREFIX}{session}|{call_id}"), signature.to_string());
 }
 
 /// 记一个「会话 + 函数名 → 签名」（响应侧兜底档；会话键拿不到时不记，
@@ -86,12 +90,12 @@ pub fn remember_for_session(session: &str, name: &str, signature: &str) {
     insert(format!("{SESSION_PREFIX}{session}|{name}"), signature.to_string());
 }
 
-/// 按 call id 取回签名（请求侧回填的主键档）。
-pub fn lookup_call(call_id: &str) -> Option<String> {
-    if call_id.is_empty() {
+/// 按会话与 call id 取回签名（请求侧回填的主键档）。
+pub fn lookup_call(session: &str, call_id: &str) -> Option<String> {
+    if session.is_empty() || call_id.is_empty() {
         return None;
     }
-    lookup(&format!("{CALL_PREFIX}{call_id}"))
+    lookup(&format!("{CALL_PREFIX}{session}|{call_id}"))
 }
 
 /// 按「会话 + 函数名」取回签名（请求侧回填的兜底档）。

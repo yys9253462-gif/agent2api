@@ -56,7 +56,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE,
 };
 
-use crate::gateway::proxy_port;
+use crate::gateway::{local_client, proxy_port};
 use crate::port_conflict::{ConflictKind, Occupant, PortConflict, StartupFailure};
 use crate::settings;
 use crate::server;
@@ -75,7 +75,7 @@ const HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 /// 同时被 `commands::backend_status` 使用（前端启动阶段显示「服务已就绪」提示），
 /// 因此保持为公开函数、语义不变：能拿到 2xx 就算就绪。
 pub async fn is_ready(port: u16) -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build() else {
+    let Ok(client) = local_client(HEALTH_TIMEOUT) else {
         return false;
     };
     matches!(
@@ -114,15 +114,27 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     // 桌面形态默认只听本机回环：管理 API 不出 127.0.0.1；用户显式开启
     // 「局域网访问」后绑 0.0.0.0，此时免鉴权语义由下面的闸门接管
     // （headless 形态由 agent2api-server 二进制按 AGENT2API_HOST 自行决定）。
-    let mut state = server::ServerState::bootstrap(port, host).map_err(StartupFailure::other)?;
+    // 数据库迁移和历史回填会阻塞，不能占住处理 IPC 与启动等待的异步线程。
+    let mut state = tauri::async_runtime::spawn_blocking(move || {
+        server::ServerState::bootstrap(port, host)
+    })
+    .await
+    .map_err(|error| StartupFailure::other(format!("网关初始化任务失败: {error}")))?
+    .map_err(StartupFailure::other)?;
 
-    // 面板访问控制的库句柄注入（桌面不注册管理员 → 该体系不启用，行为不变；
-    // 与容器共用数据目录且注册过时，桌面管理 API 需要 Key —— 壳自动携带）
+    // 访问控制与桌面壳使用同一份进程内会话状态。
     server::access::attach_db(state.db().cloned());
 
     // 管理界面（Tauri 窗口）跑在本机：OAuth 回调可以占本机登记端口，
     // 判据与监听地址解耦 —— 开了局域网访问（0.0.0.0）后依然成立。
     state.local_panel = true;
+
+    // ── 桌面壳标志（Linux 上「挑哪个更新资产」的判据）──────────────
+    // Linux 的桌面壳与容器 / headless 是**同一份编译目标**，而后端的更新检查
+    // 必须知道「本进程有没有 GUI 壳」才能决定：桌面壳挑 deb / AppImage 安装包
+    // 交给壳去装，容器挑服务端包原地替换（见 `update::version::desktop_shell`）。
+    // 不置位时的行为与改造前一致（容器侧不变），所以这里只需壳自己声明。
+    server::core::update::set_desktop_shell(true);
 
     // ── 局域网访问的安全闸门（headless 的同款语义，见 bin/agent2api-server）──
     // 监听一出回环，「一把 Key 都没有 → 全放行」的免鉴权语义不再成立：
@@ -195,6 +207,7 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
         if is_ready(port).await {
             let scope = if lan.lan_access { "，局域网访问已开启" } else { "" };
             server::logging::log("[Server]", &format!("服务已就绪（127.0.0.1:{port}{scope}）"));
+            crate::panel_session::ensure_local_access().map_err(StartupFailure::other)?;
             // 起来了就清掉上一次的失败记录：那条记录描述的是「之前起不来」，
             // 留着会让界面在网关正常运行时仍显示「端口被占用」——
             // 用户刚结束完进程重启，看到这个只会以为没生效。
@@ -588,7 +601,7 @@ fn process_image_path(pid: u32) -> Option<String> {
 
 /// 端口上的服务是否是 WorkBuddy 网关（读 /health 的 product 特征字段）。
 async fn health_reports_workbuddy(port: u16) -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build() else {
+    let Ok(client) = local_client(HEALTH_TIMEOUT) else {
         return false;
     };
     let Ok(response) = client.get(format!("http://127.0.0.1:{port}/health")).send().await
@@ -683,6 +696,8 @@ fn cleanup_legacy_resources() {
 /// commands.rs / tray.rs 都无需改动。**幂等**：重复调用时发送端已被 take，
 /// 直接返回 —— 这一点与旧版 `child.take()` 的行为一致。
 pub fn shutdown(state: &AppState) {
+    crate::startup::stop();
+    crate::panel_session::clear();
     // 定时签到调度：在停服务之前先停它（对照 Node 版 closeAll 里的
     // `autoCheckin.stop(); closeDispatchers();`）。
     //
@@ -692,10 +707,6 @@ pub fn shutdown(state: &AppState) {
     // 会整段跳过，留下一个仍在轮询的循环。stop 自身也是幂等的（task 取走后
     // 再调直接返回），所以不破坏本函数「重复调用无副作用」的既有语义。
     server::core::auto_checkin::stop_global();
-    // 代理内核（mihomo sidecar）：停服务之前先杀它 —— 它是独立子进程，
-    // 父进程退出不会自动带走（Windows 上尤其如此），留着会占着监听端口，
-    // 下次启动还得清理（启动时也有兜底清理，但正常退出就该在这里杀干净）。
-    server::core::sub_kernel::shutdown();
 
     let Ok(mut guard) = state.backend.lock() else {
         return;

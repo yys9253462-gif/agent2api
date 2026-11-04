@@ -24,6 +24,7 @@ export {
   InputGroupTextarea,
 } from './input-group'
 export { Badge, BadgeDot, badgeVariants, type BadgeProps } from './badge'
+export { Avatar, AvatarImage, AvatarFallback } from './avatar'
 export { Spinner } from './spinner'
 export { Skeleton } from './skeleton'
 export { Label } from './label'
@@ -67,6 +68,8 @@ export {
   TableRow,
   TableCell,
   TableCaption,
+  type TableHeadProps,
+  type TableSortDirection,
 } from './table'
 export {
   RadioGroup,
@@ -106,5 +109,32 @@ export {
   PopoverDescription,
 } from './popover'
 export { Pager, type PagerProps } from './pager'
-export { NavItem, navItemVariants, type NavItemProps } from './nav-item'
+export { NavList, NavItem, navItemVariants, type NavItemProps } from './nav-item'
+export {
+  Sheet,
+  SheetTrigger,
+  SheetClose,
+  SheetPortal,
+  SheetOverlay,
+  SheetContent,
+  SheetTitle,
+  SheetDescription,
+  SheetHeader,
+  SheetBody,
+  SheetFooter,
+} from './sheet'
+export { ResponsiveSheet, useMediaQuery, type ResponsiveSheetProps } from './responsive-sheet'
+export { HtmlContent } from './html-content'
+export { Meter, type MeterProps } from './meter'
+export { MetricCard, MetricLabel, MetricValue, MetricGrid } from './metric'
+export { confirmDialog } from './confirm'
+export { StatusDot, type StatusDotProps } from './status-dot'
+export { Verification } from './verification'
 export { cn } from './lib/cn'
+export { Card, CardHeader, CardTitle, CardDescription, CardAction, CardContent, CardFooter, type CardProps } from './card'
+export { Item, ItemGroup, ItemContent, ItemTitle, ItemDescription, ItemMedia, ItemActions } from './item'
+export { Field, FieldGroup, FieldSet, FieldLegend, FieldLabel, FieldContent, FieldDescription, FieldError, type FieldProps } from './field'
+export { Alert, AlertTitle, AlertDescription, Empty, EmptyTitle, EmptyDescription } from './feedback'
+export { Collapsible, CollapsibleTrigger, CollapsibleContent } from './collapsible'
+export { Toast, ToastProvider, ToastTitle, ToastDescription, ToastClose, Toaster, toastManager, createToastManager } from './toast'
+export { AppFrame, Sidebar, SidebarHeader, SidebarContent, SidebarFooter, SidebarGroupLabel, PageHeader, PageTitle, PageDescription, BottomNavigation, BottomNavigationItem, WindowTitleBar, WindowControl } from './layout'

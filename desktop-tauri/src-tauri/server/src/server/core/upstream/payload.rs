@@ -12,10 +12,12 @@
 //!      把网关自有提示词写进出站 body；模式与提示词**可按提供商分别配置**
 //!      （`config::KEY_PROMPT_PROVIDERS`），未单独配置的家走全局那一份。
 //!      降级期（`core::degrade`）改用最小中性提示词。`passthrough` + 未降级时**一个字节都不动**（默认路径）。
-//!   ② **指纹脱敏层**（`core::sanitize`）：由全局开关
-//!      `sanitizeBlacklistFingerprints` 决定（快照见
-//!      [`ProviderContext::sanitize_fingerprints`]）：开关关着 → 原样；
-//!      开着 → 在副本上剥离/改写指纹。
+//!   ② **指纹脱敏层**（`core::sanitize`）：按请求开始时的配置快照决定是否
+//!      应用于当前提供商，再按词表顺序剥离 / 改写指纹。默认应用于全部提供商。
+//!   ③ **会话图片压缩层**（`core::upstream::image_compress`）：开关开启时把
+//!      内嵌 base64 大图缩到长边上限并重编码成 JPEG，带内容哈希缓存（多轮
+//!      重发同一张原图时复用）。**只在对话链路**生效 —— 生图 / 图片编辑在
+//!      本函数开头提前返回，走不到这一层。
 //!
 //! ①② 顺序不能反（与参考项目一致）：脱敏在后，于是网关提示词自己万一命中指纹
 //! 也会被清掉。⓪ 排在它们之前：先归一角色，让后面各层与各适配器看到统一形态
@@ -26,12 +28,6 @@
 //! 换账号重试复用同一份（不重复处理、不重复统计 —— 键是「家 × 账号池 ×
 //! 是否降级」，因为发送名跟着账号所在池走、而降级会在请求中途翻转）；
 //! 「这一家没有可用凭证」时根本走不到处理点，不产生一次已转发的处理。
-//!
-//! ── 与改造前的差异：不再有「按 provider 作用范围」────────────────
-//! 改造前脱敏是按 provider 逐家判定的（配置里勾了哪几家，只有那几家的请求
-//! 过脱敏）。规则集换成硬编码之后这一维**整体去掉**：开关是全局的，
-//! 要么所有出站请求都剥离指纹、要么都不剥离。理由见 `core::sanitize` 的
-//! 模块头（规则是「上游会误拦的固定模板串」，与哪一家上游无关）。
 //!
 //! ── model 字段的按家改写（备援名）────────────────────────────
 //! 候选链经备援扩池后，链上某家的目录里认的可能是**备援名**而不是请求名
@@ -77,29 +73,34 @@ pub(super) struct ProviderContext<'a> {
     /// 客户端请求体（**原始**：已 stream:true；未做任何内容处理；未注入 system
     /// —— 那是适配器的事）。各 provider 的实际发送体由 [`send_body`] 决定。
     pub body: &'a Value,
+    pub routing: super::route_context::RequestRouting,
     /// 客户端是否要流式（决定成功后的形态：SSE 透传 or 聚合）
     pub stream: bool,
+    pub images: Option<crate::server::core::providers::images::ImageOperation>,
     /// 客户端入站请求头（适配器契约的一部分；本期实现不读）
     pub client_headers: &'a HeaderMap,
     /// usage / 尝试次数旁路槽
     pub telemetry: &'a Arc<RequestTelemetry>,
-    /// 本次请求的指纹脱敏开关**快照**（请求开始时取一次，见 `upstream::forward`）。
-    ///
-    /// 为什么随请求取快照而不是每家转发前现读：同一次请求内这个开关必须一致，
-    /// 否则用户在请求进行中改了设置，会出现「前一家脱敏过、后一家没脱敏」
-    /// 这类语义漂移；快照也让判定与日志用的是同一份值。
-    pub sanitize_fingerprints: bool,
+    /// 开关、词表与提供商范围必须共用一次请求快照，避免重试中途改变请求内容。
+    pub sanitize: &'a crate::server::config::SanitizeSettings,
     /// 本次请求的**开发者角色兼容**开关快照（请求开始时取一次，与
-    /// `sanitize_fingerprints` 同一取舍：同一次请求内各家的判定必须一致）。
+    /// `sanitize` 同一取舍：同一次请求内各家的判定必须一致）。
     ///
     /// 开启时 [`send_body`] 在最前面把 `messages` 里 `role: "developer"` 的消息
     /// 归一为 `"system"`（OpenAI 新版 API 的角色；自定义 OpenAI 兼容上游是请求体
     /// 原样透传的，不归一就会把 developer 原样发出去）。默认开，见
     /// `config::KEY_DEVELOPER_ROLE_COMPAT`。
     pub developer_role_compat: bool,
+    /// 本次请求的**会话图片压缩**设置快照（请求开始时按请求取一次）。
+    ///
+    /// `Copy` 值直接内嵌（不像 `sanitize` / `prompt` 那样传引用）：字段少、
+    /// 无堆分配，取值比借用来得省事。开启时 [`send_body`] 在对话链路上把
+    /// 内嵌 base64 大图压小（见 `upstream::image_compress` 模块头）；生图 /
+    /// 图片编辑在本函数开头已提前返回，天然不经过它。
+    pub image_compress: crate::server::config::ImageCompressSettings,
     /// 本次请求的**系统提示词决定**（模式 + 文本，请求开始时从配置快照取一次）。
     ///
-    /// 与 `sanitize_fingerprints` 同一取舍：模式与文本在同一次请求内必须一致，
+    /// 与 `sanitize` 同一取舍：模式与文本在同一次请求内必须一致，
     /// 否则会出现「前一家换了提示词、后一家没换」。文本以借用形式随请求传递
     /// （提示词可能几百行，逐请求克隆纯属浪费），生命周期由
     /// `upstream::forward` 的配置快照持有。
@@ -107,6 +108,8 @@ pub(super) struct ProviderContext<'a> {
     /// 它**不是**只读的：撞内容拦截后本请求会切到中性提示词（降级），
     /// 那个开关不在本结构里 —— 它由转发层按请求持有并传给 [`send_body`]。
     pub prompt: crate::server::core::prompt::PromptPlan<'a>,
+    /// 助手自己的 system 不受网关提示词替换、追加或降级影响。
+    pub preserve_system_prompt: bool,
     /// 本次请求命中的网关 Key 的**可用提供商**白名单（R9；`None` = 不限制，
     /// 见 `core::key_scope` 模块头）。
     ///
@@ -150,6 +153,7 @@ pub(super) struct SendBody<'a> {
     pub body: Cow<'a, Value>,
     /// 该家实际收到的上游模型名 —— 也是它 `rateLimits` 冷却的键。
     pub wire_model: String,
+    pub wire_reasoning: Option<String>,
 }
 
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用）。
@@ -177,12 +181,29 @@ pub(super) struct SendBody<'a> {
 /// 的发送体只算一次），跨家则合并计数。
 /// 实时性上也有必要：命中发生在**某一家即将发送时**，那时请求还没收尾，
 /// telemetry 槽位还开着（记账点读快照在最后）。
-pub(super) fn send_body<'a>(
+///
+/// ── 为什么是 async（插件架构改动）─────────────────────────────
+/// 内部的思考档位注入要问适配器「这个等级翻译成什么字段」，而插件实现
+/// 在另一个进程里（`reasoning_patch_async`）。三处调用点（
+/// `provider_loop` 的两条发送路径）本来就在 async 函数里，改成 async 不
+/// 产生额外的状态机成本。
+pub(super) async fn send_body<'a>(
     ctx: &'a ProviderContext<'_>,
     provider_id: &str,
     account: Option<&Value>,
     degraded: bool,
 ) -> SendBody<'a> {
+    if ctx.images.is_some() {
+        let requested = ctx.body.get("model").and_then(Value::as_str).unwrap_or("");
+        let wire = crate::server::core::providers::catalog::wire_target_for_provider(
+            requested, provider_id, account,
+        );
+        let mut body = Cow::Borrowed(ctx.body);
+        rewrite_model(&mut body, requested, &wire.model, provider_id);
+        ctx.telemetry.note_upstream_model(&wire.model);
+        ctx.telemetry.note_upstream_reasoning(None);
+        return SendBody { body, wire_model: wire.model, wire_reasoning: None };
+    }
     // ── ⓪ 角色归一层（开发者角色兼容开关）───────────────────────────
     // 在所有改写**之前**：先把 developer 角色归一成 system，后面各层（提示词、
     // 脱敏、各适配器）看到的就是统一形态 —— 适配器自己的 developer→system 映射
@@ -214,7 +235,8 @@ pub(super) fn send_body<'a>(
     // 内容拦截后由转发层置位）：降级期用最小中性提示词（`custom` 模式除外，
     // 见 `PromptChoice::text_for`）。
     let prompt = ctx.prompt.for_provider(provider_id);
-    let after_prompt = match prompt.apply(role_base.as_ref(), degraded) {
+    let processed = if ctx.preserve_system_prompt { None } else { prompt.apply(role_base.as_ref(), degraded) };
+    let after_prompt = match processed {
         Some(next) => {
             logging::verbose(
                 "[Upstream]",
@@ -233,26 +255,59 @@ pub(super) fn send_body<'a>(
             );
             Cow::Owned(next)
         }
-        // passthrough 且未降级：一个字节都不动（默认路径，零拷贝沿用客户端原始体）
-        None => Cow::Borrowed(ctx.body),
+        None => role_base,
     };
     // ── ② 指纹脱敏层（核心规则见 `core::sanitize`）─────────────────────
-    let body = match ctx.sanitize_fingerprints {
-        true => match crate::server::core::sanitize::sanitize_body(after_prompt.as_ref()) {
+    let body = if ctx.sanitize.applies_to(provider_id) {
+        match crate::server::core::sanitize::sanitize_body(after_prompt.as_ref(), &ctx.sanitize.rules) {
             Some((scrubbed, hits)) => {
-                // 命中表可能为空：`sanitize_text` 末尾的去空白也能单独构成一次
-                // 改动（预检命中、但没有任何规则真正替换）。那时不该往请求日志
-                // 的「敏」标签里写一条空记录。
                 if !hits.is_empty() {
                     ctx.telemetry.note_sensitive_hits(&hits);
                 }
                 Cow::Owned(scrubbed)
             }
             None => after_prompt,
-        },
-        false => after_prompt,
+        }
+    } else {
+        after_prompt
     };
-    // ── ③ 原生（服务端执行）工具声明闸门 ──────────────────────────────
+    // ── ③ 会话图片压缩层（仅对话链路）─────────────────────────────────
+    // 把内嵌 base64 大图缩到长边上限并重编码（参数与开关见
+    // `config::ImageCompressSettings`），顺带以内容哈希缓存压缩结果 ——
+    // 多轮对话里客户端每轮重发同一张原图时直接命中，不再重复解码编码。
+    //
+    // 生图 / 图片编辑在函数开头（`ctx.images.is_some()`）就提前返回了，走不到
+    // 这里 —— 需求明确本功能只作用在对话场景。
+    //
+    // 纯 CPU 活（一张几 MB 的图可能几百毫秒），经 `blocking::in_place` 让出
+    // 当前 tokio worker（多线程运行时下 `block_in_place`；否则就地跑）。只在
+    // 真有候选图时才克隆请求体（`has_compressible` 早退，多数请求零拷贝）。
+    let body = if ctx.image_compress.enabled
+        && crate::server::core::upstream::image_compress::has_compressible(body.as_ref())
+    {
+        let settings = ctx.image_compress;
+        let mut owned = body.into_owned();
+        let stats = crate::server::core::blocking::in_place(|| {
+            crate::server::core::upstream::image_compress::compress_images_in_place(
+                &mut owned, &settings,
+            )
+        });
+        if stats.changed() {
+            logging::verbose(
+                "[Upstream]",
+                &format!(
+                    "会话图片压缩：{} 张 provider={provider_id} {}KB -> {}KB",
+                    stats.compressed,
+                    stats.bytes_before / 1024,
+                    stats.bytes_after / 1024,
+                ),
+            );
+        }
+        Cow::Owned(owned)
+    } else {
+        body
+    };
+    // ── ④ 原生（服务端执行）工具声明闸门 ──────────────────────────────
     // 内置家是各家官方客户端的后端：官方客户端只声明 `type:"function"` 的函数
     // 工具（联网搜索走客户端自己的链路），上游对原生工具类型的处理从「整轮 400」
     // （CatPaw）到「静默剔除」（Qoder / Trae）都有 —— 所以统一在这里降级：
@@ -289,7 +344,8 @@ pub(super) fn send_body<'a>(
         .to_string();
     if requested.is_empty() {
         // 没有 model 字段：不改写，也没有可用的冷却键（空串，与改造前一致）
-        return SendBody { body, wire_model: requested };
+        ctx.telemetry.note_upstream_reasoning(None);
+        return SendBody { body, wire_model: requested, wire_reasoning: None };
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
@@ -306,7 +362,8 @@ pub(super) fn send_body<'a>(
         &requested,
         &wire.model,
         wire.reasoning.as_deref(),
-    );
+    )
+    .await;
     // 采集「实际随上游请求发出的思考等级」（请求日志模型列的 `(等级)`）。
     // 注入值优先（映射绑定生效时的最终档位，CatPaw 已在 patch 内归并）；
     // 没注入时问承载家的 `outbound_reasoning` —— 客户端显式指定的档位走这条
@@ -314,17 +371,28 @@ pub(super) fn send_body<'a>(
     // 记 None（空串），显示层不给「没发的等级」预支一个值。
     // 注入路径已经问过一次适配器，这里再查一次注册表是两次哈希查找，可忽略。
     let upstream_reasoning = injected.or_else(|| outbound_reasoning_of(provider_id, &body));
-    ctx.telemetry.note_upstream_reasoning(upstream_reasoning);
-    SendBody { body, wire_model: wire.model }
+    ctx.telemetry.note_upstream_reasoning(upstream_reasoning.clone());
+    SendBody { body, wire_model: wire.model, wire_reasoning: upstream_reasoning }
 }
 
 /// 承载家的 [`ProviderAdapter::outbound_reasoning`]（读发送体里随行的等级）。
 ///
 /// 未知 provider id 返回 None：与 [`apply_reasoning`] 里同一条防御 ——
 /// 选路早已校验过注册表，走到这里还查不到说明调用链坏了，什么都不做比 panic 安全。
-fn outbound_reasoning_of(provider_id: &str, body: &Value) -> Option<String> {
-    let kind = crate::server::core::providers::kind_from_id(provider_id)?;
-    crate::server::core::providers::adapter::adapter_for(kind).outbound_reasoning(body)
+///
+/// ── 插件家为什么返回 None ────────────────────────────────────
+/// 这个方法在同步上下文里（发送体构建的收尾），插件实现要走 RPC，没法在这里
+/// await。它的唯一用途是**遥测**「这次实际发出去的思考等级」，缺了不影响
+/// 字节 —— 插件家记 `None`（显示层按「没记录」处理），等 P6 把
+/// `ChatPlan` 扩成带 reasoning 字段时再补。
+pub(super) fn outbound_reasoning_of(provider_id: &str, body: &Value) -> Option<String> {
+    // 内置家走静态注册表（零分配）；插件家在同步上下文里无法 await，
+    // 走 `adapter_by_id` 也只是拿到本地缓存（`outbound_reasoning` 是纯读）。
+    match crate::server::core::providers::kind_from_id(provider_id) {
+        Some(kind) => crate::server::core::providers::adapter::adapter_for(kind).outbound_reasoning(body),
+        None => crate::server::core::providers::adapter::adapter_by_id(provider_id)?
+            .outbound_reasoning(body),
+    }
 }
 
 /// 请求体里的消息条数（提示词层的详细日志用；没有 messages 数组时给 0）。
@@ -451,7 +519,7 @@ fn rewrite_model(body: &mut Cow<'_, Value>, requested: &str, wire: &str, provide
 /// 来源 —— 映射绑定生效时它就是发出去的档位（CatPaw 的归并已在 patch 内完成）。
 /// 其余分支（没绑 / 关闭思考 / Skip / 请求体不是对象）一律返回 None，
 /// 由调用方改问承载家的 `outbound_reasoning`。
-fn apply_reasoning(
+async fn apply_reasoning(
     body: &mut Cow<'_, Value>,
     provider_id: &str,
     requested: &str,
@@ -474,11 +542,15 @@ fn apply_reasoning(
     // 未知 provider id 直接返回：选路早已按注册表校验过（`provider_loop` 对未知
     // id 直接 503），走到这里说明调用链坏了 —— 什么都不做比 panic 安全
     // （release 是 panic=abort）。
-    let Some(kind) = crate::server::core::providers::kind_from_id(provider_id) else {
+    //
+    // 插件家在这里**保留**：`reasoning_patch_async` 正是为它们加的异步
+    // 伴生方法（内置家转调同步实现，零成本），所以统一走 `adapter_by_id`
+    // —— 它先查内置枚举、再查插件表，两者都能拿到。
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider_id) else {
         return None;
     };
-    let adapter = crate::server::core::providers::adapter::adapter_for(kind);
-    match adapter.reasoning_patch(level, wire_model, body.as_ref()) {
+    // 走异步伴生方法：内置家直接转调同步实现（零成本），插件家走 RPC。
+    match adapter.reasoning_patch_async(level, wire_model, body.as_ref()).await {
         crate::server::core::providers::adapter::ReasoningPatch::Set { field, value } => {
             // 先取可变对象再打日志：请求体不是 JSON 对象时写不进去（正常路径不会
             // 发生 —— chat 入口已校验过是对象），此时**不能**打「已注入」——

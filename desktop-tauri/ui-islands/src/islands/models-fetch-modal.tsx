@@ -1,9 +1,7 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import {
-  Badge,
   Button,
-  Checkbox,
   Dialog,
   DialogBody,
   DialogContent,
@@ -18,15 +16,10 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-  type BadgeProps,
 } from '@ui'
 import { t } from '../i18n'
+import { ModelsFetchError } from './models-fetch-error'
+import { ModelsFetchTable, type RefreshItem, type Row } from './models-fetch-table'
 
 /**
  * Agent2API · 「获取模型」弹窗（模型管理页那颗按钮的本体）。
@@ -83,21 +76,7 @@ type Account = {
 type ProviderMeta = { id?: string; label?: string }
 type CustomProvider = { id?: string; models?: Array<{ id?: unknown }> }
 
-/** 逐家刷新结果的一条（`/api/models/refresh` 的 results，契约见 adapter.rs）：`status` 三档
- *  refreshed / skipped / failed，`count` 只在 refreshed 时有，`refreshedAt` 是这家清单**当前**
- *  的拉取时刻（失败 / 跳过时是上次成功那次，0 = 从未成功）。响应 = 逐家结果 + 顶层汇总。 */
-type RefreshItem = {
-  provider?: string; providerLabel?: string; status?: string; count?: unknown
-  refreshedAt?: unknown; fixed?: boolean; message?: string; accountId?: string
-}
 type RefreshResponse = { results?: RefreshItem[]; refreshed?: unknown }
-
-/**
- * 内置家表体的**一行**：待获取的家与已有结果的家合成同一条行模型（见 buildRows）。`item` 缺席
- * 就是「这家还没拉过」——状态列显示「待获取」、计数与说明留空，而「更新日期」照样显示这家清单当前
- * 的时刻。逐行「获取」回来时只替掉对应那一行的 `item`，其余行不受影响。
- */
-type Row = { provider: string; label: string; item?: RefreshItem }
 
 /** open() 的入参（与旧实现逐字一致） */
 type OpenOptions = {
@@ -154,7 +133,6 @@ type SharedWindow = {
     providerFeatures?: (provider?: string) => { emailAsName?: boolean } | undefined
     byPriorityOrder?: (a: Account, b: Account) => number // 账号页同一条优先级排序
   }
-  wbTableColumns?: { repaint?: (id: string) => void } // 按登记 id 重画某张表
 }
 
 function shared(): SharedWindow {
@@ -162,54 +140,6 @@ function shared(): SharedWindow {
 }
 
 /* ─── 常量 ───────────────────────────────────── */
-
-/**
- * 表格骨架（两种形态各一张表、各存一份列宽，见 table-columns.js 的登记）：`TABLE_ID` 是 DOM
- * 元素 id —— 列宽层按它找表，**必须保留**；`TABLE_COL_ID` 是列宽登记 id（与元素 id 是两个命名
- * 空间，登记按「表」记账，同一登记的元素会在弹窗重建中换好几茬）。`COLS_*` 是列 key 的**顺序
- * 表**，`<colgroup>` 与表头都按它建。
- */
-const TABLE_ID = { intl: 'fm-table-intl', custom: 'fm-table-custom' }
-const TABLE_COL_ID = { intl: 'fetch-models', custom: 'fetch-models-custom' }
-const COLS_INTL: readonly string[] = ['provider', 'source', 'state', 'count', 'note', 'updated', 'op']
-const COLS_CUSTOM: readonly string[] = ['pick', 'model', 'state']
-
-/**
- * 列宽百分数（逐字照抄旧 CSS 的 `#fm-table-intl .f-*` / `#fm-table-custom .f-*`）：没拖过的列走
- * 这里的百分数，拖过的列由 table-columns.js 写 `<col>` 的 inline width 覆盖（th 上不能写宽度，
- * 它会盖过 col，拖动就失效）。
- *
- * 七列怎么分（每格还要减去 td 的左右内边距）：更新日期 16% 要装下 formatTime 的完整输出（只给
- * 「日期」会在同一天的两次刷新之间分不出先后，而这弹窗的用处之一正是看清单有多旧）；模型来源 21%
- * 由邮箱长度定（emailAsName 的家以邮箱为主名）；提供商 13% 装注册名（「AutoClaw 国际版」这类最长
- * 的名字会折行，可接受）；说明 20% 比最长那句「远程目录已更新…」窄一点、会折成两行 —— 折行比截断
- * 好，且只有「已刷新」的行吃这句长文案；操作 15% 装那一颗逐行按钮 —— 它是本表最宽的一档约束：
- * 译文里最长的 `重新获取`（pt-BR「Buscar novamente」≈ 120px）+ 内边距刚好放得下，再窄会被截断。
- */
-const WIDTH_INTL: Record<string, string> = {
-  provider: 'w-[13%]', source: 'w-[21%]', state: 'w-[9%]',
-  count: 'w-[6%]', note: 'w-[20%]', updated: 'w-[16%]', op: 'w-[15%]',
-}
-/** 自定义家的窄形态（三列）：勾选 40px ≈ 8%、状态 92px ≈ 18%、上游模型吃剩余 */
-const WIDTH_CUSTOM: Record<string, string> = { pick: 'w-[8%]', model: 'w-[74%]', state: 'w-[18%]' }
-
-/** 表头文案（按列 key 取；空串 = 勾选列没有标题，与旧实现一致） */
-const HEAD_LABEL: Record<string, string> = {
-  pick: '', provider: t('提供商'), source: t('模型来源'), state: t('状态'), count: t('模型数'),
-  note: t('说明'), updated: t('更新日期'), model: t('上游模型'), op: t('操作'),
-}
-
-/**
- * 逐家结果的三种状态（旧实现的 KIND 映射逐字搬过来，kind 从 CSS 类名换成组件库 Badge 的
- * variant）：refreshed → `badge brand`，failed → `badge bad`，skipped → 基础 `badge`（组件库的
- * outline 档）。认不出的 status 走兜底：基础徽章 + 原样回显 status（后端加了新档位时不会显示成
- * 「未知」而无从排查）。
- */
-const KIND: Record<string, { variant: NonNullable<BadgeProps['variant']>; label: string }> = {
-  refreshed: { variant: 'brand', label: t('已刷新') },
-  failed: { variant: 'destructive', label: t('失败') },
-  skipped: { variant: 'outline', label: t('跳过') },
-}
 
 /**
  * 目录刷新**不走账号维度**的家（与后端 `ProviderAdapter::refresh_uses_account` 的 false 集合同
@@ -307,17 +237,6 @@ function pendingProviders(): ProviderMeta[] {
   return (shared().wbProviders?.all?.() || []).filter(item => scoped.has(item?.id ?? ''))
 }
 
-/** 「更新日期」格：这家清单**当前**的拉取时刻。后端逐行给 `refreshedAt`（失败 / 跳过的行是上次
- *  成功那次的时刻，0 = 从未成功过 → 占位）—— 用「本次请求的时刻」会在失败行上撒谎。 */
-function refreshedText(item: RefreshItem): string {
-  return formatTime(Number(item.refreshedAt) || 0) || '—'
-}
-
-/** 逐家结果的徽章与文案（见 KIND 的说明） */
-function kindOf(item: RefreshItem): { variant: NonNullable<BadgeProps['variant']>; label: string } {
-  return KIND[String(item.status)] ?? { variant: 'outline', label: String(item.status || t('未知')) }
-}
-
 /**
  * 读「模型来源」的落盘记忆：`{providerId: accountId}` 的扁平对象。
  *
@@ -361,9 +280,7 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
   const { onDone, onRefreshed } = options
 
   const [status, setStatus] = React.useState<Status>('idle')
-  /** 拉取失败的原因：整屏换成「获取失败：…」，同时留一份脚注 */
   const [errorText, setErrorText] = React.useState('')
-  /** 脚注（toast 会消失，脚注留一份） */
   const [hint, setHint] = React.useState('')
   /**
    * 在途状态（全刷 / 逐行 / 导入，三者互斥）：置真期间不许关窗，关掉会让「到底成没成」变成未知；
@@ -373,6 +290,7 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
   /** 逐行取数时**哪一家**在途（`busyKind === 'row'` 时有值）：那一行的按钮转「获取中…」 */
   const [busyRow, setBusyRow] = React.useState('')
   const busy = busyKind !== null
+  const failed = status === 'error'
   /**
    * 本次会话是否**已经拉过**一次（打开时是 false）。弹窗打开**不自动拉取**，所以「拉过没有」
    * 是一份真实状态：按钮文案（获取模型 / 重新获取）与自定义家的汇总行都读它。
@@ -391,22 +309,10 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
   /** 「模型来源」的落盘记忆（打开时读一次；选中即写回并更新本状态） */
   const [savedSource, setSavedSource] = React.useState<Record<string, string>>(loadSavedSource)
 
-  /**
-   * 表头与 colgroup 就位后请列宽层重画一次：恢复拖过的列宽、补拖动把手、绑拖动事件（表和表头都
-   * 随弹窗重建，把手会随表头一起消失 —— 每轮重建后都要补，见 table-columns.js 的 repaint 说明）。
-   * 旧实现是在 renderHead() 末尾同步调的，这里等 DOM 提交之后再调，时机等价。
-   */
-  React.useEffect(() => {
-    shared().wbTableColumns?.repaint?.(custom ? TABLE_COL_ID.custom : TABLE_COL_ID.intl)
-  }, [custom])
-
   /** 内置家：本次范围里的家（与 scopeProviders 同源，也就是真正会进请求的名单） */
   const pending = custom ? [] : pendingProviders()
   /** 内置家的表体行（待获取的家 + 已有结果的家，见 buildRows）；自定义家没有这条模型 */
   const rows = custom ? [] : buildRows()
-  /** 自定义家：按搜索词过滤后的上游模型 id（大小写不敏感，与旧实现同口径） */
-  const needle = keyword.trim().toLowerCase()
-  const shown = upstream.filter(id => !needle || id.toLowerCase().includes(needle))
 
   /**
    * 汇总行（表格左端，旧实现 paintSummary 的文案与状态语义）：自定义家是「已选 N / 上游共
@@ -512,10 +418,6 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
 
   /* ─── 取数与导入 ─────────────────────────── */
 
-  /**
-   * **全刷**（底部那颗）：自定义家拉该家上游，内置家按本次范围刷新各家目录，结果**整表替换**。
-   * 失败一律把整屏换成「获取失败：…」并留一份脚注（toast 会消失，脚注不会）。
-   */
   async function load() {
     if (busy) return
     setBusyKind('load')
@@ -546,10 +448,16 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
         return
       }
       // 「模型来源」下拉的选择与刷新范围随请求带上（范围见 scopeProviders）
-      const result = await shared().workbuddyDesktop?.refreshModels({
-        accounts: buildSourceMap(sourceRows), providers: scopeProviders(),
-      })
-      setResults(Array.isArray(result?.results) ? result.results : [])
+      const refresh = shared().workbuddyDesktop?.refreshModels
+      if (!refresh) throw new Error(t('模型目录刷新不可用，请重新打开面板'))
+      const providers = pending.map(item => item.id).filter((id): id is string => Boolean(id))
+      const result = await refresh({ accounts: buildSourceMap(sourceRows), providers })
+      if (!Array.isArray(result?.results) || result.results.some(item => !item || typeof item.provider !== 'string'
+        || !['refreshed', 'failed', 'skipped'].includes(item.status || ''))
+        || providers.some(provider => result.results!.filter(item => item.provider === provider).length !== 1)) {
+        throw new Error(t('网关未返回逐家模型目录刷新结果'))
+      }
+      setResults(result.results)
       setFetched(true)
       setStatus('ready')
       // 真刷到新目录时通知调用方 —— 刷新落地只改了后端那份目录，模型管理页自持的 manage 视图
@@ -557,10 +465,8 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
       // 失败 / 跳过时不通知：清单一个字没变，重拉只会白跑一趟。回调不依赖本弹窗还在。
       if (Number(result?.refreshed) > 0) onRefreshed?.()
     } catch (error) {
-      const message = errorMessage(error)
-      setErrorText(message)
+      setErrorText(errorMessage(error))
       setStatus('error')
-      setHint(message)
     } finally {
       setBusyKind(null)
     }
@@ -575,7 +481,7 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
    * 留着，界面上只有这一行发生变化。
    *
    * 失败**不**整屏换成「获取失败」：表里其他行的结果是有效的，一行失败不该把它们一起抹掉 ——
-   * 只留脚注 + toast 说清原因，这一行维持原样（待获取的行仍是「待获取」，已有结果的行保住上次读数）。
+   * 只留脚注 + toast 说清原因，并把当前行标为失败；其他行保留本轮已有结果。
    * 与全刷同一口径：`refreshed > 0` 才通知调用方（失败 / 跳过的清单一个字都没变）。
    */
   async function loadRow(row: Row) {
@@ -584,17 +490,28 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
     setBusyRow(row.provider)
     setHint('')
     try {
-      const result = await shared().workbuddyDesktop?.refreshModels({
-        // 这一行的下拉当前值（+ 落盘记忆）；后端只认它白名单里的那一家
+      const refresh = shared().workbuddyDesktop?.refreshModels
+      if (!refresh) throw new Error(t('模型目录刷新不可用，请重新打开面板'))
+      const result = await refresh({
         accounts: buildSourceMap([{ provider: row.provider, reported: row.item?.accountId }]),
         providers: [row.provider],
       })
-      setResults(prev => mergeResults(prev, Array.isArray(result?.results) ? result.results : []))
+      const items = Array.isArray(result?.results) ? result.results.filter(item => item?.provider === row.provider) : []
+      if (items.length !== 1 || !['refreshed', 'failed', 'skipped'].includes(items[0].status || '')) {
+        throw new Error(t('网关未返回逐家模型目录刷新结果'))
+      }
+      const item = items[0]
+      setResults(prev => mergeResults(prev, [item]))
       setFetched(true)
       setStatus('ready')
       if (Number(result?.refreshed) > 0) onRefreshed?.()
     } catch (error) {
       const message = errorMessage(error)
+      setResults(prev => mergeResults(prev, [{
+        provider: row.provider, providerLabel: row.label, status: 'failed', message,
+      }]))
+      setFetched(true)
+      setStatus('ready')
       setHint(message)
       toast(t('获取失败：{message}', { message }), 'err')
     } finally {
@@ -652,27 +569,6 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
     setPicked(next)
   }
 
-  /** 整屏一行提示（空态 / 加载 / 失败）：`<td colspan>` 占满整行，colspan 按当前形态的列数算 ——
-   *  与旧实现 emptyRow 同一个算法。 */
-  function stateRow(text: string) {
-    return (
-      <TableRow>
-        <TableCell colSpan={custom ? COLS_CUSTOM.length : COLS_INTL.length}
-          className='py-[26px] text-center text-muted-foreground'>{text}</TableCell>
-      </TableRow>
-    )
-  }
-
-  /** 表格里的数值 / 时间格（旧 CSS 的 .rate）：等宽小字、数字等宽对齐 */
-  function rateCell(text: string) {
-    return <span className='font-mono text-[11.5px] tabular-nums text-muted-foreground'>{text}</span>
-  }
-
-  /** 模型 / 提供商名的格子（旧 CSS 的 .mid .t）：等宽小字、超长省略 */
-  function nameCell(text: string) {
-    return <div className='truncate font-mono text-[12px] font-semibold'>{text}</div>
-  }
-
   /** 「模型来源」格：该家账号的下拉（用哪个账号去打这家的目录接口）。无可选账号与不走账号维度的
    *  家都显示空占位，占位的 title 说明原因（「这家清单是全局的」/「这家还没有可用账号」）。 */
   function sourceCell(pid: string, reported?: unknown) {
@@ -700,107 +596,13 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
     )
   }
 
-  /** 自定义家的表体：一行一个上游模型 + 勾选框 + 是否已在清单里。已在清单里的行整体压淡、复选框
-   *  禁用（不重复导入），徽章文案说明后果。 */
-  function customBody() {
-    if (status === 'idle') return stateRow(t('点右侧「获取模型」从上游拉取这家的模型清单'))
-    if (status === 'loading') return stateRow(t('正在获取…'))
-    if (status === 'error') return stateRow(t('获取失败：{message}', { message: errorText }))
-    // 「没匹配上」与「上游压根没返回」是两件事，文案分开
-    if (!shown.length) return stateRow(upstream.length
-      ? t('没有匹配「{keyword}」的模型', { keyword: needle })
-      : t('上游没有返回任何模型'))
-    return shown.map(id => {
-      const has = managed.has(norm(id))
-      return (
-        <TableRow key={id} className={has ? 'opacity-50' : undefined}>
-          <TableCell>
-            <Checkbox checked={picked.has(id)} disabled={has} aria-label={id}
-              onCheckedChange={next => setPicked(prev => {
-                const out = new Set(prev); if (next) out.add(id); else out.delete(id); return out
-              })} />
-          </TableCell>
-          <TableCell>{nameCell(id)}</TableCell>
-          <TableCell>
-            {has ? (
-              <Badge variant='brand' title={t('这个模型已经在这家的清单里，不重复导入')}>{t('已添加')}</Badge>
-            ) : (
-              <Badge variant='outline' title={t('勾上它，导入后即进入这家的清单')}>{t('未添加')}</Badge>
-            )}
-          </TableCell>
-        </TableRow>
-      )
-    })
-  }
-
-  /**
-   * 行内的「只看这一家」按钮：在途的那一行转「获取中…」，已经有结果的行说「重新获取」、还没有的
-   * 说「获取」（两处措辞沿用底部那颗全刷的同一口径）。在途期间所有行按钮一起禁用 —— 连点没有意义，
-   * 后端也有最短请求间隔，不如把「现在有一次刷新在跑」直接摆在界面上。
-   */
-  function rowFetchButton(row: Row) {
-    const fetching = busyKind === 'row' && busyRow === row.provider
-    return (
-      <Button variant='outline' size='sm' className='w-full' disabled={busy}
-        title={t('只刷新这一家的模型清单')}
-        onClick={() => { void loadRow(row) }}>
-        {fetching ? t('获取中…') : row.item ? t('重新获取') : t('获取')}
-      </Button>
-    )
-  }
-
-  /**
-   * 内置家的表体：**一屏一条行模型**（见 buildRows）—— 待获取的家与已有结果的家都在这里，一行的
-   * 内容按 `row.item` 是否有值分流（没有 = 待获取，有 = 那一条结果）。
-   *
-   * 为什么第一屏不是一张空表：①「模型来源」下拉与逐行「获取」按钮是随行渲染的，行还没有时它们就
-   * 不存在 —— 用户没法先选「用哪个账号去拉」，也没法只拉一家；②用户一眼能看到这次会刷哪些家（与
-   * scopeProviders 同源，也就是真正会进请求的那份名单）。「更新日期」列在待获取的行上也照样有值：
-   * 它显示的是这家清单**当前**的时刻（从 manage 视图读，见 providerRefreshedAt）—— 那正是用户
-   * 决定「要不要刷」的依据，等刷完才有值就太晚了。
-   *
-   * 「正在获取…」「获取失败…」两屏仍留给**全刷**（那是一次整表请求，逐行读数在那一刻全都不可信）；
-   * 逐行的失败只在脚注 + toast 里说，表照旧（见 loadRow）。
-   */
-  function intlBody() {
-    if (status === 'loading') return stateRow(t('正在获取…'))
-    if (status === 'error') return stateRow(t('获取失败：{message}', { message: errorText }))
-    if (!rows.length) return stateRow(t('还没有可刷新的提供商：先在账号页添加一个账号'))
-    return rows.map(row => {
-      const item = row.item
-      if (!item) {
-        const at = formatTime(Number(shared().wbModelsPanel?.providerRefreshedAt?.(row.provider)) || 0)
-        return (
-          <TableRow key={row.provider}>
-            <TableCell>{nameCell(row.label)}</TableCell>
-            <TableCell>{sourceCell(row.provider)}</TableCell>
-            <TableCell><Badge variant='outline'>{t('待获取')}</Badge></TableCell>
-            <TableCell>{rateCell('—')}</TableCell>
-            <TableCell>{rateCell('—')}</TableCell>
-            <TableCell>{rateCell(at || '—')}</TableCell>
-            <TableCell>{rowFetchButton(row)}</TableCell>
-          </TableRow>
-        )
-      }
-      const kind = kindOf(item)
-      const count = Number(item.count)
-      // 已刷新的行固定说清「来源」列会怎么变；其余行优先用后端给的原因（skipped / failed 的
-      // message），没给才按 fixed 标记分辨「能力边界」与「本次没取到新内容」—— 按 message 文案
-      // 匹配会在措辞调整后静默失效
-      const note = item.status === 'refreshed'
-        ? t('远程目录已更新，「来源」列会显示为「远程」')
-        : item.message || (item.fixed ? t('这家用固定模型清单，无可刷新') : t('本次没有取到新内容'))
-      return (
-        <TableRow key={row.provider}>
-          <TableCell>{nameCell(row.label)}</TableCell>
-          <TableCell>{sourceCell(row.provider, item.accountId)}</TableCell>
-          <TableCell><Badge variant={kind.variant}>{kind.label}</Badge></TableCell>
-          <TableCell>{rateCell(count ? t('{n} 个', { n: count }) : '—')}</TableCell>
-          <TableCell><span className='text-[11.5px] leading-[1.5] text-muted-foreground'>{note}</span></TableCell>
-          <TableCell>{rateCell(refreshedText(item))}</TableCell>
-          <TableCell>{rowFetchButton(row)}</TableCell>
-        </TableRow>
-      )
+  /** 勾 / 取消勾一个模型：复选框与整行点击共用这一条出口，两处口径不会走偏 */
+  function togglePicked(id: string, next: boolean) {
+    setPicked(prev => {
+      const out = new Set(prev)
+      if (next) out.add(id)
+      else out.delete(id)
+      return out
     })
   }
 
@@ -822,66 +624,57 @@ function ModelsFetchModal({ options, onClose }: { options: OpenOptions; onClose:
       }}
     >
       {/* 宽度：内置家是宽表（旧 .modal-wide ≈ 920px），自定义家只有三列（旧
-          .modal-narrow ≈ 552px，与宽表区分开）；两侧各留 24px 与遮罩内边距对齐 */}
-      <DialogContent className={custom ? 'w-[min(552px,calc(100vw-48px))]' : 'w-[min(920px,calc(100vw-48px))]'}>
+          .modal-narrow ≈ 552px，与宽表区分开）；两侧各留 24px 与遮罩内边距对齐。
+          两档都在旧值上加宽 10%（920 → 1012 / 552 → 607）：七列那张表挤在 920px 里时
+          「说明」那格几乎每行都折行，宽一点能少折几行。 */}
+      <DialogContent className={failed ? 'w-[min(640px,calc(100vw-48px))]'
+        : custom ? 'w-[min(607px,calc(100vw-48px))]' : 'w-[min(1012px,calc(100vw-48px))]'}>
         <DialogHeader>
           <DialogTitle>{t('获取模型 — {name}', { name })}</DialogTitle>
         </DialogHeader>
         <DialogBody>
-          {/* 工具行：**汇总在左、动作在右**（获取模型是最右那颗）—— 用户扫一眼左边就知道
-              这次的结果，右边的按钮才是下一个动作（旧 .fm-tools 的分工） */}
-          <div className='flex flex-wrap items-center gap-2.5'>
-            <span className='text-[11.5px] text-muted-foreground'>{summary}</span>
-            {custom && (
-              // 搜索框：图标走 InputGroupAddon，宽度沿用旧 .fm-search 的 240px
-              <InputGroup className='w-[240px] flex-none'>
-                <InputGroupInput type='search' placeholder={t('搜索模型 ID…')} autoComplete='off'
-                  value={keyword} onChange={event => setKeyword(event.currentTarget.value)} />
-                <InputGroupAddon aria-hidden='true'>⌕</InputGroupAddon>
-              </InputGroup>
-            )}
-            <div className='mr-auto' />
-            {custom && (
-              <>
-                <Button variant='ghost' size='sm' onClick={selectAllUnadded}>{t('全选未添加')}</Button>
-                <Button variant='ghost' size='sm' onClick={() => setPicked(new Set())}>{t('清空')}</Button>
-              </>
-            )}
-            {/* 文案按「这次有没有真的拿到一份结果」定：拉失败时仍是「获取模型」（用户要的是再试
-                一次），成功之后才是「重新获取」。这是**全刷**那一颗（逐家都打一次上游）—— title 里
-                写明范围，免得与每行那颗只看一家的按钮混起来 */}
-            <Button variant='outline' size='sm' title={t('刷新全部家（逐家打上游）')} disabled={busy}
-              onClick={() => { void load() }}>
-              {busyKind === 'load' ? t('获取中…') : fetched ? t('重新获取') : t('获取模型')}
-            </Button>
-          </div>
-          <Table id={custom ? TABLE_ID.custom : TABLE_ID.intl}
-            // table-fixed：colgroup 的百分数（含列宽层写回的 px）要靠它生效
-            className='table-fixed'
-            // 滚动盒的高度上限（旧 .fm-wrap 的 max-height）
-            containerClassName='max-h-[min(48vh,460px)]'>
-            {/* col / th 上的 data-col 是列宽层（table-columns.js）定位列的依据 */}
-            <colgroup>
-              {(custom ? COLS_CUSTOM : COLS_INTL).map(key => (
-                <col key={key} data-col={key} className={custom ? WIDTH_CUSTOM[key] : WIDTH_INTL[key]} />
-              ))}
-            </colgroup>
-            <TableHeader>
-              <TableRow>
-                {(custom ? COLS_CUSTOM : COLS_INTL).map(key => (
-                  <TableHead key={key} data-col={key}>{HEAD_LABEL[key]}</TableHead>
-                ))}
-              </TableRow>
-            </TableHeader>
-            {/* 末行不画底线（旧 .models-table tbody tr:last-child td 的规则） */}
-            <TableBody className='[&_tr:last-child>td]:border-b-0'>{custom ? customBody() : intlBody()}</TableBody>
-          </Table>
+          {failed ? <ModelsFetchError message={errorText} /> : (
+            <>
+              <div className='flex flex-wrap items-center gap-2.5'>
+                <span className='text-[11.5px] text-muted-foreground'>{summary}</span>
+                {custom && (
+                  <InputGroup className='w-[240px] flex-none'>
+                    <InputGroupInput type='search' placeholder={t('搜索模型 ID…')} autoComplete='off'
+                      value={keyword} onChange={event => setKeyword(event.currentTarget.value)} />
+                    <InputGroupAddon aria-hidden='true'>⌕</InputGroupAddon>
+                  </InputGroup>
+                )}
+                <div className='mr-auto' />
+                {custom && (
+                  <>
+                    <Button variant='ghost' size='sm' onClick={selectAllUnadded}>{t('全选未添加')}</Button>
+                    <Button variant='ghost' size='sm' onClick={() => setPicked(new Set())}>{t('清空')}</Button>
+                  </>
+                )}
+                <Button variant='outline' size='sm' title={t('刷新全部家（逐家打上游）')} disabled={busy}
+                  onClick={() => { void load() }}>
+                  {busyKind === 'load' ? t('获取中…') : fetched ? t('重新获取') : t('获取模型')}
+                </Button>
+              </div>
+              <ModelsFetchTable custom={custom} status={status} rows={rows}
+                upstream={upstream} managed={managed} picked={picked} keyword={keyword}
+                busy={busy} busyRow={busyRow} onPick={togglePicked}
+                onFetchRow={row => { void loadRow(row) }} sourceCell={sourceCell} formatTime={formatTime}
+                refreshedAt={pid => Number(shared().wbModelsPanel?.providerRefreshedAt?.(pid)) || 0} />
+            </>
+          )}
         </DialogBody>
         <DialogFooter>
-          <span className='min-w-0 text-[11.5px] text-muted-foreground'>{hint}</span>
+          {!failed && hint && (
+            <span className='min-w-0 text-[11.5px] text-muted-foreground [overflow-wrap:anywhere]'>{hint}</span>
+          )}
           <div className='mr-auto' />
-          <Button variant='outline' onClick={handleCloseClick}>{custom ? t('取消') : t('完成')}</Button>
-          {custom && (
+          <Button variant='outline' onClick={handleCloseClick} disabled={busy}>
+            {failed ? t('关闭') : custom ? t('取消') : t('完成')}
+          </Button>
+          {failed ? (
+            <Button variant='default' disabled={busy} onClick={() => { void load() }}>{t('重试')}</Button>
+          ) : custom && (
             <Button variant='default' disabled={!picked.size || busy} onClick={() => { void importPicked() }}>
               {busyKind === 'import' ? t('导入中…')
                 : picked.size ? t('导入选中的 {n} 个模型', { n: picked.size }) : t('导入')}
@@ -908,7 +701,7 @@ function unmountModal() {
  * 选中的那家；`custom` 由调用方判好。**打开只建壳，不拉取** —— 拉取要用户点「获取模型」才发生。
  */
 function openModal(options: OpenOptions) {
-  if (!options?.providerId) return
+  if (!options || (options.custom && !options.providerId)) return
   unmountModal() // 重复打开先拆掉上一份（旧实现同样是 close() 打头）
   host = document.createElement('div')
   document.body.append(host)

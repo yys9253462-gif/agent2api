@@ -44,7 +44,7 @@ type RadioGroupItemProps = Omit<React.ComponentProps<typeof Radio.Root>, 'classN
   className?: string
 }
 
-function RadioGroupItem({ className, ...props }: RadioGroupItemProps) {
+function RadioGroupItem({ className, children, ...props }: RadioGroupItemProps) {
   return (
     <Radio.Root
       data-slot='radio-group-item'
@@ -59,6 +59,7 @@ function RadioGroupItem({ className, ...props }: RadioGroupItemProps) {
       )}
       {...props}
     >
+      {children}
       <Radio.Indicator
         data-slot='radio-group-indicator'
         className='grid place-content-center data-unchecked:hidden'

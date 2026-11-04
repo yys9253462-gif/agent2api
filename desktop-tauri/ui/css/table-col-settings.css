@@ -67,8 +67,6 @@ body.colset-dragging { cursor: grabbing; user-select: none; }
 .req-head > .ta-center, .req-row > .ta-center { text-align: center; }
 .req-head > .ta-right, .req-row > .ta-right { text-align: right; }
 
-/* 签到记录：同表共用 ck-table 类，压过 `.ck-table th { text-align: left }`。
-   单元格内容是行内级（文本 / badge / span），text-align 这一层就够 */
 .ck-records-table th.ta-left, .ck-records-table td.ta-left { text-align: left; }
 .ck-records-table th.ta-center, .ck-records-table td.ta-center { text-align: center; }
 .ck-records-table th.ta-right, .ck-records-table td.ta-right { text-align: right; }

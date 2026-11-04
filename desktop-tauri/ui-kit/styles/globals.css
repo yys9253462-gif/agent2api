@@ -1,68 +1,25 @@
-/* ─────────────────────────────────────────────
-   Agent2API · 组件库样式入口
-
-   消费方式（见 desktop-tauri/ui-islands/src/styles/islands.css）：
-     @import '@agent2api/ui/styles/globals.css';
-     @source '<组件库 src 的相对路径>';
-     @source '<消费方自己的源码目录>';
-   消费方必须补 @source —— 本文件已用 source(none) 关掉自动检测，
-   类名只在显式声明的目录里找，扫描范围完全确定。
-
-   两处与 shadcn 默认做法的有意偏离：
-
-   1) 不引入 preflight。@import "tailwindcss" 会连带 preflight（把 h1-h6 字号、
-      ul/ol 缩进、img 显示方式、button 默认样式全部重置）。既有界面有 60 多个
-      经典脚本 + 16 个手写 CSS 文件，依赖这些浏览器默认值的角落很难一一枚举，
-      直接引入等于全站视觉回归。这里按 Tailwind 官方文档「禁用 preflight」的
-      写法只取 theme 与 utilities 两层，基础重置由 ui/css/tokens.css 继续承担
-      （box-sizing 等已在那边声明）。
-
-   2) utilities 带 important。既有 CSS 是未分层的，而 Tailwind 工具类在
-      @layer utilities 里 —— CSS 规范规定未分层样式优先于所有分层样式，
-      于是 ui/css/components.css 里 `input[type="text"]`（特异性 0,1,1）会盖掉
-      组件上的 `.h-\[30px\]`（0,1,0），新组件的观感被老样式反向支配。
-      加 important 后组件库掌握样式主权；既有页面不用任何 Tailwind 类，
-      因此不受影响。等 ui/css 那批手写样式迁移完毕，去掉 important 即可
-      （消费方用 `!` 前缀才能覆盖组件样式的限制也随之解除）。
-   ───────────────────────────────────────────── */
-
 @layer theme, base, components, utilities;
 
 @import 'tailwindcss/theme.css' layer(theme);
-@import 'tailwindcss/utilities.css' layer(utilities) source(none) important;
-
+@import 'tailwindcss/utilities.css' layer(utilities) source(none);
 @import 'tw-animate-css';
 @import 'shadcn/tailwind.css';
-
 @import './theme.css';
+@import './primitives.css';
+@import './selection.css';
+/* 分类侧栏的统一观感：刻意放在所有 @layer 之外（未分层恒压过分层与旧的页面样式表） */
+@import './nav.css';
 
 @layer base {
-  *,
-  ::before,
-  ::after {
-    box-sizing: border-box;
-  }
-
-  button:not(:disabled),
-  [role='button']:not(:disabled) {
-    cursor: pointer;
-  }
+  *, ::before, ::after { box-sizing: border-box; }
+  button, input, select, textarea { font: inherit; }
+  button:not(:disabled), [role='button']:not(:disabled) { cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+  [hidden]:not([hidden='until-found']) { display: none !important; }
 }
 
 @layer utilities {
-  /* hidden 属性 = 显式隐藏，必须压过组件自身的 display。
-     消费方 ui/css/tokens.css 里那条 [hidden] 压不住本层的工具类：那份文档没分层，
-     而重要声明的层序是倒过来的 —— 分层里的 !important 反压未分层的 !important。
-     所以这条写在工具层里，靠两个属性选择器（0,2,0）胜过 .flex / .inline-flex（0,1,0），
-     与顺序无关。两个来源都靠它兜底：
-       · Base UI 自己：keepMounted 的弹窗收起、浮层 Positioner 关闭时打的就是 hidden；
-       · 界面代码：节点必须常驻（状态在闭包 / DOM 里）、只按状态切显隐的那些段与按钮
-         —— 行内 style 与单类名都压不过 !important 工具类，属性式才稳。 */
-  [hidden][hidden] {
-    display: none !important;
-  }
+  [hidden][hidden]:not([hidden='until-found']) { display: none !important; }
 }
 
-/* 组件库自己的源码：类名都写在 src 下的 tsx 里，必须显式声明才会生成。
-   路径相对本文件（ui-kit/styles/ → ui-kit/src）。 */
 @source '../src';

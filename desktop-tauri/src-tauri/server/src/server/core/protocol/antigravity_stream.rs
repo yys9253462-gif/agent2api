@@ -34,7 +34,7 @@
 //!   - 完成信号 = `finishReason` **或** `data: [DONE]`；EOF 前一个都没见到
 //!     → 按截断报错（错误帧 + `[DONE]`，**不补** finish）；错误帧前不补 usage
 //!     帧（带 usage 且 choices 为空的帧是收尾帧形态，会让部分客户端提前认为
-//!     流已结束 —— 与 `commandcode_outbound` 逐字同形）。
+//!     流已结束 —— 与 `ai_sdk_ndjson` 逐字同形）。
 //!
 //! ── thoughtSignature 的带出与回填（issue #291）───────────────
 //! 上游把历史回放里 functionCall 的签名当**硬性要求**：缺 → 400「missing a
@@ -86,7 +86,7 @@ fn usage_metadata(usage: &Value) -> Value {
     })
 }
 
-/// 上游错误状态码 → 下行 `error.type`（与 `commandcode_outbound` 的映射同形）
+/// 上游错误状态码 → 下行 `error.type`（与 `ai_sdk_ndjson` 的映射同形）
 fn error_type(status: u16) -> &'static str {
     match status {
         400 | 422 => "invalid_request_error",
@@ -335,7 +335,7 @@ impl ChatFromAntigravityStream {
         if let Some(signature) = signature.as_deref() {
             // 签名入服务端缓存（issue #291，见模块头）：多数客户端下一轮不会
             // 回带非标的 `extra_content`，请求侧按这两档键回填
-            super::antigravity_signature_cache::remember_call(&id, signature);
+            super::antigravity_signature_cache::remember_call(&self.session, &id, signature);
             super::antigravity_signature_cache::remember_for_session(&self.session, &name, signature);
         }
         let index = self.tool_index;
@@ -377,7 +377,7 @@ impl ChatFromAntigravityStream {
     /// 收尾：finish 帧 + usage 帧 + `[DONE]`（只做一次）。
     ///
     /// 有 finishReason（哪怕零内容，如 SAFETY 拦截）时正常收尾；一个完成信号
-    /// 都没有的「空流」按空响应报错（与 `commandcode_outbound` 同一取舍：
+    /// 都没有的「空流」按空响应报错（与 `ai_sdk_ndjson` 同一取舍：
     /// 不能把空回答记成一次成功计费）。
     fn complete(&mut self, reason: &str) -> Vec<bytes::Bytes> {
         if self.finished {

@@ -157,6 +157,11 @@ pub async fn run_upgrade(State(state): State<ServerState>) -> Response {
             // 旧聚合行刚导进来，模型维度还按请求名累计，不重算的话本次运行
             // 的报表会一直把映射别名当成独立模型。
             request_stats.remap_model_dimension_once();
+            request_stats.backfill_source_dimensions();
+            request_stats.prune();
+            if let Some(logs) = logging::store_ref() {
+                logs.prune();
+            }
         }
         outcomes
     })

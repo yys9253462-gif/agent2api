@@ -20,11 +20,13 @@ use std::collections::BTreeMap;
 use rusqlite::{params, Connection};
 
 use super::record::{AccountAccum, DailyEntry, ModelAccum, ProviderAccum};
+use super::source::{ApiKeyAccum, ClientAccum};
 
 /// `request_daily` 的列顺序（所有 SELECT 都按这个顺序取，`decode_daily`
 /// 依赖它；不写 `SELECT *` 的理由同 `sql::REQUEST_COLUMNS`）
 const DAILY_COLUMNS: &str = "date, requests, successful, tokens, cache_hit_tokens, \
-     cache_input_tokens, model_tokens, provider_stats, account_stats";
+     cache_input_tokens, model_tokens, provider_stats, account_stats, client_stats, api_key_stats, \
+     source_stats_version";
 
 /// JSON 数组列 → `Vec<T>`。解析失败或内容不是数组时退化成空表。
 ///
@@ -56,6 +58,9 @@ fn decode_daily(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyEntry> {
         model_tokens: decode_accum::<ModelAccum>(&model_tokens),
         provider_stats: decode_accum::<ProviderAccum>(&provider_stats),
         account_stats: decode_accum::<AccountAccum>(&account_stats),
+        client_stats: decode_accum::<ClientAccum>(&row.get::<_, String>(9)?),
+        api_key_stats: decode_accum::<ApiKeyAccum>(&row.get::<_, String>(10)?),
+        source_stats_version: row.get(11)?,
     })
 }
 
@@ -97,14 +102,16 @@ pub(super) fn select_daily_row(
 pub(super) fn upsert_daily(conn: &Connection, day: &DailyEntry) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO request_daily (date, requests, successful, tokens, cache_hit_tokens, \
-         cache_input_tokens, model_tokens, provider_stats, account_stats) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         cache_input_tokens, model_tokens, provider_stats, account_stats, client_stats, api_key_stats, \
+         source_stats_version) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
          ON CONFLICT(date) DO UPDATE SET requests = excluded.requests, \
          successful = excluded.successful, tokens = excluded.tokens, \
          cache_hit_tokens = excluded.cache_hit_tokens, \
          cache_input_tokens = excluded.cache_input_tokens, \
          model_tokens = excluded.model_tokens, provider_stats = excluded.provider_stats, \
-         account_stats = excluded.account_stats",
+         account_stats = excluded.account_stats, client_stats = excluded.client_stats, \
+         api_key_stats = excluded.api_key_stats, source_stats_version = excluded.source_stats_version",
         params![
             day.date,
             day.requests,
@@ -115,6 +122,9 @@ pub(super) fn upsert_daily(conn: &Connection, day: &DailyEntry) -> rusqlite::Res
             encode_accum(&day.model_tokens),
             encode_accum(&day.provider_stats),
             encode_accum(&day.account_stats),
+            encode_accum(&day.client_stats),
+            encode_accum(&day.api_key_stats),
+            day.source_stats_version,
         ],
     )?;
     Ok(())

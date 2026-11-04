@@ -76,8 +76,11 @@ pub async fn refresh(manual: bool, interval_ms: i64) -> Value {
         Ok(Claim::Acquired(guard)) => guard,
         Ok(Claim::Deferred(state)) => {
             row["status"] = json!("skipped");
+            // 手动触发越过冷却（`ManualBackoff::Bypass`），这时再说「冷却中」
+            // 会与「按钮其实能立刻重试」自相矛盾 —— 与各家目录刷新同一口径，
+            // 见 `providers::catalog_refresh::deferred_message` 的说明。
             row["message"] = json!(if state.retry_at > logging::now_ms() || state.running() {
-                state.waiting_message()
+                if manual { state.waiting_message_bypassing() } else { state.waiting_message() }
             } else {
                 "沿用缓存，尚未到刷新时间".to_string()
             });

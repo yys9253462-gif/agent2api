@@ -46,7 +46,7 @@ function SelectTrigger({ className, children, ...props }: SelectTriggerProps) {
         // 随之归零，过长标签省略号收口 —— 完整值在展开的浮层与触发器的 title 里。
         // 这条选择器会连箭头图标的 span 一起命中，truncate 不改 display，对它无影响。
         '[&>span]:min-w-0 [&>span]:truncate',
-        'text-[12.5px] font-normal text-foreground',
+        'text-[12.5px] font-normal text-foreground max-[767px]:h-10 max-[767px]:text-base',
         'transition-colors duration-150 ease-out',
         'hover:border-control-border-hover hover:bg-control-hover',
         'focus-visible:border-primary focus-visible:shadow-focus focus-visible:outline-none',

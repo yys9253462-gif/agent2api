@@ -129,6 +129,7 @@ pub(crate) fn merge_imported(items: &[Value]) -> Result<MergeReport, String> {
 /// 报错拦的是手改数据 —— 空基址的定义转发必然失败，收进来只是埋雷）。
 /// 展示名缺失不报错：`item_of` 会回落成 id，与读取路径同一取向。
 fn normalize_item(object: &Map<String, Value>) -> Result<Value, String> {
+    super::presets::validate(object.get("presetKey"))?;
     let mut item = item_of(object);
     let base_url = item
         .get("baseUrl")

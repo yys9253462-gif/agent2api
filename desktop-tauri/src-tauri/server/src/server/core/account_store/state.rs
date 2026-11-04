@@ -59,9 +59,24 @@ fn as_optional_text(value: Option<&Value>) -> Option<String> {
     }
 }
 
+fn normalize_plugin_value(value: Value) -> Value {
+    if let Value::String(text) = &value {
+        if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(text) {
+            return Value::Object(fields);
+        }
+    }
+    value
+}
+
 impl StoredAccount {
     /// 用一份字段表构造（调用方保证 id 已就位）
-    pub fn from_map(fields: Map<String, Value>) -> Self {
+    pub fn from_map(mut fields: Map<String, Value>) -> Self {
+        // 存量插件字段可能多序列化了一层；非法值保留给凭据读取端明确报错。
+        for key in ["pluginSecret", "pluginPublic"] {
+            if let Some(value) = fields.remove(key) {
+                fields.insert(key.to_string(), normalize_plugin_value(value));
+            }
+        }
         Self { fields }
     }
 
@@ -72,7 +87,7 @@ impl StoredAccount {
             return None;
         };
         match fields.get("id") {
-            Some(Value::String(id)) if !id.is_empty() => Some(Self { fields }),
+            Some(Value::String(id)) if !id.is_empty() => Some(Self::from_map(fields)),
             _ => None,
         }
     }
@@ -96,6 +111,43 @@ impl StoredAccount {
 
     pub fn id(&self) -> &str {
         self.fields.get("id").and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// 顶层字段优先、回落 `pluginPublic` / `pluginSecret` 的取值（issue #380）。
+    ///
+    /// ── 为什么读侧也要兜一层（写侧已经镜像了）────────────────────
+    /// 镜像只在**新写入**时生效：升级前落库的插件账号顶层仍然是空的，而
+    /// 「回填迁移」不能覆盖所有情况（例如用户从备份恢复了一份旧记录）。
+    /// 读侧兜底让这批记录不必等迁移就能用 —— 迁移只是把字段真正落到盘上，
+    /// 不是正确性的前提。
+    ///
+    /// 顺序：顶层 > `pluginPublic` > `pluginSecret`。`pluginPublic` 在
+    /// `pluginSecret` 之前，因为它是插件 `account_view` 的产出、已经归一过
+    /// （例如 `edition` 被翻成 `cn` / `intl`，而 secret 里可能是 `international`）。
+    pub fn identity_field(&self, key: &str) -> Option<&Value> {
+        if let Some(value) = self.fields.get(key).filter(|value| !value.is_null()) {
+            if !value.as_str().is_some_and(|text| text.trim().is_empty()) {
+                return Some(value);
+            }
+        }
+        for holder in ["pluginPublic", "pluginSecret"] {
+            if let Some(value) = self
+                .fields
+                .get(holder)
+                .and_then(|object| object.get(key))
+                .filter(|value| !value.is_null())
+            {
+                if !value.as_str().is_some_and(|text| text.trim().is_empty()) {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
+    /// [`Self::identity_field`] 的字符串形态（缺失 / 非字符串给空串）。
+    fn identity_text(&self, key: &str) -> String {
+        self.identity_field(key).map(|value| as_text(Some(value))).unwrap_or_default()
     }
 
     /// 所属提供商 id（`"workbuddy"` / `"raccoon"`，契约见 `core::providers`）。
@@ -134,16 +186,16 @@ impl StoredAccount {
     }
 
     pub fn uid(&self) -> String {
-        as_text(self.fields.get("uid"))
+        self.identity_text("uid")
     }
 
     pub fn nickname(&self) -> String {
-        as_text(self.fields.get("nickname"))
+        self.identity_text("nickname")
     }
 
     /// 账号类型：缺省视为个人版（对应 Node 版 `type || 'personal'`）
     pub fn account_type(&self) -> String {
-        let value = as_text(self.fields.get("type"));
+        let value = self.identity_text("type");
         if value.is_empty() { "personal".to_string() } else { value }
     }
 
@@ -181,9 +233,14 @@ impl StoredAccount {
 
     // ── 端点与版本 ──────────────────────────────────────────
 
-    /// 记录里显式保存的版本 id；缺失时返回 None（由调用方按默认版本兜底）
+    /// 记录里显式保存的版本 id；缺失时返回 None（由调用方按默认版本兜底）。
+    ///
+    /// 顶层缺失时回落 `pluginPublic` / `pluginSecret`（issue #380）：插件落库
+    /// 只写那两个子对象，顶层 `edition` 是后来才补的镜像字段。缺了它
+    /// `resolve_edition(None)` 会回落 `cn`，国际版账号被当成国内版反查。
     pub fn edition(&self) -> Option<String> {
-        as_optional_text(self.fields.get("edition"))
+        let value = self.identity_text("edition");
+        if value.is_empty() { None } else { Some(value) }
     }
 
     /// 记录里显式保存的 prefixPath。
@@ -192,16 +249,27 @@ impl StoredAccount {
     pub fn prefix_path(&self) -> Option<String> {
         match self.fields.get("prefixPath") {
             Some(Value::String(text)) => Some(text.clone()),
-            _ => None,
+            // 顶层没有这个键（插件落库形态）时回落子对象；空串同样是有效值。
+            _ => ["pluginPublic", "pluginSecret"]
+                .iter()
+                .find_map(|holder| {
+                    self.fields
+                        .get(*holder)
+                        .and_then(|object| object.get("prefixPath"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
         }
     }
 
     pub fn endpoint(&self) -> Option<String> {
-        as_optional_text(self.fields.get("endpoint"))
+        let value = self.identity_text("endpoint");
+        if value.is_empty() { None } else { Some(value) }
     }
 
     pub fn platform(&self) -> Option<String> {
-        as_optional_text(self.fields.get("platform"))
+        let value = self.identity_text("platform");
+        if value.is_empty() { None } else { Some(value) }
     }
 
     // ── 运营属性 ────────────────────────────────────────────
@@ -325,7 +393,7 @@ impl StoredAccount {
 
     /// 小浣熊新手任务的**结算台账**：`{ "<task_key>": <毫秒时刻> }`。
     ///
-    /// 键是 `providers::raccoon::onboarding` 的任务 key（`desktop_login_grant` /
+    /// 键是插件 `raccoon::onboarding` 的任务 key（`desktop_login_grant` /
     /// `mobile_login_grant`），值是这条**一次性**登录奖励结算的时刻 —— 「本轮刚
     /// 领到」（granted=true）与「探测确认早已发放过」（granted=false）都算结算：
     /// 一次性福利落定后不会再变，之后状态查询直接按「已领取」展示。不记的话，
@@ -401,14 +469,20 @@ impl StoredAccount {
     /// **原样存取**，归一化（认不出的值怎么落）在 `zcode::normalize_plan` 一处：
     /// 存储层不做取值白名单，否则将来加第三条通道要改两个地方。
     pub fn zcode_plan(&self) -> String {
-        as_text(self.fields.get(crate::server::core::providers::zcode::PLAN_FIELD))
+        let key = crate::server::core::providers::zcode::PLAN_FIELD;
+        let value = as_text(self.fields.get(key));
+        if !value.trim().is_empty() { value }
+        else { as_text(self.fields.get("pluginSecret").and_then(|secret| secret.get(key))) }
     }
 
     pub fn set_zcode_plan(&mut self, value: &str) {
-        self.fields.insert(
-            crate::server::core::providers::zcode::PLAN_FIELD.to_string(),
-            Value::String(value.to_string()),
-        );
+        let key = crate::server::core::providers::zcode::PLAN_FIELD;
+        self.fields.insert(key.to_string(), Value::String(value.to_string()));
+        for field in ["pluginSecret", "pluginPublic"] {
+            if let Some(Value::Object(fields)) = self.fields.get_mut(field) {
+                fields.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
     }
 
     /// 是否「有可用凭证」（当前账号派生、凭据查询都以此为准）
@@ -459,9 +533,22 @@ impl StoredAccount {
     /// `modelAppSecret` 是它独有的凭证键）：那家不用 Bearer token，转发凭证是
     /// 一对网关 Basic key，漏了这一条它整家都会被静默过滤掉（见
     /// [`Self::has_officeace_key`]）。
+    ///
+    /// 第七条判据 `has_plugin_secret()` 只对插件家有效（凭证是不透明的
+    /// `pluginSecret`，网关不解析 —— 见 `account_store::plugin_accounts`）。
+    /// 漏了它，插件家的账号会在选路第一级就被当成「没有凭证」全部跳过。
     pub fn has_credentials(&self) -> bool {
         self.has_token() || self.is_desktop() || self.has_api_key() || self.has_jwt()
-            || self.no_auth() || self.has_officeace_key()
+            || self.no_auth() || self.has_officeace_key() || self.has_plugin_secret()
+    }
+
+    /// 记录里是否有非空的 `pluginSecret`（插件家的不透明凭证）。
+    ///
+    /// 只判「在不在、是不是 null」而不判内容：那份 JSON 的形状由插件定义，
+    /// 网关读它就是在猜别人的格式。空对象也算有凭证 —— 某些插件家（例如
+    /// 免登录的访客模式）确实会存一个空对象表示「没有可存的凭证但账号有效」。
+    pub fn has_plugin_secret(&self) -> bool {
+        matches!(self.fields.get("pluginSecret"), Some(value) if !value.is_null())
     }
 
     /// 记录是否**显式声明「该上游无需鉴权」**（自定义账号的 `noAuth: true`）。
@@ -535,6 +622,11 @@ impl StoredAccount {
     // ── 通用字段读写（导入合并、限额标记等需要直接改字段）──
 
     pub fn set(&mut self, key: &str, value: Value) {
+        let value = if matches!(key, "pluginSecret" | "pluginPublic") {
+            normalize_plugin_value(value)
+        } else {
+            value
+        };
         self.fields.insert(key.to_string(), value);
     }
 

@@ -1,8 +1,7 @@
 //! 网关 API Key 列表（config.json 的 `apiKeys` 字段）。
 //!
 //! 形状：`apiKeys: [{id, name, key, enabled, createdAt, allowedProviders, allowedModels}]`。
-//! 多把 Key 任一命中即通过；一把启用的都没有 → 不鉴权（网关只监听 127.0.0.1，
-//! 与旧的「未配置 apiKey」语义一致）。
+//! 模型调用必须命中一把启用、可解密且非空的 Key；没有可用 Key 时拒绝调用。
 //!
 //! ── 与旧字段 `apiKey` 的关系 ────────────────────────────────
 //! 1.x 只有一把 Key（`apiKey` 字符串）。读侧兼容：`apiKeys` 缺失而 `apiKey` 存在时，
@@ -203,6 +202,10 @@ fn decode_key(raw: &str, id: &str) -> (String, bool) {
 }
 
 impl ApiKeyEntry {
+    pub fn is_usable(&self) -> bool {
+        self.enabled && !self.key_unreadable && !self.key.is_empty()
+    }
+
     /// 从一条 JSON 记录解析出条目（**密文与历史明文都能读**）。
     ///
     /// ── 解密失败为什么必须保留记录（本文件最关键的一条补充）────────
@@ -379,14 +382,9 @@ pub fn list() -> Vec<ApiKeyEntry> {
     entries_from(config::current().raw())
 }
 
-/// 当前**启用**的明文 Key（鉴权中间件用）；空 = 免鉴权
-///
-/// ── 降级态（`key_unreadable`）的记录**不要**在这里筛掉 ───────────
-/// 那些记录带着**密文**留在列表里（见 `from_value`）。筛掉它们的后果是：
-/// 密钥文件一丢、全表都解不开 → 列表变空 → 中间件判「免鉴权模式」直接放行
-/// （见模块头），等于一次密钥文件丢失就把网关对全网放开。留在列表里则相反：
-/// 密文永远不可能与客户端带来的明文相等，实际效果是「这些 Key 暂时不可用」，
-/// 正是降级期该有的行为。
+/// 当前启用的 Key 配置（含降级态记录和环境变量 Key），不是可调用 Key 的清单。
+/// 不可解密记录仍需保留，避免本机管理准入把凭证故障误判为未配置 Key。
+/// 模型调用另按 `is_usable` 拒绝这些记录。
 pub fn active_keys_from(raw: &Map<String, Value>) -> Vec<String> {
     let mut keys: Vec<String> = entries_from(raw)
         .into_iter()
@@ -401,31 +399,8 @@ pub fn active_keys_from(raw: &Map<String, Value>) -> Vec<String> {
     keys
 }
 
-/// 按明文 Key 找出**当前启用**的那条记录（R9：把「命中的是哪把 Key」交给 handler）。
-///
-/// ── 为什么要有这个函数 ──────────────────────────────────────
-/// 鉴权中间件（`http::require_api_key`）原先只需要回答「这个请求能不能进」，
-/// 于是它只比对一串明文 Key（`active_keys_from`）。可用提供商 / 可用模型
-/// 是**逐把 Key** 的限制，handler 因此必须知道「这次用的是哪一把」——
-/// 本函数就是那个反向查找，中间件命中后调它一次，把记录塞进请求扩展
-/// （见 `http::require_api_key` 的实现与说明）。
-///
-/// ── 什么情况下返回 None（且必须放行，不是拒绝）────────────────
-///   - **免鉴权模式**：一把启用的 Key 都没有 —— 请求根本没有「命中的 Key」，
-///     限制自然不存在（不限制）。中间件在那个分支根本不会调本函数。
-///   - **环境变量 Key**（`WORKBUDDY_PROXY_API_KEY`）：它不是一个列表记录，
-///     没有地方挂白名单。**按不限制处理**（`None`），这是启动注入旁路的既有
-///     语义 —— 它是给脚本/CI 的通用口令，加一层「无法配置的限制」只会让人
-///     误以为它被限制了。
-///   - Key 在两次读盘之间被改/删：同样按不限制（宁可放行，不可因为在管理页
-///     改了一下名称就把正在跑的客户端全挡掉）。
-///
-/// ── 为什么要传 `raw` 而不是自己调 `list()` ───────────────────
-/// `config::current()` 会**克隆整份配置**（含全部 raw 字段）。鉴权是每个请求
-/// 都要走的热路径，而调用方手里已经有一份刚取到的快照 —— 让它再调一次
-/// `list()` 就是为同一件事多克隆一次配置。这里收快照、调用方复用，
-/// 顺带让「判定用的是哪一份快照」在调用点一眼可见（不会出现「查 Key 用一份、
-/// 查白名单用另一份」的窗口期）。
+/// 按明文 Key 找出当前可用的记录；返回 None 不代表已经通过鉴权。
+/// 环境变量 Key 由模型鉴权入口单独识别，无效、停用或不可解密记录不会匹配。
 pub fn entry_for_key_from(raw: &Map<String, Value>, key: &str) -> Option<ApiKeyEntry> {
     let env = crate::server::config::parse::env_api_key_value();
     if env.as_deref() == Some(key) {
@@ -433,7 +408,7 @@ pub fn entry_for_key_from(raw: &Map<String, Value>, key: &str) -> Option<ApiKeyE
     }
     entries_from(raw)
         .into_iter()
-        .find(|entry| entry.enabled && entry.key == key)
+        .find(|entry| entry.is_usable() && entry.key == key)
 }
 
 /// 随机生成一把 Key：`sk-a2a-` + 32 位十六进制。

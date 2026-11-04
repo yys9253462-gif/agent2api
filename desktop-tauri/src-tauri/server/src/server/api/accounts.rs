@@ -4,10 +4,11 @@
 //!                                       provider 与顶层 providers 摘要）
 //!   POST   /api/accounts                手动添加账号（accessToken/refreshToken JSON）
 //!   GET    /api/accounts/export         导出全部账号（含 token，换机器后导入继续用）
+//!   POST   /api/accounts/export-files   导出单账号或本组的逐账号文件 { id? / provider? }
 //!   POST   /api/accounts/import         导入账号（merge：按 uid 匹配，命中更新、未命中追加）
 //!   POST   /api/accounts/current        把账号置顶（仅调整全局优先级）{ id }
-//!   POST   /api/accounts/batch          批量操作 { action, ids, proxy?, maxConcurrent? }
-//!                                       action: enable / disable / proxy / concurrency / remove
+//!   POST   /api/accounts/batch          批量操作（见 accounts_batch.rs）
+//!                                       enable / disable / proxy / concurrency / usageQuery / limiters / remove
 //!   POST   /api/accounts/reorder        整队重排（分组模式）{ queue: [id, …] }
 //!   POST   /api/accounts/refresh        刷新指定（或当前）账号的 token { id? }
 //!   POST   /api/accounts/refresh-expiring 刷新**全部**已过期/临期的账号凭证（批量）
@@ -52,16 +53,14 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::Method;
 use axum::response::Response;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
+pub use super::accounts_batch::batch_accounts;
+
 use crate::server::core::account_store::AccountStoreError;
-use crate::server::core::auth::WorkBuddyAuthError;
 use crate::server::core::billing::checkin;
 use crate::server::core::proxies::ProxyConfigError;
 use crate::server::core::providers::adapter::adapter_for;
-use crate::server::core::providers::kuku::credentials::KukuCredentials;
 use crate::server::core::providers::zcode;
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::management_error;
@@ -71,17 +70,12 @@ use crate::server::ServerState;
 
 /// 账号存储错误 → 管理信封（打日志 + 原状态码）。
 ///
-/// 可见性是 `pub(super)`：`api::session` 的 AutoClaw 验证码登录要落账号
-/// （`add_autoclaw_account`），失败时必须是同一个响应形状与同一条日志格式 ——
+/// 可见性是 `pub(super)`：`api::session` 的 Loomy 验证码登录要落账号
+/// （`add_loomy_account`），失败时必须是同一个响应形状与同一条日志格式 ——
 /// 让那边各写一份会让「登录失败」与「添加失败」在界面上长得不一样。
 pub(super) fn store_error(error: AccountStoreError) -> Response {
     logging::log("[Accounts]", &format!("❌ {}", error.message));
     management_error(error.status_code, error.message)
-}
-
-fn auth_error(error: WorkBuddyAuthError) -> Response {
-    logging::log("[Accounts]", &format!("❌ {}", error.message));
-    management_error(error.http_status(), error.message)
 }
 
 pub(super) fn proxy_error(error: ProxyConfigError) -> Response {
@@ -89,130 +83,161 @@ pub(super) fn proxy_error(error: ProxyConfigError) -> Response {
     management_error(error.status_code, error.message)
 }
 
+/// 标准账号的添加入口：把面板 payload 拆成 `NormalizeInput` 交给真实 adapter。
+/// 插件与本体共用 secret/public 落库及公开白名单，不在 API 中读取令牌字段。
+/// `account_source` 是网关选择的来源，不从 payload 或 secret 中取。
+async fn add_plugin_account(
+    state: &ServerState,
+    adapter: &dyn crate::server::core::providers::adapter::ProviderAdapter,
+    provider: &str,
+    payload: &Value,
+    import_name: Option<&str>,
+    account_source: &str,
+) -> Response {
+    use crate::server::core::proxies::{normalize_account_proxy, resolve_account_proxy, ResolvedProxy};
+    // 缺省不覆盖存量出口；显式 null/direct 是需要落库的直连选择。
+    let proxy_config = match payload.get("proxy") {
+        Some(value) if !value.is_null() && !value.is_object() => {
+            return management_error(400, "账号代理配置必须是对象或 null，未回退直连");
+        }
+        Some(value) => match normalize_account_proxy(value) {
+            Ok(config) => Some(config.unwrap_or_else(|| json!({ "source": "direct" }))),
+            Err(error) => return proxy_error(error),
+        },
+        None => None,
+    };
+    // normalize 与落账号共用同一归一配置；pool/Clash 解析失败不能静默直连。
+    let selected_proxy = match proxy_config.as_ref() {
+        None => None,
+        Some(config) if config.get("source").and_then(Value::as_str) == Some("direct") => None,
+        Some(config) => {
+            if crate::server::core::proxies::is_rotate_config(config) {
+                return management_error(400, "添加标准账号不支持轮询代理，请选择直连或一条代理");
+            }
+            let Some(resolution) = resolve_account_proxy(Some(config)) else {
+                return management_error(400, "账号代理未能解析，未回退直连");
+            };
+            if resolution.error().is_some() {
+                return management_error(400, "账号代理无法解析，请检查所选代理是否存在且已启用；未回退直连");
+            }
+            match ResolvedProxy::from_json(&resolution.to_json()) {
+                Ok(Some(proxy)) => Some(proxy),
+                _ => return management_error(400, "账号代理出口无效，请检查主机与端口；未回退直连"),
+            }
+        }
+    };
+    let proxy = selected_proxy.map(|proxy| agent2api_provider_protocol::WireProxy {
+        protocol: proxy.protocol,
+        host: proxy.host,
+        port: proxy.port,
+        username: proxy.username,
+        password: proxy.password,
+    });
+
+    let source = if payload.get("importDesktop").and_then(Value::as_bool).unwrap_or(false) {
+        agent2api_provider_protocol::NormalizeSource::Desktop
+    } else if let Some(content) = payload
+        .get("authFileContent")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        agent2api_provider_protocol::NormalizeSource::FileText {
+            content: content.to_string(),
+            file_name: payload
+                .get("authFileName")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    } else if let Some(content) = payload
+        .get("authFileB64")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        agent2api_provider_protocol::NormalizeSource::FileBase64 {
+            content: content.to_string(),
+            file_name: payload
+                .get("authFileName")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    } else {
+        // 新 runtime 的手动归一器只吃自身凭证/方法参数，不把网关代理配置混入
+        // RAW 认证输入。旧插件仍收到原 payload，保留历史归一合同。
+        let mut manual_payload = payload.clone();
+        if crate::server::core::providers::is_scoped_runtime_provider(provider) {
+            if let Some(fields) = manual_payload.as_object_mut() {
+                if fields.get("methodIndex").is_some() {
+                    for key in ["provider", "name", "proxy"] { fields.remove(key); }
+                } else if account_source == "builtin" {
+                    for key in ["name", "proxy"] { fields.remove(key); }
+                }
+            }
+        }
+        agent2api_provider_protocol::NormalizeSource::Manual { payload: manual_payload }
+    };
+
+    let input = agent2api_provider_protocol::NormalizeInput {
+        provider: provider.to_string(),
+        source,
+        name: import_name.map(str::to_string),
+        proxy,
+    };
+    let account = match adapter.normalize_account(&state.store, input).await {
+        Ok(account) => account,
+        Err(error) => {
+            logging::log("[Accounts]", &format!("❌ {}", error.message));
+            return management_error(error.status_code, error.message);
+        }
+    };
+
+    let id = account.identity.clone();
+    let name = account
+        .public
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or(import_name)
+        .unwrap_or(adapter.label());
+    match state.store().plugin_upsert_account_with_source_and_proxy(
+        &id,
+        provider,
+        name,
+        &account.secret,
+        &account.public,
+        account.desktop,
+        account_source,
+        proxy_config.as_ref(),
+    ) {
+        Ok((record, proxy_saved)) => ok_json(json!({
+            "account": record,
+            "created": true,
+            "proxySaved": proxy_saved,
+            "list": state.store().list_visible_accounts(),
+        })),
+        Err(message) => {
+            logging::log("[Accounts]", &format!("❌ {message}"));
+            management_error(500, &message)
+        }
+    }
+}
+
 /// 解析请求体：空 body 视为 `{}`；非法 JSON 按各处的原始文案报 400。
 ///
 /// Node 版不同分支的文案不一样（「上传内容不是有效 JSON」/「请求内容不是有效 JSON」），
 /// 所以文案由调用方传入，不统一成一句话。
-fn parse_json_body(body: &Bytes, fallback_message: &str) -> Result<Value, Response> {
+pub(super) fn parse_json_body(body: &Bytes, fallback_message: &str) -> Result<Value, Response> {
     match parse_body(body) {
         Ok(value) => Ok(value),
         Err(_) => Err(management_error(400, fallback_message)),
     }
 }
 
-/// 文件导入失败的统一包装：给文案补上「哪个文件」——前端传了 `authFileName`
-/// 才显示文件名，没传就说「凭证文件」。
+/// `authFileContent` / `authFileB64`（凭证文件导入）现在**只服务插件家**：
+/// 两个字段由 `add_plugin_account` 原样转成 `NormalizeSource::{FileText,
+/// FileBase64}`，文件解析（含「这一家的文件是文本还是二进制」）是插件自己的
+/// 知识。网关不再按家拼「哪个文件导不进来」的文案 —— 那套措辞会与插件实际
+/// 支持的格式漂移，而用户看到的错误必须来自真正解析它的那一侧。
 ///
-/// 为什么在接口层拼、不传进账号存储：文件名是**这次请求的用户上下文**，而
-/// 落账号的入口（`add_*_account`）只认内容 —— 让它多收一个名字字符串，等于把
-/// HTTP 字段的语义泄进账号存储的解析口径里（同一个入口还要服务「手动粘贴」等
-/// 没有文件名的调用方）。
-fn describe_file_import_error(
-    error: AccountStoreError,
-    file_name: Option<&str>,
-) -> AccountStoreError {
-    AccountStoreError::new(
-        format!(
-            "凭证文件{}无法导入：{}",
-            file_name.map(|name| format!("「{name}」")).unwrap_or_default(),
-            error.message,
-        ),
-        error.status_code,
-    )
-}
-
-/// `authFileB64`（二进制凭证文件）的统一 400：**只识别、不实现**的几家才调它。
-///
-/// 接了文本文件导入的几家（小浣熊 / CatPaw / Cline）都会调它：这三家的
-/// 凭证文件都是**文本 JSON**，二进制是别家才有的形态（KukuAI 的 Cookies 是
-/// SQLite —— 它**实现** `authFileB64`，不调这里，见其分支与
-/// `kuku_credentials_from_b64_file`）；别家分支不读文件导入三字段（历史契约不变）。
-/// 为什么明确 400 而不是静默忽略：静默会让用户以为导入成功了，而账号根本没落。
-fn binary_auth_file_unsupported(provider: &str) -> AccountStoreError {
-    AccountStoreError::new(
-        format!(
-            "该提供商（{}）暂不支持二进制凭证文件（authFileB64），请改用文本内容（authFileContent）",
-            crate::server::core::providers::label_of(provider)
-        ),
-        400,
-    )
-}
-
-/// KukuAI 文件导入（`authFileB64`）：二进制 Cookies 文件的 base64 → 解析出凭证。
-///
-/// 为什么是 base64 + 临时文件：KukuAI 的凭证文件是 Cookies 的 SQLite **二进制**，
-/// 文本字段（`authFileContent`）装不下它；而读写判定只有
-/// `kuku::credentials::read_credentials_from_path` 这一份、按**路径**工作（与本机
-/// `importDesktop` 共用），所以先把字节解回临时文件、再走同一条读取链 ——
-/// 不另写「从内存字节解析 SQLite」，免得两边对「什么算有效的 Cookies 库」的口径
-/// 分叉。
-///
-/// 临时文件的生命周期只覆盖这一次读取：读取完成**无论成败**立即删除（成功时
-/// 凭证已读到内存，失败时内容也不该留在盘上）；base64 解码失败时文件压根没建，
-/// 写入失败时顺手清掉可能留下的半截文件。
-///
-/// 所有失败的文案都经 `describe_file_import_error` 带上原文件名（与另外三家同款），
-/// 状态码一律 400（这是「这次请求给的文件有问题」，不是服务端故障）。
-fn kuku_credentials_from_b64_file(
-    encoded: &str,
-    auth_file_name: Option<&str>,
-) -> Result<KukuCredentials, AccountStoreError> {
-    let bytes = BASE64.decode(encoded).map_err(|error| {
-        describe_file_import_error(
-            AccountStoreError::new(
-                format!("authFileB64 不是合法的 base64（{error}）；请重新选择文件后再试"),
-                400,
-            ),
-            auth_file_name,
-        )
-    })?;
-    let path = kuku_temp_cookies_path();
-    if let Err(error) = std::fs::write(&path, &bytes) {
-        // 写入失败也可能已经留下半截文件（建文件成功、写盘失败）：顺手清掉，
-        // 不留本次请求的残留（清不掉也不阻断，只是垃圾）。
-        let _ = std::fs::remove_file(&path);
-        return Err(describe_file_import_error(
-            AccountStoreError::new(
-                format!(
-                    "写入临时文件失败（{}）：{error}；请检查系统临时目录是否可写（磁盘空间 / 权限）后重试",
-                    path.display()
-                ),
-                400,
-            ),
-            auth_file_name,
-        ));
-    }
-    let read_result =
-        crate::server::core::providers::kuku::credentials::read_credentials_from_path(&path);
-    // 读后即删：失败也要删（见函数说明）—— 这里是最靠近「文件不再需要」的位置，
-    // 删一次覆盖后面所有分支（含解析失败）。
-    let _ = std::fs::remove_file(&path);
-    read_result.map_err(|error| {
-        describe_file_import_error(
-            AccountStoreError::new(error.file_import_message(), 400),
-            auth_file_name,
-        )
-    })
-}
-
-/// KukuAI 文件导入的临时 Cookies 文件路径（系统临时目录 + 随机文件名）。
-///
-/// 随机段与 `proxy_pool::new_id` / `upstream::request::new_request_id` 同一手法
-/// （`RandomState` 的随机种子 + 毫秒 + 进程号，不引第三方依赖）：只要求并发写
-/// 不撞名，不承担安全语义（文件读完即删）。
-fn kuku_temp_cookies_path() -> std::path::PathBuf {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u64(logging::now_ms() as u64);
-    hasher.write_u64(std::process::id() as u64);
-    let suffix = (hasher.finish() & 0xffff_ffff) as u32;
-    std::env::temp_dir().join(format!(
-        "kuku-cookies-{}-{}-{suffix:08x}",
-        std::process::id(),
-        logging::now_ms()
-    ))
-}
-
 /// 百分号解码（对应 Node 版 `decodeURIComponent(path.slice(...))`）。
 ///
 /// axum 已在提取参数时解过一次；账号 id 形如 `user-<uid>`、正常不含特殊字符，
@@ -262,21 +287,6 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
     let suffix = full_path.strip_prefix("/api/accounts").unwrap_or("");
     let rest = suffix.strip_prefix('/').map(str::to_string);
     dispatch(state, method, rest.as_deref(), &full_path, &query, &body).await
-}
-
-/// 账号写、批量改代理 / 删除账号后的**监听器对账**（lazy listeners 的触发点，
-/// 见 `api::proxies::reconcile_listeners`）。
-///
-/// 用「改动前后引用 id 集合」的差集来判：改个备注名 / 改密钥不该付一次内核
-/// 重启的等待（重启要重建全部监听器，几秒）。引用增加要补监听器、引用减少
-/// 要回收端口（删账号 / 改走别的代理 / 改直连）—— 两个方向都交给对账的缺口
-/// 检测收敛，这里不猜方向，只拦「没变化」这一种白重启。
-fn reconcile_kernel_listeners(state: &ServerState, before: &std::collections::HashSet<String>) {
-    let after = state.store().referenced_pool_ids();
-    if &after == before {
-        return; // 引用集合没变（纯改配置），不重启
-    }
-    super::proxies::reconcile_listeners(state);
 }
 
 /// `/api/proxies*` 的入口（同样接受任意方法）。
@@ -350,7 +360,7 @@ pub async fn dispatch(
     // ① 精确命中 `/api/accounts`
     if rest.is_none() {
         match method.as_str() {
-            "GET" => return ok_json(state.store().list_accounts()),
+            "GET" => return ok_json(state.store().list_visible_accounts()),
             "POST" => return add_account(&state, body).await,
             // Node 版对 `/api/accounts` 上的其它方法同样走 404 信封
             _ => {
@@ -362,7 +372,10 @@ pub async fn dispatch(
 
     // ② 固定子路径（Node 版把它们放在 `<id>` 通配之前的原因）
     match (method.as_str(), rest) {
+        ("GET", "sorting") => return super::accounts_sort::get_sorting(&state),
+        ("PUT", "sorting") => return super::accounts_sort::save_sorting(&state, body),
         ("GET", "export") => return export_accounts(&state),
+        ("POST", "export-files") => return super::accounts_export::account_files(&state, body).await,
         ("POST", "import") => return import_accounts(&state, body).await,
         ("POST", "current") => return set_current(&state, body).await,
         ("POST", "batch") => return batch_accounts(&state, body).await,
@@ -516,9 +529,9 @@ pub async fn dispatch(
 ///   ① `Raccoon` → 小浣熊路径：`importDesktop === true` 导入桌面端实时登录态
 ///      （忽略 token 字段）；否则手动添加（token / refreshToken，或粘贴
 ///      auth.json 内容）；
-///   ② `CatPaw` → CatPaw 路径（W5-T-d4）：`importDesktop === true` 导入桌面端
-///      实时登录态（`~/.meituan-catpaw/auth.json`）；否则手动添加（token + uid/
-///      loginName，兼容粘贴原项目账号记录与桌面端 auth.json 内容）；
+///   ② `CatPaw` → 实现已搬到插件：装上插件时上面的 `serves_provider` 分流
+///      先带走（三种来源都由插件的 `account.normalize` 处理），没装插件时
+///      如实报 503；
 ///   ③ `AutoClaw` → AutoClaw 路径（W4b-T-c2）：`importDesktop === true` 导入
 ///      桌面端实时登录态（`%APPDATA%/AutoClaw/auth.json`，DPAPI 解密）；
 ///      否则手动添加（token/refreshToken + deviceId，`enc:` 密文自动解密）；
@@ -526,7 +539,7 @@ pub async fn dispatch(
 ///      （`store.add_account`，归属由这里的 provider id 给出：国际版与国内版
 ///      共用同一套凭证形态与落账号路径，差别只在落进哪一家）。
 ///
-/// ── 文件导入（小浣熊 / CatPaw / Cline / KukuAI）──────────────────
+/// ── 文件导入（小浣熊 / Cline / KukuAI，以及插件家）─────────────────
 /// payload 新增三个可选字段（契约，历史请求不受影响）：
 ///   - `authFileContent`：用户手选的凭证文件**文本内容**（KukuAI 不吃文本 ——
 ///     它的凭证是二进制 SQLite，收到文本明确 400 指路 `authFileB64`）；
@@ -551,26 +564,23 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
-    // 引用集合快照（成功落账号后对账，见 `reconcile_kernel_listeners`）
-    let refs_before = state.store().referenced_pool_ids();
     let provider = payload
         .get("provider")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
     let store = state.store();
-    // 三家（小浣熊 / CatPaw / AutoClaw）的分派形状相同：`importDesktop: true`
-    // 导入桌面端实时登录态，否则按 payload 手动添加。差异只在调哪个方法，
-    // 因此这里把「取 flag + 取 name」收一次，各分支只留一行调用。
-    let import_desktop = payload
-        .get("importDesktop")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let name = payload
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string);
     let import_name = name.as_deref();
+    if let Some(response) = super::accounts_export::import_account_file(state, provider, &payload, import_name) {
+        return response;
+    }
+    if crate::server::core::providers::availability::is_suspended(provider) {
+        return management_error(503, "该提供商已暂停接入，暂不支持添加账号；已有数据保留");
+    }
     // ── 「文件导入」三字段（均为可选；文件导入契约）─────────────
     // 用户在界面上**手选**桌面客户端的凭证文件时，前端把文件内容放进这些字段：
     //   - `authFileContent`：文件文本内容（JSON 类文件，前端已读过整个文件）；
@@ -581,21 +591,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
     // 里的**凭证解析后落库**（得到一个可独立转发的账号，文件可来自任意机器或
     // 备份），后者只建一条「实时读本机固定路径」的记录；两者同时给时以文件为准
     // （用户的显式选择更强）。两个内容字段都没有时行为不变（历史契约零变化）。
-    // 接了这条路径的四家（小浣熊 / CatPaw / Cline / KukuAI）见各自分支，
-    // 别家的分支不读这三个字段。
-    let auth_file_content = payload
-        .get("authFileContent")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty());
-    let auth_file_b64 = payload
-        .get("authFileB64")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty());
-    let auth_file_name = payload
-        .get("authFileName")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    // 三个字段本身**不做解析**：插件家由 `add_plugin_account` 转成
+    // `NormalizeSource::{FileText,FileBase64}`（插件自己按家解析），内置家
+    // 只剩 Cline / KukuAI 等仍读它们的分支。
     // ── 自定义提供商（`custom-` 前缀，不在静态注册表里）─────────
     // 它**不进** `ProviderKind` 枚举 —— `kind_from_id` 对它返回 None 是设计
     // 而不是遗漏（见 `providers` 的模块头），所以必须在穷举 match **之前**
@@ -611,590 +609,248 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 // 幂等合并（同 key / 同家无需鉴权）时为 false：前端据此把提示
                 // 说成「已更新」而不是「已添加」，见 CustomAccountUpsert 的说明
                 "created": upsert.created,
-                "list": store.list_accounts(),
+                "list": store.list_visible_accounts(),
             })),
             Err(error) => store_error(error),
         };
     }
-    let result = match crate::server::core::providers::kind_from_id(provider) {
+    // 真实插件与本体 runtime ID 共用 normalize / 标准落库，必须先于旧枚举拒绝路径。
+    // 同一 ID 仍由插件优先执行；source 仅区分来源，不改变 provider 归属。
+    if crate::server::core::providers::is_executable_provider(provider) {
+        let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider) else {
+            return management_error(503, format!("提供商执行体尚未就绪：{provider}"));
+        };
+        let source = if crate::server::core::plugin_host::serves_provider(provider) {
+            "plugin"
+        } else {
+            "builtin"
+        };
+        return add_plugin_account(state, adapter.as_ref(), provider, &payload, import_name, source).await;
+    }
+    // ── 兜底分派：**每个分支都直接返回**（没有内置落库路径了）──────
+    // 本版本不再内置任何一家的账号实现，所以这里的每个 arm 都是 503 指路。
+    // 保留穷举 match 而不是删成一句通用 503：新增 `ProviderKind` 时编译器
+    // 会强制给出分支，而「这家到底是不是真的搬完了」只有逐家看过才知道 ——
+    // 一句通用兜底会让「忘了迁某一家」变成静默的错误文案。
+    match crate::server::core::providers::kind_from_id(provider) {
+        // Raccoon（小浣熊）：实现已整体搬到插件（JWT 凭证解析 / 桌面端实时
+        // 登录态 / 文件导入 / 续期 / 目录 / 余额 / 签到 / 新手任务），这里只留
+        // 拒绝路径 —— 装上插件时上面的 `serves_provider` 分流会先带走。
         Some(crate::server::core::providers::ProviderKind::Raccoon) => {
-            // ── 文件导入优先于 importDesktop（文件导入契约）────────────
-            // 两条路径的语义完全不同，别混用：
-            //   - `authFileContent`（文件导入）＝把文件里的**凭证解析后落库**，
-            //     得到一个**可独立转发**的账号（文件可来自另一台机器或备份，
-            //     导入后不依赖本机客户端）—— 与「手动粘贴」同一入口
-            //     `add_raccoon_account`，校验 / 撞 id 保护 / 来源标记全部复用；
-            //   - `importDesktop: true` ＝只建一条 `raccoon-desktop` 记录，
-            //     记录**不落 token**，转发时实时读本机固定路径
-            //     （`~/.box-agent/config/auth.json`）。
-            // 两者同时给时以文件为准：用户的显式文件更强。
-            // `authFileB64` 本期不实现：二进制凭证是别家（Cookies/加密库）才有
-            // 的形态，明确 400 而不是静默忽略（静默会让用户以为导入成功了）。
-            if let Some(content) = auth_file_content {
-                // 解析失败 → 400；成功 → 与「手动粘贴」同一入口落账号
-                // （400 文案统一经 describe_file_import_error 带上文件名）
-                match serde_json::from_str::<Value>(content) {
-                    Ok(parsed) => store
-                        .add_raccoon_account(&parsed, import_name)
-                        .map_err(|error| describe_file_import_error(error, auth_file_name)),
-                    Err(_) => Err(describe_file_import_error(
-                        AccountStoreError::new(
-                            "不是合法 JSON（请选择小浣熊客户端登录后生成的 auth.json）",
-                            400,
-                        ),
-                        auth_file_name,
-                    )),
-                }
-            } else if auth_file_b64.is_some() {
-                Err(binary_auth_file_unsupported(provider))
-            } else if import_desktop {
-                store.import_raccoon_desktop_account("manual")
-            } else {
-                store.add_raccoon_account(&payload, import_name)
-            }
+            return management_error(
+                503,
+                "小浣熊的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与桌面端读取实现",
+            );
         }
+        // CatPaw：实现已整体搬到插件（凭证归一化、桌面端实时登录态、余额凭证、
+        // 会话协议转发）。装上插件时上面的 `serves_provider` 分流会先带走，
+        // 三种来源（文件 / 桌面端 / 粘贴）都由插件的 `account.normalize` 处理。
         Some(crate::server::core::providers::ProviderKind::CatPaw) => {
-            // ── 文件导入优先于 importDesktop（与上一条分支同款）────────
-            // `authFileContent`（文件导入）＝把文件里的凭证解析后落库，得到
-            // 一个可独立转发的账号（文件可来自任意机器/备份）—— 与「手动粘贴」
-            // 同一入口 `add_catpaw_account`（它认嵌套 auth.json：
-            // `auth.accessToken` + `account.uid`/`loginName`，见那边的取值候选表）；
-            // `importDesktop: true` ＝只建一条 `desktop-auth` 记录，记录**不落
-            // token**，转发时实时读本机固定路径（`~/.meituan-catpaw/auth.json`）。
-            if let Some(content) = auth_file_content {
-                match serde_json::from_str::<Value>(content) {
-                    Ok(parsed) => store
-                        .add_catpaw_account(&parsed, import_name)
-                        .map_err(|error| describe_file_import_error(error, auth_file_name)),
-                    Err(_) => Err(describe_file_import_error(
-                        AccountStoreError::new(
-                            "不是合法 JSON（请选择 CatPaw 客户端登录后生成的 auth.json）",
-                            400,
-                        ),
-                        auth_file_name,
-                    )),
-                }
-            } else if auth_file_b64.is_some() {
-                Err(binary_auth_file_unsupported(provider))
-            } else if import_desktop {
-                store.import_catpaw_desktop_account("manual")
-            } else {
-                store.add_catpaw_account(&payload, import_name)
-            }
+            return management_error(
+                503,
+                "CatPaw 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与桌面端读取实现",
+            );
         }
-        // AutoClaw（W4b-T-c2）：粘贴 token / refreshToken（含 `enc:` 密文自动解密）
-        // → 手动添加；`importDesktop: true` → 导入桌面端实时登录态（记录不落 token）。
-        //
-        // 两个地区走**同一份实现**、按地区参数化（`autoclaw::region`）：账号集合
-        // 按 provider 隔离，因此这里的 kind → region 必须逐字对应，不能让国际版
-        // 落进国内版的记录里（那会让两家的账号在同一分组里混着，选路也按错误的
-        // 域名发请求）。`importDesktop` 两地都给：桌面端那个 auth.json 没有地区
-        // 标记、两个构建共用，**地区由用户选的那一项决定**（见
-        // `import_autoclaw_desktop_account` 与 `region.rs` 的完整讨论）。
-        Some(kind @ (crate::server::core::providers::ProviderKind::AutoClaw
-            | crate::server::core::providers::ProviderKind::AutoClawIntl)) => {
-            let region = crate::server::core::providers::autoclaw::Region::from_kind(kind)
-                .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
-            if import_desktop {
-                store.import_autoclaw_desktop_account(region, "manual")
-            } else {
-                store.add_autoclaw_account(region, &payload, import_name)
-            }
+        // AutoClaw（两个地区）：实现已整体搬到插件（凭证解析 / safeStorage 解密 /
+        // 桌面端实时登录态 / 续期 / 转发 / 短信与 OAuth 登录），这里只留拒绝路径
+        // —— 装上插件时上面的 `serves_provider` 分流会先带走。
+        Some(
+            crate::server::core::providers::ProviderKind::AutoClaw
+            | crate::server::core::providers::ProviderKind::AutoClawIntl,
+        ) => {
+            return management_error(
+                503,
+                "AutoClaw 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与登录实现",
+            );
         }
-        // CodeArts：粘贴凭证（AK/SK/STS + domain/user + 可选的 refresh token 与
-        // oauth_context）。**不调上游**——凭据是登录换来的，添加时没有可交换的
-        // 授权码；目录与连通性由刷新链路验。
-        // 网页登录（要 DPoP + PKCE 回调）在 M5 后续切片，届时这里加一条分支。
+        // CodeArts：实现已整体搬到插件（AK/SK/STS 凭据解析、DPoP + PKCE 登录、
+        // 目录三源、余额、每日福利），这里只留拒绝路径 —— 装上插件时上面的
+        // `serves_provider` 分流会先带走。
         Some(crate::server::core::providers::ProviderKind::CodeArts) => {
-            match crate::server::core::providers::codearts::credentials::Credential::from_payload(&payload) {
-                Ok(credential) => store.add_codearts_account(&credential, import_name, "manual"),
-                Err(reason) => Err(AccountStoreError::new(reason, 400)),
-            }
+            return management_error(
+                503,
+                "CodeArts 的账号需要安装提供商插件：本版本不再内置该家的凭据解析与登录实现",
+            );
         }
-        // Qoder（两个地区走同一份实现、按地区参数化，与 AutoClaw 同款）：
-        // 粘贴 PAT / 凭证 → 手动添加。拆家后界面上是两张卡片（`qoder` /
-        // `qoder-intl`），地区由 kind 反查（provider 身份是权威，payload 里
-        // 的 `mode` 只是兼容字段）。
-        Some(kind @ (crate::server::core::providers::ProviderKind::Qoder
-            | crate::server::core::providers::ProviderKind::QoderIntl)) => {
-            let region = crate::server::core::providers::qoder::endpoints::Region::from_kind(kind)
-                .unwrap_or(crate::server::core::providers::qoder::endpoints::Region::Cn);
-            match crate::server::core::providers::qoder::auth::prepare_account(&payload, region).await {
-                Ok(credentials) => store.add_qoder_account(region, &credentials, import_name, "manual"),
-                Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
-            }
+        // Qoder（两个地区）：实现已整体搬到插件（设备授权登录、PAT 换证、
+        // 续期、目录、会话式转发、额度、签到、风控组件），这里只留拒绝路径
+        // —— 装上插件时上面的 `serves_provider` 分流会先带走。
+        Some(
+            crate::server::core::providers::ProviderKind::Qoder
+            | crate::server::core::providers::ProviderKind::QoderIntl,
+        ) => {
+            return management_error(
+                503,
+                "Qoder 的账号管理需要安装提供商插件：本版本不再内置该家的设备授权与凭据解析实现",
+            );
         }
-        // Accio（两个地区）：粘贴 accessToken / refreshToken（`mode` 选地区，
-        // 缺省国际版）→ 手动添加。「网页登录」是另一条链路（适配器的
-        // `supports_web_login` 走 `/api/session/login/start` → OAuth 回调 →
-        // 同一个落账号入口 `add_accio_account`）。
-        //
-        // `importDesktop` 不提供：Accio 桌面端的登录态落在 Electron 会话与 OS
-        // 加密区里（没有 auth.json 那种稳定可读的文件形态），给了入口只会稳定
-        // 失败 —— 与 AutoClaw「一读一解密」不同，不要照抄那边。
-        Some(kind @ (crate::server::core::providers::ProviderKind::Accio
-            | crate::server::core::providers::ProviderKind::AccioCn)) => {
-            let region = crate::server::core::providers::accio::endpoints::Region::from_kind(kind)
-                .unwrap_or(crate::server::core::providers::accio::endpoints::Region::Global);
-            if import_desktop {
-                return management_error(
-                    400,
-                    format!(
-                        "Accio {}不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
-                        region.label()
-                    ),
-                );
-            }
-            match crate::server::core::providers::accio::auth::prepare_account(&payload).await {
-                Ok(credentials) => store.add_accio_account(&credentials, import_name, "manual"),
-                Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
-            }
+        // Accio（两个地区）：实现已整体搬到插件（含粘贴凭证归一化、网页登录、
+        // 续期与转发），这里只留拒绝路径 —— 装上插件时上面的 `serves_provider`
+        // 分流会先带走。
+        Some(
+            crate::server::core::providers::ProviderKind::Accio
+            | crate::server::core::providers::ProviderKind::AccioCn,
+        ) => {
+            return management_error(
+                503,
+                "Accio 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与登录实现",
+            );
         }
-        // Cline：粘贴 accessToken / refreshToken → 手动添加；
-        // `importDesktop: true` → 导入桌面端实时登录态（记录不落 token，
-        // 实时读 `~/.cline/data/settings/providers.json`）；
-        // `authFileContent` → 文件导入（从 providers.json 提取凭证后**落 token**）。
-        // 校验（token 非空 / 长度 / 补 `workos:` 前缀 / 从 JWT 取 expiresAt 与
-        // 展示名）都在 `add_cline_account` 里，与设备授权登录共用同一入口。
-        // **两个池各是一个 provider**（`cline-free` / `cline-pass`），添加时
-        // 由 body 的 `provider` 决定进哪一家 —— 不需要额外的池参数。
-        Some(kind @ (crate::server::core::providers::ProviderKind::ClineFree
-            | crate::server::core::providers::ProviderKind::ClinePass)) => {
-            let provider_id = crate::server::core::providers::kind_id(kind);
-            // ── 文件导入优先于 importDesktop（文件导入契约）────────────
-            // 两条路径的语义完全不同，别混用：
-            //   - `authFileContent`（文件导入）＝把用户手选的 `providers.json`
-            //     里的凭证**提取出来落库**，得到一个**可独立转发**的账号
-            //     （文件可来自另一台机器或备份）—— 与「手动粘贴」同一入口
-            //     `add_cline_account`（补 `workos:` 前缀 / 落 token / 撞 id 保护
-            //     全部复用）；
-            //   - `importDesktop: true` ＝只建一条 `cline-<池>-desktop` 记录，
-            //     记录**不落 token**，转发时实时读本机固定路径。
-            // 「文件文本 → 凭证」的提取口径与桌面导入共用同一份（见
-            // `account_store::cline_accounts` 的 `cline_credentials_from_settings_text`），
-            // 不在这里另写一套键名候选 —— 两处口径分叉会让「同一个文件，手选能
-            // 导入、本机路径却报格式不对」这种最难排查的形态出现。
-            if let Some(content) = auth_file_content {
-                store
-                    .add_cline_account_from_file(provider_id, content, import_name)
-                    .map_err(|error| describe_file_import_error(error, auth_file_name))
-            } else if auth_file_b64.is_some() {
-                Err(binary_auth_file_unsupported(provider))
-            } else if import_desktop {
-                store.import_cline_desktop_account(provider_id, import_name)
-            } else {
-                store.add_cline_account(provider_id, &payload, import_name)
-            }
+        // Cline：实现已整体搬到插件（设备授权登录、凭证解析、续期、目录、
+        // 伪装头、余额、转发），这里只留拒绝路径 —— 装上插件时上面的
+        // `serves_provider` 分流会先带走。
+        Some(
+            crate::server::core::providers::ProviderKind::ClineFree
+            | crate::server::core::providers::ProviderKind::ClinePass,
+        ) => {
+            return management_error(
+                503,
+                "Cline 的账号管理需要安装提供商插件：本版本不再内置该家的设备授权登录与凭证解析实现",
+            );
         }
-        // ZCode（两个地区）：**粘贴凭证**（`jwt` + `accessToken`）→ 手动添加；
-        // 「网页登录」是另一条链路（`api::session::login_start` 的 ZCode 分支 →
-        // `core::login::zcode` 的 CLI 轮询任务 → 同一个落账号入口
-        // `add_zcode_account`）。
-        //
-        // ── 为什么两个字段都要收、且只给一个也能落 ───────────────
-        // 两者服务**不同的功能**（见 `zcode::credentials` 的模块头）：
-        // `accessToken` 转发用、`jwt` 领取用，互相不能替代。用户想测哪一半
-        // 就填哪一半 —— 只给了 jwt 的账号能领取不能转发（转发会如实报缺），
-        // 反之亦然。这正是「粘贴」这条路相对网页登录的价值：
-        // 不必先过一遍 OAuth 就能单独验证领取协议。
-        //
-        // `importDesktop` 不提供：ZCode 客户端的凭证在它自己的加密存储里，
-        // 没有 auth.json 那种稳定可读的形态 —— 给了入口只会稳定失败
-        // （与 Accio 同一处境、同一处置，不要照抄 AutoClaw 那边）。
-        Some(kind @ (crate::server::core::providers::ProviderKind::Zcode
-            | crate::server::core::providers::ProviderKind::ZcodeIntl)) => {
-            let region = crate::server::core::providers::zcode::region::Region::from_kind(kind)
-                .unwrap_or(crate::server::core::providers::zcode::region::Region::Cn);
-            if import_desktop {
-                return management_error(
-                    400,
-                    format!(
-                        "ZCode {}不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
-                        region.label()
-                    ),
-                );
-            }
-            let text_field = |key: &str| {
-                payload
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .to_string()
-            };
-            let access_token = text_field("accessToken");
-            let jwt = text_field("jwt");
-            if access_token.is_empty() && jwt.is_empty() {
-                return management_error(
-                    400,
-                    "请至少填写 accessToken（用于转发）或 jwt（用于领取套餐）",
-                );
-            }
-            let credentials = crate::server::core::providers::zcode::credentials::ZcodeCredentials {
-                region,
-                access_token,
-                jwt,
-                user_id: text_field("userId"),
-                // 设备标识是领取链路的活动期要求（见 `credentials.rs` 的模块头）：
-                // 用户没给就新生成一个，随凭证落盘后跨请求稳定
-                device_mid: crate::server::core::providers::zcode::credentials::new_device_mid()
-                    .unwrap_or_default(),
-            };
-            store.add_zcode_account(&credentials, import_name, "manual")
+        // ZCode（两个地区）：实现已整体搬到插件（CLI 轮询登录、编码套餐凭证
+        // 换取、活动套餐通道、领取、余额、验证码令牌池、目录、转发），这里只留
+        // 拒绝路径 —— 装上插件时上面的 `serves_provider` 分流会先带走。
+        Some(
+            crate::server::core::providers::ProviderKind::Zcode
+            | crate::server::core::providers::ProviderKind::ZcodeIntl,
+        ) => {
+            return management_error(
+                503,
+                "ZCode 的账号管理需要安装提供商插件：本版本不再内置该家的 CLI 登录与凭证换取实现",
+            );
         }
-        // Trae：**粘贴凭据**（`accessToken` / `refreshToken` / 设备三件套）→ 手动添加。
-        // 「网页登录」是另一条链路（`api::session::login_start` 的 Trae 分支 →
-        // `core::login::trae` 的回调任务 → 同一个落账号入口 `add_trae_account`）。
-        //
-        // ── 形状判定为什么交给 `Credential::from_payload` ────────
-        // 参考实现的落盘形态是嵌套的 `{type, provider, auth{…}, account{…}}`
-        // （CPA 的凭据文件），而手填表单是平铺的。两个位置都读一次是必须的：
-        // 只认平铺会让「从 CPA 导出粘贴过来」变成一句"缺 accessToken"，而那份
-        // 数据明明是完整的。它同时**拒绝**别家的蛇形键（`access_key_id` 一类），
-        // 免得一条有内容的记录被当成空凭据收下。
-        //
-        // `importDesktop` 不提供：Trae 桌面端的登录态在它自己的加密存储里
-        // （与 Accio / ZCode 同一处境），给了入口只会稳定失败。
+        // Trae：实现已整体搬到插件（网页登录、凭据解析、续期、目录、转发、
+        // 额度、签到），这里只留拒绝路径 —— 装上插件时上面的 `serves_provider`
+        // 分流会先带走。
         Some(crate::server::core::providers::ProviderKind::Trae) => {
-            if import_desktop {
-                return management_error(
-                    400,
-                    "Trae 不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
-                );
-            }
-            let mut credential =
-                match crate::server::core::providers::trae::credentials::Credential::from_payload(&payload) {
-                    Ok(credential) => credential,
-                    Err(reason) => return management_error(400, reason),
-                };
-            // 身份是 best-effort 的读数（昵称/uid 只影响显示与去重）：
-            // 粘贴的凭据一般不带 uid，这里替用户问一次上游。问不到也照样落账号
-            // —— 见 `providers::trae::profile` 模块头，「登录已成功却因为读不到
-            // 昵称而判失败」是本家明确要避免的那种行为。
-            if credential.uid.is_empty() {
-                if let Ok(identity) =
-                    crate::server::core::providers::trae::profile::get_user_info(&credential, None).await
-                {
-                    credential.uid = identity.uid;
-                    credential.nickname = identity.nickname;
-                    credential.enterprise_id = identity.enterprise_id;
-                }
-            }
-            store.add_trae_account(&credential, import_name, "manual")
+            return management_error(
+                503,
+                "Trae 的账号管理需要安装提供商插件：本版本不再内置该家的网页登录与凭据解析实现",
+            );
         }
-        // Loomy（讯飞）：**粘贴 session** → 手动添加（短信登录是另一条链路，
-        // `POST /api/session/login/loomy/sms/verify` → 同一个落账号入口
-        // `add_loomy_account`）。
+        // Loomy（讯飞）：实现已整体搬到插件（粘贴 session、短信登录、续期、
+        // 转发、额度、签到、新手任务），这里只留拒绝路径 —— 装上插件时上面的
+        // `serves_provider` 分流会先带走。
         //
-        // `importDesktop` 不提供：Loomy 的登录态在客户端自己的加密存储里，
-        // 没有 auth.json 那种稳定可读的文件形态 —— 给了入口只会稳定失败
-        // （与 Accio / ZCode 同一处境）。
+        // 曾经这里保留了一条内置的 `add_loomy_account` 粘贴路径，后果是
+        // 「没装插件也能加进一个 Loomy 账号，但转发与签到全部 503」——
+        // 账号能建、功能全无，用户看不出为什么。与其他家统一成同一条 503。
         Some(crate::server::core::providers::ProviderKind::Loomy) => {
-            if import_desktop {
-                return management_error(
-                    400,
-                    "Loomy 不支持导入桌面端登录态，请用「手机号验证码登录」或粘贴 session 添加账号",
-                );
-            }
-            store.add_loomy_account(&payload, import_name)
+            return management_error(
+                503,
+                "Loomy 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与短信登录实现",
+            );
         }
-        // KukuAI（百度文库库库 AI）：**粘贴 Cookie**（Cookie 头 / Cookie 编辑器
-        // JSON / `{BDUSS, STOKEN}` 对象）→ 解析并向上游验证（userreport 换
-        // 会话三件套 + uk）→ 落账号。
-        //
-        // `importDesktop: true` → 读本机客户端登录态（`%APPDATA%\baidugenflowpro\
-        // Network\Cookies`，明文 SQLite 无需解密，见 `kuku::credentials` 模块头）
-        // → 同样验证 → 落账号。
-        //
-        // `authFileB64` → **文件导入**：把用户手选的 Cookies 文件解析出凭证后
-        // 落库（来源 `"file"`），文件可来自另一台机器 / 备份，导入后不依赖本机
-        // 客户端 —— 与「粘贴 Cookie」落进同一入口 `add_kuku_account`。
-        //
-        // 验证失败（凭证无效 / 客户端占用 Cookies 文件）→ 400，不落空记录。
+        // KukuAI（百度文库库库 AI）：实现已整体搬到插件（三态凭证解析——粘贴
+        // Cookie / 本机客户端 Cookies 数据库 / 文件导入——加真实校验与网页登录），
+        // 这里只留拒绝路径。装上插件时上面的 `serves_provider` 分流会先带走。
         Some(crate::server::core::providers::ProviderKind::Kuku) => {
-            // ── 文件导入优先于 importDesktop（文件导入契约；本家吃**二进制**）──
-            // KukuAI 的凭证文件是 Cookies 的 SQLite 数据库（二进制），不是 JSON
-            // 文本：文件内容走 `authFileB64`（前端读文件字节后 base64），
-            // `authFileContent` 对它只是「传错了字段」—— 明确 400 指路 base64，
-            // 不静默忽略（会让用户以为导入成功了），也不硬当 Cookie 头解析
-            // （那会把「字段选错」伪装成「缺 BDUSS」）。
-            //
-            // 为什么落临时文件再把路径交给解析：读写判定（rusqlite 打开 + 查
-            // `cookies` 表）只有 `read_credentials_from_path` 这一份、按**路径**
-            // 工作，让文件导入与 importDesktop 复用同一条读取链（见
-            // `kuku_credentials_from_b64_file` 的说明）；临时文件读完即删。
-            //
-            // 与 importDesktop 的语义差别（别混用）：文件导入＝把用户手选文件里
-            // 的**凭证解析后落库**，得到一个**可独立转发**的账号（来源标记
-            // `"file"`）；`importDesktop: true` ＝只建一条记录，转发时**实时**读
-            // 本机固定路径（来源标记 `"desktop"`，占用冲突由两段式处置解）。
-            // 两者同时给时以文件为准：用户的显式文件更强。
-            if let Some(encoded) = auth_file_b64 {
-                // 两个内容字段同时出现时以 base64 为准：文本形态对 KukuAI 必然
-                // 不可用，而 base64 是能走通的那条路（见上）。
-                match kuku_credentials_from_b64_file(encoded, auth_file_name) {
-                    // 解码 / 临时文件 / 解析失败 → 400（文案已带原文件名）
-                    Err(error) => Err(error),
-                    Ok(parsed) => {
-                        // 与 importDesktop 同一条链：真实校验（userreport 换会话
-                        // 三件套 + uk）通过才落账号；网络失败同样 400 —— 要的是
-                        // 「现在真的能用」。
-                        match crate::server::core::providers::kuku::credentials::enrich_identity(
-                            &parsed,
-                            None,
-                            true,
-                        )
-                        .await
-                        {
-                            Ok(verified) => store.add_kuku_account(&verified, import_name, "file"),
-                            Err(error) => {
-                                Err(AccountStoreError::new(error.message, error.status_code))
-                            }
-                        }
-                    }
-                }
-            } else if auth_file_content.is_some() {
-                Err(describe_file_import_error(
-                    AccountStoreError::new(
-                        "KukuAI 的桌面凭证是二进制的 Cookies 数据库，不能用文本导入（请用 authFileB64 传文件内容）",
-                        400,
-                    ),
-                    auth_file_name,
-                ))
-            } else {
-                // ── 历史路径（行为逐字不变）：importDesktop → 实时读本机固定
-                //    路径；否则把 payload 当粘贴的 Cookie 解析 ──
-                let parsed = if import_desktop {
-                    match crate::server::core::providers::kuku::credentials::read_desktop_credentials()
-                    {
-                        Ok(credentials) => credentials,
-                        Err(reason) => return management_error(400, reason),
-                    }
-                } else {
-                    match crate::server::core::providers::kuku::credentials::credentials_from_payload(
-                        &payload,
-                    ) {
-                        Ok(credentials) => credentials,
-                        Err(reason) => return management_error(400, reason),
-                    }
-                };
-                let verified = match crate::server::core::providers::kuku::credentials::enrich_identity(
-                    &parsed,
-                    None,
-                    true,
-                )
-                .await
-                {
-                    Ok(credentials) => credentials,
-                    Err(error) => return management_error(error.status_code, error.message),
-                };
-                store.add_kuku_account(
-                    &verified,
-                    import_name,
-                    if import_desktop { "desktop" } else { "manual" },
-                )
-            }
+            return management_error(
+                503,
+                "KukuAI 的账号管理需要安装提供商插件：本版本不再内置该家的 Cookie 解析与校验实现",
+            );
         }
-        // MonkeyCode（长亭科技）：**粘贴 session**（`monkeycode_ai_session` cookie）
-        // → 先向上游 `GET /api/v1/users/status` 校验并归一化，再落账号（`login.rs`
-        // 里顺带 best-effort 发现 image_id）。两个站点走同一份实现、按地区参数化
-        // （provider id 是权威，见 `monkeycode::region`）。
-        //
-        // `importDesktop` 不提供：本家的登录态就是浏览器 cookie，没有客户端
-        // 「auth.json」那种可读文件（与 Accio / ZCode 同一处境）。
-        Some(kind @ (crate::server::core::providers::ProviderKind::MonkeyCode
-            | crate::server::core::providers::ProviderKind::MonkeyCodeIntl)) => {
-            let region = crate::server::core::providers::monkeycode::Region::from_kind(kind)
-                .unwrap_or(crate::server::core::providers::monkeycode::Region::Cn);
-            if import_desktop {
-                return management_error(
-                    400,
-                    format!(
-                        "MonkeyCode {}不支持导入桌面端登录态，请粘贴 session（monkeycode_ai_session）添加账号",
-                        region.label()
-                    ),
-                );
-            }
-            let session = payload
-                .get("session")
-                .or_else(|| payload.get("accessToken"))
-                .or_else(|| payload.get("token"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("")
-                .to_string();
-            if session.is_empty() {
-                return management_error(400, "请粘贴 MonkeyCode 的 session cookie（monkeycode_ai_session）");
-            }
-            let provided_image = payload
-                .get("imageId")
-                .or_else(|| payload.get("image_id"))
-                .and_then(Value::as_str);
-            match crate::server::core::providers::monkeycode::login::verify_session(
-                region,
-                &session,
-                provided_image,
-            )
-            .await
-            {
-                Ok(credentials) => {
-                    store.add_monkeycode_account(region, &credentials, import_name, "manual")
-                }
-                Err(error) => return management_error(error.status_code, error.message),
-            }
+        // MonkeyCode（长亭科技）：实现已整体搬到插件（session 探活、image_id
+        // 发现、目录、会话转发），这里只留拒绝路径。装上插件时上面的
+        // `serves_provider` 分流会先带走。
+        Some(crate::server::core::providers::ProviderKind::MonkeyCode)
+        | Some(crate::server::core::providers::ProviderKind::MonkeyCodeIntl) => {
+            return management_error(
+                503,
+                "MonkeyCode 的账号管理需要安装提供商插件：本版本不再内置该家的 session 校验实现",
+            );
         }
-        // Command Code（`api.commandcode.ai`）：**粘贴 API Key**（`user_` 开头）
-        // → 本地归一化（剥引号 / `Authorization: Bearer …` 整行 / 尾部杂字段）
-        // + 形态检查，随后一次 best-effort 探活（`GET /alpha/billing/credits`
-        // 的 401/403 才判无效）→ 落账号。key 本身也是上游的账号身份
-        // （没有 userId 可解析，账号 id 由 key 摘要派生，见
-        // `commandcode_accounts.rs` 的模块头）。
-        //
-        // `importDesktop` 不提供：本家的凭证就是一枚 API Key，没有客户端
-        // 「auth.json」那种可读登录态（与 Loomy / MonkeyCode 同一处境）。
+        // Command Code：实现已整体搬到插件（API Key 归一化 / 形态检查 / 探活 /
+        // 目录 / NDJSON 转发）。装上插件时上面的 `serves_provider` 分流会先带走。
         Some(crate::server::core::providers::ProviderKind::CommandCode) => {
-            if import_desktop {
-                return management_error(
-                    400,
-                    "Command Code 不支持导入桌面端登录态，请粘贴 API Key（user_ 开头）添加账号",
-                );
-            }
-            let raw = payload
-                .get("apiKey")
-                .or_else(|| payload.get("accessToken"))
-                .or_else(|| payload.get("token"))
-                .or_else(|| payload.get("key"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let credentials =
-                match crate::server::core::providers::commandcode::login::verify_key(raw).await {
-                    Ok(credentials) => credentials,
-                    Err(error) => return management_error(error.status_code, error.message),
-                };
-            store.add_commandcode_account(&credentials, import_name, "manual")
+            return management_error(
+                503,
+                "Command Code 的账号管理需要安装提供商插件：本版本不再内置该家的 API Key 校验与转发实现",
+            );
         }
-        // Antigravity（Google 的 AI IDE）：**粘贴 Google refresh token**
-        // → 本地归一化（剥引号 / `refresh_token=` 整行 / 空白；`1//` 是令牌本体，
-        // 不剥）→ 打一次 Google token 端点做**真实校验**（refresh_token 没有可判
-        // 的本地形态，不像 `user_` 那种有前缀可查），顺带拿到 access_token /
-        // 到期时间 → best-effort 发现 `cloudaicompanionProject` → 落账号
-        // （见 `providers::antigravity::login` 的模块头）。
-        //
-        // `importDesktop` 不提供：本家的登录态在 Antigravity IDE 自己的存储里
-        // （与 Accio / ZCode / Loomy 同一处境）—— 给了入口只会稳定失败。
+        // Antigravity（Google 的 AI IDE）：实现已整体搬到插件（授权码登录 +
+        // refresh token 归一化 + 探活 + 转发 + 余额），这里只留拒绝路径。
         Some(crate::server::core::providers::ProviderKind::Antigravity) => {
-            if import_desktop {
-                return management_error(
-                    400,
-                    "Antigravity 不支持导入桌面端登录态，请粘贴 Google refresh token（1// 开头）添加账号",
-                );
-            }
-            let credentials = match crate::server::core::providers::antigravity::login::verify_paste(
-                &payload, None,
-            )
-            .await
-            {
-                Ok(credentials) => credentials,
-                Err(error) => return management_error(error.status_code, error.message),
-            };
-            store.add_antigravity_account(&credentials, import_name, "manual")
+            return management_error(
+                503,
+                "Antigravity 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与探活实现",
+            );
         }
-        // OfficeAce（华为云果办 / OfficeClaw）：粘贴模型网关的 Basic 凭据
-        // （`baseUrl` + `modelAppKey`/`modelAppSecret`，可选控制面临时凭据）。
-        // **不调上游**（与 CodeArts 同口径）——凭据是导入/登录换来的，添加时
-        // 没有可交换的授权码；目录与连通性由刷新链路验。
+        // OfficeAce（华为云果办 / OfficeClaw）：实现已整体搬到插件（含自助
+        // OAuth 登录与续期），这里只留拒绝路径 —— 装上插件时上面的
+        // `serves_provider` 分流会先带走。
         Some(crate::server::core::providers::ProviderKind::OfficeAce) => {
-            // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
-            store.add_officeace_account(&payload, import_name, true)
+            return management_error(
+                503,
+                "OfficeAce 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与登录实现",
+            );
         }
-        // OrcaTerm（腾讯云遨驰终端桌面客户端）：**粘贴 accessToken**（OAuth JWT）
-        // → 本地归一化（剥 `Bearer ` / `ot_session=` 前缀；整段 data.bin JSON
-        // 直接粘也行）→ 打一次 `GetUserInfo` 做**真实校验**（顺带补 userId 与
-        // 昵称；JWT 里本来就有 userId，这一步同时确认 token 没被上游拒绝）→
-        // 落账号（续期由网关接管，见 `orcaterm::credentials` 模块头）。
-        //
-        // `importDesktop: true` → 读桌面客户端登录态
-        // （`%APPDATA%\com.orcaterm-desktop.app\data.bin`，Tauri store 明文 JSON
-        // 无需解密，见 `orcaterm::credentials::read_desktop_credentials`）→
-        // 同样校验 → 落账号。校验失败（token 无效 / 文件不存在）→ 400，不落空记录。
+        // OrcaTerm（腾讯云遨驰终端桌面客户端）：实现已整体搬到插件，这里不再
+        // 保留内置分支 —— 装上插件时上面的 `serves_provider` 分流会带走，
+        // 没装插件时落到这里，如实拒绝而不是走一条没有执行体的落库路径。
         Some(crate::server::core::providers::ProviderKind::OrcaTerm) => {
-            let parsed = if import_desktop {
-                match crate::server::core::providers::orcaterm::credentials::read_desktop_credentials()
-                {
-                    Ok(credentials) => credentials,
-                    Err(reason) => return management_error(400, reason),
-                }
-            } else {
-                match crate::server::core::providers::orcaterm::credentials::credentials_from_payload(
-                    &payload,
-                ) {
-                    Ok(credentials) => credentials,
-                    Err(reason) => return management_error(400, reason),
-                }
-            };
-            // 真实校验 + 补身份：GetUserInfo 失败（token 无效 / 上游拒绝）→ 400。
-            // 网络失败同样 400 —— 添加时验证与 kuku 同一口径（要的是「现在真的能用」）。
-            let verified = match crate::server::core::providers::orcaterm::credentials::fetch_user_info(
-                &parsed, None,
-            )
-            .await
-            {
-                Ok((user_id, nickname)) => {
-                    let mut credentials = parsed;
-                    if credentials.user_id.is_empty() {
-                        credentials.user_id = user_id;
-                    }
-                    if credentials.nickname.is_empty() {
-                        credentials.nickname = nickname;
-                    }
-                    credentials
-                }
-                Err(error) => return management_error(error.status_code, error.message),
-            };
-            store.add_orcaterm_account(
-                &verified,
-                import_name,
-                if import_desktop { "desktop" } else { "manual" },
-            )
+            return management_error(
+                503,
+                "OrcaTerm 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析与探活实现",
+            );
         }
-        // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
-        // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
-        // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
-        // `None`（老客户端不带 provider 字段）按国内版，历史契约不变。
-        // `importDesktop: true` → 读本机官方客户端（Tencent WorkBuddy）的登录态
-        // 文件（`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\`，国内版
-        // `workbuddy-desktop*.info`、国际版 `workbuddy-desktop-ai*.info`，见
-        // `account_store::workbuddy_import` 的模块头）；文件内容原样交
-        // `add_account` 落库，备注名取 payload 的 `name`（可选）。老客户端不带
-        // provider 字段时无从选文件组，直接 400 而不是静默按国内版。
+        // 智谱清言（`chatglm.cn`）：实现已整体搬到插件（访客换证 / 粘贴令牌 /
+        // 导入本机登录态三条路径、续期、目录、转发、余额、签到、任务中心），
+        // 这里只留拒绝路径 —— 装上插件时上面的 `serves_provider` 分流会先带走。
+        Some(crate::server::core::providers::ProviderKind::Chatglm) => {
+            return management_error(
+                503,
+                "智谱清言的账号管理需要安装提供商插件：本版本不再内置该家的访客换证、令牌校验与本机登录态读取实现",
+            );
+        }
+        // ModelScope（魔搭）的两个站点：实现已整体搬到插件（`ms-` 令牌探活取
+        // 身份、转发、目录、魔粒、签到），这里只留拒绝路径 —— 装上插件时上面的
+        // `serves_provider` 分流会先带走。
+        Some(
+            crate::server::core::providers::ProviderKind::Modelscope
+            | crate::server::core::providers::ProviderKind::ModelscopeIntl,
+        ) => {
+            return management_error(
+                503,
+                "ModelScope 的账号管理需要安装提供商插件：本版本不再内置该家的令牌探活与凭证解析实现",
+            );
+        }
+        // AtomCode：实现已整体搬到插件（令牌对归一化、目录、转发、额度、续期、
+        // 领取）。装上插件时上面的 `serves_provider` 分流会先带走。
+        Some(crate::server::core::providers::ProviderKind::Atomcode) => {
+            return management_error(
+                503,
+                "AtomCode 的账号管理需要安装提供商插件：本版本不再内置该家的凭证解析实现",
+            );
+        }
+        // LobsterAI：**没有粘贴路径**（如实拒绝，而不是落一条用不了的账号）。
+        // 它的凭证里有两个 `keyfrom` 与一个 `uuid`，只在换码那一刻由上游下发 ——
+        // 用户从别处粘不出这三样，缺了它们账号续不了期。所以本家只有一个入口：
+        // 网页登录落到本机 loopback 回调后由**插件**换码落账号。
+        // 装上插件时上面的 `serves_provider` 分流会先带走（插件的
+        // `normalize_account` 对同样的问题给同一条文案）。
+        Some(crate::server::core::providers::ProviderKind::LobsterAi) => {
+            return management_error(
+                400,
+                "LobsterAI 只能通过「网页登录」添加：它的续期需要换码时下发的 uuid 与 keyfrom，粘贴给不出这三项",
+            );
+        }
+        // WorkBuddy 系的两家（国内版 / 国际版）：实现已整体搬到插件
+        // （会话凭证解析 / 桌面端登录态读取 / 续期 / 转发），这里只留拒绝路径。
+        //
+        // `None`（老客户端不带 provider 字段）曾经按国内版处理：那是**旧内置
+        // 链**的兼容。现在没有可落的路径了 —— 静默按国内版落一条记录等于把
+        // 用户的凭证写进一个没有执行体的组，界面看不出异常但转发必然失败，
+        // 所以统一回 503 并指路去装插件。
         Some(crate::server::core::providers::ProviderKind::WorkBuddy)
         | Some(crate::server::core::providers::ProviderKind::WorkBuddyIntl)
         | None => {
-            let provider = crate::server::core::providers::kind_from_id(provider)
-                .map(crate::server::core::providers::kind_id);
-            if import_desktop {
-                let Some(provider) = provider else {
-                    return management_error(
-                        400,
-                        "导入桌面端登录态需要 provider 字段（workbuddy / workbuddy-intl）",
-                    );
-                };
-                store.import_workbuddy_desktop_account(provider, import_name)
-            } else {
-                store.add_account(&payload, import_name, provider)
-            }
+            management_error(
+                503,
+                "WorkBuddy 的账号管理需要安装提供商插件：本版本不再内置该家的会话凭证解析与桌面端登录态读取实现",
+            )
         }
-    };
-    match result {
-        Ok(account) => {
-            // 落号成功后对账：新增引用补监听器、失去引用回收端口（lazy listeners）
-            reconcile_kernel_listeners(state, &refs_before);
-            ok_json(json!({
-                "account": account,
-                "list": store.list_accounts(),
-            }))
-        }
-        Err(error) => store_error(error),
     }
 }
 
@@ -1264,102 +920,22 @@ pub async fn set_current(state: &ServerState, body: &Bytes) -> Response {
     }
 }
 
-// ─── POST /api/accounts/batch ───────────────────────────────
-
-pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
-    let payload = match parse_json_body(&body, "请求内容不是有效 JSON") {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    // 引用集合快照（批量改代理成功后对账，见 `reconcile_kernel_listeners`）
-    let refs_before = state.store().referenced_pool_ids();
-    // ids 去重 + 过滤空串，逐字照抄 Node 版
-    let mut ids: Vec<String> = Vec::new();
-    if let Some(items) = payload.get("ids").and_then(Value::as_array) {
-        for item in items {
-            if let Some(text) = item.as_str() {
-                if !text.is_empty() && !ids.iter().any(|existing| existing == text) {
-                    ids.push(text.to_string());
-                }
-            }
-        }
-    }
-    if ids.is_empty() {
-        return management_error(400, "缺少要操作的账号 id");
-    }
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    let result = match action.as_str() {
-        "remove" => state.store().batch_remove(&ids),
-        "enable" | "disable" => {
-            let enabled = action == "enable";
-            state.store().batch_update(&ids, &json!({ "enabled": enabled }))
-        }
-        "proxy" => {
-            // 允许 proxy=null（批量改为直连）；缺字段是显式报错
-            let Some(target) = payload.get("proxy") else {
-                return management_error(400, "批量修改代理时缺少 proxy 字段");
-            };
-            state.store().batch_update(&ids, &json!({ "proxy": target }))
-        }
-        "concurrency" => {
-            // 并发上限（0 = 不限）；缺字段是显式报错，值本身由 store 归一
-            // （非负整数、封顶 999，与单账号设置面板同一份校验）
-            let Some(target) = payload.get("maxConcurrent") else {
-                return management_error(400, "批量设置并发上限时缺少 maxConcurrent 字段");
-            };
-            state
-                .store()
-                .batch_update(&ids, &json!({ "maxConcurrent": target }))
-        }
-        other => {
-            return management_error(
-                400,
-                format!(
-                    "不支持的批量操作: {}",
-                    if other.is_empty() { "(空)" } else { other }
-                ),
-            )
-        }
-    };
-
-    match result {
-        Ok(value) => {
-            // 批量改代理 / 删除成功后对账：补监听器与回收端口都由对账的
-            // 缺口检测收敛（见 `reconcile_kernel_listeners`）
-            reconcile_kernel_listeners(state, &refs_before);
-            // 响应带上 action，与 Node 版 `{ action, ...result, list }` 一致
-            let mut merged = Map::new();
-            merged.insert("action".to_string(), Value::String(action));
-            if let Some(object) = value.as_object() {
-                for (key, item) in object {
-                    merged.insert(key.clone(), item.clone());
-                }
-            }
-            ok_json(Value::Object(merged))
-        }
-        Err(error) => store_error(error),
-    }
-}
-
 // ─── POST /api/accounts/refresh ─────────────────────────────
 
 /// 刷新账号 token（**按账号所属 provider 分派**）。
 ///
 /// workbuddy 账号走既有的 `AuthService::refresh_account`；小浣熊、AutoClaw、
-/// CodeArts、**Trae / ZCode**、Accio、Cline 账号各走自家适配器的
-/// `refresh_access_token`；**CatPaw / MonkeyCode / Command Code 账号没有可刷新的
-/// 东西**（§9.1：`X-Passport-Token` 过期只能在桌面端重新登录，没有 refreshToken；
-/// 后两家是静态 session / API Key，上游根本没有续期接口），
-/// 因此这里明确报 400 并说明做法 —— 静默走 workbuddy 的刷新会拿别家的凭证
-/// 去打腾讯的鉴权接口。
+/// CodeArts、ZCode、Cline 账号各走自家适配器的 `refresh_access_token`；
+/// **CatPaw / MonkeyCode / Command Code 账号没有可刷新的东西**（§9.1：
+/// `X-Passport-Token` 过期只能在桌面端重新登录，没有 refreshToken；后两家是
+/// 静态 session / API Key，上游根本没有续期接口），因此这里明确报 400 并说明
+/// 做法 —— 静默走 workbuddy 的刷新会拿别家的凭证去打腾讯的鉴权接口。
 ///
-/// 漏登记的实际代价（两条都是生产抓到的）：CodeArts 漏的时候用户点「刷新 Token」
+/// 已搬到插件的家（Trae / OfficeAce / AtomCode / LobsterAI …）由上面那条
+/// 「插件接管优先」分支带走；没装插件时它们的记录仍在库里，会落到各自的显式
+/// 拒绝（503）而不是 workbuddy 兜底。
+///
+/// 漏登记的实际代价（生产抓到）：CodeArts 漏的时候用户点「刷新 Token」
 /// 得到 `client key [] not found`；Trae 漏的时候得到
 /// `12153:refresh token failed:10000:token format error`（2026-10-02 15:47:57 实测）——
 /// 两条都长得像"这把凭据坏了"，其实是发错了家的端点。所以**加一家带 refreshToken
@@ -1381,8 +957,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         .filter(|value| !value.is_empty());
     let id = match id {
         Some(value) => value,
-        None => match state.store().get_active_entry() {
-            Some(entry) => entry.id,
+        // 默认刷新全局真实执行体队首，不借 WorkBuddy 专属会话入口选本体账号。
+        None => match state.store().current_account_id() {
+            Some(id) => id,
             None => return management_error(400, "当前没有可用账号"),
         },
     };
@@ -1397,6 +974,32 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             "自定义提供商账号的凭证由用户直接提供，无需刷新（更换凭证请重新添加或直接编辑）",
         );
     }
+    // 标准账号按顶层 provider 选择真实 adapter，不探测 secret 或占位 kind。
+    if let Some(provider) = state.store().account_provider_of(&id) {
+        if crate::server::core::providers::is_executable_provider(&provider) {
+            let Some(adapter) =
+                crate::server::core::providers::adapter::adapter_by_id(&provider)
+            else {
+                return management_error(400, format!("未知的提供商：{provider}"));
+            };
+            return match crate::server::core::credential_maintenance::refresh_checked(
+                state.store(),
+                adapter.as_ref(),
+                &id,
+            )
+            .await
+            {
+                Ok(_) => ok_json(json!({
+                    "refreshedId": id,
+                    "list": state.store().list_visible_accounts(),
+                })),
+                Err(error) => {
+                    logging::log("[Accounts]", &format!("❌ {}", error.message));
+                    management_error(i32::from(error.http_status().as_u16()), error.message)
+                }
+            };
+        }
+    }
     // Qoder（两个地区各查一次 —— 账号集合按 provider 隔离，同一 id 不可能
     // 同时属于两家，与 Accio / AutoClaw 同一条遍历）
     for region in crate::server::core::providers::qoder::endpoints::Region::ALL {
@@ -1408,41 +1011,68 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             return refresh_provider_account(state, &id, region.kind()).await;
         }
     }
-    // CodeArts：一次性 refresh token + 写回，必须走适配器。
-    // **这条不能省**：漏了就会落到下面的 workbuddy 兜底链路，用户得到一条与
-    // 本家毫无关系的错误（沙箱端到端实测抓到的原文是
+    // CodeArts：一次性 refresh token + 写回，必须走适配器（实现已搬到插件）。
+    // **这条不能省**：漏了就会落到下面的兜底链路，用户得到一条与本家毫无关系
+    // 的错误（沙箱端到端实测抓到的原文是
     // `auth/token/refresh 失败: client key [] not found`）。
-    if state.store().codearts_account_record(&id).is_some() {
+    if state.store().account_provider_of(&id).as_deref()
+        == Some(crate::server::core::providers::kind_id(ProviderKind::CodeArts))
+    {
         return refresh_provider_account(state, &id, ProviderKind::CodeArts).await;
     }
-    // Trae：一次性 refreshToken + 每次换发都轮换，必须走它自己的适配器
-    // （`ExchangeToken`）。**这条也不能省**：漏了就落到下面的 workbuddy 兜底，
-    // 用户点「刷新 Token」收到的是腾讯那侧的错 —— 生产实测（2026-10-02 15:47:57）
-    // 原文是 `auth/token/refresh 失败: 12153:refresh token failed:10000:token format
-    // error`，"token format error" 其实就是**把 Trae 的续期串发给了 workbuddy 的
-    // 鉴权端点**，与账号本身好不好没有任何关系。
-    if state.store().trae_account_record(&id).is_some() {
-        return refresh_provider_account(state, &id, ProviderKind::Trae).await;
+    // Trae 的续期已随实现搬到插件：装上插件时上面的 `serves_provider` 分流会
+    // 先带走；没装插件时落到下面的 workbuddy 兜底会给出与本家无关的错误，所以
+    // 这里按「记录还属于本家」显式拒绝。判据是 provider 归属，不需要读凭据 ——
+    // 网关不再解析这家的凭据形状（那部分随实现搬到插件了）。
+    if state.store().account_provider_of(&id).as_deref()
+        == Some(crate::server::core::providers::kind_id(ProviderKind::Trae))
+    {
+        return management_error(
+            503,
+            "Trae 的令牌刷新需要安装提供商插件：本版本不再内置该家的续期实现",
+        );
     }
-    // ZCode：同一条理由（它的续期是自家 OAuth 那套，不是 workbuddy 的链）
-    if state.store().zcode_account_record(&id).is_some() {
-        return refresh_provider_account(state, &id, ProviderKind::Zcode).await;
+    // ZCode：实现已随插件搬走（它本来就没有续期协议 —— 令牌用坏了只能重新
+    // 登录）。这里按「记录还属于本家」显式拒绝：没装插件时落到底下的
+    // workbuddy 兜底会给出与本家无关的错误。
+    if let Some(provider_id) = state.store().account_provider_of(&id) {
+        if crate::server::core::providers::zcode::region::Region::from_provider_id(&provider_id)
+            .is_some()
+        {
+            return management_error(
+                503,
+                "ZCode 的令牌刷新需要安装提供商插件：本版本不再内置该家的登录链实现",
+            );
+        }
     }
-    // OfficeAce：控制面临时凭据（约 2 小时）用 refresh token + DPoP 私钥续期，
-    // 必须走它自己的适配器。**这条不能省**：漏了就落到 workbuddy 兜底链路，
-    // 用户点「刷新 Token」收到的是腾讯那侧的错（与 CodeArts/Trae 同一条理由）。
+    // OfficeAce 的续期已随实现搬到插件：装上插件时上面的 `serves_provider`
+    // 分流会先带走；没装插件时 `refresh_provider_account` 拿到的是占位适配器，
+    // 会如实报「需要安装插件」。
     if state.store().officeace_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::OfficeAce).await;
     }
-    // Accio（两个地区）：走适配器的强制刷新（`POST /api/auth/refresh_token`，
-    // 结果按「比较再写」回写）。两个地区各查一次 —— 账号集合按 provider 隔离，
-    // 同一 id 不可能同时属于两家（撞 id 在存储层就报错了）。
+    // AtomCode：续期走它自己的适配器（`POST {broker}/oauth/refresh`，**会轮换**
+    // refresh token，且必须单飞 + 写回）。**这条不能省**：漏了就落到 workbuddy
+    // 兜底链路，用户点「刷新 Token」收到的是腾讯那侧的错（与 CodeArts/Trae/
+    // OfficeAce 同一条理由），而 AtomGit 的令牌会因此悄悄过期到只能重新登录。
+    if state.store().atomcode_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Atomcode).await;
+    }
+    // LobsterAI：续期走它自己的适配器（`POST /api/auth/refresh`，**会轮换**，
+    // 且必须把 uuid 与两个 keyfrom 原样回传）。**这条不能省**：漏了就落到
+    // workbuddy 兜底链路，用户点「刷新 Token」收到的是腾讯那侧的错（与
+    // CodeArts/Trae/OfficeAce 同一条理由），而龙虾的令牌会因此
+    // 悄悄过期到只能重新网页登录 —— 而那一轮登录是用户手动做的。
+    // 实现已搬到插件：没装插件时 `refresh_provider_account` 拿到的是占位适配器，
+    // 会如实报「需要安装插件」。
+    if state.store().lobsterai_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::LobsterAi).await;
+    }
+    // Accio（两个地区）的续期已随实现搬到插件：装上插件时上面的
+    // `serves_provider` 分流会先带走；没装插件时拿到的是占位适配器，会如实报
+    // 「需要安装插件」。两个地区各查一次 —— 账号集合按 provider 隔离。
     for region in crate::server::core::providers::accio::endpoints::Region::ALL {
-        if state
-            .store()
-            .accio_account_record(&id, region.provider_id())
-            .is_some()
-        {
+        if state.store().account_provider_of(&id).as_deref() == Some(region.provider_id()) {
             return refresh_provider_account(state, &id, region.kind()).await;
         }
     }
@@ -1468,34 +1098,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         };
         return refresh_provider_account(state, &id, kind).await;
     }
-    // 小浣熊账号：走它自己的刷新（结果由 `credentials::refresh` 回写）
-    if state.store().raccoon_account_record(&id).is_some() {
-        return refresh_provider_account(state, &id, ProviderKind::Raccoon).await;
-    }
-    // AutoClaw 账号：同一套「读凭证 → 强制刷新 → 按来源回写」的适配器链路。
-    // **桌面端实时登录态不主动刷新**（原项目 `account-routes.mjs` 的同款拒绝）：
-    // 网关与桌面端共用同一个 refresh_token，网关侧刷新会造成轮换竞态，
-    // 因此这类账号明确报 400 并说明做法（`autoclaw::credentials` 模块头详述）。
-    //
-    // 两个地区各查一次（账号集合按 provider 隔离）。顺序无关紧要 —— 同一 id
-    // 不可能同时属于两家（撞 id 在存储层就报错了），这里按注册表顺序写，
-    // 读起来与 `PROVIDERS` 一致。
-    for region in [
-        crate::server::core::providers::autoclaw::Region::Cn,
-        crate::server::core::providers::autoclaw::Region::Intl,
-    ] {
-        if let Some(record) = state.store().autoclaw_account_record(region, &id) {
-            if record.get("desktop").and_then(Value::as_bool).unwrap_or(false) {
-                return management_error(
-                    400,
-                    "AutoClaw 桌面端登录态由桌面客户端维护，网关不主动刷新：\
-                     请在 AutoClaw 桌面端重新登录后重试",
-                );
-            }
-            return refresh_provider_account(state, &id, region.kind()).await;
-        }
-    }
-    // CatPaw 账号：没有刷新机制（见本函数的说明）
+    // CatPaw 账号：没有刷新机制（见本函数的说明）。插件接管后这条判定同样
+    // 有效 —— 插件的 `refresh` 能力位也是 false，走适配器会得到同一条结论，
+    // 但这里先拦下能省一次 RPC，且文案更具体。
     if state.store().catpaw_account_record(&id).is_some() {
         return management_error(
             400,
@@ -1520,17 +1125,8 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             );
         }
     }
-    // Command Code：同样**没有刷新机制**（单枚静态 API Key、上游无 refresh
-    // 接口，见 `providers::commandcode::credentials` 的模块头）。不显式拦下的
-    // 话会落到下面的 workbuddy 兜底链路，用户会收到一条与腾讯鉴权端点相关的
-    // 错误 —— 与 CatPaw / MonkeyCode 漏登记时的症状同一性质。
-    if state.store().commandcode_account_record(&id).is_some() {
-        return management_error(
-            400,
-            "Command Code 的 API Key 没有刷新机制（静态 key、上游无续期接口）：\
-             请在 commandcode.ai/studio 重新获取后在本页重新粘贴",
-        );
-    }
+    // Command Code 的「没有刷新机制」判定已随账号实现搬到插件：插件的
+    // `refresh` 方法会对这类账号给出同一条结论，网关不再按 provider 预判。
     // Antigravity：**有**可刷新的 refreshToken（Google OAuth），走自家适配器的
     // 强制刷新（`grant_type=refresh_token` 打 `oauth2.googleapis.com/token`）。
     // 这条分派不能省：漏了就落到下面的 workbuddy 兜底链路，用户点「刷新 Token」
@@ -1539,16 +1135,42 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     if state.store().antigravity_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Antigravity).await;
     }
-    // WorkBuddy 系（国内版 / 国际版）的兜底：两条链路都按**账号自己的**
-    // endpoint / prefixPath / platform / edition 续期
-    // （`AuthService::refresh_account_inner` 从记录里读，见那里的说明），
-    // 因此拆家后不必按地区分派 —— 国际版账号自然打国际站的 refresh 端点。
-    match state.auth().refresh_account(&id).await {
+    // ── 兜底：按记录归属的 provider 走适配器 ─────────────────────
+    //
+    // 走到这里说明上面那些内置家的探测函数都没命中（它们按各家自己的记录
+    // 形态判）。最后这一档**不再假设是 WorkBuddy**：取记录上的 provider，
+    // 能查到适配器就走它（插件家在上面 `serves_provider` 那档已带走；这里
+    // 接住的是「插件没装 / 或某家还没单独登记」的情形，占位适配器会如实报
+    // 「需要安装插件」）。查不到适配器就明确报未知，而不是拿 WorkBuddy 的
+    // 续期去打腾讯的鉴权端点。
+    let provider = match state.store().account_provider_of(&id) {
+        Some(provider) => provider,
+        None => return management_error(404, "账号不存在"),
+    };
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(&provider) else {
+        return management_error(
+            400,
+            format!(
+                "{} 的令牌刷新需要安装提供商插件：本版本不再内置该家的续期实现",
+                crate::server::core::providers::label_of(&provider)
+            ),
+        );
+    };
+    match crate::server::core::credential_maintenance::refresh_checked(
+        state.store(),
+        adapter.as_ref(),
+        &id,
+    )
+    .await
+    {
         Ok(_) => ok_json(json!({
             "refreshedId": id,
-            "list": state.store().list_accounts(),
+            "list": state.store().list_visible_accounts(),
         })),
-        Err(error) => auth_error(error),
+        Err(error) => {
+            logging::log("[Accounts]", &format!("❌ {}", error.message));
+            management_error(i32::from(error.http_status().as_u16()), error.message)
+        }
     }
 }
 
@@ -1559,10 +1181,12 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
 /// 窗口）、按来源回写。这里是唯一调用点，差异全在各家适配器里。
 async fn refresh_provider_account(state: &ServerState, id: &str, kind: ProviderKind) -> Response {
     let adapter = adapter_for(kind);
-    match adapter.refresh_access_token(state.store(), id).await {
+    match crate::server::core::credential_maintenance::refresh_checked(state.store(), adapter, id)
+        .await
+    {
         Ok(_) => ok_json(json!({
             "refreshedId": id,
-            "list": state.store().list_accounts(),
+            "list": state.store().list_visible_accounts(),
         })),
         Err(error) => {
             logging::log("[Accounts]", &format!("❌ {}", error.message));
@@ -1683,8 +1307,6 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
     if !patch.is_object() {
         return management_error(400, "请求内容必须是 JSON 对象");
     }
-    // 引用集合快照（改代理成功后对账，见 `reconcile_kernel_listeners`）
-    let refs_before = state.store().referenced_pool_ids();
     // CatPaw 的余额查询凭证（`balanceToken`）先落盘：它是**这一家独有**的字段，
     // 通用 `update_account` 不认识它（见 `update_catpaw_balance_token` 的说明：
     // 不把它塞进四家共用的 apply_patch）。放在通用 patch 之前做，于是同一次
@@ -1745,11 +1367,15 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             Err(error) => return store_error(error),
         }
     }
-    // 自定义账号的凭证（`apiKey` / `noAuth`）：与上面两段同一处境 —— 只有自定义
-    // 家认这两个键，所以不进通用 `apply_patch`。**账号 id 由 HTTP 路径给定，
-    // 改凭证不改 id**（id 是身份：限额冷却、请求日志、导出文件都按它关联），
-    // 于是这里不需要「同 key 合并」那条添加侧的逻辑。
-    if patch.get("apiKey").is_some() || patch.get("noAuth").is_some() {
+    // 自定义账号的凭证（`apiKey` / `noAuth`）**与上游地址覆盖项（`baseUrl`）**：
+    // 与上面两段同一处境 —— 只有自定义家认这几个键，所以不进通用 `apply_patch`。
+    // **账号 id 由 HTTP 路径给定，改凭证不改 id**（id 是身份：限额冷却、请求日志、
+    // 导出文件都按它关联），于是这里不需要「同 key 合并」那条添加侧的逻辑。
+    //
+    // `baseUrl` 是账号上的**覆盖项**（缺省时转发回落到提供商的地址）：界面用它
+    // 表达「改回跟随提供商」（传 null），也是 issue #455 里那份看不见、改不掉的
+    // 旧地址的清理入口。
+    if patch.get("apiKey").is_some() || patch.get("noAuth").is_some() || patch.get("baseUrl").is_some() {
         // `custom_account_provider` 一次回答两件事：账号在不在、属不属于自定义家
         // （判据是记录里的 `provider` 前缀，不要求提供商本身还在配置里，
         // 见那个函数的说明）—— 与 balanceToken / zcodePlan 的两次查询同口径
@@ -1766,7 +1392,7 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
                 })
                 .unwrap_or(false);
             return if known {
-                management_error(400, "只有自定义提供商的账号有 API Key / 无需鉴权这两项")
+                management_error(400, "只有自定义提供商的账号有 API Key / 无需鉴权 / 上游地址这几项")
             } else {
                 store_error(AccountStoreError::new("账号不存在", 404))
             };
@@ -1780,9 +1406,20 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
                 scoped.insert(key.to_string(), value.clone());
             }
         }
-        match state.store().update_custom_credentials(&id, &Value::Object(scoped)) {
-            Ok(changes) => balance_changes.extend(changes),
-            Err(error) => return store_error(error),
+        if !scoped.is_empty() {
+            match state.store().update_custom_credentials(&id, &Value::Object(scoped)) {
+                Ok(changes) => balance_changes.extend(changes),
+                Err(error) => return store_error(error),
+            }
+        }
+        // 地址覆盖项单独一条路径：`null` / 空串 = 清除（跟随提供商），字符串 =
+        // 校验后写入。与凭证互不影响，失败也不该把已改好的凭证一起报成失败 ——
+        // 但两者都在同一次保存里，按「先凭证后地址」的顺序各自报错即可
+        if let Some(value) = patch.get("baseUrl") {
+            match state.store().update_custom_base_url(&id, value) {
+                Ok(changes) => balance_changes.extend(changes),
+                Err(error) => return store_error(error),
+            }
         }
     }
     // 自定义账号的**余额查询配置**（`balanceQuery`）：与上面 apiKey 那一段同一
@@ -1819,11 +1456,10 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
         Ok((account, mut changes)) => {
             changes.extend(balance_changes);
             // 改代理成功后对账：新引用的补监听器、旧引用失去的回收端口
-            reconcile_kernel_listeners(state, &refs_before);
             ok_json(json!({
                 "account": account,
                 "changes": changes,
-                "list": state.store().list_accounts(),
+                "list": state.store().list_visible_accounts(),
             }))
         }
         Err(error) => store_error(error),
@@ -1933,7 +1569,7 @@ pub fn clear_rate_limits(state: &ServerState, id: &str, body: &Bytes) -> Respons
             ),
         );
     }
-    ok_json(json!({ "cleared": cleared, "list": state.store().list_accounts() }))
+    ok_json(json!({ "cleared": cleared, "list": state.store().list_visible_accounts() }))
 }
 
 // ─── DELETE /api/accounts/{id} ──────────────────────────────
@@ -1944,11 +1580,9 @@ pub fn delete_account(state: &ServerState, id: &str) -> Response {
     }
     // 引用快照要在删除**之前**取：被删账号撇下的引用要靠对账回收端口
     // （最后一个引用消失 → 这个节点的监听器该收了）
-    let refs_before = state.store().referenced_pool_ids();
     match state.store().remove_account(id) {
         Ok(()) => {
-            reconcile_kernel_listeners(state, &refs_before);
-            ok_json(json!({ "list": state.store().list_accounts() }))
+            ok_json(json!({ "list": state.store().list_visible_accounts() }))
         }
         Err(error) => store_error(error),
     }

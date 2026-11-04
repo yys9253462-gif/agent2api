@@ -16,10 +16,32 @@
  *   · 纯函数（校验 / 归一化 / 文案派生）—— 状态层与视图层都要用。
  */
 
+import type { SanitizePatch } from './settings-sanitize-model'
 import { t } from '../i18n'
 
 
 // ── 从 HEAD 恢复的类型（桥成员的返回形状）──────────────
+
+/** 机器人校验状态（`/api/captcha`）：两端各一个开关 + 本进程形态 */
+export type CaptchaSetting = {
+  captchaDesktop?: boolean
+  captchaWeb?: boolean
+  /** true = 本进程是桌面壳；false = headless（Docker / 服务端） */
+  localPanel?: boolean
+}
+
+/** 写入机器人校验：两个字段都可选，缺省的那一端不改 */
+export type CaptchaPatch = {
+  captchaDesktop?: boolean
+  captchaWeb?: boolean
+}
+
+/** 面板账户信息（`/api/panel/account`） */
+export type PanelAccount = {
+  registered?: boolean
+  username?: string
+  loginEnabled?: boolean
+}
 
 export type DatabaseTableStat = { table?: string; rows?: number }
 
@@ -29,9 +51,13 @@ export type DatabaseExportResult = {
   bytes?: number
   file?: string
   tables?: DatabaseTableStat[]
+  encrypted?: boolean
+  includedKeys?: string[]
 }
 
 export type DatabaseImportResult = {
+  /** 用户在文件框里点了取消（桌面壳 / 网页端选文件都可能是这个出口） */
+  canceled?: boolean
   /** 恢复后的各表行数 */
   tables?: DatabaseTableStat[]
   /** 替换前自动建的安全备份文件名（{config_dir}/backups/ 下） */
@@ -46,6 +72,34 @@ export type DatabaseImportResult = {
    * 用户错过后只会对着空账号列表发懵。
    */
   warning?: string
+  encrypted?: boolean
+  restoredKeys?: string[]
+  reencryptedSecrets?: number
+  localKeysPreserved?: boolean
+}
+
+/**
+ * 恢复进度快照（`GET /api/backup/progress`，见 `db::backup` 的 `RestoreProgress`）。
+ *
+ * 字段全部由后端给：`phase` 是「这一步在做什么」的可读文案，`percent` 是阶段
+ * 起点的大致位置。前端不自己算百分比 —— 各阶段耗时没有可靠计量（`execute_batch`
+ * 不回调），一个只增不减的粗进度比一个乱跳的假进度诚实。
+ */
+export type RestoreProgressSnapshot = {
+  /** 正在跑 */
+  active?: boolean
+  /** 当前阶段文案 */
+  phase?: string
+  /** 大致百分比（0-100） */
+  percent?: number
+  done?: boolean
+  failed?: boolean
+  /** 失败原因（`failed` 时才有） */
+  error?: string | null
+  /** 结果（`done` 时才有，形状同 DatabaseImportResult） */
+  result?: unknown
+  startedAt?: number
+  finishedAt?: number
 }
 
 export type ModelsDevRefreshResult = {
@@ -109,6 +163,88 @@ export type AppSettings = {
   lanPanel: boolean
   /** 轻量模式：关窗销毁界面进程（释放 WebView2 内存），托盘按需重建 */
   lightweightMode: boolean
+}
+
+/**
+ * 「版本信息」的读数（`GET /api/system-info`，桌面壳命令同名）。
+ *
+ * 每个字段都可能是 null / 缺失（后端按分项降级，见 `api::system_info`）：
+ * 界面一律按「—」显示，不猜。`deployment` 是后端判定的运行形态
+ * （desktop / windows-service / docker / systemd / foreground），
+ * `runtime.webviewVersion` 桌面端是 WebView2 / WKWebView、网页端是浏览器内核。
+ */
+export type SystemInfo = {
+  app?: {
+    version?: string | null
+    license?: string | null
+    sourceUrl?: string | null
+    licenseUrl?: string | null
+    copyright?: string | null
+    channel?: string | null
+    schemaVersion?: number | null
+    dbSchemaVersion?: number | null
+  }
+  runtime?: {
+    deployment?: string | null
+    container?: boolean | null
+    os?: string | null
+    osVersion?: string | null
+    arch?: string | null
+    webviewVersion?: string | null
+    startedAt?: number | null
+    uptimeSeconds?: number | null
+    pid?: number | null
+    debugBuild?: boolean | null
+    verbose?: boolean | null
+  }
+  deployment?: {
+    host?: string | null
+    port?: number | null
+    panelPort?: number | null
+    uiHosted?: boolean | null
+    localPanel?: boolean | null
+    configDir?: string | null
+    dbFile?: string | null
+    dbBytes?: number | null
+    dbAvailable?: boolean | null
+    logFile?: string | null
+    exePath?: string | null
+    installerKind?: string | null
+    selfUpdate?: boolean | null
+  }
+  security?: {
+    adminRegistered?: boolean | null
+    panelAuth?: boolean | null
+    apiKeyCount?: number | null
+    allowNoKey?: boolean | null
+    v1FailClosed?: boolean | null
+    panelGate?: boolean | null
+    githubTokenFilled?: boolean | null
+    githubTokenOrigin?: string | null
+    updateProxy?: boolean | null
+  }
+  features?: {
+    debugMode?: boolean | null
+    sanitizeFingerprints?: boolean | null
+    cors?: boolean | null
+    developerRoleCompat?: boolean | null
+    keepaliveStrip?: boolean | null
+    autoContinue?: boolean | null
+    autoContinueMaxRounds?: number | null
+    modelsDev?: boolean | null
+    captchaEnabled?: boolean | null
+    updateBeta?: boolean | null
+  }
+  stats?: {
+    accounts?: number | null
+    enabledAccounts?: number | null
+    limitedAccounts?: number | null
+    models?: number | null
+    inFlight?: number | null
+    requests?: number | null
+    logs?: number | null
+    upgradePending?: boolean | null
+  }
 }
 
 /** 导入失败项：customProvider 标记的那条不是账号，是自定义提供商定义 */
@@ -204,24 +340,37 @@ export type SettingsBridge = {
   saveTimeouts(patch: Record<string, number>): Promise<unknown>
   getQueue(): Promise<unknown>
   saveQueue(patch: Record<string, number>): Promise<unknown>
+  getImageCompress(): Promise<unknown>
+  saveImageCompress(patch: Record<string, number | boolean>): Promise<unknown>
   getDebug(): Promise<unknown>
   saveDebug(enabled: boolean): Promise<unknown>
   getSanitize(): Promise<unknown>
-  saveSanitize(enabled: boolean): Promise<unknown>
+  saveSanitize(patch: boolean | SanitizePatch): Promise<unknown>
   getDeveloperRoleCompat(): Promise<unknown>
   saveDeveloperRoleCompat(enabled: boolean): Promise<unknown>
   getClineHeaders(): Promise<unknown>
   saveClineHeaders(overrides: Record<string, string>): Promise<unknown>
+  getZcodeVersion(): Promise<unknown>
+  saveZcodeVersion(version: string): Promise<unknown>
   getCors(): Promise<unknown>
   saveCors(enabled: boolean): Promise<unknown>
   getPrompt(): Promise<unknown>
   savePrompt(payload: PromptPatch): Promise<unknown>
   getStorage(): Promise<unknown>
-  getCaptchaSetting(): Promise<{ captchaEnabled?: boolean } | null | undefined>
-  saveCaptchaSetting(on: boolean): Promise<{ captchaEnabled?: boolean } | null | undefined>
+  getCaptchaSetting(): Promise<CaptchaSetting | null | undefined>
+  saveCaptchaSetting(patch: CaptchaPatch): Promise<CaptchaSetting | null | undefined>
+  /** 面板账户信息（设置页「账户」分类）；未注册时 registered=false */
+  getPanelAccount(): Promise<PanelAccount | null | undefined>
+  /** 改密码：要求旧密码；成功后后端撤销其他会话链，本会话保留 */
+  changePanelPassword(oldPassword: string, newPassword: string): Promise<unknown>
   panelLogout(): Promise<unknown>
+  /** 面板会话状态（桌面壳的登录通道）；网页端由 shim 以 cookie 状态回答 */
+  panelSessionStatus?(): Promise<{ registered?: boolean; authenticated?: boolean } | null | undefined>
+  /** 清除本机的面板会话令牌（登出时与 panelLogout 配套） */
+  panelSessionClear?(): Promise<unknown>
   /** 后端就绪状态（局域网地址展示要拼网关端口；其余字段本页不消费） */
   getBackendStatus?(): Promise<{ port?: number } | null | undefined>
+  onBackendReady?(callback: () => void): (() => void) | void
   // ── 局域网访问（仅桌面端渲染，web 端 shim 不提供这几个方法）──
   /** 面板管理员是否已注册（开启流程据此决定要不要先走注册步） */
   panelAdminStatus?(): Promise<{ registered?: boolean } | null | undefined>
@@ -233,9 +382,18 @@ export type SettingsBridge = {
   localIp?(): Promise<string | null | undefined>
   /** 打开外链的唯一出口（只放行 http(s)）：桌面走系统浏览器，网页端 shim 是 window.open */
   openReleasePage?(url: string): Promise<unknown>
+  /**
+   * 设置页「版本信息」的一次性读数（桌面壳命令 / 网页端 shim 同名方法）。
+   *
+   * `hideUsername` 是**纯展示**参数：命中的路径在主目录前缀处换成 `~`，
+   * 脱敏在后端做 —— 这样「复制全部信息」拿到的也是脱敏后的文本。
+   */
+  getSystemInfo?(options?: { hideUsername?: boolean }): Promise<SystemInfo | null | undefined>
   // ── 以下成员从 HEAD 恢复（并行改动移走了定义但 settings-state.ts 仍引用）──
-    exportDatabase?(includeLogs: boolean): Promise<DatabaseExportResult | null | undefined>
-    importDatabase?(): Promise<DatabaseImportResult | null | undefined>
+    exportDatabase?(includeLogs: boolean, password: string): Promise<DatabaseExportResult | null | undefined>
+    importDatabase?(password?: string): Promise<DatabaseImportResult | null | undefined>
+    /** 恢复进度（`GET /api/backup/progress`）：弹窗每 500ms 拉一次 */
+    getBackupProgress?(): Promise<RestoreProgressSnapshot | null | undefined>
     getCaptchaPool(): Promise<unknown>
     saveCaptchaPool(patch: Record<string, number>): Promise<unknown>
     getRoutingConfig(): Promise<unknown>
@@ -243,6 +401,16 @@ export type SettingsBridge = {
     getModelsDev(): Promise<ModelsDevState | null | undefined>
     saveModelsDev(on: boolean): Promise<ModelsDevState | null | undefined>
     refreshModelsDev(): Promise<{ result?: ModelsDevRefreshResult; status?: ModelsDevState } | null | undefined>
+    // ── 云同步（设置页「数据 → 云同步」，面板见 settings-cloud-sync.tsx）──
+    // 全部可选：网页端 shim 与桌面桥都提供，但老壳（升级前）没有这几个方法 ——
+    // 面板据此显示「不可用」而不是崩掉。
+    getCloudSync?(): Promise<unknown>
+    saveCloudSync?(payload: Record<string, unknown>): Promise<unknown>
+    testCloudSync?(payload: Record<string, unknown>): Promise<unknown>
+    getCloudSyncRemote?(): Promise<unknown>
+    cloudSyncUpload?(): Promise<unknown>
+    cloudSyncDownload?(): Promise<unknown>
+    importCloudSyncKey?(password: string): Promise<unknown>
 }
 
 /**
@@ -272,6 +440,8 @@ export type SharedWindow = {
   wbUnits?: { isChinese?: () => boolean; setChinese?: (on: boolean) => void }
   /** 软件更新面板的岛（update-panel.tsx）：切到设置页时让它自己刷新一次 */
   wbUpdatePanel?: { load?: () => Promise<void> | void }
+  /** 版本信息面板的岛（system-info-pane.tsx）：同上 */
+  wbSystemInfoPane?: { load?: () => Promise<void> | void }
   /** 内联图标集（icons.js）：左栏分类图标由它渲染（返回 SVG 串，注入用） */
   wbIcons?: { icon?: (name: string, size?: number) => string }
 }
@@ -281,7 +451,8 @@ export function shared(): SharedWindow {
 }
 
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return message.trim() || t('未知错误')
 }
 
 /** toast 的统一出口（运行期读 wbApp，不在模块顶层解构） */
@@ -328,18 +499,24 @@ export async function openExternal(url: string): Promise<void> {
  * 改名会让两者当场失配 —— 用户看到的只是标签，id 是内部契约。
  */
 export const CATEGORIES = [
+  { id: 'account', label: t('账户'), icon: 'accounts' },
   { id: 'general', label: t('通用'), icon: 'sliders' },
-  // AI 助手：对话模型 / 系统提示词 / 工具勾选（面板在 assistant-settings-pane.tsx）。
-  // 紧挨「通用」放 —— 它是这一页里最常回来改的一类（换模型、调工具）
-  { id: 'assistant', label: t('AI 助手'), icon: 'spark' },
+  // 注：AI 助手的配置（对话模型 / 系统提示词 / 工具勾选）已搬到助手页自己的
+  // 「助手设置」抽屉（见 assistant-settings-drawer.tsx）—— 那几项都是聊着聊着
+  // 就想改的，留在这里意味着每次调整都要离开对话页再回来。分类不再保留，
+  // 老用户 localStorage 里存着的 'assistant' 由 settings-state 的兜底回落到首项。
   { id: 'display', label: t('显示'), icon: 'display' },
   { id: 'gateway', label: t('网关'), icon: 'traffic' },
-  { id: 'routing', label: t('路由'), icon: 'route' },
   { id: 'retry', label: t('重试'), icon: 'refresh' },
   { id: 'timeout', label: t('超时'), icon: 'timer' },
   { id: 'security', label: t('安全'), icon: 'shield' },
   { id: 'data', label: t('数据'), icon: 'database' },
   { id: 'feedback', label: t('反馈与需求'), icon: 'feedback' },
+  // 「版本信息」：软件版本 / 运行环境 / 路径 / 开关状态 / 关键计数，可一键
+  // 复制成纯文本（面板在 system-info-pane.tsx）。紧挨「反馈与需求」—— 两者
+  // 是同一件事的两端：出问题了先来这儿截图，再去那儿提 issue。
+  // `system` 是新的内部 id，不与任何既有分类 / localStorage 取值冲突。
+  { id: 'system', label: t('版本信息'), icon: 'info' },
   { id: 'about', label: t('更新'), icon: 'download' },
 ] as const
 
@@ -443,52 +620,7 @@ export type NumberField = {
   hint: string
 }
 
-/** 与后端 RETENTION_MIN_DAYS / RETENTION_MAX_DAYS 同源（非法值后端会 400） */
-export const RETENTION_MIN = 1
-export const RETENTION_MAX = 99999
-
-/**
- * 保留期字段（「数据保留」面板）。
- *
- * 三项的 key 与后端 `/api/retention` 的 JSON 键逐字同源。请求日志与按天聚合
- * 用的是恢复这项设置时**新起**的键名（`requestLogRetentionDays` /
- * `dailyAggregateRetentionDays`）：旧的 `requestRetentionDays` /
- * `dailyRetentionDays` 在「全量保留」时期退役过，老配置里残留的是当时的旧默认
- * （30 / 365 天）—— 沿用旧键会让那些残留值悄悄生效，升级后的第一次记账就把
- * 老数据裁掉；换新键让它从新默认（99999 天）起步，旧键残留不被读取、也无害。
- *
- * 两档的**默认 99999 天来自后端**（`GET /api/retention` 返回，约 274 年，
- * 效果上等于全量保留）；用户改小保存后后端立即裁剪。
- */
-export const RETENTION_FIELDS: NumberField[] = [
-  {
-    key: 'logRetentionDays',
-    id: 'settings-retention-log',
-    label: t('事件日志保留天数'),
-    unit: t('天'),
-    min: RETENTION_MIN,
-    max: RETENTION_MAX,
-    hint: t('登录 / 账号切换 / 429 切换等系统事件，可填 1–99999 天。'),
-  },
-  {
-    key: 'requestLogRetentionDays',
-    id: 'settings-retention-request',
-    label: t('请求日志保留天数'),
-    unit: t('天'),
-    min: RETENTION_MIN,
-    max: RETENTION_MAX,
-    hint: t('「请求日志」页的逐条请求记录，默认 99999 天（近似全量保留），可填 1–99999 天。'),
-  },
-  {
-    key: 'dailyAggregateRetentionDays',
-    id: 'settings-retention-daily',
-    label: t('按天聚合保留天数'),
-    unit: t('天'),
-    min: RETENTION_MIN,
-    max: RETENTION_MAX,
-    hint: t('报表页的热力图与按天趋势，默认 99999 天（近似全量保留），可填 1–99999 天。'),
-  },
-]
+export { RETENTION_FIELDS, RETENTION_MIN, RETENTION_MAX } from './settings-retention-model'
 
 /**
  * 三项重试字段。第二项的键名 `retryCrossProviderCount` 是**旧措辞**（配置兼容，
@@ -574,7 +706,7 @@ export const QUEUE_FIELDS: NumberField[] = [
     unit: t('次'),
     min: 0,
     max: 10,
-    hint: t('上游模型繁忙时会先排队（回一句「建议 N 秒后再来」，Qoder 免费模型就是这样）：网关等一会儿再发同一请求，最多等几次。默认 2 次，可填 0–10；填 0 表示不等待，排队直接返回 503 并说明「不是登录态或额度问题」。'),
+    hint: t('上游模型繁忙时会先排队（回一句「建议 N 秒后再来」）：网关等一会儿再发同一请求，最多等几次。默认 2 次，可填 0–10；填 0 表示不等待，排队直接返回 503 并说明「不是登录态或额度问题」。'),
   },
   {
     key: 'queueWaitSeconds',
@@ -584,6 +716,45 @@ export const QUEUE_FIELDS: NumberField[] = [
     min: 0,
     max: 120,
     hint: t('每次等待的时长，默认 0 = 跟随上游建议（实测 9~30 秒，上游没给建议时用 15 秒）。可填 0–120 秒强制一个固定时长。'),
+  },
+]
+
+/** 会话图片压缩的开关键名（与后端 KEY_IMAGE_COMPRESS_ENABLED 逐字一致） */
+export const IMAGE_COMPRESS_ENABLED_KEY = 'imageCompressEnabled'
+
+/**
+ * 图片压缩参数：键名与后端 config.rs 的 KEY_IMAGE_COMPRESS_* 指向的 JSON 键逐字一致。
+ *
+ * 三项默认值（长边 2048 / 质量 80 / 阈值 512KB）与 OmniProxy 的默认值一致；
+ * 它们只在本面板的输入框里作提示，真正的默认值以后端解析层为准。
+ */
+export const IMAGE_COMPRESS_FIELDS: NumberField[] = [
+  {
+    key: 'imageCompressMaxEdge',
+    id: 'settings-image-compress-max-edge',
+    label: t('长边像素上限'),
+    unit: t('像素'),
+    min: 256,
+    max: 8192,
+    hint: t('图片最长边超过这个值就等比缩小（只缩不放）。默认 2048，可填 256–8192 —— 多数视觉模型在这个量级已经够用，调小更省流量、但细节会丢。'),
+  },
+  {
+    key: 'imageCompressQuality',
+    id: 'settings-image-compress-quality',
+    label: t('重编码质量'),
+    unit: '',
+    min: 40,
+    max: 95,
+    hint: t('缩放后重新存成 JPEG 时用的质量。默认 80，可填 40–95；数值越小体积越小、画质越差。'),
+  },
+  {
+    key: 'imageCompressThresholdKb',
+    id: 'settings-image-compress-threshold',
+    label: t('触发阈值'),
+    unit: t('KB'),
+    min: 0,
+    max: 10240,
+    hint: t('解码后小于这个体积的图片保持原样。默认 512KB，可填 0–10240；填 0 表示所有内嵌图片都过一遍。'),
   },
 ]
 
@@ -689,30 +860,34 @@ export function formatCount(value: unknown): string {
 
 /* ─── 页面文案（逐字来自 index.html 静态骨架） ─── */
 
-/** 标题右侧问号（`[data-tip]`）的说明全文：tooltip.js 仍在页面上跑，照旧服务这些元素 */
+/** 标题右侧问号（`[data-tip]`）的说明全文：desktop-tooltip.tsx 仍在页面上跑，照旧服务这些元素 */
 export const TIPS = {
   displayTheme: t('控制界面的深浅色，与左侧边栏底部的三个主题按钮是同一个设置（改哪一处，另一处立刻跟上）。「跟随系统」会随操作系统当前的浅色 / 深色自动切换，并在系统主题变化时即时跟上；选「浅色」或「深色」则把界面固定在该模式，不再随系统变化。窗口标题栏的深浅色会一并同步，不会出现深色界面配一条浅色标题栏的情况。'),
   displayZoom: t('等比放大或缩小整个界面（文字、控件、间距一起变），效果与浏览器按 Ctrl +/- 相同：80%–130%、5% 一档。窗口本身不缩放，变的是页面内容的显示比例，设置立即生效并记住，下次启动直接按这个比例打开。放得越大可视范围越小，窗口较窄或表格较宽时不建议调得太大。'),
   displayLanguage: t('界面语言。可选简体中文、繁體中文、English、日本語、한국어、Português (Brasil)，或「跟随系统」（按浏览器 / 系统的语言列表自动选）。切换后整页立即刷新；该偏好只存在本机（localStorage），不影响账号、密钥与转发。'),
+  accountList: t('账号页表格的两项显示偏好，只存在本机（localStorage），不影响账号数据与转发。「积分合计只统计当前筛选出来的账号」：账号页每一家的分组带右侧有一枚「可用合计」，默认按整组求和 —— 不受筛选、搜索影响，被筛掉的账号也计入（余额是资产，禁用也只表示不参与转发，额度仍在账上）。打开这一项后改为只累加当前可见的行：例如筛出 1 个 100 积分的账号，合计就是 100，而不是同组两个账号之和 1,000。分页不参与这个口径 —— 翻页看的是同一份结果的不同屏，合计不随页码变化。「隐藏账号名」与表头「账号」旁边那颗眼睛是同一个开关：打开后账号列的名字整体显示成星号，适合截图分享时遮挡账号。') + ' ' + t('百分比类读数（如 OpenCode Go、Antigravity）不能相加，组头显示的是组内最低剩余比例。'),
   tray: t('默认关闭窗口不会退出程序，而是把窗口缩到系统托盘，转发继续在后台运行（OpenAI 客户端不受影响）；要彻底退出程序，请在托盘图标上右键选「退出」。关掉这个开关后，点关闭按钮即退出程序、转发随之中断。「开机自动启动」开启后，登录系统时会自动启动本程序（通常直接驻留托盘），不需要手动打开。'),
-  lightweight: t('开启后，关闭窗口不只是隐藏，而是把界面窗口整个销毁：底层的 WebView2 六个常驻进程（约 200MB 内存）随之退出，网关转发、定时签到、余额查询都在后台进程里继续，不受影响；需要界面时点托盘图标重新打开（WebView 冷启动约 1 秒）。注意：界面销毁期间「ZCode 套餐池（Start Plan）」通道的验证码令牌由界面铸造，无法补充 —— 走该通道的请求会以 503 落进请求日志（写明原因），重新打开界面即自动恢复。此开关只在「关闭窗口时最小化到托盘」开启时有意义，最小化窗口不受影响。'),
+  lightweight: t('开启后，关闭窗口会销毁界面并释放 WebView 进程，网关转发、定时签到、余额查询仍在后台继续。ZCode 模型请求免验证时不受影响；上游要求人机验证时，需要重新打开界面，在账号的「套餐明细」中主动完成验证。此开关只在「关闭窗口时最小化到托盘」开启时有意义。'),
   lan: t('默认网关只监听 127.0.0.1，只有本机能访问。开启后网关改听所有网卡，同一局域网内的设备可以把 API 地址指向本机 IP 一起使用。出于安全考虑，开启前必须先注册一个面板管理员：管理接口从此要求管理员会话或网关 Key，模型额度不会对局域网裸奔；一把启用的网关 Key 都没有时，转发接口也会拒绝服务，直到创建第一把。改动需要重启应用生效。「同时开放网页管理面板」把管理界面也出给局域网（其他设备的浏览器打开本机 IP 即可管理），默认关闭 —— 桌面端的面板仍只由本程序自己出。'),
-  units: t('控制报表与请求日志里 Token 读数的写法：开启后按中文量级显示（1.2亿 / 8400万），关闭则用 k / M 缩写（与上游文档、接口字段的写法一致）。这只影响显示口径，不改变任何统计与存储的数值。'),
-  queue: t('只对「排队制」的上游生效（目前是 Qoder 的免费模型）：模型繁忙时上游不报错，只回一句「建议 N 秒后再来」（业务码 10605），网关按建议时长等一会儿再发同一请求，等满次数仍排不上才把「排队中」作为错误返回（HTTP 503，文案会说明这不是登录态或额度问题）。等待发生在首个字节之前，吃的是「等待响应超时」那份预算 —— 两项设置一起决定一次请求最多卡多久；排队不会标记账号限额、也不会换账号（换谁都一样在排队）。保存后对下一个请求立即生效，不用重启。'),
-  captchaPool: t('ZCode「套餐池（Start Plan）」通道的每条推理请求都要附一个当次铸造的阿里云无痕验证令牌（一次性、约 2 分钟过期）：令牌由界面里的铸造守卫静默铸好、推给网关入池，转发时逐条取用。这里的三个值管的是补货节奏：①「库存目标」= 库存低于它守卫才补铸、补到它为止，默认 3 个；②「轮询间隔」= 守卫多久看一次库存，默认 2500 毫秒，只影响反应速度（库存够用时不会多铸）；③「单轮铸造上限」= 发现缺货时一轮最多铸几个，默认 1 个（连铸之间固定隔 500 毫秒）。请求密集、请求日志里连续出现「需要人机验证令牌」的 503 时，把目标与单轮上限适当调大、轮询调快，能让池子跟得上消耗 —— 代价是上游（阿里云）对铸造频率有风控，铸得越多越快越容易触发限流，且用不掉的令牌 2 分钟即过期作废、等于白烧配额，所以建议小步调。保存后对下一轮补货立即生效，不用重启。'),
+  units: t('控制报表与请求日志里 Token 读数的写法：开启后按中文量级显示（1.2亿 / 8400万），关闭则用 k / M / B 缩写（与上游文档、接口字段的写法一致）。这只影响显示口径，不改变任何统计与存储的数值。'),
+  queue: t('只对「排队制」的上游生效：模型繁忙时上游不报错，只回一句「建议 N 秒后再来」，网关按建议时长等一会儿再发同一请求，等满次数仍排不上才把「排队中」作为错误返回（HTTP 503，文案会说明这不是登录态或额度问题）。等待发生在首个字节之前，吃的是「等待响应超时」那份预算 —— 两项设置一起决定一次请求最多卡多久；排队不会标记账号限额、也不会换账号（换谁都一样在排队）。保存后对下一个请求立即生效，不用重启。'),
+  captchaPool: t('模型请求是否需要验证码由 ZCode 上游配置决定，领取验证与模型请求免验证分别处理。后台只检查配置和库存，不自动运行验证码或弹出拼图；需要验证时，在账号的「套餐明细」中点击「开始验证」。验证令牌一次性使用，短时间内过期，失败或取消后不会自动重试。'),
+  captchaSides: t('两张开关分别管桌面端（应用内窗口，也包含开启局域网访问后从其他设备访问的那份面板）与网页端（Docker / 服务端自托管的浏览器面板）。默认都开启；桌面端只在本机使用、嫌验证耗时可以关掉，网页端暴露在网络上，建议保持开启。'),
   timeouts: t('上游请求四个阶段各自的等待上限（秒，1~3600）：①「连接中超时」= 建立 TCP/TLS 连接或代理隧道的最大等待，默认 30 秒；②「等待响应超时」= 请求发出后等上游响应头的最大时间，默认 300 秒 —— 网关请求上游恒带 stream，响应头在 SSE 建立时就到达，与模型思考多久无关；③「流式响应空闲超时」= 流式响应相邻两块数据之间允许的最大空闲，收到新数据即重新计时，默认 300 秒 —— 上游长时间不吐数据即判定连接僵死并断开；④「非流式响应超时」= 读完整份非流式响应体的总预算（一次性计时、不重置），默认 300 秒。四项都是「等待上限」，只要数据还在来，正常的流式回答就一直往下传。保存后对下一个请求立即生效，不用重启。'),
   retry: t('请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11-128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。另有「指定错误码直接换号」名单（默认 402）：命中名单的上游状态码不在同一账号重发，直接按队列换下一个账号继续试（换号也占「切换账号重试次数」），换满仍失败才把错误返回给客户端。'),
   routing: t('转发一个请求时按什么顺序挑账号：①「路由策略」决定排队规则 —— 顺序优先是排第 1 的接走所有请求、直到它不能答（限流 / 故障 / 额度尽）才轮到下一位；负载均衡是每条请求换下一位，把负载摊到各个账号上。②「会话粘性」让同一会话（相同的模型 + 相同的开头消息）尽量跟住同一个账号 —— 多轮对话的上下文缓存能复用、少换号少浪费；自动档粘 5 分钟、会话内档粘 6 小时、每轮与关闭都不粘。账号的排队位次（账号表的第一列）在所有策略下都是地基，策略在它之上再排。此外路由还有三层自愈保护：转发失败的账号退避休息一会儿（15 分钟起步翻倍、封顶 1 小时）、被 429 的账号垫底排到队尾 30 分钟、余额不足 / Token 周期用量到顶的账号由限制器拦下 —— 前两层可以在下面按需开关，限制器由账号的「限制器」设置管。'),
-  sanitize: t('上游用「逐字精确匹配」的方式审核请求体（不是语义审核）：客户端注入的固定模板句、计费头字段名、以及某些裸错误码出现在报文里就会整单拦截，返回 400。开启本项后，网关在每次转发前改写这些指纹 —— 表头键值整段删除，承载语义的模板句只换一个词（如 official CLI for Claude → official CLI tool for Claude），对话内容与语义都不受影响。规则集是内置的，不需要也无法维护词表。关掉本项后客户端模板会原样发往上游，可能重新出现模板句被误拦的报错。'),
+  sanitize: t('指纹脱敏会在转发前按词表顺序改写请求消息中的文本，包括对话内容、思考内容和工具调用参数。默认词表包含客户端模板句与计费表头的精确替换、正则删除规则，可以新增、编辑、删除、启停和调整顺序；替换内容留空表示删除匹配内容。默认应用全部提供商，也可指定多家。改动只作用于发给上游的副本，响应内容不变。编辑后点击「保存设置」，下一次请求生效；清空词表表示不做任何指纹改写，恢复默认只重置词表。'),
   developerRoleCompat: t('OpenAI 新版 API 用 developer 角色取代 system 承载指令，新版 OpenAI SDK 与部分客户端发的对话里会出现 role 为 developer 的消息；不少 OpenAI 兼容上游（尤其是自定义提供商的透传路径）不认识这个角色，收到就报 400。开启本项后，网关在每次转发前把 developer 角色的消息改写为 system —— 两类角色在 OpenAI 语义上等价（OpenAI 自己的迁移指南也是这么映射的），改写不影响对话内容与语义；对本来就只认 system 的各家内置上游同样无害。默认开启；关掉后 developer 消息会原样发往上游，不认识它的上游会报「角色不存在」一类的错误。'),
+  imageCompress: t('对话里内嵌的 base64 大图（截图、照片）既撑大请求体，也拉高按像素折算的上游计费。开启后，网关在转发前把超过阈值的图等比缩到长边上限、重新存成 JPEG —— 只改发给上游的副本，请求日志里保存的仍是你发来的原图。同一张原图在多轮对话里重复出现时复用上一次的压缩结果，不会每轮重算。http 链接图片、GIF 动图、SVG 一律不动；压完反而更大的图也保留原图。只作用在对话场景，生图与图片编辑不受影响。默认开启；不想要的话把开关关掉即可。'),
   clineHeaders: t('Cline 上游按请求头判定「调用方是不是 Cline 自家产品」：X-CLIENT-TYPE: cline-sdk 是硬门槛（缺了它免费池模型一律 403），版本号与平台标识让请求更贴近官方客户端的形态。这里列出的是网关默认会发的头：改某一行的值 = 覆盖默认值（也可以新增默认清单之外的自定义头）；把值清空保存 = 这个头不发送；在界面删掉被改过的行 = 回落默认值。改完点「保存」，下一个 Cline 请求立即生效。不懂某一行的含义就不要动它 —— 伪装头的价值在「与官方客户端逐字一致」。'),
   cors: t('网关面（/v1/*）默认不应答浏览器跨源请求：页面直连会被预检拦下，只报「无法连接 API」。注意来源是 * —— 未配「网关 Key」时任何网页都能借本机网关打上游，故默认关闭；只给自己用的话，让页面与网关同源（本地反代 /v1）更稳妥。面板接口（/api/*）不受影响。'),
+  zcodeVersion: t('ZCode 的活动套餐（限时体验礼包）由上游按**客户端版本号**决定下不下发：探测接口只在版本号达到当期门槛时才返回套餐列表，版本落后时回一份空列表（不是报错，所以界面上看起来像「没有活动」）。2026-10 那期实测：3.16.0 及以下全空，3.16.1 起才有礼包。插件内置的默认值会随活动更新，但上游每期可能再抬高一档 —— 那时如果官方客户端里能看到活动、这里却探测为空，就在这里填官方客户端当前的版本号（形如 3.16.2）。环境变量 ZCODE_APP_VERSION 优先级更高。'),
   prompt: t('客户端（Claude Code / Codex 等 CLI）会在 system 提示词里注入几十句固定模板，上游按逐字匹配审核，命中就整单拦截（HTTP 400）。指纹脱敏能改写实测命中过的那几句，但换一个客户端版本就可能冒出新的。这里可以把 system 整段换成网关自己那份：①「透传」= 不动客户端 system（默认，行为与之前完全一致）；②「替换」= 删掉客户端所有 system / developer 消息，换成网关的提示词（客户端项目规范随之消失）；③「追加」= 在开头连续 system 块之后插入一条网关提示词，既有消息逐字不动（客户端规范与网关提示词并用）。那份提示词有两个来源：提示词文件（留空用内置默认），或直接在界面上编辑正文 —— 编辑过就以那份正文为准（优先于文件），清空则回到文件 / 内置默认。另外，透传 / 追加模式下撞了内容拦截（多半是指纹误报）时，网关会自动换一段最小中性提示词重试一次，并把「降级期」开到次日 00:00 —— 期间所有请求直接带中性提示词出门，不再先撞一次 400；这里能看见并提前解除它。上面几项是**默认值**：想给某个提供商单独配，用下面的「按提供商」加一行（带「网关自带」的家默认就列在那里）—— 不同的上游对这些内容的接受程度不一样。'),
   debug: t('开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。'),
   io: t('导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。'),
-  backup: t('把整份数据库（账号、网关配置、事件日志、请求统计、调试报文与桌面设置）导出成一个 SQL 文件，恢复时整体替换本机全部数据 —— 与上面「账号导入 / 导出」的逐条合并是两种语义：恢复会连配置、日志与当前启用状态一起换成备份那台机器的状态。导出默认包含日志与调试报文（文件可能很大），不需要时可以取消勾选只备业务数据。恢复前会自动把当前数据备份到配置目录的 backups/ 下，恢复后需要重新登录管理面板。'),
-  retention: t('三档数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求日志是网关每次转发到上游的逐条记录；按天聚合供报表页的热力图与按天趋势使用。请求日志与按天聚合默认 99999 天（约 274 年，效果上等于全量保留），事件日志默认 30 天。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三档的可填范围均为 1–99999 天。'),
-  storage: t('全部数据（账号、事件日志、请求记录、调试报文、设置）统一保存在配置目录下的 agent2api.db 这一个 SQLite 数据库里。备份时只需拷贝这个文件；更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。'),
+  backup: t('将数据库和恢复凭证所需的密钥一起保存为密码加密的 .a2ab 备份，可在 Windows、macOS 或 Linux 上恢复，无需手工复制密钥。恢复时整体替换账号、配置、日志与桌面设置，并使用目标机器的密钥重新加密凭证，不覆盖本机已有钥匙。可取消包含日志以减小文件；旧 .sql 备份仍可导入。恢复前自动保留安全备份，完成后需要重新登录管理面板。'),
+  retention: t('日志与请求日志同时受保留天数和数量上限限制。日志默认 30 天、10000 条，各级别按比例保留；调试详情最多保留 3 天。请求日志默认 99999 天、1000000 条（100 万），超出后从最旧的记录开始清理，并同步删除对应原始正文。按天聚合默认 99999 天，只按天数保留，不受请求日志数量清理影响。天数可填 1–99999，数量可填 1–100000000。调小任一设置并确认后立即清理，且不可恢复。'),
+  storage: t('全部数据（账号、事件日志、请求记录、调试报文、设置）统一保存在配置目录下的 agent2api.db 中，加密密钥单独保存在库外。跨机器备份请使用「整库备份 / 恢复」，不要只复制数据库。更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。'),
   modelsDev: t('models.dev 是一个开源的模型资料库（社区维护），这里用它补齐「上游没告诉我们」的模型能力：上下文窗口、最大输出、工具调用、图片、视频、是否支持思考，以及这个模型认识哪些思考档位。优先级是：你在「模型能力」里手工改的值 > 上游清单自己声明的值 > models.dev 的值 —— 它只填上游没声明的空位，从不推翻上游已声明的。网关随包内嵌了一份快照，所以离线、首次启动、访问不通时也有数据；开启时会按「模型目录刷新」任务的间隔联网更新（同一轮里一并刷新，也可在这里立即刷新）。关闭只停联网刷新，已经拿到的数据继续用。'),
 } as const
 
@@ -720,30 +895,32 @@ export const TIPS = {
 export const NOTES = {
   timeouts: t('保存后立即生效，不用重启；超时按上游失败处理（计入请求日志的「错误」列，并按「请求重试」的设置决定是否重试）。'),
   queue: t('等待期间请求日志的状态列会显示「排队中」阶段，详情弹窗的「内部重试」里能逐次看到等待时长；等待用尽后返回 HTTP 503（不是 401/429：既不会刷新凭证，也不会把账号标成限额）。'),
-  captchaPool: t('保存后对下一轮补货立即生效，不用重启。守卫跑在应用界面里：轻量模式关窗销毁界面期间无法铸造，走套餐池（Start Plan）通道的请求会以 503 落进请求日志（写明原因），重新打开界面即自动恢复。'),
+  captchaPool: t('保存后状态读取立即生效。后台不会自动生成令牌；需要人机验证时，在账号的「套餐明细」中主动开始验证。模型请求免验证时无需保持界面打开。'),
   retry: t('保存后立即生效，不用重启；次数用尽仍失败时，错误原样返回给客户端。'),
   routing: t('保存后立即生效，不用重启：策略与粘性作用于**下一次**转发的选路，进行中的请求不受影响。'),
   retryCodes: t('命中这些上游状态码的失败不在同一账号重发，直接换下一个账号继续试（换号占用「切换账号重试次数」，换满仍失败才把错误原样返回给客户端）。输入 100–599 的状态码后回车添加，点 × 或退格删除；默认 402（积分不足）。清空全部表示任何错误都照常重试。'),
-  sanitize: t('默认开启。命中明细会记进请求日志的「敏」标签（悬停可看命中了哪几条规则）。本项只改发给上游的副本，客户端看到的响应内容不变。'),
+  sanitize: t('默认开启并应用全部提供商。编辑词表或应用范围后点击「保存设置」，下一次请求立即生效，不用重启。命中明细仍记进请求日志的「敏」标签。'),
   developerRoleCompat: t('默认开启。只改 role 字段本身，消息内容与顺序都不动；本项只改发给上游的副本，客户端看到的响应内容不变。'),
+  imageCompress: t('默认开启。只改发给上游的副本，客户端看到的响应与原图都不变；请求日志里保存的是客户端发来的原图，不是压缩后的版本。只作用在对话链路，生图 / 图片编辑不经过这里。改完对下一个请求立即生效，不用重启。'),
   clineHeaders: t('值与默认值相同的行不占覆盖（存的是「改过的键」，不是全量配置）；值留空保存表示这个头不发送，删除改过的行表示回落默认值。改完立即生效，不用重启。'),
+  zcodeVersion: t('留空 = 用插件内置的默认版本号（每期活动由插件跟随官方更新）。只有遇到「官方客户端里能看到活动、这里探测为空」时才需要填：那种情况几乎都是上游抬高了版本门槛，而版本落后的表现是一份空列表而不是报错。按官方客户端当前版本填（形如 3.16.2），保存后回到套餐明细刷新一次即刻生效。环境变量 ZCODE_APP_VERSION 若已设置，优先级高于这里。'),
   cors: t('默认关闭。改动立即生效，不用重启；关闭期间的跨源请求会被预检拦下。'),
-  debug: t('开启后新发生的请求才会被记录（已经过去的请求补不回来）。报文统一存放在本地数据库里，只保留最近 500 条（超出后丢弃最旧的），条数见左侧「数据 → 数据存储」的「调试报文」。'),
+  debug: t('开启后，新发生的请求会保存上游调试报文与下游正文，历史请求无法补录。上游调试报文只保留最近 500 条；两侧条数可在「数据 → 数据存储」查看。关闭开关不会删除已保存的报文，可在请求日志中选择「仅清空报文原文」一起清理。'),
   promptMode: t('替换 = 客户端 system / developer 消息全部删掉，换成网关的提示词；追加 = 保留客户端内容，只在开头 system 块之后多插一条。两者都只改发给上游的副本，客户端看到的响应不变。'),
   promptFile: t('UTF-8 文本文件路径，留空用内置默认提示词（通用编码助手提示词，不含任何会被上游拦截的模板句）。只在「替换 / 追加」模式下生效，透传模式不读它。'),
   promptText: t('在这里直接编辑提示词正文：保存后以这份文本为准（优先于上面的提示词文件），清空则回到文件 / 内置默认。改一个字不必再去编辑器里开文件。'),
   promptGatewayText: t('上游按「结构」校验身份：三段必须各自成块，所以这里分开编辑三段（不能合成一段）。动态段里的运行值写成占位符，发请求时才替换：{cwd} 工作目录、{platform} 平台、{shell} shell、{os_version} 系统版本、{git} 是否 git 仓库、{provider} 提供方标识、{model} 模型名。清空某一段 = 那一段恢复官方原文。第三段发出时前面会自带一个空行（官方形状）。'),
   prompt: t('改完立即生效，不用重启（下一个请求就用新模式）。降级是自动的临时状态，解除后本模式自己的提示词立刻恢复。'),
-  promptProviders: t('「用哪份提示词」本来是按上游分别决定的事，所以每家可以有自己的模式、提示词文件与正文：不在这里列出的提供商一律沿用上面那份默认设置，「跟随默认」把这一家取消、回到默认。带「网关自带」那一行的家（目前是 ZCode 两家）默认就列在这里 —— 那一段是网关自己装上去的文本，不来自客户端也不来自提示词文件，默认开启、可以关掉，也可以改它的正文（改过的那一段以你的文本为准）；关掉后还能不能通过上游校验，取决于上游当下的口径，行内说明了实测依据。「模式 / 提示词文件 / 正文」管的是客户端自己的 system 怎么处理，与那个开关是两件事。'),
+  promptProviders: t('这里只列出已保存的提供商配置；未配置的提供商沿用全局设置，可从下拉框手动添加。用户保存的模式、文件和正文优先于全局设置，「跟随默认」只取消该提供商的模式、文件和正文覆盖。ZCode 套餐池默认由插件按三块装配，客户端系统正文合入第三块，不会自动创建替换规则；手动修改的网关提示词段或关闭开关仍以用户配置为准，能否被接受取决于上游规则。'),
   modelsDev: t('「模型管理」里每个能力的来源标记（上游 / models.dev / 已覆盖）读的就是这份数据；映射弹窗的思考档位下拉也按这里的数据只列该模型真实认识的档位。'),
-  retention: t('保存后立即生效：改小保留天数会立刻删除超出的历史数据，且不可恢复。'),
+  retention: t('保存后立即生效：保留天数和数量上限同时生效，调小任一项会立即清理超出的历史数据，且不可恢复。'),
   storageFile: t('配置目录下的 agent2api.db（账号、日志、请求记录、调试报文与设置都在里面）。'),
-  storageSize: t('库主文件的大小（不含运行期间的 WAL 临时文件，退出时已自动并回）。'),
+  storageSize: t('数据库主文件与 WAL 文件的总占用，与请求日志清理弹窗采用同一口径；清理后可压缩数据库回收空闲空间。'),
   storage: t('数据统一保存在配置目录下的 agent2api.db；如需更换位置，请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。'),
-  captcha: t('开启后，登录页在浏览器后台自动完成验证（对真人无感），而脚本每次尝试都要先算一道题 —— 暴力破解与抢注的成本显著上升。仅影响面板的登录 / 注册，与 API 客户端的 API Key 无关。'),
+  captcha: t('开启后，登录页在浏览器后台自动完成验证（对真人无感），而脚本每次尝试都要先算一道题 —— 暴力破解与抢注的成本显著上升。仅影响面板的登录 / 注册，与 API 客户端的 API Key 无关。桌面端与网页端各自独立：桌面端主要服务本机与局域网，网页端（Docker / 服务端）直接暴露在网络上的登录页风险更高，建议保持开启。'),
   panelLogin: t('当前浏览器以管理员身份登录着本面板。「退出登录」会撤销这台设备的登录会话（30 天内的自动续期一并失效），需要重新输入账号密码；其他已登录的设备不受影响。'),
   exportDanger: t('导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义，可直接用于登录。请妥善保管，不要外传或上传到公共位置。'),
-  backupDanger: t('备份文件内含全部账号凭证、网关 API Key 与面板管理员凭据，可直接用于登录。请妥善保管，不要外传或上传到公共位置。'),
+  backupDanger: t('备份包含账号凭证、网关 Key、GitHub 令牌与云同步凭据的恢复密钥，整个文件受备份密码保护。请分开保管文件与密码；忘记密码无法恢复。'),
 } as const
 
 /** 状态行（`.settings-state`）的派生文案：与旧实现的赋值逐字一致 */
@@ -755,7 +932,7 @@ export const STATES = {
   appLightOn: t('轻量模式已开启：关窗即销毁界面进程（释放约 200MB 内存），网关在后台继续；界面销毁期间 ZCode 套餐池（Start Plan）通道不可用，相关请求会在请求日志里注明原因'),
   appLightOff: t('未开启轻量模式：关窗仅隐藏窗口，界面进程常驻内存，随时打开不等待'),
   unitsOn: t('当前显示为「1.2亿 / 8400万」这类中文量级。'),
-  unitsOff: t('当前显示为「1.20M / 8.4k」这类英文缩写。'),
+  unitsOff: t('当前显示为「1.20M / 8.4k / 1.2B」这类英文缩写。'),
   debugUnavailable: t('未能读取调试模式设置，请稍后重试'),
   debugOn: t('正在保存上游原始报文：'),
   debugOff: t('未开启，转发时不保存任何原始报文。'),
@@ -783,6 +960,8 @@ export const STATES = {
   zoomWeb: t('网页端的界面缩放由浏览器自己控制（Ctrl + / Ctrl -，或浏览器菜单里的缩放），此项不可调。'),
   zoomDefault: t('当前按 100% 显示（默认比例）。'),
   languageHint: t('界面语言只保存在本机（localStorage）。切换后整页立即刷新，不影响账号、密钥与转发。'),
+  groupTotalFilteredOn: t('合计只累加当前筛选后可见的账号，筛选、搜索一改数字就跟着变。'),
+  groupTotalFilteredOff: t('合计按整组统计（默认）：不受筛选、搜索影响，被筛掉与已禁用的账号也计入。'),
 } as const
 
 // ── 以下成员从 HEAD 恢复 ──────────────────────────────
@@ -874,7 +1053,7 @@ export const CAPTCHA_POOL_FIELDS: NumberField[] = [
     unit: t('个'),
     min: 1,
     max: 10,
-    hint: t('ZCode 套餐池（Start Plan）通道每条请求都要消耗一个当次铸造的人机验证令牌（一次性，2 分钟过期），库存低于该值时界面自动补铸到它。默认 3 个。调大能吸收突发并发，但用不掉的令牌 2 分钟就过期作废，烧的是上游风控配额。可填 1–10。'),
+    hint: t('验证码库存的参考目标，默认 3 个，可填 1–10。只影响库存状态展示，不会因为低于目标自动生成令牌或弹出验证码。'),
   },
   {
     key: 'zcodeCaptchaPoolPollMs',
@@ -883,7 +1062,7 @@ export const CAPTCHA_POOL_FIELDS: NumberField[] = [
     unit: t('毫秒'),
     min: 1000,
     max: 30000,
-    hint: t('铸造守卫每隔多久看一次库存（毫秒）。只影响发现缺货的反应速度 —— 库存够用时轮询不会铸造任何令牌。默认 2500 毫秒，可填 1000–30000。'),
+    hint: t('有近期套餐池请求时读取库存状态的间隔，默认 2500 毫秒，可填 1000–30000。没有近期请求时降低读取频率，轮询不会发起验证码。'),
   },
   {
     key: 'zcodeCaptchaPoolMaxPerRound',
@@ -892,7 +1071,7 @@ export const CAPTCHA_POOL_FIELDS: NumberField[] = [
     unit: t('个'),
     min: 1,
     max: 5,
-    hint: t('发现缺货时一轮最多铸几个（连铸之间固定隔 500 毫秒）。默认 1 个：SDK 同一实例连铸容易互相干扰。调大补货更快，但单轮连铸越多越容易触发上游风控。可填 1–5。'),
+    hint: t('保留旧版配置兼容，当前不会自动连铸。每次点击「开始验证」只取得一枚令牌，失败或取消后停止。'),
   },
 ]
 

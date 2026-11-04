@@ -27,7 +27,7 @@
  */
 
 import * as React from 'react'
-import { Button, Input } from '@ui'
+import { Button, Input, Field, FieldLabel } from '@ui'
 
 import { t } from '../i18n'
 
@@ -274,8 +274,8 @@ export function BalanceFieldRow({
 }): React.ReactElement {
   const id = `${idPrefix}-${field.key}`
   return (
-    <div className='field-row mt-2.5'>
-      <label htmlFor={id}>{field.label}</label>
+    <Field orientation='horizontal' className='field-row mt-2.5'>
+      <FieldLabel htmlFor={id}>{field.label}</FieldLabel>
       <Input id={id} className='min-w-[220px]' type={field.secret ? 'password' : 'text'}
         autoComplete={field.secret ? 'new-password' : 'off'}
         placeholder={configured ? t('已配置，留空则不修改') : field.placeholder}
@@ -285,7 +285,7 @@ export function BalanceFieldRow({
         <Button variant='outline' size='sm' disabled={clearBusy === true} onClick={onClear}
           title={t('清除已配置的 {label}', { label: field.label })}>{t('清除')}</Button>
       ) : null}
-    </div>
+    </Field>
   )
 }
 

@@ -1,81 +1,61 @@
-//! 登录态、token 刷新与鉴权头（对照 src/workbuddy-auth.mjs 的会话部分）。
+//! 会话读取、登录态状态与登出（**只剩编排**）。
 //!
-//! 与 Node 版的分工差异：Node 的 `createWorkBuddyAuth` 把「登录态存储 + 上游管理
-//! 请求 + 无头登录 + token 刷新 + 头构造」全放在一个模块里；Rust 侧拆三块：
-//!   - `auth_http.rs`：传输层（请求发送 / 响应解包 / 鉴权错误类型）
-//!   - 本模块：会话读取（队首账号派生）、getStatus、buildAuthHeaders、
-//!     token 刷新与临期主动刷新、清会话
-//!   - `login.rs`：无头登录流程与登录任务表
-//! 拆分的理由是刷新与登录对「取消 / 并发防重」的要求不同，混在一起会让
-//! 两者的锁与任务表互相牵扯。
+//! ── 这里原来有什么 ──────────────────────────────────────────
+//! 对照 Node 版 `workbuddy-auth.mjs` 的完整实现：会话存储、`buildAuthHeaders`、
+//! `refreshSession`（打上游 `/auth/token/refresh`）、12153 判死与
+//! `needsRelogin` 标记、`fetchAccounts` / `fetchLoginAccount`、环境变量旁路
+//! （`WORKBUDDY_TOKEN`）、`Context` 端点拼装。
 //!
-//! ── 三类前缀（务必区分）──────────────────────────────────
-//!   1. 登录/账号：`{endpoint}/v2{prefixPath}/...`（国内版 = /v2/plugin/...）
-//!   2. 计费/签到：`{endpoint}/v2/...`（不带 prefixPath）
-//!   3. LLM 对话：`{endpoint}/v2/chat/completions`（不带 prefixPath）
+//! 那些是「怎么伪装成官方客户端打上游」的知识，按项目的风险隔离要求已整体
+//! 搬到提供商插件（`agent2api-providers` 的 `workbuddy` 模块）。本模块现在只
+//! 做三件事：
 //!
-//! ── 出网（切片 3 已接入）────────────────────────────────
-//! Node 版的请求一律走 `proxyFetch`（按账号挂 undici dispatcher），出口缓存
-//! 在 `core::egress`；本模块的 token 刷新按**账号自己的** outlet 走
-//! （`session.proxy` 解析出的出口），否则会出现「能转发但刷不了 token」。
-//! 登录流程（login.rs）没有账号上下文，因此固定直连 —— 与 Node 版一致。
-
-use std::collections::HashMap;
-use std::sync::Mutex;
+//!   1. **读会话**：从账号库里取「当前账号」的会话形态（`get_current_session`
+//!      / `get_current_session_for`），供 `/api/session`、计费编排与转发兜底用；
+//!   2. **报状态**：`get_status` / `unconfigured_status` / `get_config_summary`
+//!      —— 全是**纯本地**的读数，不发网络；
+//!   3. **登出**：`clear_session`（删掉当前账号）。
+//!
+//! ── 续期去哪了 ──────────────────────────────────────────────
+//! 续期是各家自己的协议（端点、头、业务码、轮换语义），现在由适配器
+//! （插件）的 `refresh_access_token` 负责。`api/accounts.rs` 的刷新入口按
+//! 「账号归属的 provider 是否由插件服务」分流，WorkBuddy 也走那条通用链。
+//!
+//! ── 环境变量旁路（`WORKBUDDY_TOKEN`）去哪了 ─────────────────
+//! 它同样搬到了插件：插件在 `provider.info` 里申报
+//! `anonymous_default_session` / `env_credentials`，转发链路在「一个账号都
+//! 没有」时向插件要默认登录态的 token（`ensure_access_token(store, "")`）。
+//! 网关不再自己读那几个变量 —— 读它就意味着网关知道某一家有这条旁路。
 
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::state::json_number;
 use crate::server::core::account_store::AccountStore;
-use crate::server::core::endpoints::{resolve_edition, Context, ANONYMOUS_HEADERS};
-use crate::server::core::proxies::{session_proxy, ResolvedProxy};
+use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
 
-// 传输层与错误类型对本模块的调用方再导出一次：login.rs 与账号路由原来从
-// `core::auth` 取这些名字，保留这条路径可以避免它们跟着拆分而改动。
-// 登录轮询码 SERVER_CODE_RETRY_FETCH_TOKEN 也在其中 —— login.rs 用它判「token 未就绪」。
-// `send_request` 保留导出：登录流程（login.rs）与切片 4 的转发都会用它走直连档。
+// 传输层与错误类型对本模块的调用方再导出一次（`autoclaw` 等内置家直接用
+// `send_raw`；`WorkBuddyAuthError` 是管理接口失败的最小公共形状）。
 #[allow(unused_imports)]
 pub use crate::server::core::auth_http::{
-    send_public_request, send_request, send_request_via, unwrap_public_response,
-    unwrap_response, WorkBuddyAuthError, REFRESH_WINDOW_MS, SERVER_CODE_RETRY_FETCH_TOKEN,
+    send_raw, ApiResponse, WorkBuddyAuthError, REFRESH_WINDOW_MS,
 };
 
 // ─── 会话与凭证 ─────────────────────────────────────────────
 
-/// 鉴权服务句柄：账号存储 + 默认上下文 + 刷新防重表。
+/// 鉴权服务句柄：账号存储。
 ///
-/// 防重表记录「正在刷新的账号 id」：Node 版的刷新是「读账号 →
-/// 发请求 → 写回」，两个并发请求会各自发一次上游刷新、后写的覆盖先写的；
-/// 更糟的是部分上游会对同一 refreshToken 的并发使用做失效处理。
-/// 因此这里用一张占位表把并发收敛成一次真实刷新（后到者拿到同一个结果）。
-///
-/// ── 防重表为什么是**进程级**（Agent2API 改造 W2b-T3）─────────
-/// 改造前刷新只从 `ServerState` 那一份 AuthService 发起（克隆共享同一个 Arc
-/// 表，等价于进程级）。W2b 之后 provider 适配器的 `ensure_access_token`
-/// 与 `refresh_access_token` 也会触发刷新，而适配器契约只拿得到 `&AccountStore`
-/// （见 `core::providers::adapter`），于是它必须能自己构造一个 AuthService
-/// （`for_store`）。若防重表仍挂在实例上，适配器构造出的那份就与
-/// `/api/accounts/refresh` 那份**各有一张表** —— 用户点「刷新」的同一瞬间
-/// 恰好有转发在刷新同一账号时，两次真实刷新会并发打出去，
-/// 正是这张表要防的事。挪成静态表后，所有实例天然共享同一份占位状态，
-/// 行为与改造前（单实例）逐字一致。
+/// 名字保留 `AuthService` 是为了不改动 `ServerState` 的字段与各处构造点 ——
+/// 它现在只是一个「账号库 + 会话派生」的薄封装。
 #[derive(Clone)]
 pub struct AuthService {
     store: AccountStore,
-    context: Context,
 }
 
-/// 进程级刷新占位表（见 `AuthService` 的说明）。
+/// 刷新结果（供适配器与路由层共用）。
 ///
-/// 用 `OnceLock` 而不是 `lazy_static`/`std::sync::LazyLock`：
-/// 前者无需新依赖，后者在 1.77 的 MSRV 上还不可用（`LazyLock` 稳定于 1.80）。
-fn inflight_table() -> &'static Mutex<HashMap<String, ()>> {
-    static TABLE: std::sync::OnceLock<Mutex<HashMap<String, ()>>> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 刷新结果（供路由层与登录流程共用）
+/// 本模块已不做续期，这个类型保留给仍在内置实现里的几家（Raccoon / AutoClaw /
+/// CodeArts）与插件侧的会话写回路径复用。
 #[derive(Clone, Debug)]
 pub struct RefreshedAuth {
     pub access_token: String,
@@ -85,27 +65,22 @@ pub struct RefreshedAuth {
 }
 
 impl AuthService {
-    pub fn new(store: AccountStore, context: Context) -> Self {
-        Self { store, context }
+    pub fn new(store: AccountStore) -> Self {
+        Self { store }
     }
 
-    /// 用「与默认上下文同源」的上下文构造（Agent2API W2b-T3）。
-    ///
-    /// provider 适配器与模型目录刷新只拿得到 `&AccountStore`，而 `AuthService`
-    /// 还需要一个 `Context`。这里用的就是 `ServerState::bootstrap` 里那份
-    /// `endpoints::default_context()` —— 同一进程内两条构造路径的默认上下文
-    /// 因此完全一致（token 刷新本身走的是**账号自己的** endpoint，
-    /// 这个 context 只用于「账号记录里没有端点时的兜底」）。
+    /// 与 `new` 同一入口（保留旧名，改造前它是「用默认上下文构造」）。
     pub fn for_store(store: AccountStore) -> Self {
-        Self {
-            store,
-            context: crate::server::core::endpoints::default_context(),
-        }
+        Self::new(store)
     }
 
-    /// 默认上下文（未登录态展示与 /api/endpoints 用）
-    pub fn default_context(&self) -> &Context {
-        &self.context
+    /// 账号库句柄（克隆即共享）。
+    ///
+    /// 给「手上已经有会话、但要按账号 id 调适配器」的路径用 —— 目前是
+    /// `BillingService`：它按会话入参，而 `admin.action` 必须带账号 id 才能
+    /// 路由到该 provider 的插件进程。
+    pub fn store(&self) -> AccountStore {
+        self.store.clone()
     }
 
     /// 账号数据所在的**文件**（Node 版 `auth.authFile` 的对等字段）。
@@ -116,133 +91,50 @@ impl AuthService {
     /// 用户据此知道该备份什么（WAL 模式下还有 `-wal` / `-shm` 两个附属文件）；
     /// 库没打开时会回落到那个库的**约定路径**，而不是空串。
     ///
-    /// Windows 下把分隔符统一成 `\`：Node 的 `path.join` 在 Windows 上就是这么输出的，
-    /// 而这个路径会直接显示给用户（面板上的「凭证文件」）并给壳侧打开目录用，
-    /// 反斜杠形态才与 Node 版一致。
+    /// Windows 下把分隔符统一成 `\`：Node 的 `path.join` 在 Windows 上就是这么
+    /// 输出的，而这个路径会直接显示给用户（面板上的「凭证文件」）并给壳侧打开
+    /// 目录用，反斜杠形态才与 Node 版一致。
     pub fn auth_file(&self) -> String {
         normalize_display_path(&self.store.file_string())
     }
 
-    // ── 环境变量凭证（优先级最高）────────────────────────────
-    //
-    // Node 版：`WORKBUDDY_TOKEN` 存在时直接用它组会话，完全不看账号库。
-    // 这是给脚本/CI 用的旁路入口，保持一致。
-
-    fn env_session() -> Option<Value> {
-        let token = std::env::var("WORKBUDDY_TOKEN").ok()?.trim().to_string();
-        if token.is_empty() {
-            return None;
-        }
-        let refresh = std::env::var("WORKBUDDY_REFRESH_TOKEN")
-            .ok()
-            .unwrap_or_default();
-        let uid = std::env::var("WORKBUDDY_USER_ID").ok().unwrap_or_default();
-        Some(json!({
-            "auth": with_expires_at(json!({
-                "accessToken": token,
-                "refreshToken": refresh,
-                "tokenType": "Bearer",
-            })),
-            "account": { "uid": uid },
-        }))
-    }
-
-    /// 当前可用凭证；临期自动刷新并回写。
+    /// 当前可用凭证；**不再自动刷新**（续期在插件里，见模块头）。
     ///
-    /// 优先级：环境变量 WORKBUDDY_TOKEN > 账号存储当前账号。
+    /// 优先级：账号存储当前账号（WorkBuddy 国内版）。
     /// 返回 None 表示没有任何可用凭证（未登录）。
     ///
-    /// 多提供商（W2b-T3）后本函数是 `scope = None` 的薄封装：语义与改造前
-    /// 逐字一致（全局派生的当前账号，供 /api/session、计费、模型目录使用）。
     /// **转发链路不用它** —— 转发必须只看目标 provider 的账号，
     /// 走 `get_current_session_for`。
     pub async fn get_current_session(&self) -> Result<Option<Value>, WorkBuddyAuthError> {
-        self.session_with_refresh(None).await
+        self.session_of(None).await
     }
 
-    /// 指定 provider 的当前可用凭证（临期自动刷新并回写）。
+    /// 指定 provider 的当前可用凭证。
     ///
     /// 「当前账号」在该 provider 的账号组内派生（`current_entry_for_provider`），
     /// 而不是全局队首 —— 否则「只有 raccoon 账号」的机器上，
     /// workbuddy 的默认登录态会借到 raccoon 账号的凭证（发出去必然 401）。
-    ///
-    /// 环境变量旁路（`WORKBUDDY_TOKEN`）是 **workbuddy 专属**：只有 scope 是
-    /// workbuddy 时才认它（see `env_session`）。
     pub async fn get_current_session_for(
         &self,
         provider: &str,
     ) -> Result<Option<Value>, WorkBuddyAuthError> {
-        self.session_with_refresh(Some(provider)).await
+        self.session_of(Some(provider)).await
     }
 
-    /// 会话读取 + 临期刷新的共用内核；`scope` 为 None 表示全局当前账号。
-    async fn session_with_refresh(
-        &self,
-        scope: Option<&str>,
-    ) -> Result<Option<Value>, WorkBuddyAuthError> {
-        // 环境变量凭证只属于 workbuddy（WORKBUDDY_TOKEN）
-        let env_applies = scope
-            .map(|provider| provider == crate::server::core::providers::DEFAULT_PROVIDER_ID)
-            .unwrap_or(true);
-        if env_applies {
-            if let Some(session) = Self::env_session() {
-                return Ok(Some(session));
-            }
-        }
-        let entry = match scope {
-            Some(provider) => self.store.current_entry_for_provider(provider),
-            None => self.store.get_current_entry(),
-        };
-        let Some(entry) = entry else {
-            return Ok(None);
-        };
-        let expires_at = entry
-            .session
-            .get("auth")
-            .and_then(|auth| auth.get("expiresAt"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let refresh_token = entry
-            .session
-            .get("auth")
-            .and_then(|auth| auth.get("refreshToken"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if is_token_expiring(expires_at) && !refresh_token.is_empty() {
-            logging::verbose(
-                "[Auth]",
-                &format!("token 临期，自动刷新（账号 {}）…", entry.id),
-            );
-            // 续期走该账号自己的端点与出口，否则会出现「能转发但刷不了 token」
-            let refreshed = self.refresh_account(&entry.id).await?;
-            let mut session = entry.session;
-            if let Some(auth) = session.get_mut("auth") {
-                if let Some(object) = auth.as_object_mut() {
-                    object.insert(
-                        "accessToken".to_string(),
-                        Value::String(refreshed.access_token),
-                    );
-                    if let Some(token) = refreshed.refresh_token {
-                        object.insert("refreshToken".to_string(), Value::String(token));
-                    }
-                    if let Some(value) = refreshed.expires_at {
-                        object.insert("expiresAt".to_string(), json_number(value));
-                    }
-                    if let Some(value) = refreshed.refresh_expires_at {
-                        object.insert("refreshExpiresAt".to_string(), json_number(value));
-                    }
-                }
-            }
-            return Ok(Some(session));
-        }
-        Ok(Some(entry.session))
+    /// 会话读取的共用内核；`scope` 为 None 表示全局当前账号。
+    async fn session_of(&self, scope: Option<&str>) -> Result<Option<Value>, WorkBuddyAuthError> {
+        let store = self.store.clone();
+        let scope = scope.map(str::to_string);
+        let entry = super::blocking::run(move || match scope {
+            Some(provider) => store.current_entry_for_provider(&provider),
+            None => store.get_current_entry(),
+        }).await.map_err(|error| WorkBuddyAuthError::new(error.message))?;
+        Ok(entry.map(|entry| entry.session))
     }
 
     /// 会话状态只读本地凭证；续期由维护任务和实际转发按需触发。
     pub fn get_status(&self) -> Value {
-        let session = Self::env_session()
-            .or_else(|| self.store.get_current_entry().map(|entry| entry.session));
+        let session = self.store.get_current_entry().map(|entry| entry.session);
         let Some(session) = session else {
             return self.unconfigured_status();
         };
@@ -270,22 +162,10 @@ impl AuthService {
         };
         json!({
             "loggedIn": true,
-            "endpoint": session
-                .get("endpoint")
-                .and_then(Value::as_str)
-                .unwrap_or(&self.context.base_url),
-            "prefixPath": session
-                .get("prefixPath")
-                .and_then(Value::as_str)
-                .unwrap_or(&self.context.prefix),
-            "edition": session
-                .get("edition")
-                .and_then(Value::as_str)
-                .unwrap_or(&self.context.edition),
-            "platform": session
-                .get("platform")
-                .and_then(Value::as_str)
-                .unwrap_or(&self.context.platform),
+            "endpoint": session.get("endpoint").cloned().unwrap_or(Value::Null),
+            "prefixPath": session.get("prefixPath").cloned().unwrap_or(Value::Null),
+            "edition": session.get("edition").cloned().unwrap_or(Value::Null),
+            "platform": session.get("platform").cloned().unwrap_or(Value::Null),
             "accountUid": nullable_text("uid"),
             "nickname": nullable_text("nickname"),
             "accountType": account
@@ -309,10 +189,10 @@ impl AuthService {
     pub fn unconfigured_status(&self) -> Value {
         json!({
             "loggedIn": false,
-            "endpoint": self.context.base_url,
-            "prefixPath": self.context.prefix,
-            "edition": self.context.edition,
-            "platform": self.context.platform,
+            "endpoint": Value::Null,
+            "prefixPath": Value::Null,
+            "edition": Value::Null,
+            "platform": Value::Null,
             "authFile": self.auth_file(),
             "reason": "尚未登录或凭证缺失",
         })
@@ -320,15 +200,17 @@ impl AuthService {
 
     /// 上游配置摘要（对照 workbuddy-upstream-client.mjs 的 `getConfigSummary`）。
     ///
-    /// **纯本地**：只查凭证是否存在，不发任何网络请求 —— 所以本切片就能给真值。
-    /// 它不做 token 临期刷新（`get_status` 同样只读，见那里的说明），
+    /// **纯本地**：只查凭证是否存在，不发任何网络请求。它不做 token 临期刷新，
     /// 否则 /health 会被上游网络状况拖慢 —— 它是壳侧的就绪探针，探一次就出网
     /// 会让「网关是否就绪」取决于上游网络。
+    ///
+    /// `authApiBase` / `chatApiUrl` 两栏已删除：它们是**上游端点**，网关不再
+    /// 持有那套知识（`baseUrl` 仍报记录里存的值，那是账号自己的字段）。
     pub fn get_config_summary(&self) -> Value {
         let Some(entry) = self.store.get_current_entry() else {
             return json!({
                 "configured": false,
-                "baseUrl": self.context.base_url,
+                "baseUrl": Value::Null,
                 "unavailableReason": UNCONFIGURED_REASON,
             });
         };
@@ -349,10 +231,8 @@ impl AuthService {
             "baseUrl": entry
                 .session
                 .get("endpoint")
-                .and_then(Value::as_str)
-                .unwrap_or(&self.context.base_url),
-            "authApiBase": self.context.auth_api_base(),
-            "chatApiUrl": self.context.chat_api_url(),
+                .cloned()
+                .unwrap_or(Value::Null),
             "authSource": if refresh_token.is_empty() {
                 "环境变量/静态 token"
             } else {
@@ -364,272 +244,13 @@ impl AuthService {
         })
     }
 
-    /// 转发 LLM 请求所需的完整鉴权头（对齐桌面端 buildAuthHeaders）。
+    // ─── 续期（仅内置家使用）──────────────────────────────────
+
+    /// 单飞表的进程级实例（见 `refresh_flight` 的模块头）。
     ///
-    /// 逐个复刻，**包括条件头**：X-Enterprise-Id / X-Tenant-Id 只在企业账号给、
-    /// X-Domain 只在 auth.domain 存在时给、X-Department-Info 只在有
-    /// departmentFullName 时给。少给一个头不会被本地测试发现，但上游会拒绝。
-    pub fn build_auth_headers(session: &Value) -> Vec<(String, String)> {
-        let mut headers: Vec<(String, String)> = Vec::new();
-        let auth = session.get("auth").cloned().unwrap_or(Value::Null);
-        let account = session.get("account").cloned().unwrap_or(Value::Null);
-
-        if let Some(uid) = account.get("uid").and_then(Value::as_str) {
-            if !uid.is_empty() {
-                headers.push(("X-User-Id".to_string(), uid.to_string()));
-            }
-        }
-        if let Some(token) = auth.get("accessToken").and_then(Value::as_str) {
-            if !token.is_empty() {
-                headers.push(("Authorization".to_string(), format!("Bearer {token}")));
-            }
-        }
-        if let Some(enterprise_id) = account.get("enterpriseId").and_then(Value::as_str) {
-            if !enterprise_id.is_empty() {
-                headers.push(("X-Enterprise-Id".to_string(), enterprise_id.to_string()));
-                headers.push(("X-Tenant-Id".to_string(), enterprise_id.to_string()));
-            }
-        }
-        if let Some(domain) = auth.get("domain").and_then(Value::as_str) {
-            if !domain.is_empty() {
-                headers.push(("X-Domain".to_string(), domain.to_string()));
-            }
-        }
-        if let Some(department) = account.get("departmentFullName").and_then(Value::as_str) {
-            if !department.is_empty() {
-                headers.push(("X-Department-Info".to_string(), department.to_string()));
-            }
-        }
-        headers
-    }
-
-    /// 企业扩展头（对照 `enterpriseHeaders`）：总是带 X-Domain
-    /// （取 auth.domain，缺失时回退端点 authority）。
-    fn enterprise_headers(auth: &Value, context: &Context) -> Vec<(String, String)> {
-        let mut headers: Vec<(String, String)> = Vec::new();
-        if let Some(enterprise_id) = auth
-            .get("account")
-            .and_then(|account| account.get("enterpriseId"))
-            .and_then(Value::as_str)
-        {
-            if !enterprise_id.is_empty() {
-                headers.push(("X-Enterprise-Id".to_string(), enterprise_id.to_string()));
-                headers.push(("X-Tenant-Id".to_string(), enterprise_id.to_string()));
-            }
-        }
-        let domain = auth
-            .get("domain")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| context.authority());
-        if !domain.is_empty() {
-            headers.push(("X-Domain".to_string(), domain));
-        }
-        headers
-    }
-
-    // ─── token 刷新 ──────────────────────────────────────────
-
-    /// 单次 token 续期（对照 `refreshSession`）：不读盘、不写回，纯请求。
-    ///
-    /// ctx 决定向哪个端点续期 —— 多账号（国内版/国际版）必须用该账号自己的
-    /// endpoint，否则会拿 A 站点的 refreshToken 打 B 站点。
-    ///
-    /// `proxy` 是该账号的出网代理（Node 版 `refreshSession(auth, ctx, proxy)`），
-    /// 传 None 表示直连 —— 续期与转发共用同一出口，否则会出现
-    /// 「能转发但刷不了 token」。
-    pub async fn refresh_session(
-        &self,
-        auth: &Value,
-        context: &Context,
-        proxy: Option<&ResolvedProxy>,
-    ) -> Result<RefreshedAuth, WorkBuddyAuthError> {
-        let refresh_token = auth
-            .get("refreshToken")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if refresh_token.is_empty() {
-            return Err(WorkBuddyAuthError::new(
-                "缺少 refreshToken，无法续期，请重新登录",
-            ));
-        }
-        let mut headers = Self::enterprise_headers(auth, context);
-        headers.push(("X-Refresh-Token".to_string(), refresh_token.to_string()));
-        headers.push(("X-Auth-Refresh-Source".to_string(), "plugin".to_string()));
-        let url = context.auth_url("/auth/token/refresh");
-        let response =
-            send_request_via("POST", &url, Some(&json!({})), &headers, proxy, None).await?;
-        let data = unwrap_response(&response, "auth/token/refresh")?;
-        let access_token = data
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if access_token.is_empty() {
-            return Err(WorkBuddyAuthError::new("token 刷新响应缺少 accessToken"));
-        }
-        Ok(refresh_result_from(&data))
-    }
-
-    /// 按账号 id 刷新并回写（对照 account-routes.mjs 的 `refreshById`）。
-    ///
-    /// 并发防重：同一账号同时只允许一次真实刷新，后到者直接返回先到者的结果
-    /// —— 与 Node 版「单线程 + 无并发刷新」的实际效果一致，但显式化了。
-    pub async fn refresh_account(&self, id: &str) -> Result<RefreshedAuth, WorkBuddyAuthError> {
-        // 不做「等前一个完成再复用结果」的复杂等待：这里用占位表把重复请求
-        // 快速拒掉（返回明确错误），因为刷新本身很快，重复触发通常来自
-        // 用户连点或启动维护，报错比静默复用更利于定位问题。
-        // 表是**进程级**的（见 `AuthService` 的说明）：本实例、适配器构造的
-        // 实例、`/api/accounts/refresh` 共用同一份占位状态。
-        {
-            let table = inflight_table();
-            let mut guard = match table.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if guard.contains_key(id) {
-                return Err(WorkBuddyAuthError::with_status(
-                    409,
-                    format!("账号 {id} 的 token 正在刷新中，请稍后重试"),
-                ));
-            }
-            guard.insert(id.to_string(), ());
-        }
-        let result = self.refresh_account_inner(id).await;
-        if let Ok(mut guard) = inflight_table().lock() {
-            guard.remove(id);
-        }
-        result
-    }
-
-    async fn refresh_account_inner(&self, id: &str) -> Result<RefreshedAuth, WorkBuddyAuthError> {
-        let creds = self
-            .store
-            .get_credentials_by_id(id)
-            .ok_or_else(|| WorkBuddyAuthError::with_status(404, "账号不存在"))?;
-        if creds.refresh_token.is_empty() {
-            return Err(WorkBuddyAuthError::with_status(
-                400,
-                format!("账号 {} 没有 refreshToken，无法刷新", creds.name),
-            ));
-        }
-        // 按账号自己的端点续期（国内版/国际版不同站点），出口也按账号的代理走
-        let context = Context::make(
-            Some(&creds.endpoint),
-            Some(&creds.prefix_path),
-            Some(&creds.platform),
-            Some(&creds.edition),
-        );
-        // 用账号的完整会话形态作为续期入参：enterpriseId / domain 会变成
-        // X-Enterprise-Id / X-Domain 条件头，企业账号缺了它们会被上游拒绝
-        let session = self
-            .store
-            .get_session_by_id(id)
-            .map(|entry| entry.session)
-            .unwrap_or(Value::Null);
-        let auth = session.get("auth").cloned().unwrap_or(Value::Null);
-        // 续期也走该账号自己的出口（账号没配代理 → 直连）
-        let proxy = session_proxy(&session);
-        let next = self.refresh_session(&auth, &context, proxy.as_ref()).await?;
-        if next.access_token.is_empty() {
-            return Err(WorkBuddyAuthError::new("token 刷新响应缺少 accessToken"));
-        }
-        self.store.update_account_tokens(
-            id,
-            Some(&next.access_token),
-            next.refresh_token.as_deref(),
-            next.expires_at,
-            next.refresh_expires_at,
-        );
-        logging::log(
-            "[Accounts]",
-            &format!(
-                "✅ 账号 token 已刷新: {}（{}…）",
-                creds.name,
-                crate::server::core::account_store::store_util::truncate_text(&creds.uid, 8)
-            ),
-        );
-        Ok(next)
-    }
-
-    /// 手动刷新：当前账号（对照 `refreshStoredSession` 的 store 分支）。
-    pub async fn refresh_stored_session(&self) -> Result<Value, WorkBuddyAuthError> {
-        let Some(entry) = self.store.get_current_entry() else {
-            return Err(WorkBuddyAuthError::new("当前没有可刷新的登录态"));
-        };
-        let refresh_token = entry
-            .session
-            .get("auth")
-            .and_then(|auth| auth.get("refreshToken"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if refresh_token.is_empty() {
-            return Err(WorkBuddyAuthError::new("当前没有可刷新的登录态"));
-        }
-        let refreshed = self.refresh_account(&entry.id).await?;
-        let mut session = entry.session;
-        if let Some(object) = session.get_mut("auth").and_then(Value::as_object_mut) {
-            object.insert("accessToken".to_string(), Value::String(refreshed.access_token));
-            if let Some(token) = refreshed.refresh_token {
-                object.insert("refreshToken".to_string(), Value::String(token));
-            }
-            if let Some(value) = refreshed.expires_at {
-                object.insert("expiresAt".to_string(), json_number(value));
-            }
-            if let Some(value) = refreshed.refresh_expires_at {
-                object.insert("refreshExpiresAt".to_string(), json_number(value));
-            }
-        }
-        Ok(session)
-    }
-
-    // ─── 账号/登录账号接口（登录流程与转发共用）───────────────
-
-    /// 拉取账号列表（对照 `fetchAccounts`）
-    pub async fn fetch_accounts(
-        &self,
-        auth: &Value,
-        context: &Context,
-        proxy: Option<&ResolvedProxy>,
-    ) -> Result<Vec<Value>, WorkBuddyAuthError> {
-        let mut headers = Self::enterprise_headers(auth, context);
-        let token = auth
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        headers.push(("Authorization".to_string(), format!("Bearer {token}")));
-        let url = context.auth_url("/accounts");
-        let response = send_request_via("GET", &url, None, &headers, proxy, None).await?;
-        let data = unwrap_response(&response, "accounts")?;
-        Ok(data
-            .get("accounts")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    /// 登录后账号详情（对照 `fetchLoginAccount`，④ GET /v2{prefix}/login/account）
-    pub async fn fetch_login_account(
-        &self,
-        auth: &Value,
-        state: &str,
-        context: &Context,
-        proxy: Option<&ResolvedProxy>,
-    ) -> Result<Value, WorkBuddyAuthError> {
-        let mut headers = Self::enterprise_headers(auth, context);
-        let token = auth
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        headers.push(("Authorization".to_string(), format!("Bearer {token}")));
-        headers.push(("X-No-User-Id".to_string(), "true".to_string()));
-        headers.push(("X-No-Enterprise-Id".to_string(), "true".to_string()));
-        headers.push(("X-No-Department-Info".to_string(), "true".to_string()));
-        let url = context.auth_url(&format!("/login/account?state={}", urlencoding(state)));
-        let response = send_request_via("GET", &url, None, &headers, proxy, None).await?;
-        unwrap_response(&response, "login/account")
-    }
+    /// 仍在网关里的几家（Raccoon / AutoClaw / CodeArts）各自的 `refresh.rs`
+    /// 直接用 `refresh_flight::Table`，所以这里没有包装方法 —— 保留这个
+    /// 类型别名只为让上面的 `RefreshedAuth` 有明确归属。
 
     /// 清空登录态。
     ///
@@ -672,6 +293,7 @@ fn normalize_display_path(path: &str) -> String {
 }
 
 /// 未登录原因文案（getConfigSummary 用）。
+///
 /// Node 版这条是「尚未登录（node server.mjs --login）」；壳内 Rust 版没有
 /// 那个命令行入口（登录走 UI 的 /api/session/login/*），用它会指向一个不存在
 /// 的命令，因此取与启动横幅一致的措辞。
@@ -731,7 +353,7 @@ pub fn is_token_expiring(expires_at: f64) -> bool {
 }
 
 /// 把刷新响应包成 RefreshedAuth（字段缺失时给 None，让调用方保留原值）
-fn refresh_result_from(data: &Value) -> RefreshedAuth {
+pub fn refresh_result_from(data: &Value) -> RefreshedAuth {
     let enriched = with_expires_at(data.clone());
     RefreshedAuth {
         access_token: enriched
@@ -755,39 +377,5 @@ fn refresh_result_from(data: &Value) -> RefreshedAuth {
     }
 }
 
-/// 查询串值的百分号编码（对照 JS 的 `encodeURIComponent`）。
-///
-/// 自己实现而不是引 url crate 的 form 编码：`encodeURIComponent` 不转义
-/// `!'()*` 之外的可打印 ASCII，而 form 编码会把空格写成 '+'。state 是
-/// 服务端下发的随机串，两者都能用，但保持与 Node 完全一致的编码更稳妥。
-pub fn urlencoding(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')') {
-            out.push(ch);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
-/// 匿名请求头（登录流程用）
-pub fn anonymous_headers() -> Vec<(String, String)> {
-    ANONYMOUS_HEADERS
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
-}
-
-/// 版本解析的薄封装（登录流程按 edition 决定端点）
-pub fn context_for_edition(edition: Option<&str>, endpoint: Option<&str>) -> Context {
-    let info = resolve_edition(edition);
-    Context::make(
-        endpoint.or(Some(info.endpoint)),
-        None,
-        Some(info.platform),
-        Some(info.id),
-    )
-}
+/// 刷新用的出网代理类型别名（内置家的刷新签名共用它）。
+pub type RefreshProxy = ResolvedProxy;

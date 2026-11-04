@@ -1,7 +1,7 @@
 //! HTTP 路由处理器（每个文件一组端点，与 Node 版的 route 模块一一对应）。
 //!
 //! 命名约定：`*_api.rs` 对应 Node 版 src/workbuddy-*-routes.mjs 形态的模块；
-//! 单端点模块直接用端点名（health.rs / session.rs / endpoints.rs）。
+//! 单端点模块直接用端点名（health.rs / session.rs）。
 //!
 //! 现有模块：
 //!   health.rs     GET /health
@@ -24,7 +24,6 @@
 //!   auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
 //!   scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务的开关 / 间隔 / 立即执行）
 //!   update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
-//!   endpoints.rs  GET /api/endpoints（接口清单）
 //!   storage_api.rs GET /api/storage（统一库的位置、大小与各表条数，只读）
 //!   zcode_captcha.rs GET/POST /api/zcode/captcha（活动套餐通道的人机验证令牌池：
 //!                 界面静默铸造后推入，转发层按请求取用）
@@ -34,7 +33,13 @@
 //! （切片 7 之后的路由扩展），照同样的分工：新文件 + `http::router` 里登记，
 //! 并保持与 Node 版一致的分组（需鉴权的一律挂 `protected`）。
 
+// 「Agent」页：本机 AI 客户端配置接管（列表 / 保存 / 写入 / 预览 / 还原 / 导入）
+pub mod agents;
+pub mod agent_resources;
 pub mod accounts;
+pub mod accounts_batch;
+mod accounts_export;
+mod accounts_sort;
 // `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
 pub mod accounts_usage;
@@ -42,6 +47,14 @@ pub mod accounts_usage;
 // 设置读写与流式对话转发。工具定义与执行都在前端，后端不认识任何工具，
 // 见该文件模块头
 pub mod assistant;
+pub mod assistant_history;
+pub mod assistant_images;
+// 工具服务（「工具服务」页）：列表 / 开关 / 超时 / 上游提供商 / 视觉配置 /
+// 本机接入的管理面，以及对外运行时端点（Skill / MCP / REST）。上游配置与
+// 编排在 `core::tool_services`，见那两个文件模块头
+pub mod tools;
+pub mod tool_runtime;
+mod image_input;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
 // `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
 pub mod backup_api;
@@ -56,6 +69,9 @@ pub mod chat;
 // 签到中心的聚合快照（GET /api/checkin-center）：分组口径在后端唯一化，
 // 资格类状态由前端按需惰性查询，见该文件模块头
 pub mod checkin_center;
+// 云同步（设置页「数据 → 云同步」）：WebDAV / S3 兼容存储上的业务数据快照。
+// 范围与密钥封装见 `core::cloud_sync` 的模块头
+pub mod cloud_sync;
 // 签到记录明细台账（GET/DELETE /api/checkin-records）：每账号一行的成败与
 // 收益明细，记账点在 `core::billing::checkin::run_checkin`，见该文件模块头
 pub mod checkin_records;
@@ -68,6 +84,9 @@ pub mod config_api;
 // WorkBuddy 成长任务（查询 / 执行 / 开学季 / 猫猫旅行）：从参考项目
 // workbuddy2api 的 task_runner.py 移植，见该文件模块头
 pub mod growth;
+// 猫猫旅行的**定时排程**管理接口（开关 / 时刻 / 立即巡检）：
+// 调度体在 `core::growth_scheduler`，这里只是管理面
+pub mod growth_schedule;
 // 网关面（`/v1/*`）跨域访问开关：`GET/PUT /api/cors`（与 `/api/sanitize`
 // 同形的单开关端点，见该文件模块头）
 pub mod cors;
@@ -75,20 +94,24 @@ pub mod cors;
 // `core::custom_providers` 与 `core::account_store::custom_accounts`）
 pub mod custom_providers;
 pub mod debug_api;
+mod date_range;
 // 进行中行的断线兜底守卫（从 pipeline.rs 拆出：那边已近 1000 行，而它是
 // 「handler 被 axum 取消时补 408 终态」这一件事的完整封装，见该文件模块头）
 pub mod disconnect_guard;
-pub mod endpoints;
 pub mod health;
 // 「从其他工具导入」的扫描接口（当前来源：cc-switch；存储读取见
 // `core::import_ccswitch`）
 pub mod import_sources;
+pub mod images;
+mod image_assets;
+mod image_output;
 pub mod keys_api;
 /// 保活换行丢弃开关（`/api/keepalive-strip`）：与 `/api/sanitize`、`/api/debug`
 /// 同形的单开关端点，独立成文件而不是塞进 config_api —— 理由见该模块头。
 pub mod keepalive;
 pub mod logs_api;
 pub mod model_manage;
+pub(crate) mod model_access;
 // models.dev 模型元数据（开关 / 状态 / 立即刷新）：与「逐家上游目录」的
 // /api/models/refresh 分开，理由见该文件模块头
 pub mod model_meta;
@@ -100,23 +123,44 @@ pub mod models;
 pub mod onboarding;
 pub mod panel;
 pub mod pipeline;
+mod live_progress;
+mod record_persist;
+// 提供商插件包的管理面（列表 / 安装 / 卸载 / 启停）：插件是用户安装的，
+// 这一组端点就是「装插件」的唯一入口，见该文件模块头
+pub mod plugins;
+// 插件 UI 资源的托管（`/plugins/{pack}/ui/*`）：插件包可以带页面，由网关
+// 出静态资源、客户端 iframe 嵌入。不挂 protected —— 见该文件模块头
+pub mod plugin_ui;
+// 插件页的设计令牌（`/plugins/theme.css`）：把宿主那份 `ui/css/tokens.css`
+// 原样出给 iframe 里的插件页，让迁移过来的页面与宿主同一套色板 / 圆角 / 阴影
+pub mod plugin_theme;
 pub mod prompt;
 pub mod protocol;
 pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
+// 会话图片压缩设置（GET/PUT /api/image-compress）：开关 + 长边 / 质量 / 阈值三项，
+// 实施点在 `core::upstream::payload` 的 send_body（只作用在对话链路，生图不经过），
+// 见该文件模块头
+pub mod image_compress;
 pub mod retry_api;
+pub(crate) mod request_prepare;
 // 开发者角色兼容开关（GET/PUT /api/developer-role-compat）：与 /api/sanitize
 // 同形的单开关端点，转换实施点在 `core::upstream::payload` 的 send_body，
 // 见该文件模块头
 pub mod role_compat;
 pub mod routing_api;
+pub mod routing_flow;
+pub mod routing_trace;
+pub mod routing_workspace;
 pub mod sanitize;
 pub mod scheduled_tasks;
 pub mod session;
+// 侧边栏布局（GET/PUT /api/sidebar-layout）：桌面壳与网页端两个 origin
+// 共享同一份菜单布局，见该文件模块头
+pub mod sidebar_layout;
 pub mod stats_api;
 pub mod storage_api;
-pub mod subscriptions;
 pub mod timeouts_api;
 pub mod update;
 pub mod upgrade_api;
@@ -125,3 +169,9 @@ pub mod zcode_captcha;
 // 令牌池的**补货节奏**设置（目标 / 轮询间隔 / 单轮上限），见该文件模块头
 pub mod zcode_captcha_pool;
 pub mod zcode_claim;
+// ZCode 客户端版本号（设置页可改）：上游按它决定活动套餐下不下发，
+// 落后时的症状是**静默空列表**，见该文件模块头
+pub mod zcode_version;
+// 设置页「版本信息」：环境 / 版本 / 路径 / 开关状态的一次性读数
+// （`GET /api/system-info`，见该文件模块头）
+pub mod system_info;

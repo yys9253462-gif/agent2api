@@ -36,21 +36,20 @@ use crate::server::core::upstream::usage::{self, RequestTelemetry, TelemetrySnap
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 use crate::server::request_stats::{
-    AttemptDetail, MAX_RAW_BODY_BYTES, NewRequestEntry, RequestStats, RetryEvent, RunningProgress,
-    SensitiveHit,
+    AttemptDetail, NewRequestEntry, RequestStats, RetryEvent, RunningProgress, SensitiveHit,
 };
 use crate::server::ServerState;
+
+mod raw;
+pub use raw::{capture_raw_body, capture_raw_json, raw_body_text};
+use raw::RawCapture;
 
 /// 调试落盘的目录名与文件名（Node 版 `join(CONFIG_DIR, 'debug', ...)`）
 const DEBUG_DIR: &str = "debug";
 const DEBUG_REQUEST_FILE: &str = "last-request.json";
 const DEBUG_META_FILE: &str = "last-request.meta.txt";
 
-/// 明细里 `error` 摘要的字符上限。
-///
-/// 上游报错可能带上整段 HTML/长文案（`read_upstream_error` 自己截到 500 字符），
-/// 但报表页是把 error 直接铺在列表里的一列 —— 200 字符足够看清「为什么失败」，
-/// 再长只会把行撑爆。按**字符**截而不是字节：中文报错按字节截会切出半个字。
+/// 非调试请求的错误摘要上限；调试请求保留完整错误。
 const ERROR_SUMMARY_CHARS: usize = 200;
 
 /// 客户端中断 / 服务退出导致响应流被提前丢弃时的错误摘要。
@@ -153,25 +152,35 @@ pub mod terminal {
 /// 而客户端原始 body 的去重键在调用方算（见各 handler）。
 ///
 /// ── `scope`：网关 Key 的可用模型白名单（R9）────────────────────
-/// `None` = 不限制（免鉴权模式 / 环境变量 Key / 未知 Key，见 `core::key_scope`）。
+/// `None` 只表示不限制白名单；调用方必须先完成 Key 鉴权。
 /// 有 scope 时在**这里**判，而不是留到转发层：模型白名单的语义是
 /// 「这个模型对你这把 Key 不存在」，所以拒绝形态与「模型不在目录里」逐字相同
 /// （404 + `model_not_found`，照抄 OmniProxy 的
 /// `if (!keyAllowsModel(...)) return fail(res, \`模型 '${publicModel}' 不可用\`, 404, 'model_not_found')`）——
 /// 连「存在性」都不该向下游暴露：能列出却打不通，是比 404 更难解释的一种。
 ///
-/// 两条例外（与下面 ③ 的两条例外同源，各有各的理由）：
-///   - 客户端**没点名**（走默认模型回落）：回落链的候选也要按白名单收窄
-///     （见下方 `allowed` 过滤），否则会给一把只授权了 A 的 Key 注入一个它
-///     没被授权的 B —— 那不是限制，那是「用网关的默认值绕过限制」。
-///     收窄后一个都没有时给一条**可操作的**错误，而不是把无 model 的请求
-///     转给上游（那样由上游挑模型，白名单等于不存在）。
-///   - **一家可用提供商都没有**（没加账号，`active` 为空）：与 ③ 同一条例外 ——
-///     广告视图必然为空，此时报「没有可用账号」比报「模型不存在」有用。
+/// 默认模型回落也必须收窄到 Key 的模型白名单；权限检查不因缺少账号而跳过。
 pub fn resolve_model(
     state: &ServerState,
     payload: &mut Value,
     scope: Option<&KeyScope>,
+) -> Result<String, GatewayError> {
+    resolve_model_for(state, payload, scope, false)
+}
+
+pub fn resolve_image_model(
+    state: &ServerState,
+    payload: &mut Value,
+    scope: Option<&KeyScope>,
+) -> Result<String, GatewayError> {
+    resolve_model_for(state, payload, scope, true)
+}
+
+fn resolve_model_for(
+    state: &ServerState,
+    payload: &mut Value,
+    scope: Option<&KeyScope>,
+    image_generation: bool,
 ) -> Result<String, GatewayError> {
     let requested = model_field_text(payload);
     // 客户端是否**点名**了模型：默认值注入后这个事实就丢了，先记下来
@@ -218,7 +227,7 @@ pub fn resolve_model(
             if let Some(object) = payload.as_object_mut() {
                 object.insert("model".to_string(), Value::String(fallback));
             }
-        } else if scope.is_some_and(KeyScope::restricts_models) && !models.is_empty() {
+        } else if scope.is_some_and(KeyScope::restricts_models) {
             // 这条 Key 限制了模型、而目录里**没有一个是它被授权的**：
             // 继续往下走只会让上游拿它自己的默认模型去回答（白名单形同虚设），
             // 所以在这里就明确拒绝。文案指向该去改什么（管理页那两处）。
@@ -264,28 +273,24 @@ pub fn resolve_model(
             );
             return Err(GatewayError::with_status(404, message).with_code("model_not_found"));
         }
-        // R9 模型白名单：**排在广告视图校验之后**。顺序上先是「这个模型对谁都
-        // 不存在」（目录口径），再是「对你这把 Key 不存在」—— 两者的响应形状
-        // 逐字相同（同一个 code、同一个状态码），所以顺序只影响排查时的先后，
-        // 但把「目录里根本没有」排在前面能让用户先看到更容易理解的那条。
-        //
-        // 与 ③ 的两条例外一致：客户端没点名（走默认模型）与「一家可用提供商都
-        // 没有」都不在这里判（前者已在回落链里按白名单收窄过，后者交给转发层
-        // 给「没有可用账号」那条更准的提示）。第二条例外在这个分支里不能省：
-        // 白名单本身与「有没有账号」无关，但**没有账号时这把 Key 的路由照样
-        // 不通**，报「不在白名单里」会把用户指向网关 Key 页，而真正要做的是
-        // 先加账号。
-        if has_available_providers(state.store())
-            && !key_scope::allows_model(scope, &requested_model)
-        {
-            return Err(GatewayError::with_status(404, format!(
-                "模型 '{requested_model}' 不可用：不在这把网关 Key 的可用模型列表里"
-            ))
-            .with_code("model_not_found"));
+    }
+    if !requested_model.is_empty() && !key_scope::allows_model(scope, &requested_model) {
+        return Err(GatewayError::with_status(404, format!(
+            "模型 '{requested_model}' 不可用：不在这把网关 Key 的可用模型列表里"
+        )).with_code("model_not_found"));
+    }
+    if !image_generation && !requested_model.is_empty() {
+        let providers = crate::server::core::providers::catalog::forwarding_providers(&requested_model);
+        if !providers.is_empty() && providers.iter().all(|provider| {
+            crate::server::core::providers::images::provider_model_is_image(provider, &requested_model)
+        }) {
+            return Err(GatewayError::bad_request(format!(
+                "模型 '{requested_model}' 是图片生成模型，请使用 POST /v1/images/generations"
+            )).with_code("image_generation_required"));
         }
     }
     // 记录本次实际用的模型（默认值已填充完毕），供账号页筛选默认选中
-    if !requested_model.is_empty() {
+    if !requested_model.is_empty() && !image_generation {
         config::remember_request_model(&requested_model);
     }
     Ok(requested_model)
@@ -343,6 +348,18 @@ pub fn user_agent_of(headers: &axum::http::HeaderMap) -> String {
         .to_string()
 }
 
+pub fn request_source(
+    headers: &axum::http::HeaderMap,
+    identity: Option<axum::extract::Extension<crate::server::request_stats::ApiKeyIdentity>>,
+) -> crate::server::request_stats::RequestSource {
+    crate::server::request_stats::RequestSource {
+        client: crate::server::core::client::classify(
+            headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()).unwrap_or(""),
+        ),
+        api_key: identity.map(|axum::extract::Extension(identity)| identity).unwrap_or_default(),
+    }
+}
+
 // ─── 请求记账（请求统计的唯一写入点）────────────────────────
 
 /// 一条请求的收尾上下文：流式分支要把它交给响应流，等流真的结束时再记账。
@@ -374,17 +391,10 @@ pub struct RecordContext {
     pub client_reasoning: String,
     /// 下发给客户端的 HTTP 状态码
     pub status: i64,
-    /// **下游原始请求体文本**（`request_raw` 表的请求侧；已按
-    /// [`MAX_RAW_BODY_BYTES`] 截断，None = 无正文可存 —— 转发前就失败的
-    /// 路径连 body 都没解析成，或**调试模式没开**）。采集点在各入口 handler
-    /// （它们手里才有客户端发来的原始字节），经由 [`capture_raw_body`] ——
-    /// 与 `core::debug_traffic` 的**上游侧**报文共用「调试模式」这一个开关：
-    /// 开启时两侧分别采（那边存头部脱敏后的上游信封，这边存下游正文）。
+    /// **下游原始请求体文本**（`request_raw` 表的请求侧；完整保存，None = 未采集）。
     pub raw_request: Option<String>,
-    /// **响应正文文本**（`request_raw` 表的响应侧；同样截断到上限）。
-    /// 非流式路径在记账前由入口用 [`capture_raw_json`] 填（完整 JSON）；
-    /// 流式路径构造时是 None，由 `RecordingStream` 在流结束时用累积缓冲定稿
-    /// —— 那时才见得到最后一个字节。两侧与请求侧同一道开关（见上）。
+    /// **完整响应正文文本**（`request_raw` 表的响应侧）。
+    /// 非流式由入口填入，流式在结束时从采集缓冲定稿。
     pub raw_response: Option<String>,
     /// 这条请求是不是**模型测试**发起的（默认 false，见
     /// `request_stats::RequestEntry::is_test`）。
@@ -396,64 +406,7 @@ pub struct RecordContext {
     /// **请求来源客户端**（入口由 `core::client::classify` 从下游 UA 判出，
     /// 见 `request_stats::RequestEntry::client`）。空串 = 没采集到 UA
     /// （模型测试、请求体解析都失败的早失败路径）。
-    pub client: String,
-}
-
-/// 把原始字节变成可入库的正文文本（请求侧 / 响应侧共用）。
-///
-/// 截断按**字节**进行并回退到 UTF-8 边界：上限是存储/内存的度量（字节），
-/// 而正文是文本 —— 卡在多字节字符中间截断会切出半个字。先 `from_utf8_lossy`
-/// 再按 str 截断一步到位：非法字节替换成 U+FFFD（报文本应是 UTF-8 JSON，
-/// 替换只影响极端情形下的排障显示），`is_char_boundary` 保证不切半个字。
-/// 空字节给 None（`store_raw` 两侧全空时不写行，这里提前短路）。
-pub fn raw_body_text(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(bytes);
-    let mut cut = text.len().min(MAX_RAW_BODY_BYTES);
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    Some(text[..cut].to_string())
-}
-
-/// 采集下游原始请求体（`request_raw` 表的请求侧）—— **仅调试模式开启时**。
-///
-/// ── 为什么与调试模式同开关（对齐 OmniProxy）──────────────────
-/// 预览对话用的下游正文（客户端请求体 + 网关响应体）从本次改造起由
-/// `config.json` 的 `debugMode` 统一控制：开关关闭时**什么都不保存**，
-/// 请求日志详情的「预览对话」没有数据可看 —— 与 OmniProxy 的口径一致
-/// （那边入口路由写的是 `rawEnabled ? … : null`）。改造前的行为是
-/// 「始终采集」，那批历史正文已由 schema v13 一次清空。
-///
-/// ── 为什么在采集点判定而不是落库前 ──────────────────────────
-/// 关着时连 [`raw_body_text`] 的截断转换都不做（零开销）—— 与
-/// `core::debug_traffic` 各采集点的 `if enabled` 同一取向。判定用
-/// [`debug_traffic::enabled`]（调试模式的唯一判定入口），改开关对
-/// 「下一个请求」立即生效。
-///
-/// ── 同一请求内开关中途切换的取舍 ────────────────────────────
-/// 每个采集点各自读开关，所以理论上会出现「请求侧采了、响应侧没采」
-/// 这类半条（用户恰好在转发中途手动切了开关）。发生率极低、后果无害
-/// （预览能显示多少算多少），不值得为它引入「请求开始定格一次」的贯穿
-/// 参数 —— `core::debug_traffic` 的采集同样是各点独立判定。
-pub fn capture_raw_body(bytes: &[u8]) -> Option<String> {
-    if !crate::server::core::debug_traffic::enabled() {
-        return None;
-    }
-    raw_body_text(bytes)
-}
-
-/// 采集非流式响应正文（`request_raw` 表的响应侧）—— 仅调试模式开启时。
-///
-/// 与 [`capture_raw_body`] 同一道闸，差别只在入参是已解析的 JSON 值
-/// （非流式路径手里是 `Value`，序列化一份才落库）。序列化在关着时整个跳过。
-pub fn capture_raw_json<T: serde::Serialize>(value: &T) -> Option<String> {
-    if !crate::server::core::debug_traffic::enabled() {
-        return None;
-    }
-    serde_json::to_string(value).ok()
+    pub source: crate::server::request_stats::RequestSource,
 }
 
 /// 转发前就失败（body 非法 / 缺字段 / 模型不在目录）时的记账。
@@ -473,7 +426,7 @@ pub fn record_early_failure(
     started_at: i64,
     model: &str,
     client_reasoning: &str,
-    client: &str,
+    source: &crate::server::request_stats::RequestSource,
     error: &GatewayError,
 ) {
     let context = RecordContext {
@@ -489,9 +442,8 @@ pub fn record_early_failure(
         // 请求侧的正文可能解析都没解析成功，存半截没有意义
         raw_request: None,
         raw_response: None,
-        // 早失败路径只有真实流量会走（模型测试自己那条失败在 handler 里收尾）
-        is_test: false,
-        client: client.to_string(),
+        is_test: source.is_internal(),
+        source: source.clone(),
     };
     record_entry(&context, Some(error.message.clone()));
 }
@@ -540,6 +492,7 @@ pub fn live_row_sink(
                 phase: snapshot.phase.as_str().to_string(),
                 phase_started_at: snapshot.phase_started_at.or(Some(started_at)),
                 attempt_details: stored_attempt_details(&snapshot.attempts_detail),
+                route: snapshot.route.clone(),
                 sensitive_hits: stored_sensitive_hits(&snapshot.sensitive_hits),
             },
         );
@@ -555,6 +508,14 @@ fn stored_attempt_details(list: &[usage::AttemptDetail]) -> Vec<AttemptDetail> {
         .map(|item| AttemptDetail {
             provider: item.provider.clone(),
             account: item.account.clone(),
+            account_id: item.account_id.clone(),
+            model: item.model.clone(),
+            reasoning: item.reasoning.clone(),
+            reason: item.reason.clone(),
+            sticky_hit: item.sticky_hit,
+            started_at: item.started_at,
+            response_at: item.response_at,
+            finished_at: item.finished_at,
             status: item.status,
             error: item.error.clone(),
             retries: item
@@ -599,17 +560,23 @@ fn stored_sensitive_hits(list: &[usage::SensitiveHit]) -> Vec<SensitiveHit> {
 ///   attempts    旁路槽里累计的上游请求数；一次都没发出去时回落 1
 ///   error       旁路槽里的原因优先（更接近根因），否则用调用方给的兜底文案
 pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
-    let snapshot = context.telemetry.snapshot();
+    let mut snapshot = context.telemetry.snapshot();
     // 收尾时刻只取一次：明细里的 durationMs 与日志里打的那一个是同一个值
     let finished_at = logging::now_ms();
     let duration_ms = finished_at - context.started_at;
     let first_response_ms = snapshot
         .first_response_at
         .map(|at| (at - context.started_at).max(0));
-    let error = snapshot
-        .error
-        .or(fallback_error)
-        .map(|text| truncate_chars(&text, ERROR_SUMMARY_CHARS));
+    let error = snapshot.error.clone().or(fallback_error).map(|text| {
+        if context.raw_request.is_some() || context.raw_response.is_some()
+            || context.telemetry.capture().is_some() || crate::server::core::debug_traffic::enabled()
+        {
+            text
+        } else {
+            truncate_chars(&text, ERROR_SUMMARY_CHARS)
+        }
+    });
+    snapshot.finish_trace(finished_at, error.as_deref());
     let attempts = snapshot.attempts.max(1);
     let mut entry = NewRequestEntry::new(context.model.clone(), context.status);
     entry.ts = Some(context.started_at);
@@ -648,12 +615,12 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     entry.attempt_details = stored_attempt_details(&snapshot.attempts_detail);
     entry.sensitive_hits = stored_sensitive_hits(&snapshot.sensitive_hits);
     // 选路决策快照：有采集才落（没走到选路的请求是 Null，前端不渲染那一段）
-    entry.route = context.telemetry.route_decision().unwrap_or(Value::Null);
+    entry.route = snapshot.route.unwrap_or(Value::Null);
     // 来源标记：入口带进来的事实，存储层据此排除报表聚合（见该字段的说明）
     entry.is_test = context.is_test;
     // 来源客户端：入口解析请求头判好的类型（`core::client::classify`），
     // 存储层只搬运不重判 —— UA 规则只有一份
-    entry.client = context.client.clone();
+    entry.source = context.source.clone();
     entry.error = error;
     entry.prompt_tokens = snapshot.prompt_tokens;
     entry.completion_tokens = snapshot.completion_tokens;
@@ -665,7 +632,14 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // tokens ≤ 0 在记账函数里也会拦 —— 失败请求通常没有用量，加了也是零。
     let limited_account = entry.account_id.clone();
     let limited_tokens = entry.total_tokens;
+    let limited_model = if entry.upstream_model.is_empty() { entry.model.clone() } else { entry.upstream_model.clone() };
+    let limited_request = entry.id.clone();
+    let sent = snapshot.attempts > 0;
     context.stats.record(entry);
+    if sent {
+        limiter::counter::note(&limited_account, &limited_request, &limited_model,
+            &snapshot.quota_channel, limited_tokens, context.started_at);
+    }
     if !limited_account.is_empty() {
         limiter::note_request_tokens(&limited_account, limited_tokens, finished_at);
     }
@@ -800,59 +774,6 @@ pub struct RecordingStream {
     raw: RawCapture,
 }
 
-/// 响应正文的累积缓冲。
-///
-/// ── 为什么在透传流上再攒一份 ─────────────────────────────────
-/// 流式请求的响应正文是逐帧下发的，`RecordingStream` 是唯一能看到**全部**
-/// 下发字节的地方（协议转换层在它里面，见 `transformed_stream` 的顺序说明）。
-/// 预览对话要的就是「客户端实际看到的响应」，在这里抄一份最准确，也
-/// 不用各条转发路径再各接一个钩子。**只在调试模式开启时攒**（见 `enabled`）。
-///
-/// ── 内存有上界 ──────────────────────────────────────────────
-/// 攒到 [`MAX_RAW_BODY_BYTES`] 就停（后续字节只透传不缓存）：一次 SSE 响应
-/// 动辄数百 KB，不设上限等于把整条响应复制进内存 —— 请求的透传不受任何影响，
-/// 但网关不该为一个排障功能长期多占一份响应大小的内存。截断即终态：
-/// `raw_body` 读取时按「长度达到上限」给出 truncated 提示。
-struct RawCapture {
-    /// 调试模式是否开启（与请求侧 [`capture_raw_body`] 同一道闸），
-    /// **构造时定格**：转发中途切开关不会让同一条记录出现「请求侧采了、
-    /// 响应侧又攒了半截」的更细碎的半条 —— 定格后本请求的响应侧行为一致。
-    /// false = 连缓冲都不攒（push 直接丢弃，零内存开销）。
-    enabled: bool,
-    buf: Vec<u8>,
-}
-
-impl RawCapture {
-    fn new(enabled: bool) -> Self {
-        Self { enabled, buf: Vec::new() }
-    }
-
-    /// 抄一段刚下发的字节（达到上限或调试模式关着时丢弃，不报错 ——
-    /// 采集永远不影响透传）
-    fn push(&mut self, chunk: &[u8]) {
-        if !self.enabled {
-            return;
-        }
-        let remaining = MAX_RAW_BODY_BYTES.saturating_sub(self.buf.len());
-        if remaining == 0 {
-            return;
-        }
-        let take = chunk.len().min(remaining);
-        self.buf.extend_from_slice(&chunk[..take]);
-    }
-
-    /// 定稿：调试模式关着、或一个字节都没抄到，都给 None（不写行）；
-    /// UTF-8 边界与截断由 [`raw_body_text`] 统一处理。取 `&mut self`：
-    /// settle 之后本缓冲不再使用，清空与否无所谓，但 RecordingStream 只拿得到
-    /// `&mut self`
-    fn into_text(&mut self) -> Option<String> {
-        if !self.enabled {
-            return None;
-        }
-        raw_body_text(&self.buf)
-    }
-}
-
 impl RecordingStream {
     /// 带收尾帧识别的构造（见 [`RecordingStream`] 的说明）。
     ///
@@ -916,7 +837,7 @@ impl futures::Stream for RecordingStream {
                 if let Some(context) = &this.context {
                     context.telemetry.note_first_frame();
                 }
-                // 响应正文采集：抄进缓冲（上限后丢弃），透传字节原样不动
+                // 采集完整响应副本，透传字节原样不动。
                 this.raw.push(bytes);
                 // 收尾帧识别：命中即说明客户端接下来随时可能断开，那属于正常收尾
                 if let Some(scan) = &mut this.terminal {
@@ -1264,7 +1185,7 @@ mod tests {
             // 模拟真实流量：不是模型测试发起的（见 `RecordContext::is_test`）
             is_test: false,
             // 客户端不参与本用例的断言，给空串（无 UA 的形态）
-            client: String::new(),
+            source: Default::default(),
             status: 200,
             raw_request: None,
             raw_response: None,

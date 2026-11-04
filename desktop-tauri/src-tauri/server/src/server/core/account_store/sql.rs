@@ -80,6 +80,41 @@ use crate::server::core::account_store::priority::{grouped_queue_order, QueueEnt
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
 use crate::server::core::crypto::{self, SecretScope};
 
+/// 一行 `data` 列读不出来的**原因**。
+///
+/// ── 为什么要把原因分开 ──────────────────────────────────────
+/// 从前这条边界只有一个 `None`，于是「密钥文件没跟着备份过来」和「某一行 JSON
+/// 被写坏了」在调用方眼里是同一件事，都表现为「这行不存在」被 `filter_map`
+/// 静默丢掉。用户看到的只是「账号列表少了 / 空了」，查不出原因 —— 整库恢复
+/// 之后密钥不匹配正是这种场景（见 `db::backup` 的密钥指纹一节）。
+///
+/// 三种原因对应**完全不同的补救办法**，所以必须在日志里说清是哪一种：
+///   · [`Key`](Self::Key)：`account.key` 缺失或不是加密那一份 —— 把密钥文件
+///     一起带过来即可恢复（数据没坏）；
+///   · [`Json`](Self::Json)：解出来的明文不是合法 JSON —— 这一行写坏了；
+///   · [`Shape`](Self::Shape)：JSON 合法但不是账号对象（缺 `id` 等）——
+///     不是本程序写的行，或写入侧出过 bug。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeError {
+    /// 密文解不开：密钥缺失 / 不匹配，或信封本身损坏
+    Key,
+    /// 明文（或历史明文行）不是合法 JSON
+    Json,
+    /// JSON 合法但不是一条账号记录
+    Shape,
+}
+
+impl DecodeError {
+    /// 给日志用的一句话原因（用户可见，要能照着做）
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Key => "账号加密密钥不可用或与库不匹配（account.key 缺失 / 被换过）",
+            Self::Json => "记录内容不是合法 JSON",
+            Self::Shape => "记录不是一条账号（缺少 id 等必需字段）",
+        }
+    }
+}
+
 /// 一行 `data` 列 → 记录字段的 JSON `Value`（**密文与历史明文都能读**）。
 ///
 /// 这是「`data` 列 ↔ 内存明形态」这条边界的读侧内核，[`decode_data`] 与
@@ -87,26 +122,91 @@ use crate::server::core::crypto::{self, SecretScope};
 ///   - 是密文信封（`crypto::is_envelope`，判据只有 `core::crypto` 一处）→ 走
 ///     `core::crypto::open` 解开信封（它已校验明文是合法 UTF-8），再当 JSON 解析；
 ///   - 其余 → 按**历史明文** JSON 解析（本轮改造的过渡期安全网，见模块头）。
-/// 任何一步失败都返回 None：坏行跳过、不拖垮整份数据（与旧文件读取路径的口径
-/// 一致，见 `decode_data`）。**注意 `None` 不只是「坏数据」，也包含「密钥不可用
-/// 导致解不开」** —— 后者在 `save_state` 的删除段有专门处理，绝不能当「这行不存在」。
-fn decode_value(text: &str) -> Option<serde_json::Value> {
+/// 失败返回**带原因的错误**（见 [`DecodeError`]），由调用方决定跳过还是上报 ——
+/// 这里不自己打日志：同一个失败原因可能每 20 秒被读一遍，逐条上报会刷屏。
+fn decode_value(text: &str) -> Result<serde_json::Value, DecodeError> {
     if crypto::is_envelope(text) {
-        let plaintext = crypto::open(text, SecretScope::Accounts).ok()?;
-        serde_json::from_slice(&plaintext).ok()
+        let plaintext = crypto::open(text, SecretScope::Accounts).map_err(|_| DecodeError::Key)?;
+        serde_json::from_slice(&plaintext).map_err(|_| DecodeError::Json)
     } else {
-        serde_json::from_str(text).ok()
+        serde_json::from_str(text).map_err(|_| DecodeError::Json)
     }
 }
 
-/// 一行 `data` 列 → `StoredAccount`；解不开或不是对象/缺 id 时返回 None。
+/// 一行 `data` 列 → `StoredAccount`；解不开或不是对象/缺 id 时返回带原因的错误。
 ///
-/// 与旧文件读取路径的口径**逐字一致**：那时也是 `filter_map(from_value)`
-/// 逐条过滤（坏条目跳过、不拖垮整份数据）。差异只有一处：文件整体解析失败会
-/// 退化成「空列表」，而这里坏的是单行、其余行照常读出 —— 比整体丢弃更好，
-/// 也不是行为倒退（同一份数据在文件形态下本来就整体读不出来）。
-fn decode_data(text: &str) -> Option<StoredAccount> {
-    StoredAccount::from_value(decode_value(text)?)
+/// 跳过坏行这件事本身不变（与旧文件读取路径的口径一致：那时也是
+/// `filter_map(from_value)` 逐条过滤，坏条目不拖垮整份数据）—— 变的是
+/// **跳过不再是静默的**：调用方拿到错误后按原因聚合上报（见 [`warn_undecodable`]）。
+pub(crate) fn decode_data(text: &str) -> Result<StoredAccount, DecodeError> {
+    let value = decode_value(text)?;
+    StoredAccount::from_value(value).ok_or(DecodeError::Shape)
+}
+
+/// 节流上报的核心：同一条 `(上下文, 摘要)` 在 `THROTTLE` 内只真正写一次日志。
+///
+/// 计数器是进程级的：进程重启会重新报一次 —— 那时用户刚改过密钥文件，
+/// 正需要看到最新的结论。`Mutex` 中毒（某次 panic）时静默放弃上报：
+/// 日志报不出来不该反过来影响读账号。
+fn throttled_warn(context: &str, subject: &str, text: &str) {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    const THROTTLE: Duration = Duration::from_secs(600);
+
+    static LAST: OnceLock<Mutex<Vec<(String, String, Instant)>>> = OnceLock::new();
+    let now = Instant::now();
+    let Ok(mut last) = LAST.get_or_init(|| Mutex::new(Vec::new())).lock() else {
+        return;
+    };
+    if let Some((_, _, at)) = last
+        .iter()
+        .find(|entry| entry.0 == context && entry.1 == subject)
+    {
+        if now.duration_since(*at) < THROTTLE {
+            return;
+        }
+    }
+    last.retain(|entry| !(entry.0 == context && entry.1 == subject));
+    last.push((context.to_string(), subject.to_string(), now));
+    drop(last);
+    crate::server::logging::log("[Accounts]", text);
+}
+
+/// 把一批「读不出来的行」按原因聚合成**一条**警告日志。
+///
+/// ── 为什么要聚合而不是逐行打 ────────────────────────────────
+/// 全量读取时，界面每 20 秒轮询一次。密钥不匹配时全部行都
+/// 读不出来，逐行打就是每次轮询几十条日志 —— 日志库会被这件事刷满，真正
+/// 有用的记录反而被埋掉。这里按原因计数，一轮只出一条。
+fn warn_undecodable(context: &str, errors: &[DecodeError]) {
+    // 按原因计数（三种原因最多三条，不必用 HashMap）
+    for kind in [DecodeError::Key, DecodeError::Json, DecodeError::Shape] {
+        let count = errors.iter().filter(|item| **item == kind).count();
+        if count == 0 {
+            continue;
+        }
+        throttled_warn(
+            context,
+            kind.describe(),
+            &format!(
+                "{context}：{count} 条账号记录读不出来，已跳过 —— {}。\
+                 数据仍在库里，修好之后重新读取即可恢复（不需要重新导入）。",
+                kind.describe()
+            ),
+        );
+    }
+}
+
+/// 单行读取失败的上报入口（`load_by_id` 的错误已经在文案里带上了原因）。
+///
+/// 单独一个函数而不是让调用方自己拼 `throttled_warn`：转发热路径上的调用点
+/// 只想知道「这条读不出来该不该吱一声」，不该自己决定节流键长什么样。
+pub(crate) fn warn_load_failure(context: &str, message: &str) {
+    throttled_warn(
+        context,
+        message,
+        &format!("{context}失败：{message}（数据仍在库里，修好之后重新读取即可恢复）"),
+    );
 }
 
 /// `StoredAccount` → 一行 `data` 列文本（**加密成 `enc1:` 信封**）。
@@ -137,31 +237,26 @@ fn encode_data(record: &StoredAccount) -> rusqlite::Result<String> {
     })
 }
 
-/// 全部账号，按物理顺序（见模块头「顺序」一节）。
-///
-/// 这是「确实需要整份数据」的路径才用的读法：列表快照、导出、启动迁移、
-/// 批量操作、`pick_current` 一类的全局派生。**单条增删改不该用它** ——
-/// 那些路径走 [`load_by_id`] / [`priorities_except`]。
-pub(crate) fn load_all(conn: &Connection) -> rusqlite::Result<Vec<StoredAccount>> {
-    let mut stmt = conn.prepare("SELECT data FROM accounts ORDER BY rowid")?;
-    let mut rows = stmt.query([])?;
-    let mut records = Vec::new();
-    while let Some(row) = rows.next()? {
-        let text: String = row.get(0)?;
-        if let Some(record) = decode_data(&text) {
-            records.push(record);
-        }
-    }
-    Ok(records)
-}
-
 /// 按主键取一条（不存在返回 None）。单条读写路径的第一步。
+///
+/// 读不出来时**上抛**而不是返回 `None`：这个函数的调用方全是「拿这条记录做
+/// 具体修改」的路径（改备注、改代理、启停、删），把「读不出来」当成「不存在」
+/// 会让它们走进「新建一条」的分支 —— 那等于用一条空记录覆盖掉解不开的凭证，
+/// 是不可逆的数据丢失。错误文案直接给出原因（见 [`DecodeError::describe`]），
+/// 用户能看到「密钥不匹配」而不是一句「账号不存在」。
 pub(crate) fn load_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<StoredAccount>> {
     let mut stmt = conn.prepare("SELECT data FROM accounts WHERE id = ?1")?;
     let mut rows = stmt.query(params![id])?;
     while let Some(row) = rows.next()? {
         let text: String = row.get(0)?;
-        return Ok(decode_data(&text));
+        return match decode_data(&text) {
+            Ok(record) => Ok(Some(record)),
+            Err(error) => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("账号 {id} 读不出来：{}", error.describe()).into(),
+            )),
+        };
     }
     Ok(None)
 }
@@ -180,45 +275,21 @@ pub(crate) fn load_by_provider(
         conn.prepare("SELECT data FROM accounts WHERE provider = ?1 ORDER BY rowid")?;
     let mut rows = stmt.query(params![provider])?;
     let mut records = Vec::new();
+    let mut errors = Vec::new();
     while let Some(row) = rows.next()? {
         let text: String = row.get(0)?;
-        if let Some(record) = decode_data(&text) {
-            records.push(record);
+        match decode_data(&text) {
+            Ok(record) => records.push(record),
+            Err(error) => errors.push(error),
         }
     }
+    warn_undecodable(&format!("读取 {provider} 的账号"), &errors);
     Ok(records)
 }
 
 /// 账号总数 —— 统计与管理接口用（如清空前的确认提示）。
 pub(crate) fn count_all(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
-}
-
-/// 某个 provider 的账号数 —— 「这一家有没有账号」的判定
-/// （三家旧数据导入的触发条件就是「本家账号列表为空」）。
-///
-/// 用投影列 COUNT 而不是读记录：这里只问「有没有 / 有几条」，
-/// 不需要知道它们长什么样。
-pub(crate) fn count_by_provider(conn: &Connection, provider: &str) -> rusqlite::Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM accounts WHERE provider = ?1",
-        params![provider],
-        |row| row.get(0),
-    )
-}
-
-/// 全部账号的 id —— 旧数据导入的「同 id 跳过」判定用。
-///
-/// 与 `priorities_all` 同理：只取主键一列，不解析任何记录的 JSON。
-/// 导入过程中新加的 id 由调用方自己往集合里补（同批内也不能重号）。
-pub(crate) fn all_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM accounts")?;
-    let mut rows = stmt.query([])?;
-    let mut values = Vec::new();
-    while let Some(row) = rows.next()? {
-        values.push(row.get(0)?);
-    }
-    Ok(values)
 }
 
 /// 全部账号的优先级数值 —— `next_free_priority` 的入参。
@@ -272,9 +343,13 @@ pub(crate) fn priority_holder(
             |row| row.get(0),
         )
         .optional()?;
+    // 读不出来就当「没有占位者」：这个函数只用来把 409 文案写得更好懂，
+    // 不是冲突判定的依据（判定走 `priorities_*` 的纯数值列）。为一条文案
+    // 把整个保存动作失败掉是本末倒置 —— 这里刻意吞掉错误，不报日志
+    // （全量账号读取会按原因统一上报，不在这里重复）。
     Ok(text
         .as_deref()
-        .and_then(decode_data)
+        .and_then(|text| decode_data(text).ok())
         .map(|record| record.name()))
 }
 
@@ -329,7 +404,7 @@ pub(crate) fn apply_priorities(
                 row.get(0)
             })
             .optional()?;
-        let Some(record) = data.as_deref().and_then(decode_data) else {
+        let Some(record) = data.as_deref().and_then(|text| decode_data(text).ok()) else {
             continue;
         };
         if record.priority() == *priority {
@@ -526,13 +601,13 @@ pub(crate) fn save_state(conn: &mut Connection, state: &AccountState) -> rusqlit
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             let text: String = row.get(1)?;
-            existing.push((id, decode_value(&text)));
+            existing.push((id, decode_value(&text).ok()));
         }
     }
 
     // 删除：库里在、目标状态里没有的 —— 但**只删「读得出来」的行**。
     //
-    // `existing` 的 id 来自主键列（总能读到），而 `state.accounts` 来自 `load_all`，
+    // `existing` 的 id 来自主键列（总能读到），而 `state.accounts` 来自全量读取，
     // 那里解不开的行会被 `decode_data` 跳过。于是「密钥丢失 / 密钥不匹配 / 拷库没拷
     // `account.key`」这种场景下，全部密文行都解不开 → `state.accounts` 为**空** ——
     // 若仍按「库里在、内存里没有」删，任何一次 bulk 操作（`batch_update` /

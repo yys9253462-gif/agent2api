@@ -3,12 +3,21 @@
 //! ── 账号字段（对照客户端登录响应的实际字段）────────────────────
 //! ```text
 //!   本项目记录：{ id, provider:"loomy", name, userId, phone, accessToken(=session),
-//!                tokenTail, expiresAt, addedAt, updatedAt, source, priority, enabled }
+//!                tokenTail, addedAt, updatedAt, source, priority, enabled }
 //!   客户端登录响应：{ session, userid, phone }（data.data，见 providers/loomy/login.rs）
 //! ```
 //! `accessToken` 落盘存的是**登录 session**（它同时是模型网关的 `token`）——
 //! 键名与别家统一（`has_token()` / `access_token()` 一族认这个键），
 //! 粘贴形态另外兼容 `session` / `token`。
+//!
+//! ── 为什么不写 `expiresAt` ──────────────────────────────────
+//! 上游登录响应只有 `{session, userid, phone}`，**没有到期时刻**。曾经按「登录
+//! 时刻 + 14 天」估一个值写进 `expiresAt` 当有效期展示，结果账号用满两周就红着
+//! 写「已过期」，而上游照常放行（实测估算到期后仍能签到、能转发）。估算值不是
+//! 事实，现在不写、也不展示：失效只认上游的 `020002` / `100002`，那时由网关给
+//! 账号落 `needsRelogin`（见 `upstream::provider_loop`）。
+//! 存量记录上可能还留着历史估算的 `expiresAt`：本文件不再更新它，公开形态也
+//! **不再输出它**（见 [`AccountStore::to_loomy_public_account`]）。
 //!
 //! ── 与别家添加路径的关系 ────────────────────────────────────
 //! 三条来源共用这一个入口：短信登录（`api::session::login_loomy_sms_verify`）、
@@ -34,10 +43,6 @@ const MAX_IDENTITY_LENGTH: usize = 256;
 
 /// session 长度上限（超过这个长度的输入一定是粘错了东西）
 const MAX_SESSION_LENGTH: usize = 8192;
-
-/// 会话有效期（登录请求里的 `expire`：14 天；上游不返回明确过期时刻，
-/// 落盘时按登录时刻 + 此值估算）
-const SESSION_TTL_MS: i64 = 14 * 24 * 3600 * 1000;
 
 /// 截断到 `max` 个**字符**（不是字节；昵称可能有中文）
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -95,8 +100,10 @@ impl AccountStore {
     /// payload（两种来源形状一致）：
     ///   - `session` / `accessToken` / `token`：登录 session（必填）；
     ///   - `userId` / `userid`：讯飞 userid；
-    ///   - `phone`：手机号（可选，展示用）；
-    ///   - `expiresAt`：过期时刻（可选；短信登录底层算、粘贴形态可省）。
+    ///   - `phone`：手机号（可选，展示用）。
+    ///
+    /// payload 里的 `expiresAt` **被忽略**：上游不给到期时刻，估算值不是事实
+    /// （见模块头）。
     ///
     /// 校验：session 非空且不超长；userId 与 phone 至少有一个（否则记不出
     /// 可辨认的身份，`loomy-` 前缀的 id 会撞在一起）。
@@ -109,9 +116,9 @@ impl AccountStore {
         payload: &Value,
         name: Option<&str>,
     ) -> Result<Value, AccountStoreError> {
-        let Some(object) = payload.as_object() else {
+        if !payload.is_object() {
             return Err(AccountStoreError::new("上传内容必须是 JSON 对象", 400));
-        };
+        }
         let session = pick(payload, &["session", "accessToken", "token"]);
         if session.is_empty() {
             return Err(AccountStoreError::new(
@@ -162,7 +169,7 @@ impl AccountStore {
             })
             .unwrap_or_else(|| {
                 if phone.len() >= 11 {
-                    format!("Loomy {}", crate::server::core::providers::loomy::credentials::mask_phone(&phone))
+                    format!("Loomy {}", crate::server::core::providers::loomy::mask_phone(&phone))
                 } else if !user_id.is_empty() {
                     format!("Loomy {user_id}")
                 } else {
@@ -178,23 +185,6 @@ impl AccountStore {
             }
         };
         let now = logging::now_ms();
-        let expires_at = object
-            .get("expiresAt")
-            .and_then(Value::as_i64)
-            .filter(|value| *value > 0)
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .map(|record| {
-                        record
-                            .fields()
-                            .get("expiresAt")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0)
-                    })
-                    .filter(|value| *value > 0)
-            })
-            .unwrap_or(now + SESSION_TTL_MS);
 
         let mut record = Map::new();
         record.insert("id".to_string(), Value::String(id.clone()));
@@ -214,7 +204,9 @@ impl AccountStore {
         }
         record.insert("accessToken".to_string(), Value::String(session.clone()));
         record.insert("tokenTail".to_string(), Value::String(session_tail(&session)));
-        record.insert("expiresAt".to_string(), Value::from(expires_at));
+        // 不写 `expiresAt`：上游不给到期时刻（见模块头）。重新登录时顺带清掉
+        // 存量记录上的历史估算值 —— 留着它只会让旧值继续被别处当成事实读。
+        record.remove("expiresAt");
         record.insert("source".to_string(), Value::String("manual".to_string()));
         record.insert("priority".to_string(), Value::from(priority));
         record.insert(
@@ -255,10 +247,15 @@ impl AccountStore {
     }
 
     /// Loomy 账号的**公开形态**（进 HTTP 响应）：去掉 session 本体，只留尾 4 位。
+    ///
+    /// 同时摘掉 `expiresAt`：存量记录上那份是历史估算值（登录时刻 + 14 天），
+    /// 不是上游给的事实，下发出去只会让界面把仍然可用的账号标成「已过期」。
+    /// 失效由 `needsRelogin` 表达（网关在收到 `020002` / `100002` 时落）。
     pub fn to_loomy_public_account(&self, record: &StoredAccount) -> Value {
         let mut value = record.to_value();
         if let Some(object) = value.as_object_mut() {
             object.remove("accessToken");
+            object.remove("expiresAt");
             object.insert("available".to_string(), Value::Bool(record.enabled()));
             object.insert("hasSession".to_string(), Value::Bool(true));
         }

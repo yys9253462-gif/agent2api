@@ -1,0 +1,26 @@
+@layer components {
+  .acct-filter-body > .group { display: flex; flex-direction: column; gap: 6px; }
+  .acct-filter-body > .group > .label { font-size: 11.5px; color: var(--ui-muted-foreground); font-weight: 600; }
+  .acct-filter-body > .divider { display: none; }
+  .acct-filter-body > .group > :not(.label),
+  .model-filter-body > *, .proxy-filter-body > * { width: 100%; min-width: 0; max-width: none; }
+  .proxy-filter-body > .ml-auto { margin-left: 0; text-align: left; }
+
+  .acct-filter-body [data-slot='segmented-control'],
+  .model-filter-body [data-slot='segmented-control'],
+  .proxy-filter-body [data-slot='segmented-control'] { width: 100%; }
+  .acct-filter-body [data-slot='segmented-control'] > [data-slot='segmented-item'],
+  .model-filter-body [data-slot='segmented-control'] > [data-slot='segmented-item'],
+  .proxy-filter-body [data-slot='segmented-control'] > [data-slot='segmented-item'] { flex: 1 1 0; min-width: 0; justify-content: center; }
+
+  @media (max-width: 767px) {
+    .acct-filter-open { flex: 1 1 0; min-width: 0; }
+    .sidebar { height: 100%; position: relative; transform: none; }
+    .sidebar .nav-item .label, .sidebar .nav-group-label, .sidebar .brand-text,
+    .sidebar .sidebar-status .txt { display: block; }
+    .sidebar .nav-item { justify-content: flex-start; }
+    .sidebar .sidebar-status { align-items: flex-start; }
+    .sidebar .status-line { justify-content: flex-start; }
+    .sidebar .status-actions { display: flex; }
+  }
+}

@@ -248,8 +248,12 @@ pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
         }
     }
     let before = settings_of(config::scheduled_settings(), id);
-    config::set_scheduled_task(id, patch, task.min, task.max);
+    let plugins_before = (id == TASK_UPDATE_CHECK).then(crate::server::core::plugin_host::settings::current);
+    let saved = config::set_scheduled_task(id, patch, task.min, task.max);
     let after = settings_of(config::scheduled_settings(), id);
+    if let Some(before) = plugins_before {
+        crate::server::core::plugin_host::settings::notify_changed(before);
+    }
     if task.runner == Runner::Backend {
         if !before.enabled && after.enabled {
             // 刚开启：保留改造前「开启即跑一次」的语义（下一个 tick 就执行），
@@ -270,7 +274,9 @@ pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
             if after.enabled { "开启" } else { "关闭" }, after.interval,
             if task.unit == "seconds" { "秒" } else { "分钟" }));
     }
-    Ok(task_by_id(id))
+    let mut result = task_by_id(id);
+    result["saved"] = json!(saved);
+    Ok(result)
 }
 
 pub async fn run_now(store: &AccountStore, update: &UpdateManager, id: &str) -> Result<String, String> {
@@ -289,6 +295,10 @@ pub async fn run_now(store: &AccountStore, update: &UpdateManager, id: &str) -> 
 /// 被上游作废（refreshToken 废了、接口稳定 401）就足以让每一轮都判失败一次，
 /// 整条任务于是被推到几小时后再跑，其余账号跟着一起变旧。失败本身已经如实进了
 /// 结果与日志，不需要再把整轮一起罚掉。
+///
+/// 模型目录刷新同理，而且它的失败是**按提供商**的（见 `TASK_MODEL_REFRESH`
+/// 分支的调用点）：一家长期 401 就足以把整条任务按到 24 小时冷却上，界面上
+/// 显示成「冷却中」，看起来就是刷新功能坏了。
 ///
 /// ── 为什么「一个都没成功」仍算失败 ───────────────────────────
 /// 全失败通常意味着更上游的问题（断网、出口被挡、上游整体故障）：这时保留退避，
@@ -326,7 +336,16 @@ async fn run_backend(
     };
     let guard = match task_state::claim(task.id, interval_ms(task), manual, backoff, 1_000)? {
         Claim::Acquired(guard) => guard,
-        Claim::Deferred(state) => return Err(state.waiting_message()),
+        // 被挡住的原因要如实说：走 Bypass 的家（模型刷新 / 凭证维护）在手动
+        // 路径上并不受冷却约束，这时还提示「请在 N 秒后重试」会把用户往几分钟
+        // 甚至几小时后引 —— 而真正挡住这一轮的只是在途占位或一秒的最短间隔。
+        Claim::Deferred(state) => {
+            return Err(if manual && backoff == task_state::ManualBackoff::Bypass {
+                state.waiting_message_bypassing()
+            } else {
+                state.waiting_message()
+            })
+        }
     };
     let (summary, success) = match task.id {
         TASK_CREDENTIAL_MAINTENANCE => {
@@ -375,7 +394,16 @@ async fn run_backend(
                 // skipped（未到间隔 / 设置里关了）不写进摘要：那是常态，写进去只是噪音
                 _ => String::new(),
             };
-            (format!("{summary}{metadata_note}"), failed == 0)
+            // 成败判据与凭证维护同一条（`round_succeeded`）：逐家的失败**不该**
+            // 把整轮一起罚掉。这里的失败是**按家**的 —— 一家的登录态被上游作废
+            // （CatPaw 那种长期 401）就足以让每一轮都判失败一次，于是失败计数
+            // 按指数退避一路顶到 24 小时上限，其余能刷的家跟着一起停在旧清单上，
+            // 界面上显示成「冷却中，N 小时后重试」，看起来就是刷新功能坏了。
+            // 失败的细节已经逐条写进结果与日志，不需要再把整轮也标成失败。
+            //
+            // 「一个都没成功」仍算失败：那通常意味着断网 / 出口被挡 / 上游整体
+            // 故障，保留退避才不会被原间隔反复打上游。
+            (format!("{summary}{metadata_note}"), round_succeeded(refreshed, failed))
         }
         _ => return Err("未知后端任务".to_string()),
     };
@@ -413,9 +441,10 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
                 if !settings_of(config::scheduled_settings(), task.id).enabled {
                     continue;
                 }
-                let Some(state) = states.get(&state_key(task.id)) else { continue };
+                // 状态损坏恢复后可能缺少条目，按首次运行交给 claim 重建排期。
+                let state = states.get(&state_key(task.id));
                 // 在跑（长任务）或还没到点（含失败冷却 / 占位租约）都跳过
-                if state.running() || logging::now_ms() < state.due_at() {
+                if state.is_some_and(|state| state.running() || logging::now_ms() < state.due_at()) {
                     continue;
                 }
                 // 到点：跑一次（`run_backend` 内部按当前间隔重新排期）。

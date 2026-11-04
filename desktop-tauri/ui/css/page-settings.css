@@ -28,9 +28,12 @@
 }
 
 /* ─── 左栏：分类导航 ───
-   观感对齐主侧栏的 .nav-item，但不能直接复用那个类名：
-   app.js 的 showPage 会遍历所有 .nav-item 并按 data-page 重置 active，
-   设置页的分类项会被顺手清掉选中态（点分类后一切页就跳回「通用」）。 */
+   尺寸、hover 与选中态全部由组件库的 NavList / NavItem 统一提供
+   （ui-kit/styles/nav.css 与 theme.css 的 --ui-nav-selected-*）：选中项与主侧栏
+   一样是主色实心滑块。这里只保留本页的排版（宽度、纵向排列、滚动），不要再往
+   下面抄颜色 / 字号 / 行高，否则会像旧版那样只改一半、与主侧栏对不上。
+   不能直接复用 `.nav-item` 类名：app.js 的 showPage 会遍历所有 .nav-item 并按
+   data-page 重置 active，设置页的分类项会被顺手清掉选中态。 */
 .settings-nav {
   flex: 0 0 auto;
   width: 140px;
@@ -43,62 +46,17 @@
   overflow-y: auto;
 }
 
-.settings-nav-item {
-  position: relative;
-  display: flex;
-  align-items: center;
-  /* 纯文字项要左对齐：通用 button 是 justify-content:center，
-     不覆盖的话三个分类会各自居中，看着不像一排导航 */
-  justify-content: flex-start;
-  width: 100%;
-  /* 高度沿用通用 button 的 30px，与主侧栏 .nav-item 等高（那儿的高度也来自这条基线）。
-     不另设 height / line-height：12.5px 的行盒远小于 30px，不会溢出 */
-  padding: 0 10px;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
-  background: transparent;
-  /* 分类项是 <button>，components.css 里通用的 button 规则会给它带上
-     --shadow-1 —— 与「平铺的导航列表」冲突，这里显式清掉（.nav-item 同样处理） */
-  box-shadow: none;
-  color: var(--text-2);
-  font-size: 12.5px;
-  font-weight: 500;
-  text-align: left;
-  transition: background .15s ease, color .15s ease;
-}
-
-/* 分类图标槽：尺寸/取色与主侧栏的 .nav-item .ico 一致（17px 盒、currentColor，
-   选中态自动变主题色；svg 撑满盒子）。间距用 margin 而不是 gap —— 老浏览器之外
-   没差别，但这里与 .nav-item 的写法保持一致，两处对照着读更容易。 */
+/* 分类图标槽：尺寸与主侧栏一致，间距由导航项的 gap 给出。 */
 .settings-nav-item .ico {
   flex: 0 0 auto;
   width: 17px;
   height: 17px;
   display: grid;
   place-items: center;
-  margin-right: 7px;
+  margin-right: 0;
 }
 
 .settings-nav-item .ico svg { display: block; }
-
-/* hover：一层极淡的中性叠加底（与主侧栏同款表达式，浅色叠灰、深色叠白）。
-   带 :not(:disabled) 是为了压过 components.css 里通用的 button:hover ——
-   那个选择器特异性更高，否则会盖掉叠加底并给导航项描边。 */
-.settings-nav-item:hover:not(:disabled) {
-  background: var(--nav-hover);
-  border-color: transparent;
-  color: var(--text);
-}
-
-/* 选中态：品牌浅底 + 主题色字，与主侧栏选中项同一口径。
-   一并声明 .active:hover，让悬停选中项时仍保持选中态。 */
-.settings-nav-item.active,
-.settings-nav-item.active:hover {
-  background: var(--primary-soft);
-  border-color: transparent;
-  color: var(--primary-fg);
-  font-weight: 600;
-}
 
 /* ─── 右栏：分类内容 ───
    唯一的滚动容器；面板自带 margin-bottom 14px，这里只补回原来
@@ -113,6 +71,60 @@
 
 .settings-pane { display: none; }
 .settings-pane.active { display: block; }
+
+.settings-dlg.settings-dlg {
+  width: min(820px, calc(100vw - 48px));
+  height: min(540px, calc(100dvh - 48px));
+}
+.settings-dlg > [data-slot='dialog-header'],
+.settings-dlg > [data-slot='dialog-footer'] { flex-shrink: 0; }
+.settings-dlg-body.settings-dlg-body {
+  flex: 1;
+  min-height: 0;
+  flex-direction: row;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.settings-dlg-rail { flex: 0 0 148px; min-width: 0; }
+.settings-dlg-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px 20px 20px;
+}
+.settings-dlg-pane-head { margin-bottom: 18px; }
+.settings-dlg-pane-head h3 { font-size: 13.5px; font-weight: 600; }
+.settings-dlg-pane-head p {
+  margin-top: 4px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.settings-dlg-fields { display: flex; flex-direction: column; gap: 14px; }
+.settings-dlg-fields p { line-height: 1.7; }
+.settings-dlg-footer p { min-width: 0; line-height: 1.6; }
+
+@media (max-width: 640px) {
+  .settings-dlg-body.settings-dlg-body { flex-direction: column; }
+  .settings-dlg-rail.settings-dlg-rail {
+    flex: none;
+    border-right: 0;
+    border-bottom: 1px solid var(--sidebar-border);
+  }
+  .settings-dlg-rail .rail-scroll {
+    flex: none;
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    gap: 4px;
+  }
+  .settings-dlg-rail .rail-label { display: none; }
+  .settings-dlg-rail [data-slot='nav-item'] { flex: 0 0 auto; width: auto; }
+  .settings-dlg-main { padding: 14px 16px 18px; }
+}
 
 /* 窄窗口（与主侧栏收起的断点一致）：两栏退化为「导航在上、内容在下」，
    导航转横排铺满整行；装不下时导航自己横向滚（下面 nav 的 overflow-x）。 */
@@ -184,15 +196,6 @@
 .io-result b { color: var(--text); }
 
 /* 危险提示区（导出含凭证） */
-.danger-zone {
-  padding: 12px 14px;
-  border: 1px solid var(--danger-bd);
-  border-radius: var(--r-md);
-  background: var(--danger-soft);
-  color: var(--text-2);
-  font-size: 12px;
-  line-height: 1.65;
-}
 
 .danger-zone strong { color: var(--danger); }
 
@@ -304,73 +307,12 @@
    「指定错误码不重试」用：一排已添加的状态码徽章 + 一个行内输入框，
    回车添加、点 ✕ 删除。整框是一个输入控件的观感 —— 点空白处也会聚焦
    输入框（settings-panel.js 里有对应绑定），所以框自己要有聚焦描边。 */
-.tag-input {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  width: 320px;
-  max-width: 100%;
-  min-height: 34px;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md, 8px);
-  background: var(--surface);
-  cursor: text;
-  transition: border-color .12s ease, box-shadow .12s ease;
-}
-.tag-input:focus-within {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-soft);
-}
-.tag-input.disabled { opacity: .55; cursor: default; }
-.tag-input.disabled:focus-within { border-color: var(--border); box-shadow: none; }
 
 /* 徽章：状态码走等宽字形（与上面的数字框同一取向，位数变化一眼可见） */
-.tag-input .tag-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 2px 4px 2px 9px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
-  white-space: nowrap;
-}
 
 /* 徽章上的 ✕：小号、圆角热区，悬停加深 —— 「能点删」的视觉暗示 */
-.tag-input .tag-x {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: none;
-  color: var(--text-3);
-  font-size: 10px;
-  line-height: 1;
-  cursor: pointer;
-}
-.tag-input .tag-x:hover { background: var(--danger-soft, rgba(220, 38, 38, .12)); color: var(--danger, #dc2626); }
 
 /* 行内输入框：无框无底色（框的描边由外层 .tag-input 出），吃掉剩余宽度 */
-.tag-input .tag-input-field {
-  flex: 1 1 120px;
-  min-width: 120px;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--text);
-  font-size: 12.5px;
-  padding: 2px 0;
-}
-.tag-input .tag-input-field:disabled { background: transparent; }
 
 /* ─── 系统提示词（模式下拉 + 文件路径 + 正文按钮）───
    版式复用 .retention-row 的两列（定宽标签 + 输入），但输入不是「窄数字框」，
@@ -414,11 +356,6 @@
   font-weight: 400;
   letter-spacing: 0;
 }
-
-/* 「网关自带」那一行的标签：比普通行标签轻一档（它是同一家的**第二行**，
-   不是又一个并列的设置项），前缀一个竖线让它看起来挂在上面的家名下。
-   选择器写成 `.retention-row > label.prompt-gateway-label`：不与全局那条
-   `label` 规则比 `!important`，而是靠多一级类选择器拿到更高优先级。 */
 .retention-row > label.prompt-gateway-label {
   padding-left: 10px;
   border-left: 2px solid var(--border);
@@ -503,3 +440,181 @@
 @media (max-width: 900px) {
   .retention-row { grid-template-columns: max-content 1fr; }
 }
+
+/* 分组卡片的两栏容器。
+   ── 为什么用 `columns` 而不是 grid ──────────────────────────
+   六张卡片高度差很大（「环境」十行、「计数」七行），grid 两列会把同一行的两张
+   拉到等高 —— 矮的那张下面留一大片空白，看着像没加载完。多列流式布局让每张卡
+   按自己的高度排列，只在换列时平衡高度，视觉上紧凑得多。
+   `break-inside: avoid` 是这条布局成立的前提：少了它，一张卡片会被从中间劈开、
+   上半截在左栏底部、下半截在右栏顶部。
+   `column-gap` 与面板之间的 14px 垂直间距分开写：面板自己带 margin-bottom，
+   横向间距必须比它大一点，否则两栏会读成一栏。 */
+.sysinfo-groups {
+  columns: 2;
+  column-gap: 14px;
+}
+.sysinfo-groups > .panel {
+  /* 列内不被拆开（见上） */
+  break-inside: avoid;
+  /* `columns` 下子元素是行内流的一部分，不设 inline-size 的话卡片会按内容宽度
+     收缩；100% 让它铺满所在那一列。 */
+  inline-size: 100%;
+}
+
+/* 窄窗口退回一栏：与 .sysinfo-row 的断点同一处（900px），
+   设置面板本身也在那个宽度退化成「导航在上」的形态。 */
+@media (max-width: 900px) {
+  .sysinfo-groups { columns: 1; }
+}
+
+/* ─── 版本信息（system-info-pane.tsx）───────────────────────────
+   这一页的读者是「出问题的人 + 看截图的人」：值要能逐字核对（版本号、
+   路径、端口），所以值一律等宽；键列定宽，让十几行读下来是一条竖直的
+   对齐线，而不是每行各偏一点。 */
+
+/* 顶部环境徽章行：形态 + 版本 + 系统，一行读完 */
+.sysinfo-headline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.sysinfo-headline-version {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.sysinfo-headline-os {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+/* 键值行：定宽键列 + 吃掉剩余宽度的值列。
+   `min-width: 0` 是长路径折行的前提（grid 项默认 min-width:auto，
+   不加它，一个 200 字符的路径会把整行撑出横向滚动）。 */
+.sysinfo-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+/* 两栏布局下每张卡片只有半屏宽，150px 的键列会吃掉将近一半，
+   长路径（数据目录 / 程序路径）只剩两三个字符就换行。收到 118px：
+   最长的那几个键（「WebView / 浏览器内核」「/v1 拒绝无 Key 请求」）
+   仍能放下，值列多出三十来像素。 */
+.sysinfo-groups .sysinfo-row {
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 4px 10px;
+}
+
+.sysinfo-key {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.sysinfo-value {
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.55;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* 值里的机器可读部分（版本号 / 路径 / 端口 / PID） */
+.sysinfo-mono {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  word-break: break-all;
+}
+
+/* 括号里的补充说明（库大小这类）：比主值淡一档，不抢读数 */
+.sysinfo-dim { color: var(--text-3); }
+
+/* 「隐藏用户名」开关行：左文右开关，说明在文字下方换行 */
+.sysinfo-toggle {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.sysinfo-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  font-weight: 500;
+}
+
+/* 窄窗口：键列收窄（150px 在 360px 宽的设置面板里会吃掉一半）。
+   选择器要带上 `.sysinfo-groups` 才压得过上面那条两栏规则 —— 那时
+   `.sysinfo-groups` 已经退回单栏（columns: 1），键列反而可以更宽一点，
+   但 108px 仍比 118px 省地方，且与本文档里其余窄屏口径一致。 */
+@media (max-width: 900px) {
+  .sysinfo-row,
+  .sysinfo-groups .sysinfo-row { grid-template-columns: 108px minmax(0, 1fr); }
+}
+.db-restore-dialog.db-restore-dialog {
+  width: min(460px, calc(100vw - 48px));
+}
+
+.db-restore-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 与 DialogBody 同一口径的左右留白；上下由这里自己定（标题栏与底栏
+     各有自己的 border + padding，不需要再叠一层） */
+  padding: 16px 20px;
+  font-size: 13px;
+  color: var(--text-2);
+  /* 弹窗本体是 `max-h-[calc(100vh-48px)] overflow-hidden`：内容超长时
+     必须由这一块自己滚，否则失败原因会被直接裁掉（`min-height: 0` 是
+     flex 子项能收缩到内容以下的前提）。 */
+  min-height: 0;
+  overflow-y: auto;
+}
+/* 阶段文案与已用时：一行两端（文案可能很长，让它先换行） */
+.db-restore-phase {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-weight: 600;
+  color: var(--text);
+}
+.db-restore-elapsed {
+  margin-left: auto;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* 进度条：组件库的 Progress 是 w-full，这里只给它一点上下留白 */
+.db-restore-progress { margin: 2px 0; }
+.db-restore-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+/* 结果区：成功 / 失败两块共用 */
+.db-restore-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+.db-restore-result p { margin: 0; }

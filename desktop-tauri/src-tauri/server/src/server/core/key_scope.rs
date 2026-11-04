@@ -13,9 +13,7 @@
 //!
 //! ── 中间件怎么把「命中的那把 Key」传下去（本项目选的方式）──────
 //! 用 **axum 的请求扩展**（`http::Request::extensions_mut().insert(...)`）：
-//!   - 类型安全、无字符串键，拼错名字是编译错误；扩展里取不到就是 `None`，
-//!     与本需求「没命中 Key = 不限制」的语义天然对齐（不需要区分「没有」与
-//!     「有但不限制」—— 两者行为完全相同）；
+//!   - 类型安全、无字符串键；扩展缺失表示没有白名单，不代表通过鉴权。
 //!   - **不碰请求体与请求头**：本项目多处按「客户端原始 body 的 sha256」做
 //!     去重键（`api::chat` / `api::protocol`），往 body 里塞东西会改变去重键；
 //!     往请求头里塞则会污染转发时透传给上游的头集合（适配器会读
@@ -24,15 +22,10 @@
 //!     标准落点，本项目 `ServerState` 走 `State` 是因为它全局唯一，而「命中的
 //!     Key」是**逐请求**的，正是 Extension 的用途。
 //!
-//! ── 没有命中 Key 的三种情形（都必须 = 不限制）────────────────
-//!   1. **免鉴权模式**：一把启用的 Key 都没有 → 中间件直接放行，本类型根本不
-//!      会被放进扩展。请求照常转发（这与改造前逐字一致）。
-//!   2. **环境变量 Key**（`WORKBUDDY_PROXY_API_KEY`）：它是启动注入的通用口令，
-//!      没有列表记录可挂白名单 → `api_keys::entry_for_key` 返回 None，
-//!      按不限制处理。
-//!   3. Key 在两次读盘之间被删/停用：同样取不到记录。
-//! 三种都收敛成「扩展里没有 `KeyScope`」这一个判据，于是所有消费点只写一次
-//! `scope.map_or(true, |s| ...)`。
+//! ── 权限对象与鉴权的边界 ────────────────────────────────────
+//! 环境变量 Key 没有列表白名单，因此已鉴权请求可以没有 `KeyScope`。
+//! `None` 只表示不限制权限，不表示已通过鉴权；无效、停用或无法解密的 Key
+//! 必须由模型入口拒绝，不能回退为不受限制的模型调用。
 
 use std::collections::HashSet;
 
@@ -79,6 +72,15 @@ impl KeyScope {
             allowed_providers,
             allowed_models: HashSet::new(),
         }
+    }
+
+    pub fn for_test_provider(&self, provider: &str) -> Option<Self> {
+        if !self.allows_provider(provider) {
+            return None;
+        }
+        let mut scope = Self::provider_only(provider);
+        scope.allowed_models = self.allowed_models.clone();
+        Some(scope)
     }
 
     /// 是否限制提供商（界面上「有没有勾」的判据，也用于日志措辞）
@@ -160,11 +162,7 @@ pub fn attach(request: &mut Request, scope: KeyScope) {
     }
 }
 
-/// handler 侧取用：`Option<KeyScope>` 的便捷判定（`None` = 不限制）。
-///
-/// 单独给函数而不是让各处写 `scope.map_or(true, |s| s.allows_model(m))`：
-/// 「取不到 = 放行」这条语义只该有一处实现 —— 将来若改成「取不到也拒绝」，
-/// 只改这里。
+/// 白名单判定；`None` = 不限制。调用方必须独立完成鉴权。
 pub fn allows_model(scope: Option<&KeyScope>, model: &str) -> bool {
     scope.map_or(true, |scope| scope.allows_model(model))
 }

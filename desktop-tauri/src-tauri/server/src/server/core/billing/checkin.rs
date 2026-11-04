@@ -41,6 +41,9 @@ use crate::server::core::billing::BillingService;
 use crate::server::core::billing::WorkbuddyActivity;
 use crate::server::logging;
 
+mod summary;
+pub(crate) use summary::failure_of;
+
 /// 签到路径上的错误。对应 Node 版抛出的 AccountStoreError：
 /// 404「账号不存在」与 400「国际版账号暂不支持签到」。
 #[derive(Clone, Debug)]
@@ -81,6 +84,34 @@ pub fn supports_checkin(account: &Value) -> bool {
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    // ── 插件申报优先（2026-10）─────────────────────────────────
+    // 「这家能不能签」是 provider 知识，插件在握手时申报（`CheckinInfo`）。
+    // 申报了就照它执行 —— 下面那些内置特判（edition / isGuest / accio 家族）
+    // 是给**没申报的旧插件**留的兜底。
+    //
+    // 访客排除也走申报（`exclude_guest`）：它读的是公开形态的 `isGuest`，
+    // 而那是插件自己写进 `account_view` 的 —— 网关不解析凭证。
+    if let Some(declared) = crate::server::core::plugin_host::checkin_of(provider) {
+        if declared.exclude_guest && account.get("isGuest").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        // `daily: false` = 这家申报的是签到中心里的**别的卡**，没有每日签到。
+        // 不给这一位留出口的话，申报本身就会被当成「有签到」，那张卡之外的
+        // 账号也要被拉进来每天落一条失败。（ZCode 曾经是这一档：只有「活动
+        // 福利」；它的每日赠送套餐现在已按签到接入，`daily` 为 true。）
+        return declared.daily;
+    }
+    // ── 插件家先分流 ────────────────────────────────────────────
+    // 下面那些判据（edition / isGuest / accio 家族）全是**按内置记录形态**
+    // 写的：插件家的凭证是不透明 JSON，网关不知道里面有没有 `edition`。
+    // 而「这个 id 由插件服务」意味着执行体在插件进程里、能力位来自握手 ——
+    // 所以先问插件，别让下面任何一条按记录字段的判定抢先给出结论
+    // （尤其 `edition == "intl"` 那一条：它对插件家是纯猜测）。
+    if crate::server::core::plugin_host::serves_provider(provider) {
+        return crate::server::core::providers::adapter::adapter_by_id(provider)
+            .and_then(|adapter| adapter.plugin_checkin_capability())
+            .unwrap_or(false);
+    }
     // WorkBuddy 国际版没有国内版的普通签到接口，但上游客户端把它接到同一条
     // 「每日活跃」调度上（活动探测 + 条件领取 + 免费模型保活），所以它**参与**
     // 签到目标集合，执行形态在 `checkin_for` 按 provider 分派（workbuddy-intl）。
@@ -103,15 +134,42 @@ pub fn supports_checkin(account: &Value) -> bool {
     // 别家差别最大，所以在「今天还能不能再领」「要不要重试」这两件事上与签到同构 ——
     // 上面那条按 `edition` 的 intl 一刀切与本家无关（它没有版本概念，恒 cn）。
     // Trae 曾与 CodeArts 同列排除表；SOLO 转积分制后模型调用花的就是签到钱包
-    // 那份钱，它已在 `providers::trae::checkin` 接入本链，不要再加回来。
+    // 那份钱，它已接入本链（实现现由插件提供），不要再加回来。
+    //
+    // ── 智谱清言的**访客账号**不在签到范围 ──────────────────────
+    // 访客没有积分体系：上游对每日登录积分 / 积分活动 / 任务中心一律 401
+    // （实测；实现已搬到插件，那段说明在插件的 `chatglm/checkin` 模块头），
+    // 所以它进本链的
+    // **唯一**后果是负面的 —— 永远显示「待签」、把「今日签到进度」的分母
+    // 撑大（`checkin_center` 按本判据分组），并在签到记录台账里每天落一条
+    // 失败（那句中性文案不在 `claim_pending` 的白名单里）。因此按访客形态
+    // 排除，改由签到中心的「不参与每日签到」如实说明原因
+    // （`api::checkin_center::out_of_scope_reason`）—— 静默消失比签不上更糟。
+    //
+    // 判据读公开形态的 `isGuest`（插件账号由插件的 `account_view` 给，
+    // 存量账号由 `store_view::public_account` 注入，见那里的说明）：**必须走
+    // 公开形态**，因为签到中心的分组与批量签到的目标解析读的是同一份快照 ——
+    // 判据只此一处，两处才不会分叉。
+    if account.get("isGuest").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    // ── 插件家：能力位来自握手 ─────────────────────────────────
+    // 走到这里说明它不在上面任何一个内置分支里（`edition` / `isGuest` 那些
+    // 账号级判据对插件家没有意义 —— 插件上报的是不透明 JSON，网关不知道
+    // 里面有没有 `edition`）。所以这里问的是握手里那个静态能力位。
+    if crate::server::core::providers::kind_from_id(provider).is_none() {
+        return crate::server::core::providers::adapter::adapter_by_id(provider)
+            .and_then(|adapter| adapter.plugin_checkin_capability())
+            .unwrap_or(false);
+    }
     !crate::server::core::account_store::is_accio_family(provider)
 }
 
 /// 账号的提供商 id（缺失时按默认 provider 处理，与账号存储的兜底口径一致）。
 ///
-/// 签到范围的判定按提供商分派：WorkBuddy 走腾讯的每日签到接口，小浣熊走
-/// 桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）——
-/// 两家的接口互不相通，拿小浣熊的 token 去打腾讯的签到接口只会稳定报错。
+/// 签到范围的判定按提供商分派：WorkBuddy 走腾讯的每日签到接口，其余各家走
+/// 各自的链路（插件侧实现）—— 各家的接口互不相通，拿一家的 token 去打另一家
+/// 的签到接口只会稳定报错。
 fn provider_of(account: &Value) -> &str {
     account
         .get("provider")
@@ -192,7 +250,17 @@ pub fn resolve_checkin_targets(
         // 唯一的拒绝理由：上游这一站根本没有签到/活跃任务（Qoder 等的国际版）。
         // 文案与签到中心「范围外」分组那句同义 —— 两处说法不一致会让用户以为
         // 遇到的是两个不同的问题。WorkBuddy 国际版已由活跃任务分支放行。
+        //
+        // 访客单独给一句：它「不支持签到」的原因与别家不同（不是这一站没接链
+        // 路，而是访客本来就没有积分体系），用户看到「该账号暂不支持签到」
+        // 会去翻设置找原因。文案与签到中心的范围外原因同义。
         if !supports_checkin(&found[0]) {
+            if found[0].get("isGuest").and_then(Value::as_bool) == Some(true) {
+                return Err(CheckinError::new(
+                    "访客账号没有积分体系，仅登录账号可签到",
+                    400,
+                ));
+            }
             return Err(CheckinError::new("该账号暂不支持签到或每日活跃任务", 400));
         }
         return Ok((found, 0));
@@ -215,22 +283,17 @@ pub fn resolve_checkin_targets(
 ///   - **WorkBuddy 国内版**：计费服务的每日签到（`billing.claim_daily_checkin`）；
 ///   - **WorkBuddy 国际版**：活跃探测、条件领取与免费模型保活
 ///     （`billing.workbuddy_daily_activity`，模型链可在签到中心自定义）；
-///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
-///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
-///     （`providers::autoclaw::checkin::claim_daily_signin`）；
+///   - **小浣熊**：桌面登录积分链路（实现已搬到插件）；
+///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务（实现已搬到插件）；
 ///   - **Qoder**：活动（campaign）领取链路，中国版直领；国际版要先带设备
 ///     风控身份重新拉活动列表（`providers::qoder::checkin` + `qoder::risk`）；
 ///     （`providers::qoder::checkin::claim_daily_checkin`）；
-///   - **Trae**：SOLO 的 `checkin_credits` 领取（`providers::trae::checkin`）；
-///   - **CodeArts**：当日 ops 福利（`providers::codearts::welfare` 的
-///     delivery → claim → confirm → 回读核实）。它的「签到」是**写请求**，
-///     受本家自己的限流闸约束，所以这一支要吃 `manual` 参数（见下）。
+///   - **Trae**：Trae 的 `checkin_credits` 领取（实现已搬到插件）；
+///   - **CodeArts**：当日 ops 福利（实现已搬到插件，走插件分支）。
 ///
-/// `manual` 只对 CodeArts 有意义（别家的签到接口幂等且无本地闸）：真值表示这次
-/// 执行是**用户在面板上点出来的**（单账号 `single` / 批量 `manual`），假值表示
-/// 无人值守的定时或启动补签。它决定 welfare 那两道闸（每天 ≤6 次写、间隔
-/// ≥10 分钟）要不要生效 —— 闸保护的是无人值守的重试，不是用户的点击
-/// （见 `providers::codearts::welfare` 的模块头）。
+/// `manual` 现在只剩「用户在面板上点出来的」这一个语义（单账号 `single` /
+/// 批量 `manual` 为真，定时与启动补签为假），经插件 RPC 透传给 CodeArts 等
+/// 需要按触发来源执行写请求限制的提供商。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
@@ -254,57 +317,33 @@ pub async fn checkin_for(
         .or_else(|| account.get("name").cloned())
         .unwrap_or(Value::Null);
     let display = name.as_str().unwrap_or(&id).to_string();
-    // 分派的键就是账号的 provider id（`provider_of` 已归一）；AutoClaw 两个
-    // 地区各是一个 provider，因此下面按 `region.provider_id()` 反查地区，
-    // 而不是写死 `"autoclaw"`（那样国际版账号会掉进 `_` 分支）
+    // 分派的键就是账号的 provider id（`provider_of` 已归一）。两个地区各是一个
+    // provider，因此插件家要按各自的 id 分别申报能力位。
     let provider_id = provider_of(account);
+    // ── 插件家先分流（与 `supports_checkin` 同一顺序）────────────────
+    // 下面那串 `match` 全部是内置执行体。装上插件后同一个 id 两边都有，而
+    // 权威是插件（`adapter_by_id` 也是插件优先）—— 先命中内置分支的症状是
+    // 「签到跑了，但插件那边的台账与账号状态没动」。
+    if crate::server::core::plugin_host::serves_provider(provider_id) {
+        if let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider_id) {
+            if adapter.plugin_checkin_capability() == Some(true) {
+                let claim = adapter
+                    .checkin_claim_with_options(store, &id, manual)
+                    .await
+                    .map_err(|error| error.message);
+                return claim_result(id, name, &display, true, claim);
+            }
+        }
+    }
     match provider_id {
-        "raccoon" => {
-            let claim =
-                crate::server::core::providers::raccoon::balance::claim_daily_grant(store, &id)
-                    .await
-                    .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        "autoclaw" | "autoclaw-intl" => {
-            let region = crate::server::core::providers::autoclaw::Region::from_provider_id(
-                provider_id,
-            )
-            .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
-            let claim = crate::server::core::providers::autoclaw::checkin::claim_daily_signin(
-                region, store, &id,
-            )
-            .await
-            .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        "qoder" | "qoder-intl" => {
-            // Qoder 的每日权益以活动（campaign）形式下发，两个地区走同一条
-            // 实现按地区分支：中国版直接领；国际版要先带设备风控身份重新拉
-            // 活动列表（见 `qoder::checkin` 的模块头）。地区由 provider id
-            // 反查（拆家后它就是身份），与 AutoClaw 两个地区的分派同款。
-            let region = crate::server::core::providers::qoder::endpoints::Region::from_provider_id(
-                provider_id,
-            )
-            .unwrap_or(crate::server::core::providers::qoder::endpoints::Region::Cn);
-            let claim =
-                crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, region, &id)
-                    .await
-                    .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        "trae" => {
-            // SOLO 那一条通道的每日签到（`providers::trae::checkin`）。它的
-            // `alreadyCompleted` / 中性结果都由实现自己给：活动未下发、
-            // 凭据没有 deviceId、国际版谱系这三格都不算失败，也不落当日台账
-            // （除"已签"那格），免得定时链把一次"没得签"当成"没签成"反复重打。
-            let claim = crate::server::core::providers::trae::checkin::claim_daily_checkin(
-                store, &id,
-            )
-            .await
-            .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
+        // 小浣熊的桌面登录积分链路已随实现搬到插件（`checkin` 能力位），走上面
+        // 那条插件分支（`plugin_checkin_capability`）。
+        // AutoClaw 的两个地区：签到已随实现搬到插件，走上面那条插件分支
+        // （`plugin_checkin_capability`）。
+        // Qoder 的每日权益领取已随实现搬到插件，走上面那条插件分支
+        // （`plugin_checkin_capability`）。
+        // Trae 的每日签到已随实现搬到插件，走上面那条插件分支
+        // （`plugin_checkin_capability`）。
         "workbuddy-intl" => {
             // WorkBuddy 国际版：没有国内版的普通签到接口，走「每日活跃」链路 ——
             // 探测活动 → 条件领取 → 免费模型保活 + 网页会话（`billing::activity`
@@ -343,52 +382,19 @@ pub async fn checkin_for(
                 "error": Value::Null,
             })
         }
-        "loomy" => {
-            // Loomy 没有独立的签到接口：「每日赠送积分」由**每日首次登录**
-            // 触发刷新（`POST /api/v1/points/first-login`，见 `loomy::checkin`
-            // 的模块头）。自动签到框架对它就是「每天替账号打一次这个接口」。
-            let claim =
-                crate::server::core::providers::loomy::checkin::claim_daily_login(store, &id)
-                    .await
-                    .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        "kuku" => {
-            // KukuAI：「免费领积分」活动的每日任务（每日登录 / 完成一次对话），
-            // 接口幂等（重复领 reward_point=0），见 `kuku::checkin` 的模块头。
-            // 业务会话由实现内部换发 genflowpro STOKEN（`kuku::engine`）保障。
-            let claim =
-                crate::server::core::providers::kuku::checkin::claim_daily_checkin(store, &id)
-                    .await
-                    .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        "officeace" => {
-            // OfficeAce：`POST /v1/subscription/bonus/claim`（V11 签名）一次把当天
-            // 所有可领的奖励（每日签到 + 一次性新人礼）发下来；一天一个活动只能领
-            // 一次、重复领不报错，幂等由上游保证（见 `officeace::checkin` 模块头）。
-            let claim =
-                crate::server::core::providers::officeace::checkin::claim_daily_checkin(store, &id)
-                    .await
-                    .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        "codearts" => {
-            // CodeArts：当日 ops 福利（每日登录送积分那一组，`Rewards::DailyLogin`
-            // ——一次性注册礼归新手福利，不在这里领，见 welfare 的模块头）。
-            // 四步流程与限流闸都在实现里，这里只把结论翻成签到结果行。
-            let claim = crate::server::core::providers::codearts::welfare::claim_account(
-                store,
-                &id,
-                crate::server::core::providers::codearts::models::DEFAULT_BASE_URL,
-                logging::now_ms(),
-                manual,
-            )
-            .await
-            .map_err(|error| error.message)
-            .map(welfare_claim_of);
-            claim_result(id, name, &display, true, claim)
-        }
+        // CodeArts 的每日 ops 福利已随实现搬到插件（`welfare.claim`，能力位
+        // `checkin`），走上面那条插件分支。
+        // 智谱清言的签到（每日登录积分 + 活动领取 + 每日任务）已随实现搬到插件，
+        // 走上面那条插件分支（`plugin_checkin_capability`）。
+        // ZCode 两地的每日签到（领当天赠送套餐）同样在插件里，走上面那条
+        // 插件分支；它的窗口是每天 19:00 起（见 `auto_checkin::times`）。
+        // 访客的排除仍在
+        // `supports_checkin` 的 `isGuest` 分支里 —— 那是网关侧的集合划分。
+        // ModelScope（魔搭）的两个站点：签到 = 调一次登录信息接口
+        // （`GET {网页站}/api/v1/users/login/info`，**调用即触发当日魔粒**，
+        // 幂等；见 `providers::modelscope::checkin` 的模块头）。
+        // 两个站点各打各的网页站、令牌不通用 —— 地区由 provider id 反查
+        // （账号集合按 provider 隔离，同一 id 不可能同时属于两家）。
         // 兜底只服务默认那家（WorkBuddy 国内版）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
@@ -407,7 +413,83 @@ pub async fn checkin_for(
                 .claim_daily_checkin(Some(&entry.session))
                 .await
                 .map_err(|error| error.message);
-            let mut row = claim_result(id, name, &display, false, claim);
+            let mut row = claim_result(id.clone(), name, &display, false, claim);
+            // ── 每日活跃上报：点亮成长中心连登 / 活跃地图 ──────────────
+            // 签到（`daily-checkin`）只推进**签到活动**自己的连签，成长中心的
+            // 连登与热力图只认 `/v2/report` 的一条 `chat_request_send` 事件
+            // （2026-10-19 实测：签到后签到连签 14→15，而 `growth/streak`
+            // 的 days 与当日热力格一格未动；补发一条上报后 0→1 / 0→2）。
+            // 见 `growth::daily_activity` 的模块头。
+            //
+            // 结果落在行的 `growth` 键上，**刻意不叫 `activity`**：那个键是
+            // 国际版日活链路的读数，`day_completed` / 台账会把它当成「今天
+            // 已完成」—— 对国内版，上报只点亮地图，不等于积分领到了，
+            // 混用会让签到失败的账号被记成已签。
+            //
+            // 企业版没有个人成长体系（`/activity/growth/*` 一律 403），
+            // 与下面两条一次性奖励同一门控；上报对它零收益（上游仍回 200）。
+            if !is_enterprise_session(&entry.session) {
+                // ── 每日活跃上报：点亮成长中心连登 / 活跃地图 ──────────────
+                // 实现（`/v2/report` 的事件形状、按天幂等记忆、竞态读数过滤）
+                // 全在**插件**里（`workbuddy::admin` 的 `growth.daily`）。
+                // 网关这边只剩「把读数落库 + 记日志」——`mark_streak_days`
+                // 动的是网关的账号库，插件写不到。
+                let growth_row = match crate::server::core::providers::adapter::adapter_by_id(
+                    provider_id,
+                ) {
+                    Some(adapter) => {
+                        match adapter
+                            .admin_action(store, &id, "growth.daily", &Value::Null)
+                            .await
+                        {
+                            Ok(row) => {
+                                let days = row.get("streakDays").and_then(Value::as_i64);
+                                if let Some(days) = days {
+                                    if !store.mark_streak_days(&id, days) {
+                                        logging::verbose(
+                                            "[Accounts]",
+                                            &format!("账号 {id} 的连登天数未能落盘"),
+                                        );
+                                    }
+                                }
+                                let sent =
+                                    row.get("reported").and_then(Value::as_bool).unwrap_or(false);
+                                if sent {
+                                    logging::verbose(
+                                        "[Accounts]",
+                                        &format!(
+                                            "账号 {display}: 每日活跃已上报{}",
+                                            days.map(|days| format!("（连登 {days} 天）"))
+                                                .unwrap_or_default()
+                                        ),
+                                    );
+                                }
+                                row
+                            }
+                            // 附加收益失败：只记日志，绝不影响签到结果
+                            Err(error) => {
+                                logging::verbose(
+                                    "[Accounts]",
+                                    &format!("账号 {display} 每日活跃上报失败: {}", error.message),
+                                );
+                                json!({
+                                    "reported": false,
+                                    "streakDays": Value::Null,
+                                    "error": error.message,
+                                })
+                            }
+                        }
+                    }
+                    None => json!({
+                        "reported": false,
+                        "streakDays": Value::Null,
+                        "error": "没有可用的 WorkBuddy 适配器（未安装插件？）",
+                    }),
+                };
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("growth".to_string(), growth_row);
+                }
+            }
             // ── 一次性运营奖励：挂在签到末尾顺带领 ────────────────
             // 新手礼包与活动补偿（如 2026-10 的 DeepSeek 故障补偿 500 积分）
             // 都没有自己的入口，官方口径是去「用量管理 / 个人中心」手动点领取
@@ -453,18 +535,37 @@ pub async fn checkin_for(
             }
             row
         }
-        other => json!({
-            "id": id,
-            "name": name,
-            "claim": Value::Null,
-            // 展示名走注册表：`other` 是 provider id，直接回显会得到
-            // 「workbuddy-intl 的签到链路尚未接入」这种读不出意思的文案
-            // （拆家后这条分支会先撞上国际版）。
-            "error": format!(
-                "{} 的签到链路尚未接入",
-                crate::server::core::providers::label_of(other)
-            ),
-        }),
+        // AtomCode 的「签到」（领取免费 CodingPlan）已随实现搬到插件，
+        // 走上面那条插件分支（`plugin_checkin_capability`）。
+        other => {
+            // ── 兜底（插件与内置分支都已在前面分流）───────────────────
+            // 走到这里只剩两种可能：没有插件接管、且不在上面任一内置分支里。
+            // 再问一次适配器是为了覆盖「内置家但没有签到执行体」的那几档
+            // （插件统一实现之后它们也可能申报了能力），判据与上面一致。
+            if let Some(adapter) =
+                crate::server::core::providers::adapter::adapter_by_id(other)
+            {
+                if adapter.plugin_checkin_capability() == Some(true) {
+                    let claim = adapter
+                        .checkin_claim(store, &id)
+                        .await
+                        .map_err(|error| error.message);
+                    return claim_result(id, name, &display, true, claim);
+                }
+            }
+            json!({
+                "id": id,
+                "name": name,
+                "claim": Value::Null,
+                // 展示名走注册表：`other` 是 provider id，直接回显会得到
+                // 「workbuddy-intl 的签到链路尚未接入」这种读不出意思的文案
+                // （拆家后这条分支会先撞上国际版）。
+                "error": format!(
+                    "{} 的签到链路尚未接入",
+                    crate::server::core::providers::label_of(other)
+                ),
+            })
+        }
     }
 }
 
@@ -473,22 +574,6 @@ pub async fn checkin_for(
 /// 四档结论在「今天还能不能再领」这件事上分三类，映射必须与
 /// [`checkin_completed_today`] / [`claim_pending`] 的口径对齐 —— 那两处是调度
 /// （`auto_checkin::tick` 要不要稍后重试）、落账（要不要写 `checkinAt`）与
-/// 台账（outcome 档位）共用的唯一判据：
-///   · `Confirmed`（官方已确认到账）→ `success`：今天真领到了；
-///   · `Already`（已领取并确认）→ `alreadyCompleted`：上游说今天已经领过 ——
-///     两者都算「今天签到完成」，于是落 `checkinAt`、计入 succeeded、进签到记录；
-///   · `NotEligible`（暂无可领取活动）/ `Skipped`（被本地限流闸挡住，只可能出现在
-///     自动路径）→ **中性未领取**：不落账，定时链稍后重试（文案由 `claim_pending` 认）。
-fn welfare_claim_of(outcome: crate::server::core::providers::codearts::welfare::Outcome) -> Value {
-    use crate::server::core::providers::codearts::welfare::Outcome;
-    let label = outcome.label();
-    match outcome {
-        Outcome::Confirmed => json!({ "success": true, "msg": label }),
-        Outcome::Already => json!({ "success": false, "alreadyCompleted": true, "msg": label }),
-        Outcome::NotEligible | Outcome::Skipped => json!({ "success": false, "msg": label }),
-    }
-}
-
 /// 把一次签到调用翻成统一的结果行（`{id, name, claim, error}`）。
 ///
 /// ── `log_success_msg` 为什么是一个参数而不是统一口径 ─────────
@@ -534,10 +619,10 @@ fn claim_result(
 /// `pub`：签到记录台账（`core::checkin_records`）的 outcome 判定复用它 ——
 /// 「今天已完成」的口径在调度、落账与台账三处必须是同一份（判据只此一份）。
 ///
-/// 三种情况都算，因为它们在「今天不能再领」这件事上没有区别：
+/// 插件的结构化 outcome 优先；下面三条只兼容没有 outcome 的旧结果：
 ///   1. `success === true`：本次真的领到了；
 ///   2. `alreadyCompleted === true`：上游明确告知今天已完成
-///      （AutoClaw 的 `daily_signin` 会带这个字段，见 `providers::autoclaw::checkin`）；
+///      （AutoClaw 的 `daily_signin` 会带这个字段，插件原样透出）；
 ///   3. `msg` 里含「已签到 / 已领取」：WorkBuddy 只把「今日已签到」放在文案里，
 ///      没有专门的码位可用，所以这里只能看文案。
 ///
@@ -550,14 +635,20 @@ fn claim_result(
 /// 实测见过自动签到 4 个账号全部未领取、17 秒后手动逐个重试全部成功
 /// （批次撞上上游风控），所以判据必须收紧到「上游说签过了」。
 pub fn checkin_completed_today(claim: &Value) -> bool {
-    if claim.get("success").and_then(Value::as_bool) == Some(true) {
-        return true;
+    if claim.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()) {
+        return false;
     }
-    if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
+    if let Some(outcome) = claim.get("outcome").and_then(Value::as_str) {
+        return matches!(outcome, "claimed" | "done");
+    }
+    if claim.get("success").and_then(Value::as_bool) == Some(true)
+        || claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true)
+    {
         return true;
     }
     let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
-    message.contains("已签到") || message.contains("已领取")
+    !(message.contains("可能") || message.contains("未能") || message.contains("未见") || message.contains("失败"))
+        && (message.contains("已签到") || message.contains("已领取"))
 }
 
 /// 行的 `activity` 段是否携带「活跃上报成功」读数（`report.succeeded`）。
@@ -601,6 +692,9 @@ pub fn web_conversation_ok(row: &Value) -> bool {
 /// 上游的活跃计数不认它；失败（网络错误 / 凭证失效）也不算 —— 失败行照旧
 /// 显示待签，与 [`checkin_completed_today`] 的收紧原则一致。
 pub fn day_completed(row: &Value) -> bool {
+    if row.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()) {
+        return false;
+    }
     row.get("claim")
         .map(checkin_completed_today)
         .unwrap_or(false)
@@ -609,12 +703,8 @@ pub fn day_completed(row: &Value) -> bool {
 }
 
 /// 这条领取结果是「中性未领取」—— 不是成功、不是已签、也不是失败，而是
-/// 「此刻没有可领的活动」。Qoder 国际版的活动窗口每天 10:00（UTC+8）才开，
-/// 定时签到在这个窗口之前跑完时结果必然长这样；自动签到调度据此判断
-/// 「今天要不要保持未落账、过段时间重试」（见 `auto_checkin::tick`）。
-///
-/// 判据刻意与 [`checkin_completed_today`] 相反且**只认中性文案**：把失败
-/// （网络错误 / 凭证失效）也当成 pending 会让坏账号整天反复重试打上游。
+/// 「此刻没有可领的活动」。它不落 checkinAt，也不计失败；是否自动重试还要看
+/// 插件的 retryAt（见 auto_checkin::retry），不是所有无活动结果都能靠等待恢复。
 pub fn claim_pending(claim: &Value) -> bool {
     if checkin_completed_today(claim) {
         return false;
@@ -623,16 +713,13 @@ pub fn claim_pending(claim: &Value) -> bool {
     if claim.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()) {
         return false;
     }
+    if let Some(outcome) = claim.get("outcome").and_then(Value::as_str) {
+        return matches!(outcome, "inactive" | "ineligible");
+    }
     let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
-    // 两个地区的「无活动」文案都含这一句；实现改措辞时这里要跟着对齐
-    //（`providers::qoder::checkin::no_claim` 与 trae 的「未领取 + 原因」不同形，
-    // trae 不走这条 pending 逻辑 —— 它没有窗口概念）。
-    // CodeArts 的两条（`providers::codearts::welfare::Outcome::label`）同理：
-    // 「暂无可领取活动」是运营活动还没下发（再过一阵可能就有），「等待重试」是
-    // 被本地那两道写闸挡住（今天还有额度、只是间隔没到）—— 两者都该让定时链
-    // 稍后重试，而不是记成失败。改那边的文案时这两条也要跟着改。
     message.contains("没有可领取的签到活动")
         || message.contains("未下发每日积分活动")
+        || message.contains("暂未给该账号下发每日积分活动")
         || message.contains("暂无可领取活动")
         || message.contains("等待重试")
 }
@@ -654,7 +741,24 @@ pub async fn run_checkin(
     reason: &str,
     source: &str,
 ) -> Result<Value, CheckinError> {
-    let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
+    run_checkin_selected(store, billing, providers, id, reason, source, None).await
+}
+
+pub(crate) async fn run_checkin_selected(
+    store: &AccountStore,
+    billing: &BillingService,
+    providers: &[String],
+    id: Option<&str>,
+    reason: &str,
+    source: &str,
+    selected: Option<&[String]>,
+) -> Result<Value, CheckinError> {
+    let (mut targets, mut skipped) = resolve_checkin_targets(store, providers, id)?;
+    if let Some(selected) = selected {
+        targets.retain(|account| account.get("id").and_then(Value::as_str)
+            .is_some_and(|id| selected.iter().any(|selected| selected == id)));
+        skipped = selected.len().saturating_sub(targets.len());
+    }
     // 「这次是用户在面板上点的吗」——只有 CodeArts 用得上（它的福利是写请求，
     // 有两道本地限流闸）。单账号 single 与批量 manual 都是点击触发；
     // schedule / startup 是无人值守，必须受闸。见 `checkin_for` 的说明。
@@ -697,7 +801,7 @@ pub async fn run_checkin(
     let succeeded = results
         .iter()
         .filter(|item| {
-            item.get("claim")
+            day_completed(item) && item.get("claim")
                 .map(checkin_completed_today)
                 .unwrap_or(false)
         })
@@ -715,6 +819,7 @@ pub async fn run_checkin(
                 || web_conversation_ok(item)
         })
         .count();
+    let failures: Vec<String> = results.iter().filter_map(failure_of).collect();
     if skipped > 0 {
         logging::log(
             "[Accounts]",
@@ -742,218 +847,90 @@ pub async fn run_checkin(
             reason,
         );
     }
+    // ── 连登管家：补签 → 档位兑换 → 抽奖（挂签到末尾，与参考项目同款）──
+    //
+    // 为什么挂在这里而不是独立排程：三件事的判据都依赖「今天签到了没有」
+    // （连登天数当天 +1 之后才可能解锁新档位），紧跟签到跑最准；而签到是
+    // 手动与定时共用的唯一入口（`run_checkin` 是两条链的共同执行体），
+    // 挂这里天然覆盖两条路径，不必各写一遍。
+    //
+    // ── 为什么是**后台任务**而不是 await ────────────────────────
+    // 三件事每个账号要 4~6 个上游请求（热力图 / 连登状态 / 兑换 / 抽奖余额 /
+    // 逐次抽奖），加上账号间 800ms 错峰，十几个账号就是几十秒到几分钟 ——
+    // 而管理 API 有 60 秒单请求超时（`gateway::REQUEST_TIMEOUT_MS`）。同步
+    // await 会让前端「立即全部签到」超时报错，而后端其实已经跑完，用户以为
+    // 失败了会再点一次。所以这里**只起任务不等待**：签到结果立刻返回，
+    // 连登管家的收益异步进日志与账号余额。
+    //
+    // 失败**不影响**签到结果：三件事在上游都是幂等的附加收益，且都只服务
+    // 国内版个人账号（门控在 `run_for_accounts` 里）。任何一步出错只进日志，
+    // 绝不把一次成功的签到报成失败 —— 与上面 mark_checkin / record_row 的
+    // 取舍同构。
+    //
+    // 只在**批量轮次**跑（`id.is_none()`）：单账号手动签到是「我只想签这一个」，
+    // 顺手替它兑换抽奖会让用户以为点错了按钮；批量（定时 / 手动全量）才是
+    // 「维护一遍所有账号」的意图。
+    if id.is_none() {
+        spawn_streak_bonus(store.clone(), targets.clone());
+    }
     Ok(json!({
         "results": results,
         "succeeded": succeeded,
         "active": active,
         "total": results.len(),
         "skipped": skipped,
+        "failed": failures.iter().take(5).cloned().collect::<Vec<_>>(),
+        "failedCount": failures.len(),
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    //! 签到「今天已签」判据的边界。
-    //!
-    //! ── 为什么这里要有一条**闭环**测试 ──────────────────────────
-    //! 上游（`billing::call_billing`）与下游（本模块的 `checkin_completed_today`）
-    //! 各判一次「今天已领过」，两处都靠**文案**：前者决定要不要把 HTTP 400 放行成
-    //! `Ok`，后者决定要不要落 `checkinAt`。两处必须同源 —— 只放宽一处，就会出现
-    //! 「放行了却仍判不出已完成」（面板不亮）或「判得出但先被丢成 Err」（`claim`
-    //! 为 null）这两种半截修复。`closed_loop_tolerated_400_reaches_completed` 把
-    //! 这条链整条钉住，是本次修复（上游 issue #137）唯一的端到端回归保护。
-    use super::checkin_completed_today;
-    use crate::server::core::billing::request::BillingCall;
-    use crate::server::core::billing::{is_duplicate_claim, normalize_daily_claim, BillingService};
-    use serde_json::{json, Value};
-
-    /// 上游真实的 400 文案（WorkBuddy 国内版当日已签到时的原话）。
-    const REAL_DUPLICATE: &str = "今天已签到，请明天再来";
-
-    // ── 下游判据本身 ────────────────────────────────────────────
-
-    #[test]
-    fn success_and_already_completed_are_done() {
-        // 第 1 条：本次真的领到了
-        assert!(checkin_completed_today(&json!({"success": true, "code": 0})));
-        // 第 2 条：上游明确告知（AutoClaw 的 daily_signin 带这个字段）
-        assert!(checkin_completed_today(&json!({"success": false, "alreadyCompleted": true})));
+/// 连登管家：后台跑「补签 → 档位兑换 → 抽奖」，不阻塞签到响应。
+///
+/// 抽成独立函数的原因有三条：
+///   1. **不阻塞**：见 `run_checkin` 里那段「为什么是后台任务」；
+///   2. **隔离失败**：里面任何错误都只进日志，不会冒泡到签到结果；
+///   3. **串行闸**：同一时刻只允许一轮在跑（手动连点签到不会叠出两轮
+///      重复兑换 / 抽奖 —— 上游幂等，但重复打请求本身是浪费且招风控）。
+fn spawn_streak_bonus(store: AccountStore, targets: Vec<Value>) {
+    /// 进程内串行闸：`swap(true)` 抢到才跑，跑完复位。
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        logging::verbose("[Streak]", "上一轮连登管家仍在执行，本次跳过");
+        return;
     }
-
-    #[test]
-    fn message_wording_marks_today_done() {
-        // 第 3 条：WorkBuddy 只把「今日已签到」放在文案里，没有码位可用
-        assert!(checkin_completed_today(&json!({"success": false, "msg": REAL_DUPLICATE})));
-        assert!(checkin_completed_today(&json!({"success": false, "msg": "该奖励已领取"})));
-    }
-
-    #[test]
-    fn real_failures_are_never_mistaken_for_done() {
-        // 核心不变量（见本文件上方 `checkin_completed_today` 的注释）：失败行与
-        // 「今天已签到」是两回事，把前者当作已签到会白丢一天积分 —— 实测见过
-        // 批次撞风控 4 个账号全部未领取。这几条必须全部为 false。
-        for claim in [
-            json!({"success": false, "code": -1, "msg": "计费接口请求失败: 连接上游超时"}),
-            json!({"success": false, "code": -1, "msg": "登录态已过期或被拒绝，无法调用计费接口"}),
-            json!({"success": false, "code": -1, "msg": ""}),
-            // 键缺失：`claim` 为 null 时上游路径根本没走到判据，这里模拟 msg 缺失
-            json!({"success": false, "code": 40001}),
-        ] {
-            assert!(!checkin_completed_today(&claim), "不该被判成已完成: {claim}");
-        }
-    }
-
-    // ── 闭环：上游放行 → 下游判得出 ─────────────────────────────
-
-    #[test]
-    fn closed_loop_tolerated_400_reaches_completed() {
-        // 模拟 `call_billing` 在 `tolerate_duplicate_claim: true` 时对 400 的放行：
-        // 返回 `Ok(BillingCall { code, msg, data: Null, .. })`，msg 是上游文案。
-        // `code` 取 null —— 上游 400 响应体里没有顶层 `code` 时就是这个形态。
-        let tolerated = BillingCall {
-            code: None,
-            msg: Some(REAL_DUPLICATE.to_string()),
-            request_id: None,
-            data: Value::Null,
-            raw: Some(json!({ "msg": REAL_DUPLICATE })),
+    crate::spawn_task(async move {
+        // 连登管家的执行体在插件里（`growth.streak.batch` 自己列本家账号、
+        // 自己门控、自己错峰）。网关只拿回 `{done, failed}` 两个计数记日志。
+        // 插件没装时安静跳过 —— 这是个附加动作，不该在日志里刷错误。
+        let Some(adapter) =
+            crate::server::core::providers::adapter::adapter_by_id("workbuddy")
+        else {
+            RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
         };
-
-        // 1) 上游确实会放行这一条（判据命中）
-        assert!(is_duplicate_claim(400, REAL_DUPLICATE));
-
-        // 2) 放行后的归一化产出：失败形状，但 msg 保留上游文案
-        let claim = normalize_daily_claim(tolerated);
-        assert_eq!(claim.get("success").and_then(Value::as_bool), Some(false));
-        assert_eq!(claim.get("msg").and_then(Value::as_str), Some(REAL_DUPLICATE));
-
-        // 3) 下游据此判出「今天已完成」→ `mark_checkin` 会被调用、面板标识点亮。
-        //    这一跳就是 #137 里断掉的那一环：原代码在 1) 之前就 Err 了，claim 为
-        //    null，于是这里恒为 false，`checkinAt` 永远写不进去。
-        assert!(
-            checkin_completed_today(&claim),
-            "放行了却判不出已完成 —— 上游与下游的文案判据已经脱钩"
-        );
-    }
-
-    #[test]
-    fn closed_loop_non_duplicate_400_stays_failed() {
-        // 反向：同为 400，文案与「重复领取」无关时上游**不**放行（仍 Err），
-        // 因此不会有 claim 走到下游。这里直接断言判据不命中，钉住「不能过度放宽」。
-        for detail in ["参数错误", "请求内容不是有效 JSON", "活动已结束"] {
-            assert!(!is_duplicate_claim(400, detail), "detail={detail:?} 不该被放行");
+        let summary = match adapter
+            .admin_action(&store, "", "growth.streak.batch", &Value::Null)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                logging::verbose("[Streak]", &format!("连登管家失败: {}", error.message));
+                RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        let _ = &targets;
+        let done = summary.get("done").and_then(Value::as_u64).unwrap_or(0);
+        let failed = summary.get("failed").and_then(Value::as_u64).unwrap_or(0);
+        if done > 0 || failed > 0 {
+            logging::log(
+                "[Streak]",
+                &format!(
+                    "连登管家完成：{done} 项动作{}",
+                    if failed > 0 { format!("，{failed} 项失败") } else { String::new() }
+                ),
+            );
         }
-    }
-
-    // ── HTTP 接线：真正驱动 `call_billing` 的修复分支 ────────────
-    //
-    // ⚠️ 上面那些测试**都不足以保护真正的修复点**。`closed_loop_*` 是手工构造
-    // `BillingCall` 再调 `normalize_daily_claim`，绕过了 `call_billing` —— 把
-    // `mod.rs` 里 `if options.tolerate_duplicate_claim && is_duplicate_claim(...)`
-    // 整段删掉或改成 `if false`，它们**依然全绿**（`is_duplicate_claim` 自己的
-    // 测试也照样过，因为那函数还在）。下面三条起真的 HTTP 服务，让 400 从 socket
-    // 上走一遍，把「修复分支本身」钉住 —— 这是 #137 的回归保护里唯一不可绕过的
-    // 一层。
-
-    /// 起一个只回固定响应的 mock 上游（照抄 `upstream::provider_loop::tests`
-    /// 的手写 axum 约定，项目既有风格，不引入 wiremock）。
-    /// 返回 (base_url, 命中计数, 任务句柄)；句柄由调用方持有到用例结束。
-    async fn mock_billing(
-        status: u16,
-        body: &'static str,
-    ) -> (
-        String,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        let hits = Arc::new(AtomicUsize::new(0));
-        let count = hits.clone();
-        let app = axum::Router::new().route(
-            "/v2/billing/meter/daily-checkin",
-            axum::routing::post(move || {
-                count.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    (
-                        axum::http::StatusCode::from_u16(status).unwrap(),
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        body,
-                    )
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (base, hits, task)
-    }
-
-    /// 指向 mock 的国内版 session —— `call_billing` 从这里取 endpoint 与请求头。
-    /// `edition: "cn"` 是关键：为 `intl` 会走国际版活跃任务链，根本不打这个端点。
-    fn cn_session(base: &str) -> Value {
-        json!({
-            "endpoint": base,
-            "edition": "cn",
-            "auth": { "accessToken": "test-token" },
-            "account": { "uid": "u1" },
-        })
-    }
-
-    /// 建一个可用的 `BillingService`（空账号库即可 —— session 由调用方直接给）。
-    fn billing_service(label: &str) -> (BillingService, crate::server::db::test_temp::TempDb) {
-        use crate::server::core::account_store::AccountStore;
-        let (db, guard) = crate::server::db::test_temp::TempDb::open(label);
-        let store = AccountStore::with_db(Some(db));
-        (
-            BillingService::new(crate::server::core::auth::AuthService::for_store(store)),
-            guard,
-        )
-    }
-
-    #[tokio::test]
-    async fn tolerated_400_from_real_http_reaches_completed() {
-        let (billing, _guard) = billing_service("billing-checkin-400");
-        let (base, hits, _task) = mock_billing(400, r#"{"msg":"今天已签到，请明天再来"}"#).await;
-
-        let claim = billing
-            .claim_daily_checkin(Some(&cn_session(&base)))
-            .await
-            .expect("400 +「今天已签到」应被容错放行，而不是 Err");
-
-        assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "只该打一发上游（重复领取不做重试）"
-        );
-        assert_eq!(claim.get("success").and_then(Value::as_bool), Some(false));
-        assert_eq!(claim.get("msg").and_then(Value::as_str), Some(REAL_DUPLICATE));
-        // 端到端闭环：这一跳就是 #137 断掉的地方（原代码在上一行就 Err 了，
-        // claim 为 null，于是这里恒为 false，checkinAt 永远写不进去）。
-        assert!(checkin_completed_today(&claim), "#137：放行后仍判不出已完成");
-    }
-
-    #[tokio::test]
-    async fn non_duplicate_400_from_real_http_still_errors() {
-        let (billing, _guard) = billing_service("billing-checkin-400-other");
-        let (base, _hits, _task) = mock_billing(400, r#"{"msg":"参数错误"}"#).await;
-
-        let error = billing
-            .claim_daily_checkin(Some(&cn_session(&base)))
-            .await
-            .expect_err("文案与重复领取无关的 400 必须照旧报错");
-        assert!(error.message.contains("400"), "message={}", error.message);
-    }
-
-    #[tokio::test]
-    async fn server_error_from_real_http_still_errors() {
-        let (billing, _guard) = billing_service("billing-checkin-500");
-        // 500 是**真故障**：即便文案恰好含「已签到」也不能放行，否则一次没签上的
-        // 日子会被记成已签（`checkin.rs` 注释里实测过的批次撞风控场景）。
-        let (base, _hits, _task) = mock_billing(500, r#"{"msg":"今天已签到，请明天再来"}"#).await;
-
-        billing
-            .claim_daily_checkin(Some(&cn_session(&base)))
-            .await
-            .expect_err("500 不该被容错放行");
-    }
+        RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }

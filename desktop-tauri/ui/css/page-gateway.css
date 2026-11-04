@@ -107,9 +107,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  /* 允许折行：这一行现在住着状态筛选 + 倍率排序（issue #161）+ 搜索框（240px）
-     + 勾选后的批量条，在最小窗口宽度（820px）下四者同时在场会超出通栏宽度 ——
-     折行比横向溢出好，与 .panel-head 的 flex-wrap 同一取舍（见上面的说明）。 */
+  /* 筛选、搜索和批量条在窄窗口下允许整体折行。 */
   flex-wrap: wrap;
   row-gap: 8px;
   width: 100%;
@@ -119,17 +117,8 @@
 /* 批量条：勾选后出现在筛选行的带计数小药丸（原「批量操作」孤按钮升级）——
    计数本身是这条存在的原因，写进药丸里比按钮 title 更可读 */
 .batch-chip {
-  display: inline-flex;
-  align-items: center;
   gap: 8px;
-  height: 28px;
   flex: 0 0 auto;
-  padding: 0 4px 0 11px;
-  border: 1px solid var(--primary-bd);
-  border-radius: var(--r-pill);
-  background: var(--primary-soft);
-  color: var(--primary-fg);
-  font-size: 12px;
   white-space: nowrap;
 }
 .batch-chip b { font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -154,8 +143,8 @@
 /* 表格（模型管理 / 网关 Key 共用）：贴面板左右边缘，表头粘顶。
    overflow-anchor 同 .page.active：tbody 重建时不做锚定补偿，行内点开关视口不动 */
 /* 表格滚动盒（模型管理 / 网关 Key 共用）。max-height 是**内容撑高、超过才收**的
-   语义，网关 Key 页就按这个来（那页没有自己的高度骨架）。模型管理页要的是固定
-   高度（与账号页一致），由 `.mm-main > .models-table-wrap` 覆盖成 flex 吃满剩余。 */
+   语义，网关 Key 页就按这个来（那页没有自己的高度骨架）。模型管理与网络代理页
+   由页面的 flex 布局覆盖成吃满剩余高度。 */
 .models-table-wrap { overflow: auto; overflow-anchor: none; max-height: min(62vh, 720px); border-top: 1px solid var(--border); }
 
 .models-table {
@@ -197,6 +186,28 @@
 .page[data-page="gateway"] .models-table thead th { padding: 8px 10px; font-size: 11px; letter-spacing: 0; }
 .page[data-page="gateway"] .models-table td { padding: 7px 10px; }
 
+@media (max-width: 767px) {
+  .page[data-page="gateway"] .models-table thead:has(th[data-col="rate"]) {
+    display: block;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--table-head-bg);
+  }
+  .page[data-page="gateway"] .models-table thead tr {
+    display: flex;
+    margin: 0 0 10px;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: var(--table-head-bg);
+  }
+  .page[data-page="gateway"] .models-table thead th:not([data-col="rate"]) { display: none; }
+  .page[data-page="gateway"] .models-table thead th[data-col="rate"] { position: static; }
+  .page[data-page="gateway"] .models-table thead .col-grip { display: none; }
+  .page[data-page="gateway"] .models-table [data-table-sort] { min-height: 30px; }
+}
+
 /* 表头的问号提示（完整口径从括号长标题挪进 title，见 models-page）——
    「模型映射」「上下文 / 输出」「能力」三处共用；后两处讲的是来源标记怎么读 */
 .page[data-page="gateway"] .models-table .th-help {
@@ -225,8 +236,11 @@
 /* 勾选列的表头 / 单元格都居中：一整列只有复选框，居中才与账号页勾选列同一观感
    （数据行走列设置的 ta-center；th 上的 text-align 是全局 left，这里单独补） */
 .models-table th[data-col="check"] { text-align: center; }
-.models-table .c-model { width: 19%; }
+.models-table .c-model { width: 17%; }
 .models-table .c-rate { width: 5.5%; }
+/* 可见性列：「可见 / 不展示」两个短词，6% 够放下。宽度从「上游模型」列匀来
+   （那一列原来 19%，长模型名的截断阈值本来也够宽） */
+.models-table .c-visibility { width: 6%; }
 .models-table .c-source { width: 6.5%; }
 /* 能力位两列：数值一格（上下文 / 最大输出）、四枚图标圆点一格。
    并入映射列的宽度从这里来 —— 五列会把它挤到装不下 chips（见 models-page
@@ -240,20 +254,16 @@
 .keys-table .k-time { width: 16%; }
 .keys-table .k-state { width: 8%; }
 .keys-table .k-act { width: 10%; }
-
-/* 代理池表（islands/proxies-page.tsx）的默认列宽。
-   与上面两组同一条口径：默认宽度写在**普通类**上、由 colgroup 的 <col> 带上，
-   没拖过的列走它，拖过的列由 table-columns.js 往 <col> 写 inline width 盖掉它。
-   所以这里不能用 Tailwind 的 w-[196px] 那类工具类 —— 组件库的 Tailwind 是
-   `!important` 导出的（见 ui-kit/styles/globals.css），`width: 196px !important`
-   会反过来压住拖动写下的 inline 宽度，表现为「拖完松手、列宽弹回原值」。
-   节点列不给宽度：它是全表唯一内容长度不可控的列（名字 + 协议 + 引用数），
-   由 table-layout: fixed 把剩余宽度分给它。 */
 .proxies-table .p-pick { width: 36px; }
-.proxies-table .p-addr { width: 196px; }
+.proxies-table .p-addr { width: 24%; }
+.proxies-table .p-usage { width: 14%; }
 .proxies-table .p-state { width: 58px; }
-.proxies-table .p-test { width: 28%; }
-.proxies-table .p-act { width: 168px; }
+.proxies-table .p-test { width: 23%; }
+.proxies-table .p-act { width: 150px; }
+.page[data-page="proxies"] .models-table th { font-size: 11px; }
+.page[data-page="proxies"] .models-table td { padding: 14px 12px; }
+.page[data-page="proxies"] .models-table th[data-col="pick"],
+.page[data-page="proxies"] .models-table th[data-col="state"] { text-align: center; }
 
 /* 禁用 / 已删除的行整体压淡，开关与操作列保持可点 */
 .models-table tr.off td { opacity: .5; }
@@ -357,11 +367,38 @@
 .src.remote i { background: var(--primary); opacity: 1; }
 .src.manual i { background: var(--warn); opacity: 1; }
 
+/* ── 「可见性」列 ────────────────────────────────────────
+   与「来源」列同一套色点语法（两列并排，扫表时读的是点的颜色）：
+   可见 = 品牌蓝、不展示 = 琥珀（与「手动」同一档 —— 都是「需要留意的
+   非默认状态」）。「未声明 / 没判据」走 `.rate` 的 `—`，不上色。 */
+.src.shown-visibility { color: var(--text-2); }
+.src.shown-visibility i { background: var(--primary); opacity: 1; }
+.src.hidden-visibility { color: var(--warn); }
+.src.hidden-visibility i { background: var(--warn); opacity: 1; }
+
 /* ── 「能力」列：四枚图标圆点（2026-10 重设计）──────────────
    文字徽章 → 图标圆点：四个键在每一行都出现，扫表时读的是「几个亮圆」，
    具体语义由悬停提示兜底（capabilityTip）。三态：
    支持 = 品牌淡底圆、明确不支持 = 灰实底圆、未声明 = 虚线圈。 */
 .caps-open.caps-badges { gap: 4px; flex-wrap: wrap; }
+
+/* 图片模型的能力格：两枚标签（图片生成 / 图片编辑）上下层叠、整叠居中。
+   与上面那排圆点是**互斥**的两种形态：四枚圆点问的是对话模型的能力
+   （工具 / 图片识别 / 视频 / 思考），图片模型身上它们全是「不支持」。
+   ── 为什么要 block 级 + max-content + auto 外边距 ──────────────
+   这一列的对齐默认是左（列设置里只有「选择」「操作」两列带 align）。要让这一格
+   的标签叠居中，改 text-align 是错的 —— 那是整列的事，会把对话模型的圆点也挪到
+   中间。flex 子项之外的块级盒子带定宽 + auto 左右外边距才会居中，所以这里
+   显式 width: max-content（宽度 = 最长那枚标签，悬停底只包住标签本身，
+   不会铺满整格）+ margin 的左右改 auto（覆盖 .caps-open 的 -4px 外扩）。 */
+.caps-open.caps-image {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: max-content;
+  margin: -3px auto;
+}
 .cap-dot {
   position: relative;
   display: inline-flex;
@@ -476,14 +513,15 @@
 #key-restrict-summary { margin-top: 2px; }
 
 /* ─────────────────────────────────────────────
-   模型管理页：占满剩余高度，滚动只发生在列表内部
+   模型管理与网络代理页：占满剩余高度，滚动只发生在列表内部
 
    与账号页（layout.css 的 .page.active[data-page="accounts"]）同一套骨架：
    页面本身不滚，面板吃满剩余高度，面板里只有「列表」那一块滚 —— 表格高度因此
    与窗口绑定，而不是随模型条数伸缩（模型少时表格矮成一条、多时把整页顶长，
    两种都不该发生）。同一页里的左栏是列表，所以它也自己滚。
    ───────────────────────────────────────────── */
-.page.active[data-page="gateway"] {
+.page.active[data-page="gateway"],
+.page.active[data-page="proxies"] {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -491,7 +529,8 @@
   overflow: hidden;
   padding-bottom: var(--pad);
 }
-.page[data-page="gateway"] .panel {
+.page[data-page="gateway"] .panel,
+.page[data-page="proxies"] .panel {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -528,10 +567,15 @@
 }
 /* 面板头 / 表尾：都是固定高度的两块，不参与压缩 */
 .mm-main > .panel-head,
-.mm-main > .panel-foot { flex: 0 0 auto; }
+.mm-main > .panel-foot,
+.page[data-page="proxies"] .panel > .panel-head,
+.page[data-page="proxies"] .panel > .panel-foot,
+.page[data-page="proxies"] .panel > .batch-bar,
+.page[data-page="proxies"] .panel > [data-slot='responsive-sheet-inline'] { flex: 0 0 auto; }
 /* 表格区：吃掉剩余高度。内容少时它照旧占满（表格下方是空白，不是滚动条），
    内容多时自己滚 —— 「固定高度」的判据是**它不随内容变**，而不是永远出滚动条 */
-.mm-main > .models-table-wrap {
+.mm-main > .models-table-wrap,
+.page[data-page="proxies"] .panel > .models-table-wrap {
   flex: 1 1 auto;
   min-height: 0;
   /* 清掉共用的内容上限：这一页的高度由上面那条 flex 链给，不由内容给 */
@@ -553,6 +597,8 @@
      padding box 内，分组标题的负外边距一旦铺进去就是 11px 的横向溢出。 */
   overflow: hidden;
 }
+
+.page[data-page="gateway"] .prov-rail [data-slot='nav-item'] { padding-top: 6px; padding-bottom: 6px; }
 
 /* 条目区： aside 里唯一滚动的块（家数多了自己滚） */
 .rail-scroll {
@@ -640,11 +686,6 @@
   background: color-mix(in srgb, currentColor 18%, transparent);
 }
 
-/* 条目本体（一家一行）已换成组件库 NavItem（models-page.tsx 的 rail()）：
-   行高、圆角、字号、字重、选中态配色、过渡曲线都在组件里取同一套令牌，
-   旧的 .pv / .pv.on / .pv .n 一组规则随之删除 —— 左栏剩下的自定义样式只有
-   头像（.pv-ico）、计数药丸（上面两条）与下面的删除 ×。 */
-
 /* 自定义家条目外层的定位容器（条目本体是组件库 NavItem 的 button，删除按钮不能嵌在
    它里面 —— button 套 button 会被解析器拆开，绝对定位也跟着失去参照）。
    宽高都交给里面的条目，这一层只负责给 × 当坐标原点。 */
@@ -700,4 +741,39 @@
     border-right: 0;
     border-bottom: 1px solid var(--sidebar-border);
   }
+}
+
+/* ── 未挂载的模型映射（models-dangling.tsx）──────────────────────
+   指向的上游模型已不在任何模型行上（上游下线 / 承载它的那家当前没有行），
+   映射的 chip 因此无处渲染。它是一份「这批数据有问题」的提醒，刻意不做成
+   表格的一行：定高、自己滚，不参与上面表格的 flex:1 高度分配（底色与表格
+   分开，让人一眼看出它不是模型列表的一部分）。 */
+.models-dangling {
+  flex: 0 0 auto;
+  max-height: 26vh;
+  overflow: auto;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.models-dangling .dg-head { display: flex; align-items: center; gap: 8px; }
+.models-dangling .dg-title { font-size: 12.5px; font-weight: 650; color: var(--text-2); }
+.models-dangling .dg-hint { margin: 4px 0 8px; font-size: 11.5px; line-height: 1.6; color: var(--text-3); }
+.models-dangling .dg-list { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.models-dangling .dg-item { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.models-dangling .dg-prov { flex: 0 0 auto; color: var(--text-3); }
+.models-dangling .dg-map { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-family: var(--font-mono); }
+.models-dangling .dg-map code[data-copy] { cursor: pointer; }
+.models-dangling .dg-arrow { color: var(--text-3); }
+.models-dangling .dg-state { flex: 0 0 auto; font-size: 11px; color: var(--text-3); }
+/* 「默认绑定」标注：形状照 alias chip 里那枚 .binding-default（同一个含义，同一种长相） */
+.models-dangling .dg-tag {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 500;
 }

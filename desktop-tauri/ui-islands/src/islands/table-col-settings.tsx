@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
+import { flushSync } from 'react-dom'
 import { Button, Popover, PopoverContent, SegmentedControl, Switch, cn } from '@ui'
 import { t } from '../i18n'
 
@@ -30,11 +31,9 @@ import { t } from '../i18n'
  * 当成「点面板外」，得自己把这一次认出来。
  * 控件仍全部走组件库：显隐 `Switch`、对齐三档 `SegmentedControl`、按钮 `Button`。
  *
- * ── 触发按钮（齿轮）为什么留在命令式一侧 ───────────────────────
- * 它插在 legacy 渲染出来的表头工具条里（`#batch-bar .batch-actions`、`.panel-head .head-actions`），
- * 插入位置与「排在最前 / 最后」由那些脚本的加载期决定；它的 `.colset-btn` / `.open` 样式也还在
- * ui/css 里。那是「打开浮层的触发管道」而不是浮层本体：换成 React 只会多一层宿主对齐成本，
- * 换不来任何行为收益，所以照旧 —— 按钮本身不归 React 管。
+ * ── 触发按钮 ────────────────────────────────────────────────
+ * Button 挂在 display:contents 宿主中，工具条位置由 register 决定。
+ * 宿主必须一起留在文档中，否则 React 的事件委托无法收到按钮点击。
  *
  * ── 点外关闭与按钮自己那一下（这段是本次最容易做错的地方）──────
  * Base UI 判定「点面板外」是在 document 的**捕获阶段**（useDismiss 的 click 监听），
@@ -733,25 +732,22 @@ function syncStaticHead(
  *
  * 它同时就是浮层的锚点（PopoverContent 的 anchor 收它），所以不必再套包裹层。
  */
-function makeButton(spec: TableEntry): Anchor {
-  const button = document.createElement('button')
-  button.type = 'button'
-  button.className = `sm colset-btn${spec.buttonClass ? ` ${spec.buttonClass}` : ''}`
-  button.id = `btn-colset-${spec.id}`
-  button.title = t('调整「{name}」的列：显示 / 隐藏、顺序、对齐', { name: spec.label || spec.id })
-  button.innerHTML = `${shared().wbIcons?.icon?.('settings', 14) || ''}<span>${t('列设置')}</span>`
-  button.setAttribute('aria-haspopup', 'dialog')
-  button.setAttribute('aria-expanded', 'false')
-  button.addEventListener('click', event => {
-    // 面板开着时点这颗按钮：Base UI 已在捕获阶段把它判成「点面板外」并关了窗，
-    // 这一次冒泡到这里只需认领标记、不再开回去（否则按钮按下去关不掉，见文件头）
-    if (outsidePressEvent === event) {
-      outsidePressEvent = null
-      return
-    }
-    togglePanel(spec, button)
-  })
-  return button
+function makeButton(spec: TableEntry): HTMLElement {
+  const host = document.createElement('span')
+  host.style.display = 'contents'
+  flushSync(() => createRoot(host).render(<Button variant='outline' size='sm'
+    className={`colset-btn${spec.buttonClass ? ` ${spec.buttonClass}` : ''}`}
+    id={`btn-colset-${spec.id}`}
+    title={t('调整「{name}」的列：显示 / 隐藏、顺序、对齐', { name: spec.label || spec.id })}
+    aria-haspopup='dialog' aria-expanded={false}
+    onClick={event => {
+      if (outsidePressEvent === event.nativeEvent) { outsidePressEvent = null; return }
+      togglePanel(spec, event.currentTarget)
+    }}>
+    <span dangerouslySetInnerHTML={{ __html: shared().wbIcons?.icon?.('settings', 14) || '' }} />
+    <span>{t('列设置')}</span>
+  </Button>))
+  return host
 }
 
 function mountOf(spec: TableSpec): Element | null {

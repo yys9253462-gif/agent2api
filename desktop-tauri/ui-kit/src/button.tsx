@@ -25,9 +25,9 @@ import { cn } from './lib/cn'
 
 const buttonVariants = cva(
   [
-    'group/button inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap border',
+    'group/button inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap border [font-family:inherit]',
     'font-medium transition-[background-color,border-color,color,transform,box-shadow] duration-150 ease-out',
-    'outline-none select-none active:translate-y-[0.5px]',
+    'outline-none select-none active:translate-y-[0.5px] focus-visible:shadow-focus',
     'disabled:pointer-events-none disabled:opacity-45 disabled:shadow-none',
     '[&_svg]:pointer-events-none [&_svg]:shrink-0',
   ],
@@ -71,6 +71,9 @@ const buttonVariants = cva(
         'icon-xs': 'size-6 rounded-sm p-0',
         'icon-sm': 'h-[26px] w-[26px] rounded-sm p-0',
         'icon-lg': 'size-9 rounded-md p-0',
+        touch: 'h-[46px] rounded-md px-4 text-[14px]',
+        'touch-sm': 'h-[34px] rounded-sm px-3 text-[12.5px]',
+        'icon-touch': 'size-9 rounded-full p-0',
       },
     },
     defaultVariants: { variant: 'default', size: 'default' },
@@ -83,7 +86,7 @@ type ButtonProps = Omit<React.ComponentProps<typeof BaseButton>, 'className'> &
   }
 
 function Button({ className, variant, size, ...props }: ButtonProps) {
-  return <BaseButton className={cn(buttonVariants({ variant, size }), className)} {...props} />
+  return <BaseButton data-slot='button' className={cn(buttonVariants({ variant, size }), className)} {...props} />
 }
 
 export { Button, buttonVariants, type ButtonProps }

@@ -42,7 +42,7 @@
 import * as React from 'react'
 import {
   Badge, Button, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
-  Label, MultiSelect, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Spinner,
+  Label, MultiSelect, Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
   Switch, Textarea, Tooltip, TooltipContent, TooltipTrigger,
 } from '@ui'
 import {
@@ -58,6 +58,12 @@ import {
   bindingsOf, errorMessage, getSnapshot, levelOf, modelRowOf, providerLabelOf, toast,
 } from './models-panel-state'
 import { t } from '../i18n'
+import { ModelApiKeyField } from '../../../ui-shared/model-api-key-field'
+import { modelApiKeyAllows } from '../../../ui-shared/model-api-key'
+import { useModelApiKeys } from '../../../ui-shared/use-model-api-keys'
+import { useRememberedModelApiKey } from '../../../ui-shared/model-api-key-memory'
+import { gatewayBase } from './assistant-state'
+import { ModelTestResult, modelTestOk as isOk, type ModelTestSlot as Slot, type TestModelResponse } from './model-test-result'
 
 /* ─── 类型 ─────────────────────────────────── */
 
@@ -82,47 +88,6 @@ type TestModelRequest = {
   test_id?: string
 }
 
-/** 一次测试的响应（POST /api/models/test 永远 2xx，失败结论在 `status` / `error` 里） */
-type TestModelResponse = {
-  success?: boolean
-  status?: number
-  error?: string | null
-  reply?: string
-  reasoning?: string
-  provider?: string
-  model?: string
-  protocol?: string
-  proxy?: string | null
-  account_id?: string | null
-  account_name?: string | null
-  upstream_model?: string | null
-  upstream_reasoning?: string | null
-  duration_ms?: number
-  ttfb_ms?: number | null
-  attempts?: number
-  prompt_tokens?: number
-  completion_tokens?: number
-  total_tokens?: number
-}
-
-/**
- * 一个账号一条的测试槽位。
- *
- * `label` / `position` 是**发起时**的快照：结果回来时那一条账号可能已被改名或删掉，而用户要看的
- * 是「我刚才点的那一条」的结论 —— 改用结果里的 `account_name` 会让块标题中途变脸。
- */
-type Slot = {
-  accountId: string
-  label: string
-  position: number
-  testId: string
-  startedAt: number
-  state: 'running' | 'done'
-  result?: TestModelResponse
-  /** 桥接层失败（本机接口不可达 / 超时）：与「上游给出的失败结论」分开表达 */
-  transport?: string
-}
-
 /**
  * window 上由其它脚本 / 其它岛挂载的共享桥。
  *
@@ -133,7 +98,8 @@ type Slot = {
  */
 type WindowBridge = {
   workbuddyDesktop?: {
-    testModel(payload: TestModelRequest): Promise<TestModelResponse | null | undefined>
+    testModel(payload: TestModelRequest, apiKey: string): Promise<TestModelResponse | null | undefined>
+    getModelApiKeys?(): Promise<unknown>
     /** 「终止请求」：按关联 id 置位取消令牌（测试的中止走它，见模块头） */
     terminateStatsRequest?(id: string): Promise<unknown>
     /** 代理池列表（「网络代理」页维护的命名出口节点） */
@@ -170,13 +136,6 @@ const FALLBACK_PROTOCOLS: Array<{ value: string; label: string }> = [
   { value: 'anthropic', label: 'Anthropic - Messages' },
 ]
 
-/** 结果块里的协议简写（非默认协议时展示） */
-const PROTOCOL_SHORT: Record<string, string> = {
-  chat_completions: 'Chat Completions',
-  responses: 'Responses',
-  anthropic: 'Anthropic Messages',
-}
-
 /** 临时直连在节点下拉里的取值（与后端 parse_proxy_override 的 direct 分支对齐） */
 const PROXY_DIRECT = 'direct'
 
@@ -186,34 +145,6 @@ const SOURCE_LABEL: Record<string, string> = {
   builtin: t('内置清单'),
   manual: t('手动登记'),
 }
-
-/**
- * 失败原因 → 下一步。**只按 HTTP 状态分类**，不猜上游的文案：429 与 401 指向完全不同的处置
- * （一个等一会儿自己会好，一个换账号也救不回来），5xx / 404 又是另外两件事。
- * 后端给的 `error` 原样展示在上一行，这里只补「接下来做什么」。
- */
-const STATUS_HINT: Array<{ test: (status: number) => boolean; hint: string }> = [
-  {
-    test: status => status === 429,
-    hint: t('该账号对这个模型正在限额冷却，等一会儿自己会好；也可以先测别的账号。'),
-  },
-  {
-    test: status => status === 401 || status === 403,
-    hint: t('上游拒绝了这条登录态：重新登录一次，或把这条账号删掉。'),
-  },
-  {
-    test: status => status === 404,
-    hint: t('上游不认识这个模型名：先点「获取模型」刷新清单，或核对默认绑定指向的上游模型。'),
-  },
-  {
-    test: status => status === 504,
-    hint: t('上游没在预算内给完回答。可以只勾一个账号再测一次，看是普遍慢还是某一个账号慢。'),
-  },
-  {
-    test: status => status >= 500,
-    hint: t('多半是上游自己的问题，过一会儿再试。同一个错误出现在所有账号上时，先查模型目录与映射。'),
-  },
-]
 
 /* ─── 纯函数工具 ─────────────────────────────── */
 
@@ -252,13 +183,6 @@ function newTestId(): string {
   return `${hex(8)}-${hex(4)}-4${hex(3)}-a${hex(3)}-${hex(12)}`
 }
 
-/** 毫秒读数：1 秒以内给整数毫秒，再长给秒（两位小数；十秒以上一位就够） */
-function formatMs(value: unknown): string {
-  const time = Number(value)
-  if (!Number.isFinite(time) || time <= 0) return '—'
-  return time < 1000 ? `${Math.round(time)} ms` : `${(time / 1000).toFixed(time < 10000 ? 2 : 1)} s`
-}
-
 /**
  * 「测试」那颗按钮的门禁：该家**没有可用账号**（启用 + 凭证完整）→ 一行都发不出去，
  * 这是唯一还成立的置灰理由。返回空串 = 可以测；否则返回要挂在按钮 title 上的原因。
@@ -271,6 +195,9 @@ function formatMs(value: unknown): string {
  * 直发、映射上的思考等级不注入 —— 测的就是这个模型在这家上游的**真实形态**。
  */
 export function testBlockReason(provider: string, model: ManageModel): string {
+  if (model.kind === 'image') {
+    return t('图片生成模型请通过 /v1/images/generations 调用，暂不支持对话测试')
+  }
   if (!usableAccounts(provider).length) {
     return t('该提供商没有可用账号（要在账号页启用一个、且凭证完整），一行都发不出去')
   }
@@ -295,30 +222,6 @@ function NoteBlock({ children, plain = false }: { children: React.ReactNode; pla
   )
 }
 
-/**
- * 一个可折叠块（思考过程）。头是组件库的 ghost 按钮而不是自绘 button ——
- * tokens.css 只给 button 做了 `font / color: inherit`，没清浏览器默认的描边与底色。
- * 左对齐靠「末件 ml-auto」而不是 `justify-start`：那是同一个属性的两张工具类，
- * 谁赢由 Tailwind 的产出顺序决定（center 在后），不能指望覆盖。
- */
-function Fold({ open, label, text, onToggle }: {
-  open: boolean; label: string; text: string; onToggle: () => void
-}) {
-  return (
-    <div className='overflow-hidden rounded-sm border border-border'>
-      <Button variant='ghost' size='xs' className='w-full' aria-expanded={open} onClick={onToggle}>
-        <span className='truncate'>{label}</span>
-        <span aria-hidden='true' className='ml-auto text-[10px]'>{open ? '▴' : '▾'}</span>
-      </Button>
-      {open ? (
-        <div className='border-t border-hairline bg-surface px-2.5 py-2'>
-          <pre className='whitespace-pre-wrap font-mono text-[11.5px] leading-[1.65] text-subtle'>{text}</pre>
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
 /** 「已等待 1.4s」的读秒：只在跑着的时候开定时器（停表后不再空转） */
 function useClock(active: boolean): number {
   const [now, setNow] = React.useState(() => Date.now())
@@ -329,14 +232,6 @@ function useClock(active: boolean): number {
     return () => window.clearInterval(timer)
   }, [active])
   return now
-}
-
-/** 成功判据：没有错误结论、且状态码是 2xx（后端把「上游失败」也放在 2xx 的响应体里） */
-function isOk(slot: Slot): boolean {
-  if (slot.transport || !slot.result) return false
-  if (slot.result.error) return false
-  const status = Number(slot.result.status) || 0
-  return status >= 200 && status < 300
 }
 
 /* ─── 弹窗本体 ───────────────────────────────── */
@@ -356,6 +251,16 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   const [poolError, setPoolError] = React.useState('')
   const [reasoning, setReasoning] = React.useState('')
   const [stream, setStream] = React.useState(true)
+  const keyState = useModelApiKeys(async () => {
+    const load = bridge().workbuddyDesktop?.getModelApiKeys
+    if (!load) throw new Error(t('当前环境不支持读取 API Key'))
+    return load()
+  })
+  const { value: apiKeyId, ready: keySelectionReady, select: setApiKeyId } = useRememberedModelApiKey('model-test', gatewayBase)
+  const selectedKey = keyState.keys.find(key => key.id === apiKeyId)
+  const keyAllowed = Boolean(selectedKey && modelApiKeyAllows(selectedKey, target.id, provider))
+  const selectedKeyRef = React.useRef(selectedKey)
+  selectedKeyRef.current = selectedKey
   /**
    * 默认只勾**队列里最靠前的那个可测账号**（真实链路的第一个候选）。
    * 对当前模型正在冷却的账号靠后站：拿它测只会第一跳就拿回 429，而用户要的是「这个模型通不通」。
@@ -432,7 +337,9 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
       setSlots(previous => previous.map(item => (item.testId === slot.testId ? { ...item, ...patch } : item)))
     }
     try {
-      const result = await bridge().workbuddyDesktop?.testModel(body)
+      const key = selectedKeyRef.current
+      if (!key) throw new Error(t('请先选择一把 API Key'))
+      const result = await bridge().workbuddyDesktop?.testModel(body, key.key)
       if (!result) {
         settle({ state: 'done', transport: t('桥接调用返回空（本机网关没有响应这次测试）') })
         return
@@ -445,6 +352,14 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
 
   /** 发起一轮：勾了几个账号就并发发几次（一个账号一条请求，互不影响） */
   function run(): void {
+    if (!keySelectionReady || !keyState.ready || !selectedKey) {
+      toast(t('请先选择一把 API Key'), 'err')
+      return
+    }
+    if (!keyAllowed) {
+      toast(t('所选 API Key 无权调用此模型或提供商'), 'err')
+      return
+    }
     const chosen = usable.filter(account => picked.includes(account.id))
     if (!chosen.length) {
       toast(t('至少选一个测试账号'), 'err')
@@ -533,9 +448,12 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   const proxyItems: Array<{ value: string; label: string; disabled?: boolean }> = [
     { value: '', label: t('跟随账号配置') },
     { value: PROXY_DIRECT, label: t('直连（不使用代理）') },
+    // 已禁用的池条目置灰：测试会走它解析（失败即回退直连），选它测出来的
+    // 结论不是用户想要的那个 —— 与账号页代理列同一口径
     ...(pool ?? []).map(item => ({
       value: `${POOL_VALUE_PREFIX}${item.id}`,
       label: poolItemLabel(item),
+      disabled: item.enabled === false,
     })),
   ]
   if (pool === null) {
@@ -556,99 +474,15 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
       + (isRateLimited(account, target.id) ? t(' · 限额中') : ''),
   }))
 
-  /** 一个账号的结果块（成功：回复 + 思考过程折叠；失败：错误结论 + 下一步） */
   function slotBlock(slot: Slot): React.ReactNode {
-    const head = (badge: React.ReactNode, metrics: string): React.ReactNode => (
-      <div key='head' className='flex items-center gap-2.5 border-b border-hairline px-3 py-2'>
-        {badge}
-        <b className='min-w-0 truncate text-[12.5px] text-foreground' title={slot.label}>{slot.label}</b>
-        {slot.position ? <span className='flex-none text-xs text-subtle'>#{slot.position}</span> : null}
-        <span className='ml-auto flex-none font-mono text-[11.5px] tabular-nums text-subtle'>{metrics}</span>
-      </div>
-    )
-
-    if (slot.state === 'running') {
-      const waited = (now - slot.startedAt) / 1000
-      return (
-        <div key={slot.testId}
-          className='flex items-center gap-2.5 rounded-md border border-border bg-surface-2 px-3 py-2.5 text-xs text-subtle'>
-          <Spinner className='flex-none' />
-          <span className='min-w-0 truncate'>
-            {t('账号 ')}<b className='text-foreground'>{slot.label}</b>{t(' 已发出，等待上游首帧…')}
-          </span>
-          <span className='ml-auto flex-none font-mono tabular-nums'>
-            {t('已等待 {seconds}s', { seconds: waited.toFixed(1) })}
-          </span>
-        </div>
-      )
-    }
-
-    const result = slot.result
-    if (!isOk(slot)) {
-      const status = Number(result?.status) || 0
-      const hint = STATUS_HINT.find(item => item.test(status))?.hint
-        ?? (slot.transport ? t('确认桌面端还在运行，再重试一次。') : '')
-      return (
-        <div key={slot.testId} className='rounded-md border border-border bg-surface-2'>
-          {head(
-            <Badge shape='tag' variant='destructive' className='flex-none'>{status || t('失败')}</Badge>,
-            t('用时 {time}', { time: formatMs(result?.duration_ms) }),
-          )}
-          <div className='flex flex-col gap-1.5 px-3 py-2.5'>
-            <div className='text-[12.5px] leading-[1.7]'>
-              {slot.transport
-                ? <><b className='text-destructive'>{t('本机网关没有返回结论')}</b>{t('：')}{slot.transport}</>
-                : <><b className='text-destructive'>{t('测试未通过')}</b>{t('：')}{result?.error || t('上游没有给出可读的错误说明')}</>}
-              {Number(result?.attempts) > 1 ? t('（中间共尝试 {n} 次）', { n: Number(result?.attempts) }) : ''}
-            </div>
-            {hint ? <p className='text-xs leading-[1.65] text-subtle'>{hint}</p> : null}
-          </div>
-        </div>
-      )
-    }
-
-    const reply = String(result?.reply ?? '')
-    const reasoningText = String(result?.reasoning ?? '')
     const foldKey = `think-${slot.testId}`
-    // 「上游 xxx」只在实际模型与被测名不同（映射改名）时才有信息量，同名不重复念一遍；
-    // 协议与节点在显式切换时一并标出，便于对照本次测试条件
-    const metaLine = [
-      result?.upstream_model && result.upstream_model !== target.id
-        ? t('上游 {model}', { model: result.upstream_model }) : '',
-      result?.upstream_reasoning ? t('思考等级 {level}', { level: result.upstream_reasoning }) : '',
-      result?.protocol && result.protocol !== 'chat_completions'
-        ? (PROTOCOL_SHORT[result.protocol] || result.protocol) : '',
-      result?.proxy ? t('节点 {proxy}', { proxy: result.proxy }) : '',
-      Number(result?.attempts) > 1 ? t('尝试 {n} 次', { n: Number(result?.attempts) }) : '',
-    ].filter(Boolean).join(' · ')
-    return (
-      <div key={slot.testId} className='rounded-md border border-border bg-surface-2'>
-        {head(
-          <Badge shape='tag' variant='success' className='flex-none'>{Number(result?.status) || 200}</Badge>,
-          t('用时 {time} · 首字 {ttfb}', { time: formatMs(result?.duration_ms), ttfb: formatMs(result?.ttfb_ms) }),
-        )}
-        <div className='flex flex-col gap-2 px-3 py-2.5'>
-          <div className='flex items-center gap-2 text-[11.5px] text-subtle'>
-            <span className='flex-none'>{t('回复')}</span>
-            {metaLine ? <span className='min-w-0 truncate' title={metaLine}>{metaLine}</span> : null}
-            {/* 复制走 clipboard.js 的全局委托（data-copy），与模型名那枚复制同一套 */}
-            <Button variant='ghost' size='2xs' className='ml-auto flex-none' data-copy={reply}>{t('复制')}</Button>
-          </div>
-          <div className='max-h-[220px] overflow-y-auto whitespace-pre-wrap rounded-sm border border-border bg-surface px-3 py-2 text-[12.5px] leading-[1.7]'>
-            {reply || <span className='text-subtle'>{t('（上游这一次返回了空正文）')}</span>}
-          </div>
-          {reasoningText ? (
-            <Fold open={folds.has(foldKey)} label={t('思考过程（{n} 字）', { n: reasoningText.length })} text={reasoningText}
-              onToggle={() => setFolds(previous => {
-                const next = new Set(previous)
-                if (next.has(foldKey)) next.delete(foldKey)
-                else next.add(foldKey)
-                return next
-              })} />
-          ) : null}
-        </div>
-      </div>
-    )
+    return <ModelTestResult key={slot.testId} slot={slot} model={target.id} now={now} expanded={folds.has(foldKey)}
+      onToggle={() => setFolds(previous => {
+        const next = new Set(previous)
+        if (next.has(foldKey)) next.delete(foldKey)
+        else next.add(foldKey)
+        return next
+      })} />
   }
 
   /**
@@ -713,6 +547,11 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
               <TooltipContent>{targetTip}</TooltipContent>
             </Tooltip>
           </div>
+
+          <ModelApiKeyField {...keyState} value={apiKeyId} onChange={setApiKeyId} id='model-test-api-key'
+            disabled={!keySelectionReady} rememberSelection
+            onRefresh={() => { void keyState.refresh().catch(() => {}) }} t={t} />
+          {selectedKey && !keyAllowed ? <p role='status' className='text-xs text-destructive'>{t('所选 API Key 无权调用此模型或提供商')}</p> : null}
 
           <div className='flex flex-col gap-1.5'>
             <Label htmlFor='model-test-system'>{t('系统提示词')}</Label>
@@ -822,7 +661,7 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
         </DialogBody>
         <DialogFooter className='justify-end'>
           <Button variant='outline' onClick={onClose}>{t('关闭')}</Button>
-          <Button variant='default' disabled={!picked.length || !usable.length} onClick={run}>{t('开始测试')}</Button>
+          <Button variant='default' disabled={!picked.length || !usable.length || !keySelectionReady || !keyState.ready || !keyAllowed} onClick={run}>{t('开始测试')}</Button>
         </DialogFooter>
 
         {/* ── 结果层：叠在参数层之上的一层（位置与 overlayForceRender 的理由见模块头）── */}

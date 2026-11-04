@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::gateway;
@@ -464,7 +464,7 @@ pub async fn submit_kuku_sms_code(
         let _ = window.eval(&format!("window.__kukuSmsCode = '{}';", code));
         tokio::time::sleep(POLL_INTERVAL).await;
         match poll_once(&active.state).await {
-            PollOutcome::Pending => continue,
+            PollOutcome::Pending(_) => continue,
             PollOutcome::Done(_) => break,
             PollOutcome::Failed(error) => return Err(error),
             PollOutcome::Unreachable(error) => {
@@ -599,21 +599,21 @@ const RACCOON_CALLBACK_PATH: &str = "/callback";
 /// 那两家的登录链路是固定的几个站点（腾讯系 / 商汤系 + 各自的验证码托管方），
 /// 能列全；白名单在这里是免费的额外一层约束，就不放弃。
 ///
-/// ── AutoClaw 国际版为什么不设限（本次新增，务必读）─────────────
+/// ── AutoClaw 国际版为什么不设限（务必读）───────────────────
 /// 它的登录页与身份提供方都不在我们的名单里（Zai 的授权页、Google 的
 /// `accounts.google.com`），而**更要紧的是回调落在本机**：授权完成后浏览器会
 /// **顶层导航到 `http://localhost:<登记端口>/auth/callback-zai|google`**
-/// （z.ai 的白名单只认官方客户端那四个端口，见
-/// `providers::autoclaw::callback_server`）。
-/// 那个 loopback 地址一旦被白名单拦下，症状是「用户明明登录成功、网关却永远
+/// （z.ai 的白名单只认官方客户端那四个端口）。
+/// 那个 loopback 地址一旦被白名单拦下，症状是「用户明明登录成功、插件却永远
 /// 等不到授权码」—— 与 [`is_login_callback`] 注释里警告过的那类静默故障同形，
 /// 而这次连回调识别都救不了它：回调本身就是一次普通 HTTP 导航，
 /// 没有任何「非本机协议」的特征可供识别，只能在白名单这一层放行。
-/// （[`autoclaw_callback_forward`] 会把这类导航改成访问网关自己，因此那一步
-/// 也不能被白名单挡住 —— 它同样发生在放行之后。）
+/// （那个端口由**插件**绑定并收下回调，壳侧不参与 —— 见插件
+/// `autoclaw/callback_server.rs`。因此它必须被放行到这里。）
 fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         "raccoon" => Some(RACCOON_ALLOWED_HOSTS),
+        "doubaowork" => Some(&["doubao.com", "feishu.cn", "larksuite.com"]),
         // CatPaw / Qoder / Cline / AutoClaw 都不设限（理由见上）；**新加
         // provider 时不要让它落到默认分支** —— 那会静默沿用 WorkBuddy 的
         // 白名单，症状是登录窗口白屏（AutoClaw 那家还会连回调一起拦掉）。
@@ -661,16 +661,35 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
         // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
         // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
+//
+        // OrcaTerm（腾讯云遨驰终端）同样不设限：登录窗口开在官方 OAuth 授权页
+        // （`orcaterm.com/oauth/authorize`），它会 302 到 `open.weixin.qq.com`
+        // 的微信二维码（`qrconnect`），沿途还会拉 `res.wx.qq.com` 的样式与
+        // `localhost.weixin.qq.com` 的轮询 —— 主机不可穷举。**显式列出**
+        // （落进默认分支会拿到 WorkBuddy 的白名单 → 授权页白屏，日志里什么也
+        // 看不出）。
         //
-        // OrcaTerm（腾讯云遨驰终端）同样不设限：登录窗口开在官方 Web 控制台
-        // （`orcaterm.cloud.tencent.com`），而扫码登录是**云账号**那一套 ——
-        // 控制台会拉 `cloud.tencent.com` 的 `wxQrcode`、再把
-        // `open.weixin.qq.com/connect/qrconnect` 以 iframe 嵌进来，之后还可能
-        // 跳账号中心 / 协议页等不可穷举的主机。**显式列出**（落进默认分支会拿到
-        // WorkBuddy 的白名单 → 控制台白屏，日志上什么也看不出）。
-        "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
+        // AtomCode 同样不设限：授权页由代理给出（`acs.atomgit.com/auth/login`
+        // 换来的 `login_url`，实际落在 AtomGit 的账号站点上），之后会按用户选的
+        // 登录方式继续跳不可穷举的主机。**不用回本机** —— 凭证由网关**轮询代理**
+        // 取回（`auth/check` → `auth/token`，见 `providers::atomcode::oauth` 的
+        // 模块头），所以这里没有 loopback 回调要放行；但「不设限」仍是必须显式
+        // 写出的选择。
+        //
+        // LobsterAI 不设限，而且这一条**必须是 None**：它的授权页完成后会
+        // **302 回本机**（`http://127.0.0.1:<网关端口>/auth/callback`），那次
+        // 导航一旦被白名单拦下，症状就是用户明明授权成功、网关永远等不到码，
+        // 而日志里什么都看不出（与 CodeArts / Trae 的 loopback 回调同一情形）。
+        // 授权页本身在 `lobsterai.youdao.com`，沿途还可能有微信登录的第三方主机。
+        // 千问办公两版的授权页在 `qwenwork.cn` / `.ai`（它会 302 到站点自己的
+        // 标准登录页 `/biz/signin`，沿途主机不可穷举）；2026-11-03 起它还有一条
+        // **本机回环回调**（`http://127.0.0.1:<插件端口>/callback`，见插件
+        // `providers/qoder/authorize.rs`）—— 那条导航被拦下的症状同样是
+        // 「授权成功但永远收不到码」。与 Qoder 同组，必须是 None。
+        "catpaw" | "qoder" | "qoder-intl" | "qwenwork" | "qwenwork-intl" | "cline-free"
+        | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "orcaterm" => None,
+        | "kuku" | "antigravity" | "officeace" | "orcaterm" | "atomcode" | "lobsterai" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -690,6 +709,12 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
 /// `social_restore` 勾选时对 WorkBuddy 国际版额外放行 [`SOCIAL_IDENTITY_HOSTS`]：
 /// 恢复出来的 Google / GitHub 按钮做的是顶层跳转，不放行就会白屏（理由见该常量）。
 fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
+    if provider == "deepseek-web" {
+        return url.as_str() == "about:blank" || crate::deepseek_login::allowed(url);
+    }
+    if provider == "doubaowork" {
+        return url.as_str() == "about:blank" || crate::doubaowork_login::allowed(url);
+    }
     match url.scheme() {
         "about" | "data" => true,
         "https" | "http" => {
@@ -726,10 +751,24 @@ fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
 /// 这里只是**识别**（后端 `raccoon::oauth::parse_callback_code` 才是最终校验，
 /// 它有一模一样的口径）；两边都宽一点，避免同一个 URL 在壳与后端得到不同结论。
 ///
-/// **只有小浣熊走回调**：workbuddy 的凭证由后端轮询上游取回，Qoder 走设备授权
-/// 轮询（见 `providers::qoder::oauth`），两家都没有自定义协议回调 ——
-/// 别把「没有回调」误写成「什么都算回调」。
+/// **只有小浣熊与 OrcaTerm 走自定义协议回调**：workbuddy 的凭证由后端轮询上游
+/// 取回，Qoder 走设备授权轮询（见 `providers::qoder::oauth`），两家都没有自定义
+/// 协议回调 —— 别把「没有回调」误写成「什么都算回调」。
+///
+/// ── OrcaTerm 为什么也算（本轮修正）───────────────────────────
+/// 它的授权页是官方桌面端那条链，回调固定为
+/// `orcaterm://oauth_callback?session_id=…`（见
+/// `providers/orcaterm/login.rs` 模块头）。那个 URL 里的 `session_id` 是
+/// **我们自己生成的一次性凭据**，后端据此换令牌 —— 壳侧必须把它截下来
+/// （放行给系统 = 本机没装官方客户端时是一个错误页，登录永远收不了尾）。
 fn is_login_callback(url: &url::Url, provider: &str) -> bool {
+    if provider == "orcaterm" {
+        let host_matches = url
+            .host_str()
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|host| host == "oauth_callback");
+        return url.scheme() == "orcaterm" && host_matches;
+    }
     if provider != "raccoon" {
         return false;
     }
@@ -738,74 +777,6 @@ fn is_login_callback(url: &url::Url, provider: &str) -> bool {
         .map(str::to_ascii_lowercase)
         .is_some_and(|host| host == RACCOON_CALLBACK_HOST);
     url.scheme() == RACCOON_CALLBACK_SCHEME && host_matches && url.path() == RACCOON_CALLBACK_PATH
-}
-
-/// AutoClaw OAuth 的回调：命中时返回**网关自己的**回调地址（把这次导航改道过去）。
-///
-/// ── 为什么内嵌窗口要拦这一手（issue #11 的兜底）───────────────
-/// z.ai 的 redirect_uri 白名单只认官方客户端登记过的那四个 loopback 端口
-/// （`18432 / 19654 / 19723 / 53699`，见
-/// `providers::autoclaw::callback_server` 的模块头），因此网关交给上游的
-/// `navigate_uri` 也必须是那四个端口之一 —— 但那个端口**不一定归我们**：
-/// 官方 AutoClaw 客户端一启动就把四个全绑了，回调会被它接走，网关永远等不到
-/// 授权码（表现是「登录完成了，界面一直转圈到 5 分钟超时」）。
-///
-/// 内嵌窗口是我们自己的窗口，可以在**请求发出之前**把这次跳转截下来、改成
-/// 访问网关自己的回调路由（授权码由我们换），与谁占着那个端口无关。
-/// 抢到端口的那一轮同样会走这里：只是少一次 302 直达，结果一致。
-///
-/// ── 口径（宽进严出，宁可不拦也别拦错）───────────────────────
-/// 只认「http + localhost/127.0.0.1 + 四个登记端口之一 + 两个已知回调路径」，
-/// 并且**跳过网关自己的端口** —— 用户完全可以把网关端口设成 18432，那时
-/// 回调本来就落在我们身上，再改道就成了自我循环（拦下 → 跳同一个地址 → 拦下）。
-fn autoclaw_callback_forward(url: &url::Url) -> Option<String> {
-    if url.scheme() != "http" {
-        return None;
-    }
-    let host = url.host_str()?.to_ascii_lowercase();
-    if host != "localhost" && host != "127.0.0.1" {
-        return None;
-    }
-    let port = url.port_or_known_default()?;
-    if port == crate::gateway::proxy_port() {
-        return None;
-    }
-    if !agent2api_server::server::core::providers::autoclaw::callback_server::REGISTERED_CALLBACK_PORTS
-        .contains(&port)
-    {
-        return None;
-    }
-    let path = url.path();
-    if path != "/auth/callback-zai" && path != "/auth/callback-google" {
-        return None;
-    }
-    let query = url
-        .query()
-        .map(|value| format!("?{value}"))
-        .unwrap_or_default();
-    Some(format!(
-        "http://localhost:{}{path}{query}",
-        crate::gateway::proxy_port()
-    ))
-}
-
-/// 把登录窗口导航到改道后的地址（[`autoclaw_callback_forward`] 的落地点）。
-///
-/// 用 `navigate` 而不是 `eval("location.href=…")`：前者是壳侧直接下发导航，
-/// 不依赖页面上下文还能不能执行脚本（授权页是第三方的，不该假设它允许我们
-/// 在里面跑 JS）。窗口在异步任务里可能已经被用户关掉，因此取不到就当无事发生。
-fn navigate_login_window(app: &AppHandle, label: &str, target: &str) {
-    let Some(window) = app.get_webview_window(label) else {
-        return;
-    };
-    match url::Url::parse(target) {
-        Ok(parsed) => {
-            if let Err(error) = window.navigate(parsed) {
-                eprintln!("[login] AutoClaw 回调改道失败: {error}");
-            }
-        }
-        Err(error) => eprintln!("[login] AutoClaw 回调改道地址无效（{target}）: {error}"),
-    }
 }
 
 /// 归一化前端传来的 provider id（缺省 workbuddy，只认这五家）。
@@ -823,10 +794,17 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 少了它前端会收到「未知的 provider」而登录按钮直接失败。
         "workbuddy-intl" => Ok("workbuddy-intl"),
         "raccoon" => Ok("raccoon"),
+        "doubaowork" => Ok("doubaowork"),
         // Qoder 两个地区（2026-10 拆家后是独立 provider）：设备授权两站同构，
         // 壳侧只透传 provider id，地区由后端按 id 反查（与 ZCode 同款）。
         "qoder" => Ok("qoder"),
         "qoder-intl" => Ok("qoder-intl"),
+        // 千问办公两版：**与 Qoder 同一套设备授权协议**（授权地址由插件按站点
+        // 现拼、轮询设备令牌取凭据，见 `providers::qoder::oauth`），所以同样是
+        // 壳侧只透传 provider id、站点由插件按 id 反查。**这一条不能少** ——
+        // 少了两版的「网页登录」点下去就是「不支持网页登录的提供商：qwenwork」。
+        "qwenwork" => Ok("qwenwork"),
+        "qwenwork-intl" => Ok("qwenwork-intl"),
         "catpaw" => Ok("catpaw"),
         "cline-free" => Ok("cline-free"),
         "cline-pass" => Ok("cline-pass"),
@@ -853,6 +831,14 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // `http://127.0.0.1:<网关端口>/oauth/callback` 落回网关自己，所以窗口
         // **必须允许**导航到本机端口（见下面 allowed_hosts 的同一条）。
         "codearts" => Ok("codearts"),
+        // LobsterAI（网易有道「有道龙虾」）：授权地址由**后端适配器**现拼
+        // （门户的 hash 路由 + `redirect_uri` 指向网关自己那个 loopback 端口，
+        // 见 `providers::lobsterai::oauth::build_authorize_url`），壳侧只负责
+        // 开窗口与轮询 —— 与 CodeArts 同一条路。它的回调落在
+        // `http://127.0.0.1:<网关端口>/auth/callback`（**裸路径**，理由见
+        // `http.rs` 那条路由的注释），所以窗口**必须允许**导航到本机端口，
+        // 见下面 allowed_hosts 的同一条。
+        "lobsterai" => Ok("lobsterai"),
         // Trae（SOLO CN）：授权地址由**后端**问上游 guidance 拼（PKCE + 回调 URL），
         // 壳侧只负责开窗口与轮询 —— 与 ZCode 同一条路。特别地，它的回调落在
         // `http://127.0.0.1:<随机端口>/authorize`（网关自己监听的那台 loopback，
@@ -878,12 +864,22 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
-        // OrcaTerm（腾讯云遨驰终端）：地址由**后端适配器**返回（官方 Web 控制台
-        // 首页 `orcaterm.cloud.tencent.com/terminal`），壳侧负责开窗口、在窗口里
-        // 等控制台写入的 `ot_session` Cookie 出现后交回网关
-        // （`POST /api/session/login/orcaterm/complete`，见 `run_embedded` 的
-        // 等待循环与 `submit_orcaterm_login`）。
+        // OrcaTerm（腾讯云遨驰终端）：地址由**后端适配器**返回（官方 OAuth 授权页，
+        // 它会 302 到微信二维码），壳侧负责开窗口并把回调
+        // `orcaterm://oauth_callback?session_id=…` 交回网关换令牌
+        // （见 `start_orcaterm` 与 `providers/orcaterm/login.rs` 的模块头）。
         "orcaterm" => Ok("orcaterm"),
+        // AtomCode（AtomGit / GitCode）：授权地址由**后端适配器**向代理现取
+        // （`providers::atomcode::oauth`），壳侧只负责开窗口与轮询 —— 与
+        // ZCode / OfficeAce 同一条路。它的授权回调由代理自己在
+        // `acs.atomgit.com/callback` 终结、**永远不回到本机**，授权结果由网关
+        // 轮询代理判定（`auth/check` → `auth/token`），所以窗口最后停在代理页上
+        // 也不影响登录判定，壳侧既不用捕获自定义协议也不用转交回调。
+        //
+        // **这一条不能少**：前端（`add-account-configs.ts` 的 ATOMCODE）早就把
+        // 「网页登录」按钮画出来了，缺了它点下去就是
+        // 「登录失败：不支持网页登录的提供商：atomcode」。
+        "atomcode" => Ok("atomcode"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1006,8 +1002,8 @@ fn emit_login_state(app: &AppHandle, state: LoginState) {
 /// 只有传输层错误（本地网关瞬时不可达）才继续重试 —— 那类错误下一拍自愈，
 /// 提前放弃反而会把一次正常的登录掐断。
 enum PollOutcome {
-    /// `{pending:true}`
-    Pending,
+    /// `{pending:true,hint?}`；缺少明确 done 的响应也按等待处理。
+    Pending(Option<String>),
     /// `{done:true, …}` —— 携带任务载荷（`{account, warning…}`，登录收尾
     /// 时透传给前端，例如 KukuAI 的「凭证已落库但未通过上游复核」警告）。
     Done(serde_json::Value),
@@ -1024,13 +1020,23 @@ enum PollOutcome {
 
 /// 读一次后端登录状态。
 async fn poll_once(state: &str) -> PollOutcome {
-    let path = format!("/api/session/login/wait?state={state}");
+    let query = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("state", state);
+        query.finish()
+    };
+    let path = format!("/api/session/login/wait?{query}");
     let value = match gateway::call("GET", &path, None).await {
         Ok(value) => value,
         Err(error) => return PollOutcome::Unreachable(error),
     };
-    if value.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
-        return PollOutcome::Pending;
+    if value.get("pending").and_then(serde_json::Value::as_bool) == Some(true)
+        || value.get("pending").is_some_and(serde_json::Value::is_object)
+        || value.get("done").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        let hint = value.get("hint").or_else(|| value.pointer("/pending/hint"))
+            .and_then(serde_json::Value::as_str).map(str::to_string);
+        return PollOutcome::Pending(hint);
     }
     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
         return PollOutcome::Failed(error.to_string());
@@ -1062,6 +1068,355 @@ pub async fn cancel(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 新 options 只在 methodIndex 存在时启用动态协议；旧 Rust 签名和各家专用支路保留。
+pub async fn start_with_options(
+    app: &AppHandle,
+    edition: String,
+    mode: String,
+    provider: String,
+    social_restore: bool,
+    options: Option<Value>,
+) -> Result<Value, String> {
+    let dynamic = options.as_ref().is_some_and(|value| value.get("methodIndex").is_some());
+    if provider.trim() == "deepseek-web" {
+        if current_login(app).is_some() {
+            return Err("已有登录流程在进行，请先完成当前登录或等待超时".into());
+        }
+        if mode == "external" {
+            return Err("DeepSeek 自动网页登录需要桌面内嵌窗口；系统浏览器登录后请使用粘贴令牌。".into());
+        }
+        let mut options = options.unwrap_or_else(|| json!({}));
+        if !dynamic { options["methodIndex"] = json!(1); }
+        return crate::deepseek_login::start(app, &options).await;
+    }
+    if !dynamic {
+        // 旧入口也能带登录代理：界面上的代理选择器对内置家同样生效
+        // （antigravity 这类上游在无头服务器上只有应用内代理能出网）。
+        // 其余键（inputs / methodIndex）旧入口不认识，不传。
+        let proxy = options.as_ref().and_then(|value| value.get("proxy")).cloned();
+        return start(app, edition, mode, provider, social_restore, proxy).await;
+    }
+    let options = options.unwrap_or(Value::Null);
+    if options.get("methodIndex").and_then(Value::as_u64)
+        .filter(|index| *index <= 9_007_199_254_740_991).is_none()
+    {
+        return Err("登录方式索引必须是非负安全整数".into());
+    }
+    crate::startup::wait().await?;
+    let id = if provider.trim().is_empty() { "workbuddy" } else { provider.trim() };
+    // 动态入口只认当前已登记执行体（插件或本体 runtime provider），不让旧身份
+    // 表里的 MissingPlugin 占位或任意陌生 id 绕过运行时目录。
+    if !crate::server::core::providers::is_executable_provider(id) {
+        return Err(format!("提供商未在运行时目录中登记：{id}"));
+    }
+    // 动态 id 不经过旧地区别名归一，也不从占位 kind 反推；注册后原样透传。
+    let provider = id;
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|_| "无法生成登录流程标识")?;
+    let reservation = format!("starting-{}", nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+    {
+        let state = app.state::<crate::state::AppState>();
+        let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
+        if guard.is_some() {
+            return Err("已有登录流程在进行，请先完成当前登录或等待超时".into());
+        }
+        *guard = Some(ActiveLogin {
+            state: reservation.clone(), edition: edition.clone(), mode: mode.clone(),
+            provider: provider.into(),
+        });
+    }
+    emit_login_state(app, LoginState {
+        active: true, provider: Some(provider.into()), edition: Some(edition.clone()), mode: Some(mode.clone()),
+    });
+    let mut request = json!({
+        "provider": provider, "edition": edition, "mode": mode,
+        "socialRestore": social_restore, "options": options,
+    });
+    // HTTP 新契约带完整 options，同时兼容当前 API 的平铺读取。缺省字段不补
+    // null（inputs 缺省是 {}，proxy 的显式 null 则必须保留为直连）。
+    for key in ["methodIndex", "inputs", "proxy"] {
+        if let Some(value) = options.get(key) { request[key] = value.clone(); }
+    }
+    let response = gateway::call("POST", "/api/session/login/start", Some(&request)).await;
+    let started = match response {
+        Ok(value) => value,
+        Err(error) => { clear_active_login(app, &reservation); return Err(error); }
+    };
+    let Some(flow) = started.get("state").or_else(|| started.get("flow"))
+        .and_then(Value::as_str).filter(|value| !value.trim().is_empty())
+    else {
+        clear_active_login(app, &reservation);
+        return Err("后端未返回登录状态".into());
+    };
+    let auth_url = match started.get("url").or_else(|| started.get("authUrl")) {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => {
+            let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": flow }))).await;
+            clear_active_login(app, &reservation);
+            return Err("后端返回的登录链接格式无效".into());
+        }
+    };
+    let only_external = started.get("externalBrowser").and_then(Value::as_bool) == Some(true);
+    let mode_id = if auth_url.trim().is_empty() { "auto" }
+        else if only_external || mode == "external" { "external" } else { "embedded" };
+    let claimed = {
+        let state = app.state::<crate::state::AppState>();
+        let claimed = match state.login.lock() {
+            Ok(mut guard) if guard.as_ref().is_some_and(|active| active.state == reservation) => {
+                *guard = Some(ActiveLogin {
+                    state: flow.into(), edition: edition.clone(), mode: mode_id.into(), provider: provider.into(),
+                });
+                true
+            }
+            _ => false,
+        };
+        claimed
+    };
+    if !claimed {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": flow }))).await;
+        return Ok(json!({ "ok": false, "canceled": true }));
+    }
+    let mut instructions = started.get("instructions").and_then(Value::as_str).unwrap_or("").to_string();
+    if only_external && mode == "embedded" && !auth_url.trim().is_empty() {
+        if !instructions.is_empty() { instructions.push('\n'); }
+        instructions.push_str("此登录方式只支持系统浏览器，已按提供商要求打开；不会伪装成内嵌窗口。");
+    }
+    emit_login_progress(app, flow, &started, &instructions, None);
+    let result = run_dynamic_login(app, provider, flow, auth_url, mode_id, &started, &instructions).await;
+    if result.as_ref().map(|value| value.get("ok").and_then(Value::as_bool)) != Ok(Some(true)) {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": flow }))).await;
+    }
+    clear_active_login(app, flow);
+    result
+}
+
+/// 只推送公开进度，不把授权 URL、options.inputs 或回调正文放进事件/日志。
+fn emit_login_progress(app: &AppHandle, flow: &str, started: &Value, instructions: &str, hint: Option<&str>) {
+    let Some(active) = current_login(app).filter(|active| active.state == flow) else { return; };
+    let manual_callback = started.get("manualCallback").and_then(Value::as_bool) == Some(true);
+    let callback_input = if manual_callback && started.get("callbackInput").and_then(Value::as_str) == Some("code") {
+        "code"
+    } else { "url" };
+    let progress = json!({
+        "active": true, "provider": active.provider, "edition": active.edition, "mode": active.mode,
+        "state": flow, "manualCallback": manual_callback, "callbackInput": callback_input,
+        "instructions": instructions, "hint": hint,
+    });
+    let _ = app.emit("login:progress", &progress);
+    // 兼容仅订阅 onLoginState 的共享 UI 桥，新增字段不会改变旧状态结构。
+    let _ = app.emit("login:state", &progress);
+}
+
+#[derive(Clone)]
+struct DynamicNavigation {
+    hosts: Vec<String>,
+    callbacks: Vec<url::Url>,
+    /// 插件申报的**本机登录页**（`127.0.0.1:<port>` 这类）。
+    ///
+    /// ── 为什么需要单独一列 ──────────────────────────────────
+    /// 网关原先只允许「HTTPS 授权页」与「授权地址里登记的回环回调」两种
+    /// 地址。有些插件（AStudio）的登录页本身就是回环 HTTP 页面（要跑极验
+    /// 滑块），既不是 HTTPS 也不是回调；不单独放行的话点「登录」直接报
+    /// 「登录链接不是允许的 HTTPS 站点或合法本机回调地址」。
+    /// 只接受**带显式端口的回环主机**，且必须由插件在 `allowedHosts` 里
+    /// 明确申报，不放宽任何非回环地址。
+    loopback_pages: Vec<(String, u16)>,
+}
+
+/// `127.0.0.1:1234` / `localhost:1234` / `[::1]:1234` → (host, port)。
+fn loopback_page(value: &str) -> Option<(String, u16)> {
+    let text = value.trim().to_ascii_lowercase();
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        if let Some(rest) = text.strip_prefix(host) {
+            if let Some(port) = rest.strip_prefix(':') {
+                if let Ok(port) = port.parse::<u16>() {
+                    if port > 0 {
+                        return Some((host.to_string(), port));
+                    }
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+impl DynamicNavigation {
+    fn new(auth: &url::Url, started: &Value) -> Result<Self, String> {
+        let raw = match started.get("allowedHosts") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items.iter().map(|value| {
+                value.as_str().ok_or("登录域名白名单格式无效".to_string())
+                    .map(|text| text.trim().to_string())
+            }).collect::<Result<Vec<_>, String>>()?,
+            Some(_) => return Err("登录域名白名单格式无效".into()),
+        };
+        let mut hosts = Vec::new();
+        let mut loopback_pages = Vec::new();
+        for item in raw {
+            if let Some(page) = loopback_page(&item) {
+                loopback_pages.push(page);
+                continue;
+            }
+            let host = item
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if host.is_empty() { return Err("登录域名白名单含有空主机".to_string()); }
+            hosts.push(host);
+        }
+        let mut callbacks = Vec::new();
+        let mut capture = |key: &str, value: &str| {
+            if matches!(key, "redirect_uri" | "redirect" | "redirect_url" | "callback_url"
+                | "auth_callback_url" | "navigate_uri" | "return_url") {
+                if let Ok(callback) = url::Url::parse(value) {
+                    if callback.host_str().is_some() && callback.username().is_empty() && callback.password().is_none() {
+                        callbacks.push(callback);
+                    }
+                }
+            }
+        };
+        for (key, value) in auth.query_pairs() { capture(&key, &value); }
+        // SPA 授权页也会把 redirect_uri 放在 hash 路由的查询串里。
+        if let Some((_, query)) = auth.fragment().and_then(|fragment| fragment.split_once('?')) {
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) { capture(&key, &value); }
+        }
+        Ok(Self { hosts, callbacks, loopback_pages })
+    }
+
+    fn is_callback(&self, url: &url::Url) -> bool {
+        if matches!(url.scheme(), "file" | "javascript" | "data" | "about" | "blob") { return false; }
+        if matches!(url.scheme(), "https" | "http") && !self.allows(url) { return false; }
+        self.matches_callback(url)
+    }
+
+    fn matches_loopback_page(&self, url: &url::Url) -> bool {
+        let Some(host) = url.host_str() else { return false; };
+        let Some(port) = url.port_or_known_default() else { return false; };
+        self.loopback_pages.iter().any(|(page_host, page_port)| {
+            host.eq_ignore_ascii_case(page_host) && port == *page_port
+        })
+    }
+
+    fn matches_callback(&self, url: &url::Url) -> bool {
+        url.username().is_empty() && url.password().is_none() && self.callbacks.iter().any(|target| {
+            url.scheme() == target.scheme() && url.host_str() == target.host_str()
+                && url.port_or_known_default() == target.port_or_known_default() && url.path() == target.path()
+        })
+    }
+
+    fn allows(&self, url: &url::Url) -> bool {
+        if !url.username().is_empty() || url.password().is_some() { return false; }
+        let Some(host) = url.host_str() else { return false; };
+        match url.scheme() {
+            "https" => self.hosts.is_empty() || self.hosts.iter().any(|item| {
+                host.eq_ignore_ascii_case(item) || host.to_ascii_lowercase().ends_with(&format!(".{item}"))
+            }),
+            // HTTP 只用于授权地址实际登记的回环 callback，或插件明确申报的
+            // 本机登录页；仅白名单写 localhost 不够。
+            "http" => matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+                && (self.matches_callback(url) || self.matches_loopback_page(url))
+                && (self.hosts.is_empty() || self.hosts.iter().any(|item| {
+                    host.eq_ignore_ascii_case(item) || host.to_ascii_lowercase().ends_with(&format!(".{item}"))
+                })),
+            _ => false,
+        }
+    }
+}
+
+/// 动态流程独立于旧 Cookie/自定义协议支路；空 URL 也有流程，只跳过开页。
+async fn run_dynamic_login(
+    app: &AppHandle, provider: &str, flow: &str, auth_url: &str, mode: &str,
+    started: &Value, instructions: &str,
+) -> Result<Value, String> {
+    let mut profile = None;
+    let mut window = None;
+    if !auth_url.trim().is_empty() {
+        if auth_url.chars().any(|ch| ch <= '\u{20}' || ch == '\u{7f}') {
+            return Err("登录链接包含无效字符".into());
+        }
+        let auth = url::Url::parse(auth_url).map_err(|_| "登录链接无效")?;
+        let policy = DynamicNavigation::new(&auth, started)?;
+        if !policy.allows(&auth) { return Err("登录链接不是允许的 HTTPS 站点或合法本机回调地址".into()); }
+        if mode == "external" {
+            if std::env::var("WORKBUDDY_SKIP_OPEN_BROWSER").as_deref() != Ok("1") {
+                open_in_browser(auth_url)?;
+            }
+        } else {
+            profile = Some(LoginProfile::new()?);
+            let nav_policy = policy.clone();
+            let nav_state = flow.to_string();
+            let popup_state = nav_state.clone();
+            let seen = Arc::new(AtomicBool::new(false));
+            let nav_seen = seen.clone();
+            let built = WebviewWindowBuilder::new(app, login_window_label(flow), WebviewUrl::External(auth))
+                .data_directory(profile.as_ref().ok_or("登录环境不可用")?.path().to_path_buf())
+                .general_autofill_enabled(false)
+                .title(format!("登录 {} 账号", crate::server::core::providers::label_of(provider)))
+                .inner_size(1100.0, 820.0).min_inner_size(760.0, 560.0).center()
+                .on_navigation(move |url| {
+                    if nav_policy.is_callback(url) {
+                        if !nav_seen.swap(true, Ordering::SeqCst) {
+                            let state = nav_state.clone();
+                            let callback = url.as_str().to_string();
+                            tauri::async_runtime::spawn(async move { submit_callback(&state, &callback).await; });
+                        }
+                        return false;
+                    }
+                    nav_policy.allows(url)
+                })
+                .on_new_window(move |url, _| {
+                    if policy.is_callback(&url) && !seen.swap(true, Ordering::SeqCst) {
+                        let state = popup_state.clone();
+                        let callback = url.as_str().to_string();
+                        tauri::async_runtime::spawn(async move { submit_callback(&state, &callback).await; });
+                    }
+                    tauri::webview::NewWindowResponse::Deny
+                }).build().map_err(|_| "打开登录窗口失败")?;
+            let handle = app.clone();
+            let state = flow.to_string();
+            built.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::CloseRequested { .. }) && login_is_current(&handle, &state) {
+                    clear_active_login(&handle, &state);
+                    let payload = json!({ "state": state });
+                    tauri::async_runtime::spawn(async move {
+                        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&payload)).await;
+                    });
+                }
+            });
+            window = Some(built);
+        }
+    }
+    // pollIntervalMs=0 只说明插件如何完成流程，不能关闭网关 /wait 轮询。
+    let interval = Duration::from_millis(started.get("pollIntervalMs").and_then(Value::as_u64)
+        .filter(|value| *value > 0).unwrap_or(2_000).clamp(1_000, 30_000));
+    let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
+    let mut last_hint = None;
+    let result = loop {
+        if !login_is_current(app, flow) { break Ok(json!({ "ok": false, "canceled": true })); }
+        if tokio::time::Instant::now() >= deadline { break Err("登录等待超时（5 分钟），请重试".into()); }
+        match poll_once(flow).await {
+            _ if !login_is_current(app, flow) => break Ok(json!({ "ok": false, "canceled": true })),
+            PollOutcome::Pending(hint) => {
+                if hint != last_hint {
+                    emit_login_progress(app, flow, started, instructions, hint.as_deref());
+                    last_hint = hint;
+                }
+            }
+            PollOutcome::Done(payload) => break Ok(json!({ "ok": true, "payload": payload, "external": mode == "external" })),
+            PollOutcome::Failed(error) => break Err(error),
+            PollOutcome::Unreachable(error) if task_gone(&error) => break Ok(json!({ "ok": false, "canceled": true })),
+            // 不记录 transport error 原文：它可能含带令牌的 URL。
+            PollOutcome::Unreachable(_) => {}
+        }
+        tokio::time::sleep(interval).await;
+    };
+    if let Some(window) = window { let _ = window.destroy(); }
+    drop(profile);
+    result
+}
+
 /// 发起一次登录。阻塞到登录完成、失败、取消或超时。
 ///
 /// `provider` 缺省（空串）按 workbuddy 处理 —— 老版本界面不会传它，
@@ -1075,11 +1430,15 @@ pub async fn start(
     mode: String,
     provider: String,
     social_restore: bool,
+    proxy: Option<Value>,
 ) -> Result<serde_json::Value, String> {
     if current_login(app).is_some() {
         return Err("已有登录流程在进行，请先完成当前登录或等待超时".to_string());
     }
     let provider = normalize_provider(&provider)?;
+    if provider == "doubaowork" {
+        return crate::doubaowork_login::start(app, &mode).await;
+    }
 
     // 小浣熊：授权地址由**后端适配器**生成（静态地址 + 本地生成的 state），
     // 所以请求体里只带 provider，不带 edition（那是 workbuddy 的端点维度）。
@@ -1091,8 +1450,9 @@ pub async fn start(
     if provider == "kuku" {
         return start_kuku(app, &mode).await;
     }
-    // OrcaTerm：官方 Web 控制台（适配器给的地址），登录成功后壳侧读窗口里的
-    // `ot_session` Cookie 交回网关（见 `submit_orcaterm_login`）。
+    // OrcaTerm：官方 OAuth 授权页（适配器给的地址，自动跳微信二维码），回调
+    // `orcaterm://oauth_callback?session_id=…` 由窗口拦下交回网关换令牌
+    // （见 `start_orcaterm`）。
     if provider == "orcaterm" {
         return start_orcaterm(app, &mode).await;
     }
@@ -1115,6 +1475,9 @@ pub async fn start(
         // 归属已经在 provider id 里 —— 与 ZCode 同款，不再读 edition 形参。
         "qoder" => "cn",
         "qoder-intl" => "intl",
+        // 千问办公两版同理（两张卡片、没有地区下拉）
+        "qwenwork" => "cn",
+        "qwenwork-intl" => "intl",
         // ZCode 的两个地区由 **provider 本身**决定（界面上是两张卡片，
         // 没有地区下拉，因此面板不会传 `edition`）。不看 `edition` 形参的
         // 后果只是标题里的「国内版/国际版」四个字，但既然信息已经在
@@ -1137,10 +1500,16 @@ pub async fn start(
     // 给它这个选项只会制造一个永远等不到回调的卡死。
     let use_external = mode == "external" && provider != "raccoon";
 
+    let mut request = json!({ "edition": edition_id, "provider": provider });
+    // 登录代理：显式 `null`（用户选直连）也要带过去，与动态入口同一口径
+    // （见上面那段 `for key in ["methodIndex", "inputs", "proxy"]` 的注释）。
+    if let Some(proxy) = proxy {
+        request["proxy"] = proxy;
+    }
     let started = gateway::call(
         "POST",
         "/api/session/login/start",
-        Some(&json!({ "edition": edition_id, "provider": provider })),
+        Some(&request),
     )
     .await?;
     let login_state = started
@@ -1181,6 +1550,8 @@ pub async fn start(
         // Qoder 两家品牌名自带地区（两张卡片、无地区下拉），标题不拼后缀
         "qoder" => "Qoder 中国版",
         "qoder-intl" => "Qoder 国际版",
+        "qwenwork" => "千问办公 国内版",
+        "qwenwork-intl" => "千问办公 国际版",
         "cline-free" => "Cline Free",
         "cline-pass" => "Cline Pass",
         "catpaw" => "CatPaw",
@@ -1202,6 +1573,10 @@ pub async fn start(
         // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
         // 不需要地区
         "officeace" => "OfficeAce 果办",
+        "lobsterai" => "LobsterAI",
+        // AtomCode 只有一家（AtomGit / GitCode 的编码 Agent，没有地区/版本概念），
+        // 品牌名里不需要地区
+        "atomcode" => "AtomCode",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
@@ -1210,7 +1585,8 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace"
+        | "qoder-intl" | "qwenwork" | "qwenwork-intl" | "antigravity" | "officeace" | "lobsterai"
+        | "atomcode"
     ) {
         format!("登录 {provider_label} 账号")
     } else {
@@ -1364,20 +1740,23 @@ async fn start_kuku(app: &AppHandle, mode: &str) -> Result<serde_json::Value, St
     result
 }
 
-/// OrcaTerm 网页登录：**官方 Web 控制台 + 壳侧读 `ot_session` Cookie 交回**。
+/// OrcaTerm 网页登录：**官方 OAuth 授权页 + 微信扫码 + 后端换令牌**。
 ///
-/// 与 KukuAI 同一形态（`start_kuku`）：官方页面上怎么登录由用户自己决定
-/// （控制台里的微信扫码由云账号那一套驱动），壳侧只在窗口里等一枚登录态
-/// Cookie 出现。因此 `mode = "external"` 同样要拒绝 —— 系统浏览器里的
-/// Cookie 壳读不到，等下去只会等到 5 分钟超时。
+/// 窗口打开的是 `orcaterm.com/oauth/authorize?...&session_id=<uuid>` —— 实测该
+/// 页面**直接 302 到微信二维码**（appid `wx56e5199ef872dc22`，OrcaTerm 自己的
+/// 开放平台应用），用户扫完上游把浏览器重定向到
+/// `orcaterm://oauth_callback?session_id=…`，壳侧把那一跳截下来交给后端换令牌
+/// （见 `providers/orcaterm/login.rs` 的模块头，那里也记录了「为什么不走
+/// Web 控制台的 `ot_session`」）。
 ///
-/// 窗口打开时会注入一段脚本**帮用户点开登录面板**（控制台首页左下角
-/// 头像 → 立即登录；不点的话用户得自己找那个入口），见
-/// [`orcaterm_login_panel_script`] 的说明与边界。
+/// 与 raccoon 同一形态（回调 URL → 后端换码 → 落账号）。回调是自定义协议
+/// `orcaterm://oauth_callback`，必须由**我们自己的窗口**拦下，因此只支持
+/// 内嵌窗口：系统浏览器里那一跳会被交给系统处理（装了官方 OrcaTerm 客户端
+/// 时被它接走，没装则是一个错误页），网关永远等不到 `session_id`。
 async fn start_orcaterm(app: &AppHandle, mode: &str) -> Result<serde_json::Value, String> {
     if mode == "external" {
         return Err(
-            "OrcaTerm 的登录依赖壳侧读取登录窗口的 Cookie，只支持内嵌窗口；\
+            "OrcaTerm 的回调是自定义协议（orcaterm://oauth_callback），只能由内嵌窗口接住；\
              请用「内嵌窗口」发起，或改用「粘贴 accessToken」/「导入桌面端登录态」添加账号"
                 .to_string(),
         );
@@ -1544,7 +1923,7 @@ async fn open_external(
             return Ok(json!({ "ok": false, "canceled": true }));
         }
         match poll_once(login_state).await {
-            PollOutcome::Pending => continue,
+            PollOutcome::Pending(_) => continue,
             PollOutcome::Done(payload) => {
                 return Ok(json!({ "ok": true, "external": true, "payload": payload }))
             }
@@ -1566,6 +1945,38 @@ async fn open_external(
         }
     }
     Err(format!("已打开系统浏览器完成{edition_label}登录，但等待超时（5 分钟），请重试"))
+}
+
+pub(crate) async fn run_cookie_login(
+    app: &AppHandle,
+    provider: &'static str,
+    auth_url: &str,
+    title: &str,
+    flow: &str,
+) -> Result<serde_json::Value, String> {
+    run_cookie_login_with_proxy(app, provider, auth_url, title, flow, None).await
+}
+
+pub(crate) async fn run_cookie_login_with_proxy(
+    app: &AppHandle,
+    provider: &'static str,
+    auth_url: &str,
+    title: &str,
+    flow: &str,
+    proxy: Option<url::Url>,
+) -> Result<serde_json::Value, String> {
+    {
+        let state = app.state::<crate::state::AppState>();
+        let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
+        if guard.is_some() {
+            return Err("已有登录流程在进行，请先完成当前登录或等待超时".into());
+        }
+        *guard = Some(ActiveLogin { state: flow.into(), edition: String::new(), mode: "embedded".into(), provider: provider.into() });
+    }
+    emit_login_state(app, LoginState { active: true, mode: Some("embedded".into()), edition: None, provider: Some(provider.into()) });
+    let result = run_embedded_with_proxy(app, provider, auth_url, title, flow, false, None, false, proxy).await;
+    clear_active_login(app, flow);
+    result
 }
 
 /// 内嵌 WebView 模式：建独立窗口加载登录页，同时轮询后端。
@@ -1595,6 +2006,20 @@ async fn run_embedded(
     social_restore: bool,
     kuku_phone: Option<&str>,
     start_hidden: bool,
+) -> Result<serde_json::Value, String> {
+    run_embedded_with_proxy(app, provider, auth_url, title, login_state, social_restore, kuku_phone, start_hidden, None).await
+}
+
+async fn run_embedded_with_proxy(
+    app: &AppHandle,
+    provider: &'static str,
+    auth_url: &str,
+    title: &str,
+    login_state: &str,
+    social_restore: bool,
+    kuku_phone: Option<&str>,
+    start_hidden: bool,
+    proxy: Option<url::Url>,
 ) -> Result<serde_json::Value, String> {
     let window_label = login_window_label(login_state);
     // ── 每次登录一个独立环境（修复：第二次添加账号会看到上一个账号的登录态）──
@@ -1638,10 +2063,8 @@ async fn run_embedded(
     // 临时风控限流（同一凭证几分钟后即恢复，2026-10-07 实测对照），
     // 密集重试只会延长风控窗口。
     let mut kuku_retry_block_until: Option<tokio::time::Instant> = None;
-
-    // OrcaTerm 的登录检测（官方 Web 控制台的 `ot_session` Cookie）：
-    // 状态与逻辑都在 [`OrcatermWatch`] 里，主循环只多一行调用。
-    let mut orcaterm_watch = OrcatermWatch::default();
+    let mut doubaowork_submitted = false;
+    let mut deepseek_submitted = false;
 
     // 导航拦截与弹窗拦截**共用同一个标志**：两种入口收到的可能是同一个回调
     // （页面先改 location、再被 WebView2 派生出一条弹窗请求），分开各一个标志
@@ -1650,12 +2073,6 @@ async fn run_embedded(
     let state_for_nav = login_state_owned.clone();
     let seen_for_window = callback_seen.clone();
     let state_for_window = login_state_owned.clone();
-    // 回调改道用（见 `autoclaw_callback_forward`）：导航拦截的闭包拿不到窗口
-    // 本身（窗口还在构建中），只能带着 app 与 label，等真要改道时再取。
-    let app_for_forward = app.clone();
-    let label_for_forward = window_label.clone();
-    let app_for_window = app.clone();
-    let label_for_window = window_label.clone();
 
     let window = WebviewWindowBuilder::new(app, &window_label, WebviewUrl::External(url))
         .data_directory(profile.path().to_path_buf())
@@ -1667,6 +2084,10 @@ async fn run_embedded(
         .min_inner_size(760.0, 560.0)
         .visible(!start_hidden)
         .center();
+    let window = match proxy {
+        Some(proxy) => window.proxy_url(proxy),
+        None => window,
+    };
 
     // 恢复第三方登录入口：登录页按上游开关把 Google / GitHub / X 隐藏了，
     // 注入脚本持续摘掉那段样式（理由与边界见 social_restore_script）。
@@ -1686,11 +2107,6 @@ async fn run_embedded(
             Some(phone) => window.initialization_script(kuku_sms_script(phone)),
             None => window,
         }
-    } else if provider == "orcaterm" {
-        // OrcaTerm：注入「帮用户点开登录面板」的脚本（控制台首页左下角
-        // 头像 → 立即登录）。纯尽力而为：点不动就什么都不做，用户自己点
-        // （见 `orcaterm_login_panel_script` 的边界说明）。
-        window.initialization_script(orcaterm_login_panel_script())
     } else if social_restore {
         window.initialization_script_for_all_frames(social_restore_script())
     } else {
@@ -1706,19 +2122,12 @@ async fn run_embedded(
         // 「非法导航」拦掉 —— 拦掉的动作与「捕获回调」在 WebView2 眼里完全相同，
         // 症状是用户明明登录成功、网关却永远等不到 code。
         //
-        // ── AutoClaw 的回调为什么先「改道」（本次修正）────────────
-        // 它的回调落在 z.ai 登记的那四个端口上，那几个端口可能被官方客户端
-        // 占着（回调会被它接走）。这里在请求发出前把导航改到网关自己的回调
-        // 路由 —— 理由与口径见 `autoclaw_callback_forward`。
+        // ── AutoClaw 的回调为什么不在这里拦（拆家后）─────────────────
+        // 它的回调落在 z.ai 登记的那四个端口上，**由插件自己绑定并收下**
+        // （插件 `autoclaw/callback_server.rs`）。壳侧不能再截：截走之后插件
+        // 永远收不到授权码（那条链的回调不经过网关）。因此这里只做普通导航
+        // 白名单判定 —— 四个登记端口对 autoclaw 不设限（见 `allowed_hosts`）。
         .on_navigation(move |url| {
-            if let Some(target) = autoclaw_callback_forward(url) {
-                let app = app_for_forward.clone();
-                let label = label_for_forward.clone();
-                tauri::async_runtime::spawn(async move {
-                    navigate_login_window(&app, &label, &target);
-                });
-                return false;
-            }
             if is_login_callback(url, provider) {
                 // 返回 false 即阻止这次导航（否则 WebView2 会把它交给系统：
                 // 本机没注册 office-raccoon:// 时是一个错误页）。
@@ -1734,9 +2143,7 @@ async fn run_embedded(
             }
             // KukuAI 主站登录：每次导航（含跳 passport、登录后回跳主站）
             // 计数 +1，等待循环据此立即读一次 Cookie 存储做登录检测。
-            // OrcaTerm 同理：扫码登录会经历若干次导航（云账号登录页 →
-            // 控制台回跳），每次导航都值得马上读一次 Cookie。
-            if provider == "kuku" || provider == "orcaterm" {
+            if provider == "kuku" {
                 nav_counter_for_nav.fetch_add(1, Ordering::SeqCst);
             }
             host_allowed(url, provider, social_restore)
@@ -1750,31 +2157,22 @@ async fn run_embedded(
         //     （wry 在没有 handler 时对每个 NewWindowRequested 都 SetHandled(true)），
         //     所以这不是「放开弹窗」，只是把回调那一种从被静默丢弃变成被接住。
         //
-        // AutoClaw 的改道同样先判（它走的是顶层 302，正常不该落到这里；但授权页
-        // 若改用 window.open 打开回调，没有这一支就会「登录成功却毫无反应」）。
+        // AutoClaw 的回调由插件自己收（同上），这里不再改道：顶层导航与
+        // window.open 两种形态都会自然落到插件的监听端口上。
         //
         // KukuAI 主站例外：它的「登录」按钮可能以弹窗打开 passport 登录页。
         // 一律 Deny 会让用户点登录毫无反应 —— 这里**放行**（弹窗与主窗口
         // 同属一个 WebView2 数据目录、共享 Cookie 存储，弹窗里登录成功后
         // 等待循环照样能从 Cookie 读到 BDUSS）。
         .on_new_window(move |url, _features| {
+            if provider == "deepseek-web" && crate::deepseek_login::allowed(&url) {
+                return tauri::webview::NewWindowResponse::Allow;
+            }
+            if provider == "doubaowork" && crate::doubaowork_login::allowed(&url) {
+                return tauri::webview::NewWindowResponse::Allow;
+            }
             if provider == "kuku" {
                 return tauri::webview::NewWindowResponse::Allow;
-            }
-            // OrcaTerm 同款放行：云账号的登录链路（`cloud.tencent.com` 的
-            // wxQrcode / 账号中心）可能用 `window.open` 打开新页，一律 Deny 会
-            // 让「点了登录没反应」。弹窗与主窗口同属一个 WebView2 数据目录、
-            // 共享 Cookie 存储，弹窗里登录成功后等待循环照样能读到 `ot_session`。
-            if provider == "orcaterm" {
-                return tauri::webview::NewWindowResponse::Allow;
-            }
-            if let Some(target) = autoclaw_callback_forward(&url) {
-                let app = app_for_window.clone();
-                let label = label_for_window.clone();
-                tauri::async_runtime::spawn(async move {
-                    navigate_login_window(&app, &label, &target);
-                });
-                return tauri::webview::NewWindowResponse::Deny;
             }
             if is_login_callback(&url, provider) && !seen_for_window.swap(true, Ordering::SeqCst) {
                 let login_state = state_for_window.clone();
@@ -1894,20 +2292,36 @@ async fn run_embedded(
                 }
             }
         }
-        // OrcaTerm（官方 Web 控制台登录，见 `providers/orcaterm/login.rs` 的
-        // 模块头）：成功判据是窗口里出现 `ot_session` Cookie —— 那正是控制台
-        // 自己的登录态载体（未登录时该 Cookie 完全不存在，2026-10-16 实测对照）。
-        if provider == "orcaterm" {
-            orcaterm_watch
-                .tick(
-                    &window,
-                    login_state,
-                    nav_counter_for_check.load(Ordering::SeqCst),
-                )
-                .await;
+        // OrcaTerm（官方桌面端 OAuth 链，见 `providers/orcaterm/login.rs` 的
+        // 模块头）：**不需要这里做任何检测** —— 回调
+        // （`orcaterm://oauth_callback?session_id=…`）由 `on_navigation` /
+        // `on_new_window` 拦下并交给后端换令牌，成功与否统一走 `/wait`。
+        // 初版那套「读窗口 cookie 找 ot_session」已删除：那条 Cookie 在
+        // SPA 内扫码登录时根本不会被写出（见模块头的实测对照）。
+        if provider == "deepseek-web" && !deepseek_submitted {
+            match crate::deepseek_login::credentials(&window).await {
+                Ok(Some(credentials)) if login_is_current(app, login_state) => {
+                    deepseek_submitted = true;
+                    submit_callback(login_state, &credentials).await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("[login] {error}");
+                }
+            }
+        }
+        if provider == "doubaowork" && !doubaowork_submitted {
+            match crate::doubaowork_login::cookie(&window).await {
+                Ok(Some(cookie)) => {
+                    doubaowork_submitted = true;
+                    submit_callback(login_state, &cookie).await;
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("[login] 豆包工作 Cookie 读取失败：{error}"),
+            }
         }
         match poll_once(login_state).await {
-            PollOutcome::Pending => continue,
+            PollOutcome::Pending(_) => continue,
             // 任务载荷（`{account, warning…}`）随成功结果透传：前端据此
             // 在「账号已添加」之后补一条警告（例如 KukuAI 的凭证未通过
             // 上游复核 —— 账号未开通 KukuAI 时就是这条路）。
@@ -1943,7 +2357,7 @@ async fn submit_callback(login_state: &str, callback_url: &str) {
     let payload = json!({ "state": login_state, "callbackUrl": callback_url });
     match gateway::call("POST", "/api/session/login/callback", Some(&payload)).await {
         Ok(_) => eprintln!("[login] 已捕获登录回调并提交给网关"),
-        Err(error) => eprintln!("[login] 提交登录回调失败: {error}"),
+        Err(_) => eprintln!("[login] 提交登录回调失败，请查看登录进度提示"),
     }
 }
 
@@ -2053,207 +2467,6 @@ async fn submit_kuku_login(
     Ok(())
 }
 
-// ─── OrcaTerm（官方 Web 控制台登录）──────────────────────────
-
-/// OrcaTerm 登录检测的滚动状态。
-///
-/// 抽成一个类型而不是在 [`run_embedded`] 的等待循环里再摊一份内联变量：
-/// 那段循环里 KukuAI 的检测已经占了一大块（它有自己的影子 Cookie 时序），
-/// 再塞一份带退避的状态会让主循环难以通读。判据与 KukuAI 同款但更简单 ——
-/// `ot_session` 是一枚普通 Cookie，没有 HttpOnly 影子副本要等。
-#[derive(Default)]
-struct OrcatermWatch {
-    /// 当前节拍（每拍按时长递增；每 4 拍兜底读一次 Cookie）
-    tick: u32,
-    /// 上一次见到的导航计数（导航之后立刻读一次 Cookie）
-    last_nav: u64,
-    /// 首次发现 `ot_session` 的时刻（之后等 [`Self::STABLE_AFTER`] 再交回）
-    seen_at: Option<tokio::time::Instant>,
-    /// 本次登录是否已经交回过（成功或正在提交中）
-    submitted: bool,
-    /// 交回失败后的退避截止时刻（后端探活失败多为上游尚未生效 / 网络抖动，
-    /// 密集重试没有意义）
-    retry_block_until: Option<tokio::time::Instant>,
-}
-
-impl OrcatermWatch {
-    /// 发现 `ot_session` 之后等这么久再交回：控制台写入 Cookie 与页面把
-    /// 登录态落定（跳首页、拉身份）是两步，抢在中间交回拿到的仍是可用令牌，
-    /// 但没有必要冒这个险 —— 3 秒足够，且不影响用户感受（窗口本来还开着）。
-    const STABLE_AFTER: Duration = Duration::from_secs(3);
-    /// 交回失败后的退避时长（与 KukuAI 同一口径）
-    const RETRY_BACKOFF: Duration = Duration::from_secs(30);
-
-    /// 一拍：必要时读一次登录窗口的 Cookie，发现 `ot_session` 就交回网关。
-    ///
-    /// 读 Cookie 走独立线程 + 超时（Windows 上同步调 `cookies()` 会死锁，
-    /// 见 [`read_window_cookies`]）；读失败只记日志，下一拍再来。
-    async fn tick(
-        &mut self,
-        window: &tauri::WebviewWindow,
-        login_state: &str,
-        nav_count: u64,
-    ) {
-        if self.submitted {
-            return;
-        }
-        self.tick = self.tick.wrapping_add(1);
-        let navigated = nav_count != self.last_nav;
-        if navigated {
-            self.last_nav = nav_count;
-        }
-        // 触发时机：导航之后立即读；已经发现过 `ot_session` 时每拍都读
-        // （要拿最新的那次值交回）；否则每 4 拍兜底一次，防止「登录后长时间
-        // 不导航」漏掉。
-        let should_read = navigated || self.seen_at.is_some() || self.tick % 4 == 0;
-        if !should_read {
-            return;
-        }
-        let token = match read_window_cookies(window).await {
-            Ok(cookies) => {
-                let token = orcaterm_session_token(&cookies);
-                if token.is_none() && self.tick % 25 == 0 {
-                    // 慢节拍诊断（约 50 秒一次）：把「窗口停在哪一页、有多少条
-                    // Cookie」记下来 —— 扫码后迟迟不给 `ot_session` 时，这两条
-                    // 信息能立刻区分「还停在登录页（用户没扫完）」与
-                    // 「已登录但登录态换了存放方式（上游改版）」。
-                    let url = window
-                        .url()
-                        .map(|url| url.to_string())
-                        .unwrap_or_default();
-                    eprintln!(
-                        "[login] OrcaTerm 仍未捕获 ot_session（当前页面 {url}，共 {} 条 Cookie）",
-                        cookies.len()
-                    );
-                }
-                token
-            }
-            Err(error) => {
-                eprintln!("[login] OrcaTerm 读取窗口 Cookie 失败（下轮重试）: {error}");
-                return;
-            }
-        };
-        let Some(token) = token else {
-            return;
-        };
-        let is_first = self.seen_at.is_none();
-        let first_seen = *self.seen_at.get_or_insert_with(tokio::time::Instant::now);
-        if is_first {
-            eprintln!(
-                "[login] OrcaTerm 窗口已出现 ot_session（长度 {}），等 {} 秒后交回…",
-                token.len(),
-                Self::STABLE_AFTER.as_secs()
-            );
-        }
-        if first_seen.elapsed() < Self::STABLE_AFTER {
-            return;
-        }
-        let blocked = self
-            .retry_block_until
-            .map(|until| tokio::time::Instant::now() < until)
-            .unwrap_or(false);
-        if blocked {
-            return;
-        }
-        self.submitted = true;
-        match submit_orcaterm_login(login_state, &token).await {
-            Ok(()) => eprintln!("[login] 已把 OrcaTerm 登录态交回网关"),
-            Err(error) => {
-                eprintln!("[login] 交回 OrcaTerm 登录态失败（下轮重试）: {error}");
-                self.submitted = false;
-                self.seen_at = None;
-                self.retry_block_until = Some(tokio::time::Instant::now() + Self::RETRY_BACKOFF);
-            }
-        }
-    }
-}
-
-/// 从登录窗口的 Cookie 里挑出 OrcaTerm 的 `ot_session` 值。
-///
-/// 判据不只是名字：控制台首页在**未登录**时不会写这个 Cookie（实测对照），
-/// 但为空串或残值（用户手删、上游撤销后留的覆盖写）都要排除，所以要求
-/// 取值是 JWT 形态（三段点分且够长）。域名不做硬过滤，但多条候选时取**最长**
-/// 的一条 —— 登录态在同一窗口里只会有一条（每个数据目录一份 Cookie 存储），
-/// 取最长是为了容错而不是为了选路。
-fn orcaterm_session_token(cookies: &[tauri::webview::Cookie<'static>]) -> Option<String> {
-    let mut best: Option<String> = None;
-    for cookie in cookies {
-        if cookie.name() != "ot_session" {
-            continue;
-        }
-        let value = cookie.value().trim();
-        if value.split('.').count() != 3 || value.len() < 60 {
-            continue;
-        }
-        if best.as_deref().map(|current| value.len() > current.len()).unwrap_or(true) {
-            best = Some(value.to_string());
-        }
-    }
-    best
-}
-
-/// OrcaTerm 登录态交回：把窗口里的 `ot_session` POST 给网关收尾。
-///
-/// 与前几家的差别：交回的是**令牌本身**（不是 Cookie 头）—— OrcaTerm 的
-/// 登录态就是这一枚 JWT，Cookie 只是它的存放形态（见
-/// `providers/orcaterm/login.rs` 的模块头）。后端会再剥一次 `ot_session=`
-/// 前缀并打一次上游探活，验过才落账号。
-async fn submit_orcaterm_login(login_state: &str, token: &str) -> Result<(), String> {
-    let payload = json!({ "state": login_state, "token": token });
-    gateway::call("POST", "/api/session/login/orcaterm/complete", Some(&payload))
-        .await
-        .map_err(|error| format!("网关收尾失败: {error}"))?;
-    Ok(())
-}
-
-/// 打开 OrcaTerm 控制台后**帮用户点开登录面板**的注入脚本。
-///
-/// ── 为什么只做「点两下」这一件事 ─────────────────────────────
-/// 控制台的登录入口藏在左下角头像的浮层里（头像 → 立即登录 → 微信扫码），
-/// 而登录窗口是壳自己开的、用户没有浏览器的地址栏与既有登录态，
-/// 让它去找那个入口是没必要的门槛 —— 脚本只把入口替他点开，**扫码本身
-/// 仍由用户在官方页面上完成**（云账号的二维码、风控、协议勾选全在上游页面里，
-/// 与 KukuAI 放弃 passport 页面自动化同一条边界：不替用户完成登录动作本身，
-/// 也不复刻上游前端的实现）。
-///
-/// ── 边界（点不动就算了）─────────────────────────────────────
-/// 选择器取自控制台真实 DOM（2026-10-16 实测：`.orcaterm-header-avatar`
-/// 点击后浮层里出现 `.orcaterm-user-account-bubble__login-btn`，点它才插入
-/// `open.weixin.qq.com/connect/qrconnect` 的 iframe）。上游改版会让它失效，
-/// 因此：只点一次、失败不再重试、出现二维码即收手；用户仍可自己点头像 →
-/// 立即登录（前端那块文案也这么写）。
-fn orcaterm_login_panel_script() -> String {
-    r#"
-(function () {
-  var tries = 0;
-  var avatarClicked = false;
-  var loginClicked = false;
-  function hasQr() {
-    var frames = document.querySelectorAll('iframe');
-    for (var i = 0; i < frames.length; i++) {
-      if (/open\.weixin\.qq\.com\/connect\/qrconnect/.test(frames[i].src || '')) return true;
-    }
-    return false;
-  }
-  function loggedIn() {
-    return /(^|;\s*)ot_session=/.test(document.cookie || '');
-  }
-  function tick() {
-    if (hasQr() || loggedIn() || tries++ > 60) return;
-    if (!avatarClicked) {
-      var avatar = document.querySelector('.orcaterm-header-avatar');
-      if (avatar) { avatar.click(); avatarClicked = true; }
-    } else if (!loginClicked) {
-      var button = document.querySelector('.orcaterm-user-account-bubble__login-btn');
-      if (button) { button.click(); loginClicked = true; }
-    }
-    setTimeout(tick, 700);
-  }
-  setTimeout(tick, 1200);
-})();
-"#
-    .to_string()
-}
 
 /// 用系统默认浏览器打开链接。
 ///

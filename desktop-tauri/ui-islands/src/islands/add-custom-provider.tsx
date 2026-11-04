@@ -44,6 +44,8 @@ import {
   type CustomProviderRecord,
 } from './add-account-bridge'
 import { balanceSpecOf, type BalanceFieldKey } from './balance-query'
+import { DuplicateProviderDialog } from './add-provider-duplicate-dialog'
+import { presetOfProvider, sameProviderEndpoint } from './add-provider-metadata'
 import { t } from '../i18n'
 
 /** 展示名长度上限（与后端 custom_providers::MAX_NAME_CHARS 一致，前端先挡一次） */
@@ -69,7 +71,6 @@ const NAME_ID = 'custom-name-input'
 const BASEURL_ID = 'custom-baseurl-input'
 const APIKEY_ID = 'custom-apikey-input'
 const NOAUTH_ID = 'custom-noauth-check'
-const EXISTING_SELECT_ID = 'custom-existing-select'
 const EXISTING_APIKEY_ID = 'custom-existing-apikey-input'
 const EXISTING_NOAUTH_ID = 'custom-existing-noauth-check'
 const EXISTING_NAME_ID = 'custom-existing-name-input'
@@ -187,7 +188,7 @@ async function afterCustomAdd(message: string): Promise<void> {
   // 两层一起关（表单弹窗 + 下面的列表弹窗）：只摘外层会让表单留在屏幕上
   shared().wbAddAccountModal?.close?.()
   // 目录先刷：账号行 / 筛选器显示的提供商名都来自 wbProviders 的缓存
-  void shared().wbProviders?.refreshCustom?.()
+  await shared().wbProviders?.refreshCustom?.()
   await shared().wbApp?.refresh?.()
   toast(message)
 }
@@ -223,11 +224,11 @@ function NoAuthCheckbox({
       {/* 组件库的 Checkbox 不是原生 input（自绘的 role=checkbox 按钮），
           用包一层 <label> 建立关联：button 是可标注元素，点文字即可切换 */}
       <div className='col-start-2 row-start-1 flex h-[30px] items-center'>
-        <label className='inline-flex cursor-pointer items-center gap-2.5'>
+        <Label className='inline-flex cursor-pointer items-center gap-2.5'>
           <Checkbox checked={checked} aria-label={t('该上游无需鉴权')}
             onCheckedChange={next => onChange(next === true)} />
           <span className='text-xs text-subtle'>{t('该上游无需鉴权（不发送鉴权头）')}</span>
-        </label>
+        </Label>
       </div>
       <span className='hint'>{note}</span>
     </div>
@@ -261,49 +262,22 @@ export function CustomProviderBlock({
   const [baseHintOverride, setBaseHintOverride] = React.useState('')
   /** 预置家给的 Base URL 占位提示（自建面板没有固定地址：`https://你的站点/…`） */
   const [basePlaceholderOverride, setBasePlaceholderOverride] = React.useState('')
-  const [picked, setPicked] = React.useState(() => readField(EXISTING_SELECT_ID))
   /** 两张表单各有一枚「该上游无需鉴权」，初值都从草稿读（关掉再打开还在） */
   const [noAuth, setNoAuth] = React.useState(() => readNoAuthDraft(NOAUTH_ID))
   const [existingNoAuth, setExistingNoAuth] = React.useState(() => readNoAuthDraft(EXISTING_NOAUTH_ID))
 
   const list = React.useMemo(() => customList(), [version])
-  // 待选中的那家（带着上下文进来）优先；它不在列表里（目录还没到 / 已被删除）
-  // 时退回已选中的、再退回第一项
-  const wanted = providerHint && list.some(item => item.id === providerHint) ? providerHint : ''
-  const current = wanted || (list.some(item => item.id === picked) ? picked : (list[0]?.id || ''))
-  const pickedName = list.find(item => item.id === current)?.name || t('该提供商')
+  const pickedProvider = list.find(item => item.id === providerHint)
+  const current = pickedProvider?.id || ''
+  const pickedName = pickedProvider?.name || t('该提供商')
+  const selfHosted = mode === 'create' && Boolean(presetKey) && !shared().wbPresetProviders?.presetOf?.(presetKey)?.baseUrl
 
-  // 提交动作在底部操作条那个组件里，它按 id 现读「当前选中的是哪一家」——
-  // 下拉是组件库的按钮触发器（不是原生 select），值只能落到草稿里给它读
   React.useEffect(() => {
-    setDraftValue(EXISTING_SELECT_ID, current)
-  }, [current])
-
-  /**
-   * 切到这一家时按上下文落到哪种模式：预置家卡片把名称 / 协议 / Base URL 预填进
-   * 新建表单（都可改），而 quirks（上游特判）不进表单 —— 提交时原样随记录写入。
-   * 与旧实现的 onShow 同一时序：先按协议刷提示，再填预置值。
-   *
-   * 顺带预勾「该上游无需鉴权」：预置清单里声明了 `account.noAuth` 的家
-   * （OpenCode Zen 的免费档、本地 Ollama）本来就不要 Key —— 它正是 issue #39
-   * 里「加了提供商却处处提示要 API Key」的根因，勾上这一项才是一条可用账号。
-   * 同一张卡再点一次会重新预填，与其它字段同一时序。
-   *
-   * 「加入已有」模式（模板卡指向已建的那家，见 add-account-modal 的 pick）不预填
-   * 字段，但 noAuth 默认态照带：Ollama 这类家在加第二个账号时同样是「根本不要
-   * Key」，与第一个账号（新建时预勾）保持同一口径，用户仍可手动取消。
-   */
-  React.useEffect(() => {
-    if (!presetKey) return
+    if (mode !== 'create' || !presetKey) return
     const preset = shared().wbPresetProviders?.presetOf?.(presetKey)
     if (!preset) return
     const presetNoAuth = preset.account?.noAuth === true
-    if (mode !== 'create') {
-      setExistingNoAuth(presetNoAuth)
-      writeNoAuthDraft(EXISTING_NOAUTH_ID, presetNoAuth)
-      return
-    }
-    setDraftValue(NAME_ID, preset.name || '')
+    setDraftValue(NAME_ID, preset.baseUrl ? preset.name : '')
     setDraftValue(BASEURL_ID, preset.baseUrl || '')
     if (preset.protocol) {
       setProtocol(preset.protocol)
@@ -315,6 +289,14 @@ export function CustomProviderBlock({
     setBasePlaceholderOverride(preset.placeholder || '')
     // showToken 参与依赖：同一张预置卡再点一次也要重新预填（旧 onShow 每次进这一屏都跑）
   }, [mode, presetKey, providerHint, showToken])
+
+  const existingPresetKey = pickedProvider?.presetKey || ''
+  React.useEffect(() => {
+    if (mode !== 'existing') return
+    const presetNoAuth = presetOfProvider(pickedProvider)?.account?.noAuth === true
+    setExistingNoAuth(presetNoAuth)
+    writeNoAuthDraft(EXISTING_NOAUTH_ID, presetNoAuth)
+  }, [mode, providerHint, existingPresetKey, showToken])
 
   const anthropic = protocol === 'anthropic'
   const baseHint = baseHintOverride || (anthropic ? BASE_HINT_ANTHROPIC : BASE_HINT_OPENAI)
@@ -342,7 +324,7 @@ export function CustomProviderBlock({
         <div className='add-form'>
           <div className='add-field'>
             <Label htmlFor={NAME_ID}>
-              {t('名称')}
+              {selfHosted ? t('站点名称') : t('名称')}
               <i className='req' aria-hidden='true'>*</i>
             </Label>
             <Input
@@ -350,10 +332,12 @@ export function CustomProviderBlock({
               type='text'
               maxLength={MAX_NAME_CHARS}
               aria-required='true'
-              placeholder={t('如：智谱 GLM')}
+              placeholder={selfHosted ? t('如：公司中转站、个人备用站') : t('如：智谱 GLM')}
               {...draftProps(NAME_ID)}
             />
-            <span className='hint'>{t('1~64 个字符，账号列表里按它分组显示')}</span>
+            <span className='hint'>{selfHosted
+              ? t('填写具体站点名称；模板类型不会作为站点身份')
+              : t('1~64 个字符，账号列表里按它分组显示')}</span>
           </div>
           <div className='add-field'>
             <Label htmlFor={PROTOCOL_ID}>{t('协议')}</Label>
@@ -433,20 +417,13 @@ export function CustomProviderBlock({
         </div>
         <div className='add-form'>
           <div className='add-field'>
-            <Label htmlFor={EXISTING_SELECT_ID}>{t('提供商')}</Label>
-            <Select
-              value={current}
-              onValueChange={next => setPicked(String(next))}
-            >
-              <SelectTrigger id={EXISTING_SELECT_ID} className='col-start-2 row-start-1 w-full'>
-                <SelectValue>{pickedName}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {list.map(item => (
-                  <SelectItem key={item.id} value={item.id}>{item.name || item.id}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Label>{t('提供商')}</Label>
+            <Input readOnly value={pickedProvider ? pickedName : t('该提供商已不存在（可能已被删除），请刷新后重试')} />
+            <span className='hint'>{t('要添加到其他站点，请返回「已建 API」重新选择')}</span>
+          </div>
+          <div className='add-field'>
+            <Label>Base URL</Label>
+            <Input readOnly value={pickedProvider?.baseUrl || ''} />
           </div>
           <div className='add-field'>
             <Label htmlFor={EXISTING_APIKEY_ID}>API Key</Label>
@@ -495,8 +472,10 @@ export function CustomProviderBlock({
 /** 提交这一屏要用到的两件事：忙态与失败提示（都由底部操作条那个组件持有） */
 type FootContext = {
   presetKey: string
+  providerId: string
   setBusy: (value: boolean) => void
   setHint: (message: string) => void
+  setDuplicates: (providers: CustomProviderRecord[]) => void
 }
 
 /** 失败提示同时写 toast 与底部条（toast 几秒后就没了） */
@@ -507,7 +486,7 @@ function showSubmitError(context: FootContext, error: unknown): void {
 }
 
 /** 新建模式：POST /api/custom-providers（提供商 + 首个账号一次建成） */
-async function submitCreate(context: FootContext): Promise<void> {
+async function submitCreate(context: FootContext, allowDuplicate = false, target?: CustomProviderRecord): Promise<void> {
   const name = readField(NAME_ID)
   const protocol = readField(PROTOCOL_ID) || protocolOptions()[0].value
   const baseUrl = readField(BASEURL_ID)
@@ -517,25 +496,38 @@ async function submitCreate(context: FootContext): Promise<void> {
   if (!name) { toast(t('请填写名称'), 'err'); return }
   if (!baseUrl) { toast(t('请填写 Base URL'), 'err'); return }
   await runSubmit(context.setBusy, async () => {
-    const payload: Record<string, unknown> = { name, protocol, baseUrl }
+    if (!allowDuplicate) {
+      await shared().wbProviders?.refreshCustom?.()
+      const duplicates = customList().filter(provider => sameProviderEndpoint(provider, protocol, baseUrl))
+      if (duplicates.length) {
+        context.setDuplicates(duplicates)
+        return
+      }
+    }
+    context.setDuplicates([])
+    if (target && !customList().some(provider => provider.id === target.id && sameProviderEndpoint(provider, protocol, baseUrl))) {
+      toast(t('该提供商已不存在或地址已变更，请重新选择'), 'err')
+      return
+    }
+    const payload: Record<string, unknown> = target ? { provider: target.id } : { name, protocol, baseUrl }
     // 预置家的上游特判随记录写入（转发层按这些字段修正请求，见 preset-providers.js 的 quirks）
     const preset = context.presetKey
       ? shared().wbPresetProviders?.presetOf?.(context.presetKey)
       : null
-    const quirks = preset?.quirks || {}
-    if (quirks.urlSuffix) payload.urlSuffix = quirks.urlSuffix
-    if (quirks.headers && Object.keys(quirks.headers).length) payload.headers = { ...quirks.headers }
-    if (quirks.anthropicToolType) payload.anthropicToolType = quirks.anthropicToolType
-    // 客户端形态伪装（OpenCode 免费档）：只有预置清单声明了的家才有，
-    // 建完可在账号设置的「提供商」一段里改
-    if (preset?.clientEmulation) payload.clientEmulation = preset.clientEmulation
-    // 余额查询方案：预置卡声明了才有（deepseek / opencode / glm-cn / sub2api /
-    // newapi / sensenova 六个键）。后端校验后写进提供商记录的 `balanceScheme`
-    // —— 之后的余额查询、账号设置里的「查询设置」段都认这一个事实
     const scheme = presetSchemeOf(context.presetKey)
-    if (scheme) payload.balanceScheme = scheme
-    // 查询凭证（该方案要的那份；没有字段的家在这里恒为 null）
-    const balanceQuery = readBalanceQuery(scheme, BALANCE_CREATE_PREFIX)
+    if (!target) {
+      if (preset) payload.presetKey = preset.key
+      const quirks = preset?.quirks || {}
+      if (quirks.urlSuffix) payload.urlSuffix = quirks.urlSuffix
+      if (quirks.headers && Object.keys(quirks.headers).length) payload.headers = { ...quirks.headers }
+      if (quirks.anthropicToolType) payload.anthropicToolType = quirks.anthropicToolType
+      if (preset?.clientEmulation) payload.clientEmulation = preset.clientEmulation
+      if (scheme) payload.balanceScheme = scheme
+    }
+    // 添加到已有站点不能把新建模板的查询凭证写到另一种适配方案上。
+    const balanceQuery = !target || target.balanceScheme === scheme
+      ? readBalanceQuery(scheme, BALANCE_CREATE_PREFIX)
+      : null
     if (balanceQuery) payload.balanceQuery = balanceQuery
     // 两个凭证字段互斥（后端也这么归一）：勾了无需鉴权就不带 apiKey 上去
     if (noAuth) payload.noAuth = true
@@ -543,24 +535,36 @@ async function submitCreate(context: FootContext): Promise<void> {
     context.setHint('')
     try {
       const data = (await shared().wbProviders?.customRequest?.(
-        'POST', '/api/custom-providers', payload,
-      )) as { provider?: { name?: string } } | null
+        'POST', target ? '/api/accounts' : '/api/custom-providers', payload,
+      )) as { provider?: { name?: string }; account?: { name?: string }; created?: boolean } | null
       clearFields([NAME_ID, BASEURL_ID, APIKEY_ID])
       clearBalanceFields(scheme, BALANCE_CREATE_PREFIX)
       // 勾选框与草稿一起复位（下次进来是干净的默认态，不被上一家预勾影响）
       writeNoAuthDraft(NOAUTH_ID, false)
-      const created = data?.provider?.name || name
-      await afterCustomAdd(t('✅ 已创建自定义提供商「{name}」并添加账号', { name: created }))
+      const message = target
+        ? addedMessage(data?.account?.name || target.name || '', data?.created)
+        : t('✅ 已创建自定义提供商「{name}」并添加账号', { name: data?.provider?.name || name })
+      await afterCustomAdd(message)
     } catch (error) {
       showSubmitError(context, error)
     }
   })
 }
 
+function addedMessage(label: string, created: boolean | undefined): string {
+  const suffix = label ? `：${label}` : ''
+  return created !== false
+    ? t('✅ {label}账号已添加{name}', { label: '', name: suffix })
+    : t('✅ 已更新已有账号{name}（同一提供商内，同一把 API Key 只保留一条）', { name: suffix })
+}
+
 /** 已有模式：POST /api/accounts（custom 账号走 provider = custom-xxx 分支） */
 async function submitExisting(context: FootContext): Promise<void> {
-  const providerId = readField(EXISTING_SELECT_ID)
-  if (!providerId) { toast(t('请先选择一个自定义提供商'), 'err'); return }
+  const providerId = context.providerId
+  if (!providerId || !customList().some(item => item.id === providerId)) {
+    toast(t('该提供商已不存在（可能已被删除），请刷新后重试'), 'err')
+    return
+  }
   const apiKey = readField(EXISTING_APIKEY_ID)
   const noAuth = readNoAuthDraft(EXISTING_NOAUTH_ID)
   const name = readField(EXISTING_NAME_ID)
@@ -586,15 +590,7 @@ async function submitExisting(context: FootContext): Promise<void> {
       const label = data?.account?.name
         || customList().find(item => item.id === providerId)?.name
         || ''
-      // 后端的幂等合并只剩「同一把 Key 重复添加」一种（id 由 key 派生，见后端
-      // account_id_for；无需鉴权账号每次添加都是新的一条，同家可并存多条）。
-      // 合并时 created=false，这次提交更新的是已有账号 —— 提示必须照实说
-      // 「已更新」，照搬「已添加」会让人以为列表会多出一条（实测反馈过的误导）。
-      const suffix = label ? `：${label}` : ''
-      const message = data?.created !== false
-        ? t('✅ {label}账号已添加{name}', { label: '', name: suffix })
-        : t('✅ 已更新已有账号{name}（同一把 API Key 只保留一条，重复添加会合并）', { name: suffix })
-      await afterCustomAdd(message)
+      await afterCustomAdd(addedMessage(label, data?.created))
     } catch (error) {
       showSubmitError(context, error)
     }
@@ -607,11 +603,10 @@ async function submitExisting(context: FootContext): Promise<void> {
  * 动作本身全在 `wbCustomProvidersUi.remove` 里 —— 二次确认（说明将级联删掉多少
  * 账号）、POST /api/custom-providers/remove、刷新目录与账号列表都在那边，与账号
  * 设置弹窗里的「删除提供商」共用同一条链；这里只回答两件事：删的是哪一家
- * （下拉当前值）、删完收什么尾（关弹窗 —— 名下账号连同删光，弹窗里没有可停留
+ * （表单上下文中的 ID）、删完收什么尾（关弹窗 —— 名下账号连同删光，弹窗里没有可停留
  * 的上下文了）。
  */
-async function removeExistingProvider(): Promise<void> {
-  const providerId = readField(EXISTING_SELECT_ID)
+async function removeExistingProvider(providerId: string): Promise<void> {
   if (!providerId) { toast(t('请先选择一个自定义提供商'), 'err'); return }
   const remover = shared().wbCustomProvidersUi?.remove
   if (typeof remover !== 'function') { toast(t('删除功能不可用（脚本未就绪）'), 'err'); return }
@@ -624,16 +619,27 @@ async function removeExistingProvider(): Promise<void> {
 export function CustomFootActions({
   mode,
   presetKey,
+  providerId,
 }: {
   mode: CustomMode
   presetKey: string
+  providerId: string
 }): React.ReactElement {
   const [busy, setBusy] = React.useState(false)
   const [hint, setHint] = React.useState('')
-  const context: FootContext = { presetKey, setBusy, setHint }
+  const [duplicates, setDuplicates] = React.useState<CustomProviderRecord[]>([])
+  const context: FootContext = { presetKey, providerId, setBusy, setHint, setDuplicates }
 
   return (
     <>
+      {duplicates.length ? (
+        <DuplicateProviderDialog
+          providers={duplicates}
+          onClose={() => setDuplicates([])}
+          onCreate={() => { void submitCreate(context, true) }}
+          onExisting={provider => { void submitCreate(context, true, provider) }}
+        />
+      ) : null}
       <span className={`add-foot-hint${hint ? ' err' : ''}`} id='add-form-foot-hint'>{hint}</span>
       <span className='add-foot-actions' id='add-form-foot-actions'>
         {mode === 'existing' ? (
@@ -641,7 +647,7 @@ export function CustomFootActions({
             id={REMOVE_BUTTON_ID}
             variant='destructive'
             title={t('级联删除名下全部账号，不可恢复')}
-            onClick={() => { void removeExistingProvider() }}
+            onClick={() => { void removeExistingProvider(providerId) }}
           >
             {t('删除此提供商')}
           </Button>

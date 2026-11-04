@@ -41,8 +41,11 @@
 //!
 //! 子模块：identity.rs 身份判定与 id 分配；normalize.rs 字段归一。
 
+mod export;
 mod identity;
 mod normalize;
+
+pub use export::{export_account_files, ExportSelection, ACCOUNT_FILE_FORMAT};
 
 use serde_json::{json, Map, Value};
 
@@ -53,8 +56,8 @@ use crate::server::core::providers::kind_id;
 use crate::server::core::providers::ProviderKind;
 
 use identity::{
-    allocate_priority, allocate_unique_id, identity_of_item, identity_of_record,
-    is_desktop_item, is_reserved_desktop_id, resolve_provider,
+    allocate_priority, allocate_unique_id, identity_of_item,
+    is_desktop_item, is_reserved_desktop_id, resolve_provider, CREDENTIAL_KEYS,
 };
 use normalize::normalize_imported;
 
@@ -67,8 +70,8 @@ pub const EXPORT_VERSION: i64 = 2;
 
 /// 单条导入的处理结果
 enum ImportOutcome {
-    Updated,
-    Added,
+    Updated(String),
+    Added(String),
     Skipped(String),
 }
 
@@ -84,6 +87,7 @@ struct ImportStats {
     skipped: usize,
     failures: Vec<Value>,
     skipped_items: Vec<Value>,
+    imported_ids: Vec<String>,
 }
 
 /// 单条账号记录 → 导出形态：原样输出全部业务字段，剔除 rateLimits（本机运行时
@@ -188,8 +192,14 @@ pub fn import_accounts(store: &AccountStore, payload: &Value) -> Result<Value, A
                 &mut catpaw_invalidations,
             );
             match outcome {
-                Ok(ImportOutcome::Updated) => stats.updated += 1,
-                Ok(ImportOutcome::Added) => stats.added += 1,
+                Ok(ImportOutcome::Updated(id)) => {
+                    stats.updated += 1;
+                    stats.imported_ids.push(id);
+                }
+                Ok(ImportOutcome::Added(id)) => {
+                    stats.added += 1;
+                    stats.imported_ids.push(id);
+                }
                 Ok(ImportOutcome::Skipped(reason)) => {
                     let id = error_id_of(item);
                     stats.skipped += 1;
@@ -204,6 +214,7 @@ pub fn import_accounts(store: &AccountStore, payload: &Value) -> Result<Value, A
             }
         }
 
+        crate::server::core::account_store::codearts_accounts::migrate_limiters(&mut state.accounts);
         store.save_locked(&state, guard)?;
         let failed = stats.failures.len();
         // errors 顺序：失败 → 跳过 → 定义警告（跳过项带 skipped 标记、定义警告带
@@ -236,6 +247,7 @@ pub fn import_accounts(store: &AccountStore, payload: &Value) -> Result<Value, A
             "skipped": stats.skipped,
             "failed": failed,
             "errors": errors,
+            "importedIds": stats.imported_ids,
             "customProviders": {
                 "added": providers_added,
                 "updated": providers_updated,
@@ -318,9 +330,18 @@ fn import_one_item(
         ));
     }
 
-    // ── 凭证：至少要有一个 token（只有引用字段的记录不构成可迁移账号）──
-    // 自定义账号的凭证是 apiKey（可空 —— 与添加路径同口径，部分上游不需要
-    // key），不适用 token 检查；apiKey 的长度与归一在 normalize 的专属分支里做。
+    // ── 凭证：至少要有一个可用的凭证字段（只有引用字段的记录不构成可迁移账号）──
+    //
+    // ── 为什么不能只认 accessToken / refreshToken ─────────────────
+    // 各家的凭证键不同：自定义账号是 `apiKey`（且可空 —— 与添加路径同口径，
+    // 部分上游不需要 key）、OfficeAce 是 `modelAppKey` + `modelAppSecret` 那一对、
+    // ZCode 还带 `jwt`、Command Code 把 key 落在 `accessToken`。旧实现只认
+    // 前两个键，于是 OfficeAce 的账号**导得出去、导不回来**（每条都报
+    // 「缺少 accessToken 与 refreshToken」）—— 每加一家就要回来补一次，正是
+    // 这套逻辑要根治的维护负担。
+    //
+    // 现在按「记录里有没有**任何**一个已知凭证键」判：判据来自同一张表
+    // （`CREDENTIAL_KEYS`），新增一家时只要凭证落在这几个键上就不用改这里。
     let is_custom_provider =
         provider.starts_with(crate::server::core::custom_providers::ID_PREFIX);
     let access_token = object
@@ -335,8 +356,18 @@ fn import_one_item(
         .unwrap_or("")
         .trim()
         .to_string();
-    if !is_custom_provider && access_token.is_empty() && refresh_token.is_empty() {
-        return Err("缺少 accessToken 与 refreshToken".to_string());
+    let plugin_secret = object.get("pluginSecret").filter(|value| !value.is_null());
+    let has_any_credential = plugin_secret.is_some()
+        || CREDENTIAL_KEYS.iter().any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    // 自定义账号的 apiKey 可空（`noAuth` 形态），不强制要求凭证
+    if !is_custom_provider && !has_any_credential {
+        return Err("缺少凭证（accessToken / refreshToken / apiKey / modelAppKey 等均为空）"
+            .to_string());
     }
     if access_token.chars().count() > MAX_TOKEN_LENGTH
         || refresh_token.chars().count() > MAX_TOKEN_LENGTH
@@ -345,14 +376,14 @@ fn import_one_item(
     }
 
     // ── 身份：provider + 业务身份（四家字段不同，见 identity.rs）──
-    let identity = identity_of_item(&provider, object)?;
+    identity_of_item(&provider, object)?;
 
     // 本机 id 撞上桌面端实时登录态时跳过：固定桌面 id 不可被普通导入记录顶替
     // （它的凭证在客户端存储，改写只会把实时登录态变成一份过期副本）
     if state
         .accounts
         .iter()
-        .any(|record| record.id() == item_id && record.is_desktop())
+        .any(|record| record.id() == item_id && is_desktop_item(record.fields()))
     {
         return Ok(ImportOutcome::Skipped(format!(
             "账号 id「{item_id}」在本机是桌面端实时登录态（凭证在客户端存储），\
@@ -364,10 +395,15 @@ fn import_one_item(
     // 桌面端记录不参与匹配：它与普通账号可以是同一个人的两份记录，
     // 拿它当合并目标就会把「实时登录态」改写掉。
     let matched = state.accounts.iter().position(|record| {
-        !record.is_desktop()
+        !is_desktop_item(record.fields())
             && record.provider() == provider
-            && identity_of_record(&provider, record).as_deref() == Some(identity.as_str())
-    });
+            && crate::server::core::account_store::account_identity::same(&provider, record.fields(), object)
+    }).or_else(|| state.accounts.iter().position(|record| {
+        !is_desktop_item(record.fields())
+            && record.provider() == provider
+            && record.id() == item_id
+            && !crate::server::core::account_store::account_identity::conflicts(&provider, record.fields(), object)
+    }));
     if let Some(index) = matched {
         // 同 provider 内「id ↔ 业务身份」必须一致：导入 id 若已指向本 provider 的
         // 另一条身份，说明导出文件与本地状态自相矛盾 —— 该条失败，不覆盖也不改名
@@ -375,13 +411,10 @@ fn import_one_item(
             let points_elsewhere = state.accounts.iter().any(|record| {
                 record.id() == item_id
                     && record.provider() == provider
-                    && identity_of_record(&provider, record).as_deref() != Some(identity.as_str())
+                    && crate::server::core::account_store::account_identity::conflicts(&provider, record.fields(), object)
             });
             if points_elsewhere {
-                return Err(format!(
-                    "账号 id「{item_id}」在本提供商内指向另一条身份，与身份「{identity}」矛盾\
-                     （不覆盖，请先核对导出文件）"
-                ));
+                return Err("导入的账号 ID 在本提供商内指向另一条业务身份，未覆盖原账号".to_string());
             }
         }
         // 同 provider + 同业务身份 → 合并到本机记录，**保留本机 id**：
@@ -395,8 +428,9 @@ fn import_one_item(
                 target.insert(key, value);
             }
         }
-        // 非 WorkBuddy 记录不该带腾讯端点字段：旧版导入曾把它们注入别家记录，
-        // 这里在合并时清掉（其余各家的适配器都不读这些键，见各家凭证模块）
+        // 非 WorkBuddy 记录不该带腾讯端点字段：旧版导入曾把它们注入别家记录。
+        // 判据只问「是不是 WorkBuddy 系」，**不枚举别家** —— 新增一家 provider
+        // 时不需要回来加一行（这正是旧实现最费维护的地方）。
         if !crate::server::core::providers::workbuddy::is_workbuddy_family(&provider) {
             for key in ["edition", "prefixPath", "endpoint", "platform"] {
                 state.accounts[index].remove(key);
@@ -407,7 +441,7 @@ fn import_one_item(
             // 凭证被更新：该账号的 CatPaw 会话映射必须在锁外作废
             catpaw_invalidations.push(state.accounts[index].id().to_string());
         }
-        return Ok(ImportOutcome::Updated);
+        return Ok(ImportOutcome::Updated(state.accounts[index].id().to_string()));
     }
 
     // ── 新增 ──
@@ -415,18 +449,14 @@ fn import_one_item(
     // 别的身份占用，就是导出文件自相矛盾 —— 失败而不是覆盖，也不静默改名
     if let Some(existing) = state.accounts.iter().find(|record| record.id() == item_id) {
         if existing.provider() == provider {
-            return Err(format!(
-                "账号 id「{item_id}」在本提供商内已属于另一条身份「{}」，无法用于身份「{identity}」\
-                 （不覆盖，请先核对导出文件）",
-                existing.name()
-            ));
+            return Err("导入的账号 ID 在本提供商内已属于另一条业务身份，未覆盖原账号".to_string());
         }
     }
     // 本机 id 空间是**全局**的（四家共用一份列表）：导入原值被别家记录占用时，
     // 分配一个真正唯一的 id（绝不覆盖他人，也不回落成同样可能冲突的派生值）
     let taken: std::collections::HashSet<String> = taken_ids.iter().cloned().collect();
     let Some(new_id) = allocate_unique_id(&item_id, &taken) else {
-        return Err(format!("账号 id「{item_id}」冲突，且无法分配唯一 id"));
+        return Err("导入账号 ID 冲突，无法分配独立 ID，未覆盖原账号".to_string());
     };
 
     let normalized = normalize_imported(object, &provider, None)?;
@@ -455,10 +485,7 @@ fn import_one_item(
         let fallback = {
             let nickname = saved.nickname();
             if nickname.is_empty() {
-                format!(
-                    "账号 {}",
-                    crate::server::core::account_store::store_util::truncate_text(&identity, 8)
-                )
+                format!("账号 {}", state.accounts.len() + 1)
             } else {
                 nickname
             }
@@ -467,6 +494,6 @@ fn import_one_item(
     }
     state.accounts.push(saved);
     // id 记入占用集合：同批后续记录不会分到同一个 id
-    taken_ids.push(new_id);
-    Ok(ImportOutcome::Added)
+    taken_ids.push(new_id.clone());
+    Ok(ImportOutcome::Added(new_id))
 }

@@ -80,23 +80,13 @@ pub fn current_exe_path() -> Result<PathBuf, UpdateError> {
     Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
 }
 
-/// 上一版本的备份路径：与目标同目录、加 `.backup` 后缀（只保留一代）。
+/// 安装失败恢复用的临时备份路径：同目录、加 `.backup` 后缀，安装成功即清理。
 fn backup_path(target: &Path) -> PathBuf {
     let name = target
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| "agent2api".to_string());
     target.with_file_name(format!("{name}.backup"))
-}
-
-/// 是否存在可回滚的上一版本（面板据此决定要不要显示回滚入口）。
-pub fn backup_available() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-    current_exe_path()
-        .map(|exe| backup_path(&exe).is_file())
-        .unwrap_or(false)
 }
 
 // ─── 校验和 ─────────────────────────────────────────────────
@@ -111,7 +101,8 @@ pub async fn fetch_checksum(url: &str) -> Result<String, UpdateError> {
         ("User-Agent".to_string(), USER_AGENT.to_string()),
         ("Accept".to_string(), "text/plain".to_string()),
     ];
-    let response = client::fetch_with_egress(url, &headers, Some(CHECKSUM_TIMEOUT_MS)).await?;
+    super::assert_downloadable(url)?;
+    let response = client::fetch_official(url, &headers, Some(CHECKSUM_TIMEOUT_MS)).await?;
     if !response.status().is_success() {
         return Err(UpdateError::new(format!(
             "下载校验文件失败：GitHub 返回 HTTP {}",
@@ -407,7 +398,7 @@ fn set_mode(path: &Path, mode: u32) {
     }
 }
 
-// ─── 替换与回滚 ─────────────────────────────────────────────
+// ─── 文件替换 ───────────────────────────────────────────────
 
 /// 删除文件或目录（不存在、失败都不报错 —— 调用点都是「尽力清掉」）。
 fn remove_path(path: &Path) {
@@ -427,7 +418,7 @@ fn remove_path(path: &Path) {
 /// 实测（`/usr/local/bin/agent2api-server`）可行。**目录不能这么干** —— 见
 /// [`replace_dir`]。
 fn replace_file(target: &Path, staged: &Path, backup: &Path) -> Result<(), UpdateError> {
-    remove_path(backup); // 只保留一代备份
+    remove_path(backup);
     std::fs::rename(target, backup).map_err(|error| {
         UpdateError::new(format!("备份现行文件失败（{}）：{error}", target.display()))
     })?;
@@ -475,35 +466,6 @@ fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
             std::fs::copy(entry.path(), &destination)?;
         }
     }
-    Ok(())
-}
-
-/// 从备份还原：现行版本先挪到临时名，备份落位后再删临时名。
-///
-/// 为什么不直接 `rename(backup, target)`：目录的 rename 要求目标为空或不存在
-/// （`ENOTEMPTY`），而这里是「用一个已有目录换掉另一个已有目录」。
-///
-/// 回滚这条路可以放心用 rename：走到这里时 target 与 backup **都在可写层**
-/// （现行版本是 [`replace_dir`] 改名进来的，备份是它复制出来的），不存在
-/// overlayfs 上层/下层跨层改名的问题（[`replace_dir`] 的 `EXDEV` 只出现在
-/// 改**镜像层**里的目录时）。
-fn restore(target: &Path, backup: &Path) -> Result<(), UpdateError> {
-    if !backup.exists() {
-        return Err(UpdateError::with_status(400, "没有可回滚的上一版本（备份不存在）"));
-    }
-    let name = target
-        .file_name()
-        .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_else(|| "agent2api".to_string());
-    let stale = target.with_file_name(format!("{name}.rollback-tmp"));
-    remove_path(&stale);
-    std::fs::rename(target, &stale)
-        .map_err(|error| UpdateError::new(format!("回滚失败（无法移开现行版本）：{error}")))?;
-    if let Err(error) = std::fs::rename(backup, target) {
-        let _ = std::fs::rename(&stale, target);
-        return Err(UpdateError::new(format!("回滚失败（已还原）：{error}")));
-    }
-    remove_path(&stale);
     Ok(())
 }
 
@@ -566,10 +528,20 @@ pub fn apply(
             if dir.is_dir() {
                 if let Err(error) = replace_dir(dir, stage, &backup_path(dir)) {
                     // 整单失败：二进制也还原，不留「新版程序 + 旧版界面」的半套
-                    let _ = restore(exe, &backup_path(exe));
+                    if let Err(restore_error) = std::fs::rename(backup_path(exe), exe) {
+                        return Err(UpdateError::new(format!(
+                            "{}；恢复现行程序失败：{restore_error}", error.message
+                        )));
+                    }
                     return Err(error);
                 }
                 ui_updated = true;
+            }
+        }
+        remove_path(&backup_path(exe));
+        if ui_updated {
+            if let Some(dir) = ui_dir {
+                remove_path(&backup_path(dir));
             }
         }
         Ok(ApplyOutcome { ui_updated })
@@ -580,22 +552,6 @@ pub fn apply(
         let _ = std::fs::remove_dir_all(stage);
     }
     outcome
-}
-
-/// 回滚到上一版本（二进制与界面一起）。
-pub fn rollback(exe: &Path, ui_dir: Option<&Path>) -> Result<ApplyOutcome, UpdateError> {
-    if !backup_path(exe).is_file() {
-        return Err(UpdateError::with_status(400, "没有可回滚的上一版本（备份不存在）"));
-    }
-    restore(exe, &backup_path(exe))?;
-    let mut ui_updated = false;
-    if let Some(dir) = ui_dir {
-        if backup_path(dir).is_dir() {
-            restore(dir, &backup_path(dir))?;
-            ui_updated = true;
-        }
-    }
-    Ok(ApplyOutcome { ui_updated })
 }
 
 // ─── 重启 ───────────────────────────────────────────────────

@@ -14,51 +14,59 @@
 //! 一个模块级 logStore 常量）。用 `OnceLock` 而不是 `Mutex<Option<...>>`，
 //! 读路径无锁；写入的串行化由 LogStore 内部的锁负责。
 
-use std::sync::OnceLock;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 
 use crate::server::db::Db;
-use crate::server::logs_store::{LogEntry, LogStore, NewEntry};
-
-/// 标签 → 日志分类，与桌面端筛选下拉一致（照抄 Node 版 TAG_CATEGORY）。
-/// 后续切片使用新标签时必须在这里登记，否则会落到默认分类 server。
-///
-/// 定时任务三分类（自动签到 / 凭证自动维护 / 软件版本检查）是**新增**的分类：
-/// 登记前 `[Checkin]` / `[Maintenance]` / `[Update]` 都落到 server —— 历史条目
-/// 保持原分类不动，分类筛选只对今后落库的条目生效。
-const TAG_CATEGORY: &[(&str, &str)] = &[
-    ("[Server]", "server"),
-    ("[Init]", "server"),
-    ("[Config]", "config"),
-    ("[Security]", "config"),
-    ("[Login]", "auth"),
-    ("[Auth]", "auth"),
-    ("[Accounts]", "account"),
-    ("[Models]", "model"),
-    ("[Model]", "model"),
-    ("[Upstream]", "upstream"),
-    // 遗留映射：`[Desensitize]` 已无生产者（那个模块随规则集换成硬编码指纹脱敏
-    // 而删除），留着是为了让**历史日志条目**重放分类时仍落到「脱敏」而不是
-    // 默认的 server —— 与 `logs_store::CATEGORIES` 保留该项同理。
-    ("[Desensitize]", "desensitize"),
-    ("[Logs]", "server"),
-    ("[Billing]", "upstream"),
-    ("[Activity]", "upstream"),
-    ("[Checkin]", "checkin"),
-    ("[Maintenance]", "maintenance"),
-    ("[Update]", "update"),
-    // [HTTP] 为每个入站请求的 verbose 日志，类别与服务日志相同
-    ("[HTTP]", "server"),
-];
+use crate::server::logs_store::{category_for_tag, LogEntry, LogStore, NewEntry};
 
 /// 进程内唯一的日志库实例。启动时由 `init_store` 装入。
 static STORE: OnceLock<LogStore> = OnceLock::new();
 
 /// 是否需要把 debug 级别也上报入库（对应 Node 版 `opts.verbose`）
 static VERBOSE: OnceLock<bool> = OnceLock::new();
+
+/// 日志文件通道：`Some(...)` = 已启用（服务形态），`None` = 不启用（前台形态）。
+///
+/// ── 为什么需要它 ────────────────────────────────────────────
+/// Windows 服务进程**没有控制台**：`eprintln!` 写到的是不存在的 stderr，
+/// 内容直接丢弃。服务「起来了但什么都看不见」等于没法排障，所以服务形态
+/// 在进 SCM 之前调用 [`init_file_sink`]，把控制台那份再抄一份到文件。
+///
+/// 用 `OnceLock<Option<Mutex<File>>>` 而不是 `OnceLock<Mutex<File>>`：
+/// 打开失败（目录不可写、路径非法）时服务仍要能起来 —— 降级成「只有
+/// stderr」，而不是让初始化 panic。
+static FILE_SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+
+/// 日志文件大小上限：超过就轮转成 `.1`（只留一代）。
+/// 入库那份日志由保留天数管，但文件是另一条通道，需要自己的上限。
+const LOG_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 打开日志文件通道。默认落 `{config_dir}/logs/server.log`，可用
+/// `AGENT2API_LOG_FILE` 覆盖（相对路径按进程 CWD 解析）。
+///
+/// 重复调用只生效一次（OnceLock 语义）。打开失败不 panic：降级成
+/// 「只有 stderr」——而 stderr 在服务形态下是空的，所以失败时会往 stderr
+/// 补一行提示（前台调试时看得见）。
+///
+/// 为什么按**追加**打开：服务重启（SCM 恢复策略 / systemd Restart=）后
+/// 上一次的运行记录不能丢 —— 排查「为什么反复重启」时那正是要找的东西。
+pub fn init_file_sink() {
+    let path = log_file_path();
+    let sink = open_log_file(&path).map(Mutex::new);
+    if sink.is_none() {
+        eprintln!(
+            "⚠️  日志文件打不开（{}）：服务形态下将没有运行日志",
+            path.display()
+        );
+    }
+    let _ = FILE_SINK.set(sink);
+}
 
 /// 初始化日志库。重复调用只生效一次（OnceLock 语义），返回是否本次装入成功。
 ///
@@ -82,9 +90,11 @@ pub fn init_store(db: Option<Db>, verbose: bool) -> bool {
     if STORE.get().is_some() {
         return false;
     }
-    let _ = STORE.set(LogStore::with_db(db, || {
+    let store = LogStore::with_db(db, || {
         crate::server::config::retention_settings().log_days
-    }));
+    });
+    store.prune();
+    let _ = STORE.set(store);
     true
 }
 
@@ -96,6 +106,7 @@ fn store() -> Option<&'static LogStore> {
 /// 是否开启 verbose（默认关闭，与 Node 版一致）
 pub fn is_verbose() -> bool {
     *VERBOSE.get().unwrap_or(&false)
+        || crate::server::config::with_raw(|raw| raw.get("debugMode").and_then(Value::as_bool) == Some(true)).unwrap_or(false)
 }
 
 /// 当前毫秒 Unix 时间戳（对应 Node 版 `Date.now()`）。
@@ -127,11 +138,7 @@ fn timestamp_prefix() -> String {
 
 /// 标签 → 分类；未登记的标签落到 server（对应 Node 版 `TAG_CATEGORY[tag] || 'server'`）
 fn category_of(tag: &str) -> &'static str {
-    TAG_CATEGORY
-        .iter()
-        .find(|(name, _)| *name == tag)
-        .map(|(_, category)| *category)
-        .unwrap_or("server")
+    category_for_tag(tag).unwrap_or("server")
 }
 
 /// 从标签与消息推断级别，照抄 Node 版 inferLevel 的正则语义，但不引入 regex 依赖：
@@ -149,10 +156,70 @@ fn infer_level(tag: &str, text: &str) -> &'static str {
     "info"
 }
 
+/// 日志文件路径：`AGENT2API_LOG_FILE` 优先，默认 `{config_dir}/logs/server.log`
+fn log_file_path() -> PathBuf {
+    if let Ok(value) = std::env::var("AGENT2API_LOG_FILE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    crate::paths::config_dir().join("logs").join("server.log")
+}
+
+/// 日志文件路径的对外只读形态（设置页「版本信息」展示用）。
+///
+/// 与 [`log_file_path`] 同一份口径：排障时用户要看的就是「日志到底落在哪」，
+/// 而那个位置可能被 `AGENT2API_LOG_FILE` 改过 —— 页面显示约定路径会把人
+/// 引到一个空文件上。
+pub fn log_file_path_public() -> PathBuf {
+    log_file_path()
+}
+
+/// 打开（并按需轮转）日志文件。
+///
+/// 轮转用 `.1` 后缀覆盖旧的那一代，不做多代滚动 —— 服务日志的主要用途是
+/// 「这次为什么起不来」，一代足够；真要长期留存走数据库里的日志页。
+fn open_log_file(path: &Path) -> Option<File> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).ok()?;
+        }
+    }
+    let too_big = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > LOG_FILE_MAX_BYTES;
+    if too_big {
+        // 改名前先确认目标能被覆盖：Windows 上 rename 到已存在文件会失败
+        let rotated = path.with_extension("log.1");
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(path, &rotated);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// 往文件写一行。未启用时是空操作；写入失败静默丢弃（不能反过来触发日志，
+/// 那条路会回到 `console_line`，形成递归）。
+fn write_file_line(line: &str) {
+    let Some(Some(sink)) = FILE_SINK.get() else {
+        return;
+    };
+    if let Ok(mut file) = sink.lock() {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// 只写控制台（不写日志库）。日志库自身出错时用它，
 /// 否则「写日志失败」这件事会再触发一次写日志，形成递归。
+///
+/// 开了文件通道时同时抄一份到文件（服务形态没有控制台）。
 pub fn console_line(tag: &str, text: &str) {
-    eprintln!("{} {tag} {text}", timestamp_prefix());
+    let line = format!("{} {tag} {text}", timestamp_prefix());
+    eprintln!("{line}");
+    write_file_line(&line);
 }
 
 /// 双通道日志（对应 Node 版 log()）。
@@ -170,13 +237,13 @@ pub fn log(tag: &str, text: &str) {
     };
     // 与 Node 版一致：message 为「标签 + 文案」，前端列表里能直接看到来源
     let message = format!("{tag} {trimmed}");
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level: infer_level(tag, trimmed),
         category: category_of(tag),
         message: &message,
         data: None,
         ts: None,
-    });
+    }));
 }
 
 /// 显式指定级别的日志，其余行为与 `log()` 完全一致。
@@ -187,6 +254,9 @@ pub fn log(tag: &str, text: &str) {
 /// 调用方手里就有失败数，按它选 `"info"` / `"error"` 即可。
 pub fn log_with_level(tag: &str, text: &str, level: &str) {
     console_line(tag, text);
+    if matches!(level, "debug" | "verbose" | "trace") && !is_verbose() {
+        return;
+    }
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -195,13 +265,13 @@ pub fn log_with_level(tag: &str, text: &str, level: &str) {
         return;
     };
     let message = format!("{tag} {trimmed}");
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level,
         category: category_of(tag),
         message: &message,
         data: None,
         ts: None,
-    });
+    }));
 }
 
 /// 调试日志：只有开关打开时才入库（对应 Node 版 verbose()）。
@@ -219,13 +289,13 @@ pub fn verbose(tag: &str, text: &str) {
         return;
     };
     let message = format!("{tag} {trimmed}");
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level: "debug",
         category: category_of(tag),
         message: &message,
         data: None,
         ts: None,
-    });
+    }));
 }
 
 /// 结构化事件上报（对应 Node 版 logEvent）。
@@ -241,14 +311,17 @@ pub fn log_event(
     message: &str,
     data: Option<Value>,
 ) -> Option<LogEntry> {
+    if matches!(level, "debug" | "verbose" | "trace") && !is_verbose() {
+        return None;
+    }
     let store = store()?;
-    store.append(NewEntry {
+    crate::server::core::blocking::in_place(|| store.append(NewEntry {
         level,
         category,
         message,
         data: data.as_ref(),
         ts: None,
-    })
+    }))
 }
 
 /// 供路由层读取日志库（查询/统计/清空）。未初始化时返回 None，

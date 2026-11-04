@@ -14,15 +14,17 @@ pub mod balance;
 /// 七种方案的上游响应解析（纯函数；与 `balance` 的请求链路分开，
 /// 便于对照移植来源逐字段读）
 pub mod balance_parse;
+mod quota;
 pub mod emulation;
 pub mod forward;
 /// 商汤日日新的账号密码登录（OAuth2 + PKCE 换控制台 JWT），只服务余额查询
 pub mod sensenova_auth;
 
 pub(crate) fn catalog_providers(store: &AccountStore) -> Vec<(String, Vec<Value>)> {
+    let accounts = store.routing_snapshot();
     custom_providers::list().into_iter().filter_map(|provider| {
         let id = provider.get("id")?.as_str()?.to_string();
-        if store.accounts_for_provider(&id).is_empty() { return None; }
+        if !accounts.available_providers.contains(&id) { return None; }
         let models = custom_providers::public_models(&provider);
         (!models.is_empty()).then_some((id, models))
     }).collect()

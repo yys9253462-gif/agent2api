@@ -23,26 +23,26 @@
 //!   ③ 流式回传（OpenAI 格式原样，前端自己解析 delta / tool_calls）。
 //!
 //! ── 工具定义与执行都在前端 ───────────────────────────────────
-//! 本接口不认工具语义：`tools` 是前端按勾选过滤好的 OpenAI tools 数组，
-//! 原样进上游请求；上游回的 `tool_calls` 原样流回前端，由前端执行、再把
-//! `role: "tool"` 的结果作为下一轮的 messages 发上来。后端因此不认识任何一个
-//! 工具 —— 加工具、改工具参数都不需要动 Rust 侧（工具的实现在前端，
-//! 调的是已有的 /api/* 管理接口）。
+//! `tools` 是前端按勾选过滤好的 OpenAI tools 数组；后端核对工具 ID 与权限后
+//! 原样送给上游，不解析工具参数。`tool_calls` 流回前端，由前端执行、再把
+//! `role: "tool"` 的结果作为下一轮的 messages 发上来。工具实现调用已有的
+//! /api/* 管理接口；新增工具须同步配置中的 ID，参数与执行仍在前端。
 //!
 //! ── 记账 ────────────────────────────────────────────────────
 //! 与模型测试同一口径：进请求日志（用户在「请求日志」里看得到助手的每一次
 //! 消耗），`is_test = true` 使报表聚合排除它（人工反复发起的样本混进趋势图
-//! 会把真实流量读歪）。`client` 留空：助手是网关自己发起的，没有下游 UA。
+//! 会把真实流量读歪）。来源为 `assistant`，实际 Key 身份随请求记入日志。
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Map, Value};
 
-use crate::server::config::{self, AssistantConfig, MAX_SYSTEM_PROMPT_CHARS};
+use crate::server::config::{self, AssistantConfig, PermissionMode, MAX_SYSTEM_PROMPT_CHARS};
+use crate::server::core::assistant_sessions;
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
@@ -61,14 +61,16 @@ const MAX_MODEL_CHARS: usize = 128;
 /// 不是防用户，是防「前端 bug 把上下文堆到几千条」把网关的内存与上游的
 /// 上下文窗口一起打爆：200 条足够一场长会话（每条都是完整一问一答）。
 const MAX_MESSAGES: usize = 200;
-/// tools 数组的长度上限（前端目前最多 9 只，留足余量）
+/// tools 数组的长度上限（前端目前最多 15 只，留足余量）
 const MAX_TOOLS: usize = 64;
+/// 思考等级的长度上限（与 `model_rules::normalize_reasoning` 同一口径）
+const MAX_REASONING_CHARS: usize = 32;
 
-/* ─── 设置（设置页「AI 助手」分类）───────────────────────── */
+/* ─── 设置（助手页的「助手设置」抽屉）───────────────────────── */
 
 /// GET /api/assistant/config
 ///
-/// 出站用 `status_value`：工具表展开成完整 9 项（缺省值在后端兜底，界面不必
+/// 出站用 `status_value`：工具表展开成完整 15 项（缺省值在后端兜底，界面不必
 /// 也维护一份默认集，见 `AssistantConfig::status_value`）。
 pub async fn get_config(State(_state): State<ServerState>) -> Response {
     ok_json(json!({ "config": config::assistant_config().status_value() }))
@@ -119,6 +121,20 @@ fn parse_config(block: &Map<String, Value>) -> Result<AssistantConfig, String> {
         }
         Some(_) => return Err("model 必须是字符串或 null".to_string()),
     };
+    let reasoning = match block.get("reasoning") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => {
+            let level = text.trim();
+            if level.is_empty() {
+                None
+            } else if level.chars().count() > MAX_REASONING_CHARS {
+                return Err(format!("思考等级最长 {MAX_REASONING_CHARS} 个字符"));
+            } else {
+                Some(level.to_string())
+            }
+        }
+        Some(_) => return Err("reasoning 必须是字符串或 null".to_string()),
+    };
     let system_prompt = match block.get("systemPrompt") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(text)) => {
@@ -137,8 +153,42 @@ fn parse_config(block: &Map<String, Value>) -> Result<AssistantConfig, String> {
             .collect(),
         Some(_) => return Err("tools 必须是对象".to_string()),
     };
+    let title_model = match block.get("titleModel") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            if text.chars().count() > MAX_MODEL_CHARS { return Err("标题总结模型名过长".into()); }
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        Some(_) => return Err("titleModel 必须是字符串或 null".into()),
+    };
+    let title_prompt = match block.get("titlePrompt") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) if text.chars().count() <= MAX_SYSTEM_PROMPT_CHARS => text.clone(),
+        Some(Value::String(_)) => return Err(format!("标题总结提示词最长 {MAX_SYSTEM_PROMPT_CHARS} 字")),
+        Some(_) => return Err("titlePrompt 必须是字符串".into()),
+    };
+    let api_key_id = match block.get("apiKeyId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if id.trim().len() <= 128 => {
+            let id = id.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        }
+        Some(_) => return Err("apiKeyId 必须是有效的 Key ID 或 null".to_string()),
+    };
     Ok(AssistantConfig {
         model,
+        api_key_id,
+        reasoning,
+        title_model,
+        title_prompt,
+        // 权限模式：只认 confirm / full，缺失与未知值都回落到「变更前确认」
+        // （解析取向与 assistant_config::from_raw 一致）
+        mode: match block.get("mode") {
+            None | Some(Value::Null) => PermissionMode::default(),
+            Some(Value::String(text)) => PermissionMode::from_str_lenient(text),
+            Some(_) => return Err("mode 必须是字符串".to_string()),
+        },
         system_prompt_enabled: block
             .get("systemPromptEnabled")
             .and_then(Value::as_bool)
@@ -151,7 +201,11 @@ fn parse_config(block: &Map<String, Value>) -> Result<AssistantConfig, String> {
 /* ─── 对话（SSE）────────────────────────────────────────── */
 
 /// POST /api/assistant/chat
-pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
+pub async fn chat(State(state): State<ServerState>, headers: HeaderMap, body: Bytes) -> Response {
+    let access = match super::model_access::authenticate(&headers, super::model_access::ASSISTANT) {
+        Ok(access) => access,
+        Err(error) => return chat_error(error),
+    };
     let payload = match parse_body(&body) {
         Ok(payload) => payload,
         Err(error) => return errors::management_error(400, error.message),
@@ -166,7 +220,7 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
         return errors::management_error(400, format!("messages 最多 {MAX_MESSAGES} 条"));
     }
     // 本次请求点名的模型优先；没点名用设置里的。两者都没有时说清下一步 ——
-    // 「去设置里选一个」比「模型未指定」这种网关腔有用得多。
+    // 「去助手页选一个」比「模型未指定」这种网关腔有用得多。
     // 这里的 model 是**对外模型名**（/v1/models 的 data[].id，映射名也算），
     // 路由交给公共管道解析 —— 同名在多家时按账号优先级主备，与普通客户端一致。
     let config = config::assistant_config();
@@ -177,7 +231,7 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
             None => {
                 return errors::management_error(
                     400,
-                    "还没有选择对话模型：去「设置 → AI 助手」里选一个，或先在模型管理页确认有已启用的模型",
+                    "还没有选择对话模型：去助手页的「助手设置」里选一个，或先在模型管理页确认有已启用的模型",
                 )
             }
         },
@@ -188,6 +242,14 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
         Some(Value::Array(tools)) => {
             if tools.len() > MAX_TOOLS {
                 return errors::management_error(400, format!("tools 最多 {MAX_TOOLS} 个"));
+            }
+            for tool in tools {
+                let Some(id) = tool.get("function").and_then(|function| function.get("name")).and_then(Value::as_str) else {
+                    return errors::management_error(400, "工具缺少 function.name");
+                };
+                if !config::ALL_TOOL_IDS.contains(&id) || !config.tool_enabled(id) {
+                    return errors::management_error(403, format!("工具「{id}」未获授权"));
+                }
             }
             tools.clone()
         }
@@ -203,6 +265,12 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
     }
     outbound_messages.extend(messages);
 
+    // 思考等级：本次请求点名的优先，没点名就用设置里存的（与模型同一套「本次
+    // 覆盖 > 默认值」语义）。写进 `reasoning_effort` —— 那是客户端显式指定的
+    // 形态，按既有口径**优先于映射上绑定的等级**（见 `model_rules::reasoning`
+    // 的模块头）；各家适配器再把它翻译成本家上游认识的档位字段。
+    let reasoning = reasoning_from(&payload).or_else(|| config.reasoning.clone());
+
     let mut upstream = json!({
         "model": model,
         "messages": outbound_messages,
@@ -212,27 +280,46 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
     if !tools.is_empty() {
         upstream["tools"] = Value::Array(tools);
     }
+    if let Some(level) = reasoning.as_deref() {
+        upstream["reasoning_effort"] = Value::String(level.to_string());
+    }
 
     // 模型路由：对外名 → 上游名（默认值 / 映射别名 / 目录校验与 /v1/* 同源）
-    let requested_model = match pipeline::resolve_model(&state, &mut upstream, None) {
+    let started_at = logging::now_ms();
+    let requested_model = match super::request_prepare::resolve_model(&state, &mut upstream, access.scope.as_ref()).await {
         Ok(name) => name,
-        Err(error) => return errors::management_error(error.http_status().as_u16() as i32, error.message),
+        Err(error) => {
+            pipeline::record_early_failure(&state, started_at, &model, reasoning.as_deref().unwrap_or(""), &access.source, &error);
+            return chat_error(error);
+        }
     };
 
-    let started_at = logging::now_ms();
+    if upstream.get("tools").and_then(Value::as_array).is_some_and(|tools| tools.iter().any(|tool| {
+        tool.pointer("/function/name").and_then(Value::as_str) == Some("edit_images")
+    })) {
+        let catalog = crate::server::core::providers::catalog::models_response(state.store(), access.scope.as_ref());
+        let supports_images = catalog.get("data").and_then(Value::as_array)
+            .and_then(|models| models.iter().find(|item| {
+                item.get("id").and_then(Value::as_str).is_some_and(|id| id.eq_ignore_ascii_case(&requested_model))
+            })).is_some_and(|model| model.get("supports_images").and_then(Value::as_bool) == Some(true));
+        if !supports_images {
+            super::assistant_images::preserve_tool_references(&mut upstream);
+        }
+    }
     let telemetry = Arc::new(RequestTelemetry::with_id());
     let telemetry_id = telemetry.snapshot().id;
     // 进行中行：与真实请求同一时点。`is_test = true` —— 报表排除、请求日志标记
     // （与模型测试同一口径，见模块头）；下游模型名记用户点名的那个对外名
-    state.request_stats().record_started(
+    super::request_prepare::record_started(
+        state.request_stats(),
         &telemetry_id,
         started_at,
         &requested_model,
         &model,
-        "",
-        "",
+        reasoning.as_deref().unwrap_or(""),
+        &access.source,
         true,
-    );
+    ).await;
     if let Some(token) = cancellation::register(&telemetry_id) {
         telemetry.set_cancel_token(token);
     }
@@ -240,7 +327,7 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
 
     let outcome = state
         .upstream()
-        .forward(ForwardRequest {
+        .forward_assistant(ForwardRequest {
             body: upstream,
             stream: true,
             // 不去重：对话不是「同 body 的快速重试」，同一句再问一次就该再发一次
@@ -250,7 +337,7 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
             telemetry: telemetry.clone(),
             // **不钉提供商**：对话模型是对外名，路由语义与 /v1/chat/completions
             // 完全一致 —— 同名在多家时按账号优先级主备，失败自动落下一家
-            allowed_providers: None,
+            allowed_providers: access.scope.clone(),
             pinned_account: None,
             // 尊重模型启停：助手用的是「已启用的模型」，用户关掉的模型不该
             // 因为助手而继续消耗额度（与生产请求同一道门禁）
@@ -268,12 +355,12 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
                 started_at,
                 model: requested_model,
                 client_model: model.clone(),
-                client_reasoning: String::new(),
+                client_reasoning: reasoning.clone().unwrap_or_default(),
                 status: i64::from(status.as_u16()),
                 raw_request: None,
                 raw_response: None,
                 is_test: true,
-                client: String::new(),
+                source: access.source.clone(),
             };
             // 记账移交给响应流（它与流的生命周期同长）；守卫不再兜底
             guard.handoff();
@@ -298,12 +385,12 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
                     started_at,
                     model: requested_model,
                     client_model: model.clone(),
-                    client_reasoning: String::new(),
+                    client_reasoning: reasoning.clone().unwrap_or_default(),
                     status: 200,
                     raw_request: None,
                     raw_response,
                     is_test: true,
-                    client: String::new(),
+                    source: access.source.clone(),
                 },
                 None,
             );
@@ -320,19 +407,46 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
                     started_at,
                     model: requested_model,
                     client_model: model.clone(),
-                    client_reasoning: String::new(),
+                    client_reasoning: reasoning.clone().unwrap_or_default(),
                     status,
                     raw_request: None,
                     raw_response: None,
                     is_test: true,
-                    client: String::new(),
+                    source: access.source.clone(),
                 },
                 Some(message.clone()),
             );
             guard.complete();
-            errors::management_error(status as i32, message)
+            chat_error(error)
         }
     }
+}
+
+fn chat_error(error: errors::GatewayError) -> Response {
+    let status = error.http_status();
+    (
+        status,
+        axum::Json(json!({
+            "success": false,
+            "error": error.message,
+            "code": error.code,
+        })),
+    )
+        .into_response()
+}
+
+/// 从请求体读本次点名的思考等级（字符串；缺失 / null / 空串 → None）。
+///
+/// 只做长度与空白处理，**不校验取值**：等级表（`model_rules::REASONING_LEVELS`）
+/// 是「界面上的候选」，不是白名单 —— 用户可以在模型管理页填表外的自定义等级，
+/// 这里若只放行表内的值，同一个值在「映射绑定」与「本次覆盖」两条路上就会有
+/// 两种命运。真正的合法性由各适配器的翻译层判定（不认识的档位不会注入）。
+fn reasoning_from(payload: &Value) -> Option<String> {
+    let text = payload.get("reasoning").and_then(Value::as_str)?.trim();
+    if text.is_empty() || text.chars().count() > 32 {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// 从请求体读本次点名的模型：**对外模型名**（字符串；缺失 / null → None）。
@@ -358,4 +472,57 @@ fn model_from(payload: &Value) -> Result<Option<String>, String> {
         }
         Some(_) => Err("model 必须是字符串".to_string()),
     }
+}
+
+/* ─── 会话（左边那列历史对话）────────────────────────────── */
+
+/// GET /api/assistant/sessions → `{sessions: [{id, title, model, reasoning,
+/// createdAt, updatedAt}, …]}`（按最近更新倒序）。
+///
+/// **不带 messages**：侧边栏只用得到标题与时间，把几十条会话的全部消息体都
+/// 拉一遍是纯浪费。打开某一条时再走下面的单条接口。
+pub async fn list_sessions(State(_state): State<ServerState>) -> Response {
+    ok_json(json!({ "sessions": assistant_sessions::list() }))
+}
+
+/// GET /api/assistant/sessions/{id} → `{session: {…, messages: [...]}}`
+pub async fn get_session(State(_state): State<ServerState>, Path(id): Path<String>) -> Response {
+    match assistant_sessions::get(&id) {
+        Some(session) => ok_json(json!({ "session": session })),
+        None => errors::management_error(404, "会话不存在"),
+    }
+}
+
+/// POST /api/assistant/sessions → `{session: {…}}`（新建或覆盖同 id 的会话）。
+///
+/// body：`{id, title?, messages, model?, reasoning?}`。id 由前端生成（见
+/// `core::assistant_sessions` 的模块头），所以这条接口同时承担「新建」与
+/// 「保存」—— 前端每轮回答结束后都调它，不必区分是第几次。
+pub async fn save_session(State(_state): State<ServerState>, body: Bytes) -> Response {
+    let payload = match parse_body(&body) {
+        Ok(payload) => payload,
+        Err(error) => return errors::management_error(400, error.message),
+    };
+    match assistant_sessions::save(&payload) {
+        Ok(session) => ok_json(json!({ "session": session })),
+        Err(message) => errors::management_error(400, message),
+    }
+}
+
+/// DELETE /api/assistant/sessions/{id} → `{removed: true}`
+pub async fn delete_session(State(_state): State<ServerState>, Path(id): Path<String>) -> Response {
+    if assistant_sessions::remove(&id) {
+        ok_json(json!({ "removed": true }))
+    } else {
+        errors::management_error(404, "会话不存在")
+    }
+}
+
+/// DELETE /api/assistant/sessions → `{removed: n}`（清空全部会话）。
+///
+/// 与单条删除分开成两条路由（同前缀的 DELETE 落到这里）：前端「清空历史」
+/// 走它，免得发几十条单删请求。
+pub async fn clear_sessions(State(_state): State<ServerState>) -> Response {
+    let removed = assistant_sessions::clear();
+    ok_json(json!({ "removed": removed }))
 }

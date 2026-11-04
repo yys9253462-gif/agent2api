@@ -47,20 +47,19 @@
 //! —— `std::sync::Mutex` 不可重入，在闭包里打日志会当场死锁。本模块的日志
 //! 一律在闭包之外打（`now_ms` 只读时钟，不算 IO）。
 
+mod storage;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use self::storage::change;
 use crate::server::db::Db;
 use crate::server::logging;
-
-/// `kv` 表里的键名（保留键，见 `db::schema::RESERVED_KV_KEYS`）
-const KV_KEY: &str = "backgroundTaskState";
 
 /// 执行占位的租约时长：心跳每 30 秒续一次，留三倍余量。
 ///
@@ -102,11 +101,24 @@ impl TaskState {
     }
 
     pub fn waiting_message(&self) -> String {
+        self.describe_wait(false)
+    }
+
+    /// 手动触发**越过失败冷却**时用的那一条（见 [`ManualBackoff::Bypass`]）。
+    ///
+    /// 冷却还在只说明「上一轮为什么没成功」，不构成「现在不能试」—— 这时真正
+    /// 挡住这一轮的通常只是在途占位或最短请求间隔。照 [`waiting_message`] 的
+    /// 算法会把用户往「几小时后再试」引，而实际一秒后就能再点一次。
+    pub fn waiting_message_bypassing(&self) -> String {
+        self.describe_wait(true)
+    }
+
+    fn describe_wait(&self, backoff_bypassed: bool) -> String {
         if self.running() {
             return "任务正在执行中，请稍候".to_string();
         }
         let seconds = ((self.retry_at - logging::now_ms()).max(0) + 999) / 1000;
-        if seconds > 0 {
+        if seconds > 0 && !backoff_bypassed {
             format!("请求处于冷却期，请在 {seconds} 秒后重试")
         } else {
             "刚刚已执行，请稍后重试".to_string()
@@ -138,56 +150,21 @@ fn database() -> Result<&'static Db, String> {
         .ok_or_else(|| "任务状态数据库不可用，未发送后台请求".to_string())
 }
 
-fn read_states(conn: &rusqlite::Connection) -> Result<HashMap<String, TaskState>, String> {
-    let text: Option<String> = conn
-        .query_row("SELECT value FROM kv WHERE key = ?1", [KV_KEY], |row| row.get(0))
-        .optional()
-        .map_err(|error| format!("读取任务状态失败: {error}"))?;
-    match text {
-        Some(text) => serde_json::from_str(&text)
-            .map_err(|error| format!("任务状态格式错误: {error}")),
-        None => Ok(HashMap::new()),
-    }
-}
-
 pub fn read(key: &str) -> Result<TaskState, String> {
     Ok(read_all()?.get(key).cloned().unwrap_or_default())
 }
 
 pub fn read_all() -> Result<HashMap<String, TaskState>, String> {
-    database()?.with(read_states).ok_or_else(|| "任务状态数据库不可用".to_string())?
-}
-
-fn change(
-    key: &str,
-    mutate: impl FnOnce(&mut TaskState),
-) -> Result<TaskState, String> {
-    database()?
-        .with_mut(|conn| {
-            // 开发版和正式版可共用数据库，先取得写事务再判定到期，避免双份执行。
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("锁定任务状态失败: {error}"))?;
-            let mut states = read_states(&tx)?;
-            let state = states.entry(key.to_string()).or_default();
-            mutate(state);
-            let result = state.clone();
-            let text = serde_json::to_string(&states)
-                .map_err(|error| format!("编码任务状态失败: {error}"))?;
-            tx.execute(
-                "INSERT INTO kv (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![KV_KEY, text],
-            )
-            .map_err(|error| format!("保存任务状态失败: {error}"))?;
-            tx.commit().map_err(|error| format!("提交任务状态失败: {error}"))?;
-            Ok(result)
-        })
-        .ok_or_else(|| "任务状态数据库不可用".to_string())?
+    storage::read_all()
 }
 
 pub fn store_value(key: &str, value: Value) -> Result<(), String> {
     change(key, |state| state.value = Some(value)).map(|_| ())
+}
+
+pub(crate) fn update_value(key: &str, update: impl FnOnce(&mut Value)) -> Result<Value, String> {
+    change(key, |state| update(state.value.get_or_insert(Value::Null)))
+        .map(|state| state.value.unwrap_or(Value::Null))
 }
 
 /// 记录一次**外部发起**的真实请求（用户手动点的那一轮）：把定时排期顺延一个

@@ -10,7 +10,7 @@ import {
   DialogTitle,
   RadioGroup,
   RadioGroupItem,
-} from '@ui'
+  Label } from '@ui'
 import { t } from '../i18n'
 
 /**
@@ -34,9 +34,9 @@ import { t } from '../i18n'
  *   · 「执行清理」走 wbConfirm 二次确认，DELETE 带 mode 与列表同款筛选。
  *
  * ── 数据链路（三个接口，全部已就绪，见 stats_api.rs 的模块头）─────
- *   GET    /api/stats/requests/clear-preview   预览统计 {all, raw, dbBytes, vacuumRunning, lastVacuum}
+ *   GET    /api/stats/requests/clear-preview   {all, raw, upstreamRaw, downstreamRaw, dbBytes, vacuumRunning}
  *   POST   /api/stats/requests/compact         压缩（重复触发 409）
- *   DELETE /api/stats/requests?mode=raw|all    清理（不带筛选必须显式 all=1）
+ *   DELETE /api/stats/requests?mode=raw|all    {deleted, raw, upstreamRaw, downstreamRaw}
  *
  * ── 筛选参数为什么找 wbRequestsPanel 要 ───────────────────────
  * 「预览说删 N 条」与「确认删掉的那批」必须是同一个集合，所以两者都用
@@ -63,11 +63,11 @@ type Mode = 'all' | 'raw'
 const MODES: Record<Mode, { title: string; desc: string }> = {
   all: {
     title: t('全部删除'),
-    desc: t('删除日志记录本身。当前有筛选时只删命中的条目，按天聚合报表不受影响；无筛选时清空全部并重置报表。此方式无法恢复。'),
+    desc: t('删除请求记录，并同步清理对应的上游调试报文与下游正文。有筛选时只删除命中的记录，按天聚合报表不受影响；无筛选时清空全部并重置报表。此操作无法恢复。'),
   },
   raw: {
     title: t('仅清空报文原文'),
-    desc: t('保留统计行与报表，只抹掉请求 / 响应正文。清理后详情弹窗的「预览对话」将无原文可看，统计数字分毫不动。'),
+    desc: t('保留请求记录、用量统计与报表，同时清理上游调试报文和下游请求 / 响应正文。清理后「预览对话」与「原始报文」不再保留原文。有筛选时只清理命中请求的报文；无筛选时清空两侧全部报文。此操作无法恢复。'),
   },
 }
 
@@ -81,27 +81,33 @@ const POLL_MS = 3_000
 type ClearPreviewResponse = {
   all?: unknown
   raw?: unknown
+  downstreamRaw?: unknown
+  upstreamRaw?: unknown
   dbBytes?: unknown
   vacuumRunning?: unknown
+}
+
+type ClearResponse = {
+  deleted?: unknown
+  downstreamRaw?: unknown
+  upstreamRaw?: unknown
 }
 
 /** 归一化后的预览读数 */
 type Counts = {
   all: number
   raw: number
+  downstreamRaw: number | null
+  upstreamRaw: number | null
   dbBytes: number
   vacuumRunning: boolean
 }
 
-/**
- * 预览行的三种状态：还没拿到 / 这一次读取失败 / 有读数。
- * 用联合类型而不是 `counts | null` + 一个 error 布尔，是为了让「失败」与
- * 「还没到」在类型上就分得开（两者在界面上文案不同，混起来必然写错）。
- */
+/** 预览未就绪或缺少两侧条数时，不允许执行清理。 */
 type PreviewState =
   | { status: 'loading' }
   | { status: 'failed' }
-  | { status: 'ready'; all: number; raw: number; dbBytes: number }
+  | ({ status: 'ready' } & Omit<Counts, 'vacuumRunning'>)
 
 /** 后端桥：本岛只用到这三个接口 */
 type ClearBridge = {
@@ -110,7 +116,9 @@ type ClearBridge = {
   /** POST /api/stats/requests/compact（重复触发抛含 409 / 正在进行 的错误） */
   compactStatsDb(): Promise<unknown>
   /** DELETE /api/stats/requests?mode=raw|all */
-  clearStatsRequests(query: string): Promise<{ deleted?: number } | null | undefined>
+  clearStatsRequests(query: string): Promise<ClearResponse | null | undefined>
+  getStorage(): Promise<unknown>
+  getDebug(): Promise<unknown>
 }
 
 /**
@@ -133,6 +141,10 @@ type SharedWindow = {
       /** danger = 不可恢复的危险操作（确认键走红） */
       okClass?: string
     }) => Promise<boolean>
+  }
+  wbSettingsPanel?: {
+    renderStorage?: (data: unknown) => void
+    renderDebug?: (data: unknown) => void
   }
   wbRequestsPanel?: {
     /** 当前列表的筛选参数（查询串形态，与列表 GET 同源） */
@@ -184,13 +196,34 @@ function currentQuery(): string {
   return typeof query === 'string' ? query : ''
 }
 
+function countOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const count = Number(value)
+  return Number.isSafeInteger(count) && count >= 0 ? count : null
+}
+
 function toCounts(preview: ClearPreviewResponse | null | undefined): Counts {
+  const all = countOrNull(preview?.all)
+  const raw = countOrNull(preview?.raw)
+  if (all === null || raw === null) throw new Error(t('清理预览数据不完整'))
   return {
-    all: Number(preview?.all) || 0,
-    raw: Number(preview?.raw) || 0,
+    all,
+    raw,
+    downstreamRaw: countOrNull(preview?.downstreamRaw),
+    upstreamRaw: countOrNull(preview?.upstreamRaw),
     dbBytes: Number(preview?.dbBytes) || 0,
     vacuumRunning: preview?.vacuumRunning === true,
   }
+}
+
+async function refreshStorageCounts() {
+  const api = shared().workbuddyDesktop
+  const panel = shared().wbSettingsPanel
+  if (!api || !panel) return
+  await Promise.all([
+    api.getStorage().then(data => panel.renderStorage?.(data)),
+    api.getDebug().then(data => panel.renderDebug?.(data)),
+  ]).catch(error => console.warn('刷新报文存储统计失败:', errorMessage(error)))
 }
 
 function errorMessage(error: unknown): string {
@@ -222,6 +255,10 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
   const [vacuumRunning, setVacuumRunning] = React.useState(false)
   /** 清理在途的**界面**态（按钮变「清理中…」并禁用）；守卫用的是模块级 clearing */
   const [clearingView, setClearingView] = React.useState(false)
+  const queryRef = React.useRef(currentQuery())
+  const canClear = preview.status === 'ready'
+    && preview.downstreamRaw !== null && preview.upstreamRaw !== null
+    && (mode !== 'raw' || preview.raw > 0)
 
   /** 卸载标志：await 期间用户关了窗，回来的响应一律丢弃 */
   const aliveRef = React.useRef(true)
@@ -246,8 +283,9 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
 
   /** 把一份预览读数写进预览行与压缩按钮 */
   const applyPreview = React.useCallback((next: Counts) => {
-    setPreview({ status: 'ready', all: next.all, raw: next.raw, dbBytes: next.dbBytes })
-    setVacuumRunning(next.vacuumRunning)
+    const { vacuumRunning: running, ...counts } = next
+    setPreview({ status: 'ready', ...counts })
+    setVacuumRunning(running)
   }, [])
 
   /**
@@ -258,14 +296,13 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
   const pollOnce = React.useCallback(async () => {
     const api = shared().workbuddyDesktop
     if (!api) return
-    let raw: ClearPreviewResponse | null | undefined
+    let next: Counts
     try {
-      raw = await api.getStatsClearPreview(currentQuery())
+      next = toCounts(await api.getStatsClearPreview(queryRef.current))
     } catch {
       return
     }
     if (!aliveRef.current) return
-    const next = toCounts(raw)
     applyPreview(next)
     if (next.vacuumRunning) return
     stopPolling()
@@ -274,6 +311,7 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
     // 压缩不改数据，但库占用变小了：预览刚随上面那次响应更新过，
     // 列表顺带刷一次（vacuum 期间可能又进了新请求）
     void shared().wbRequestsPanel?.load?.({ silent: true })
+    void refreshStorageCounts()
   }, [applyPreview, stopPolling])
 
   /** 起轮询：已在轮询就直接接上（不重复起表），否则按钮先切「压缩中…」 */
@@ -294,7 +332,7 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
     try {
       const api = shared().workbuddyDesktop
       if (!api) throw new Error(t('后端桥不可用'))
-      const raw = await api.getStatsClearPreview(currentQuery())
+      const raw = await api.getStatsClearPreview(queryRef.current)
       if (!aliveRef.current) return // 等待期间已关窗：丢弃这次结果
       const next = toCounts(raw)
       applyPreview(next)
@@ -362,40 +400,53 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
    *     这里拼死，不指望后端那句 400 提示来兜。
    */
   async function handleExecute() {
-    if (clearing) return
+    if (clearing || !canClear || preview.status !== 'ready') return
     const api = shared().workbuddyDesktop
     const ask = shared().wbConfirm?.ask
     if (!api || !ask) return
 
     const label = MODES[mode].title
-    // 筛选串在确认前取一次，确认后就用它 —— 确认框里说的条数与实际删的必须是同一批
-    const query = currentQuery()
+    const query = queryRef.current
     const hasFilters = query.length > 0
-    const deleting = preview.status === 'ready' ? (mode === 'raw' ? preview.raw : preview.all) : 0
-
+    const scope = hasFilters ? t('当前筛选范围') : t('全部请求数据')
+    const counts = {
+      count: preview.all,
+      upstream: preview.upstreamRaw ?? 0,
+      downstream: preview.downstreamRaw ?? 0,
+    }
+    const summary = mode === 'raw'
+      ? t('保留 {count} 条请求记录；将清理上游调试报文 {upstream} 条、下游正文 {downstream} 条。用量统计与报表不变。', counts)
+      : t('将删除 {count} 条请求记录，并清理上游调试报文 {upstream} 条、下游正文 {downstream} 条。', counts)
     const confirmed = await ask({
       title: t('清理请求日志'),
-      html: hasFilters
-        ? t('确定按当前筛选执行「<strong>{label}</strong>」？将处理 <strong>{count}</strong> 条，此操作无法恢复。', { label: escapeHtml(label), count: deleting })
-        : t('确定对<strong>全部</strong>请求日志执行「<strong>{label}</strong>」？将处理 <strong>{count}</strong> 条，此操作无法恢复。', { label: escapeHtml(label), count: deleting }),
-      okText: mode === 'raw' ? t('抹掉原文') : t('删除'),
+      html: t('确定对<strong>{scope}</strong>执行「<strong>{label}</strong>」？<br>{summary}<br>此操作无法恢复。', {
+        scope: escapeHtml(scope), label: escapeHtml(label), summary: escapeHtml(summary),
+      }),
+      okText: mode === 'raw' ? t('清空两侧原文') : t('删除'),
       okClass: 'danger',
     })
-    if (!confirmed) return
+    if (!confirmed || clearing || !aliveRef.current) return
 
     setInFlight(true)
     try {
       const requestQuery = hasFilters ? `mode=${mode}&${query}` : `mode=${mode}&all=1`
       const result = await api.clearStatsRequests(requestQuery)
-      const deleted = Number(result?.deleted) || 0
-      // raw 模式删的是正文而不是行：「已删除 N 条」会让人以为行没了，
-      // 文案按实际删掉的东西写
-      toast(mode === 'raw' ? t('已抹掉 {count} 条报文原文', { count: deleted }) : t('已删除 {count} 条', { count: deleted }))
+      const deleted = countOrNull(result?.deleted)
+      const upstream = countOrNull(result?.upstreamRaw)
+      const downstream = countOrNull(result?.downstreamRaw)
+      if (deleted === null || upstream === null || downstream === null) {
+        toast(t('清理请求已返回，但结果数据不完整，请刷新后确认。'), 'err')
+      } else {
+        toast(mode === 'raw'
+          ? t('已清理上游调试报文 {upstream} 条、下游正文 {downstream} 条；请求记录与报表已保留。', { upstream, downstream })
+          : t('已删除 {count} 条请求记录，并清理上游调试报文 {upstream} 条、下游正文 {downstream} 条。', { count: deleted, upstream, downstream }))
+      }
       setInFlight(false) // 先解除守卫，closeModal() 才放行（与旧实现同序）
       onClose()
       // 列表收口刷新：筛选清单可能整批消失（清了明细后下拉不该再列着旧值），
       // 由面板的 notifyCleared 一并处理（清单节流清零 + 回第 1 页）
       void shared().wbRequestsPanel?.notifyCleared?.()
+      void refreshStorageCounts()
     } catch (error) {
       const message = errorMessage(error)
       setHint(t('清理失败：{message}', { message }))
@@ -405,16 +456,21 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
     }
   }
 
-  const previewText =
-    preview.status === 'ready'
-      ? t('将删除 {count} 条日志 · 其中 {raw} 条仍带报文原文 · 数据库占用 {db}', {
-          count: preview.all,
-          raw: preview.raw,
-          db: formatBytes(preview.dbBytes),
-        })
-      : preview.status === 'failed'
-        ? t('预览读取失败')
-        : t('正在统计…')
+  const previewText = preview.status === 'ready'
+    ? preview.downstreamRaw === null || preview.upstreamRaw === null
+      ? t('当前网关未提供上游 / 下游清理统计，请更新网关后再清理。')
+      : mode === 'raw'
+        ? t('保留 {count} 条请求记录 · 将清理上游调试报文 {upstream} 条、下游正文 {downstream} 条 · 数据库占用 {db}', {
+            count: preview.all, upstream: preview.upstreamRaw, downstream: preview.downstreamRaw,
+            db: formatBytes(preview.dbBytes),
+          })
+        : t('将删除 {count} 条请求记录 · 同步清理上游调试报文 {upstream} 条、下游正文 {downstream} 条 · 数据库占用 {db}', {
+            count: preview.all, upstream: preview.upstreamRaw, downstream: preview.downstreamRaw,
+            db: formatBytes(preview.dbBytes),
+          })
+    : preview.status === 'failed'
+      ? t('预览读取失败')
+      : t('正在统计…')
 
   return (
     <Dialog
@@ -440,12 +496,14 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
           <RadioGroup
             aria-label={t('清理方式')}
             value={mode}
-            onValueChange={next => setMode(next === 'raw' ? 'raw' : 'all')}
+            onValueChange={next => {
+              if (!clearing) setMode(next === 'raw' ? 'raw' : 'all')
+            }}
           >
             {MODE_ORDER.map(key => {
               const checked = mode === key
               return (
-                <label
+                <Label
                   key={key}
                   // 选中态由受控 value 推出来，交给 data-checked 变体表达
                   // （卡片底与描边走 data-checked:，卡内文字走 group-data-checked/card:）。
@@ -462,11 +520,14 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
                     {MODES[key].title}
                   </span>
                   <span className='text-[11.5px] leading-[1.55] text-subtle'>{MODES[key].desc}</span>
-                </label>
+                </Label>
               )
             })}
           </RadioGroup>
           <p className='text-[11.5px] text-muted-foreground'>{previewText}</p>
+          <p className='text-[11.5px] text-muted-foreground'>
+            {t('数据库占用包含主文件与 WAL 文件；清理后可点击「压缩数据库」回收空闲空间。')}
+          </p>
         </DialogBody>
         <DialogFooter>
           <span className='min-w-0 text-[11.5px] text-muted-foreground'>{hint}</span>
@@ -494,7 +555,7 @@ function RequestClearModal({ onClose }: RequestClearModalProps) {
             onClick={() => {
               void handleExecute()
             }}
-            disabled={clearingView}
+            disabled={clearingView || !canClear}
           >
             {clearingView ? t('清理中…') : t('执行清理')}
           </Button>

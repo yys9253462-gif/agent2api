@@ -75,6 +75,7 @@ pub async fn chat_completions(
     // axum 对 `Option<Extension<T>>` 有专门实现：取不到就是 `None`，不会像
     // 裸 `Extension<T>` 那样直接拒绝请求（那会把整个免鉴权模式打回 500）。
     key_scope: Option<Extension<crate::server::core::key_scope::KeyScope>>,
+    key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
@@ -82,12 +83,12 @@ pub async fn chat_completions(
     let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：在 headers 被 move 进转发层
     // 之前先判好，早失败路径与收尾记账共用同一个值
-    let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
+    let request_source = pipeline::request_source(&headers, key_identity);
     // ① body 必须是 JSON 对象（数组/标量/null 都算非法）
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(&state, started_at, "", "", &client, &error);
+        record_early_failure(&state, started_at, "", "", &request_source, &error);
         return error.payload_response();
     };
     // ② messages 必须是数组
@@ -99,7 +100,7 @@ pub async fn chat_completions(
         let error = GatewayError::bad_request("缺少 messages 数组");
         let model = model_field_text(&payload);
         let reasoning = pipeline::client_reasoning_of(&payload);
-        record_early_failure(&state, started_at, &model, &reasoning, &client, &error);
+        record_early_failure(&state, started_at, &model, &reasoning, &request_source, &error);
         return error.payload_response();
     }
 
@@ -124,7 +125,7 @@ pub async fn chat_completions(
     // 下游等级与下游模型名同一时机采集（payload 被就地改写前；改写只动 model，
     // 两边前后一致，见 client_reasoning_of 的说明）
     let client_reasoning = pipeline::client_reasoning_of(&payload);
-    let requested_model = match pipeline::resolve_model(&state, &mut payload, scope.as_ref()) {
+    let requested_model = match super::request_prepare::resolve_model(&state, &mut payload, scope.as_ref()).await {
         Ok(model) => model,
         Err(error) => {
             record_early_failure(
@@ -132,7 +133,7 @@ pub async fn chat_completions(
                 started_at,
                 &model_field_text(&payload),
                 &client_reasoning,
-                &client,
+                &request_source,
                 &error,
             );
             return error.payload_response();
@@ -158,18 +159,16 @@ pub async fn chat_completions(
     // （record_early_failure）没有 id，不插。id 取 telemetry 里刚生成的那个
     // —— 它与调试报文、收尾记账用的是同一个。
     let telemetry_id = telemetry.snapshot().id;
-    state
-        .request_stats()
-        .record_started(
+    super::request_prepare::record_started(
+            state.request_stats(),
             &telemetry_id,
             started_at,
             &requested_model,
             &client_model,
             &client_reasoning,
-            &client,
-            // 真实流量：不是模型测试（见 `RecordContext::is_test`）
+            &request_source,
             false,
-        );
+        ).await;
     // ── 手动终止的取消令牌（本次新增）────────────────────────────
     // 登记在进程级注册表里（键 = 上面这个 id），详情页的「终止请求」按它
     // 找到这条在途请求；转发链的每个等待点 select 它。注销见
@@ -255,7 +254,7 @@ pub async fn chat_completions(
                 // 转发主链路：不是模型测试（见 `RecordContext::is_test`）
                 is_test: false,
                 // 来源客户端：入口判好带进来（见 `RecordContext::client`）
-                client: client.clone(),
+                source: request_source.clone(),
             };
             // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
             // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
@@ -296,7 +295,7 @@ pub async fn chat_completions(
                     // 转发主链路：不是模型测试
                     is_test: false,
                     // 来源客户端：入口判好带进来
-                    client: client.clone(),
+                    source: request_source.clone(),
                 },
                 None,
             );
@@ -330,7 +329,7 @@ pub async fn chat_completions(
                     // 转发主链路：不是模型测试
                     is_test: false,
                     // 来源客户端：入口判好带进来
-                    client: client.clone(),
+                    source: request_source.clone(),
                 },
                 Some(message),
             );
@@ -352,21 +351,15 @@ pub async fn chat_completions(
 /// 句柄是 `Clone` 的轻量 Arc，且绝不在持锁时做网络请求（这是本项目的硬约束，
 /// 聚合层只调 `accounts_for_provider` 做一次文件读取）。
 ///
-/// ── R9：带 Key 请求时只返回被授权的模型 ────────────────────────
-/// 这条路由挂在**免鉴权组**（Node 版就是不查 API Key 的只读探针），但它仍然
-/// 要认 Key：客户端带着某把 Key 来拉列表时，只该看到那把 Key 被授权的部分 ——
-/// 否则「限制」在下游看起来根本不存在（列表里有，点了却 404，是最难解释的一种）。
-/// 所以这里主动从请求头解析命中的 Key（`http::key_scope_from_headers`，
-/// 与鉴权中间件**共用同一套匹配口径**），把它的白名单交给
-/// `catalog::models_response` 在列表生成处过滤。
-///
-/// 没带 Key / 带的是没命中的 Key / 网关一把启用的 Key 都没有（免鉴权模式）：
-/// 一律**不过滤**（空 `scope`）。这是刻意的：`/v1/models` 是探针，
-/// 在客户端配好 Key 之前就会被打一次（README 的接口说明也这么写），
-/// 那种请求拿不到完整列表会让「装完先看看有哪些模型」这一步直接失效。
-/// 与 `key_scope` 模块头列的三条「不限制」情形是同一套语义。
+/// `/v1/models` 不消耗模型额度，未携带 Key 时可读取公开清单。
+/// 携带 Key 时必须有效，列表按同一份鉴权结果的白名单过滤。
 pub async fn list_models(State(state): State<ServerState>, headers: HeaderMap) -> Response {
-    let scope = crate::server::http::key_scope_from_headers(&headers);
+    let scope = if headers.contains_key("x-api-key") || headers.contains_key(axum::http::header::AUTHORIZATION) {
+        match super::model_access::authenticate(&headers, "") {
+            Ok(access) => access.scope,
+            Err(error) => return error.payload_response(),
+        }
+    } else { None };
     let body = crate::server::core::providers::catalog::models_response(state.store(), scope.as_ref());
     // 异步刷新模型目录，不阻塞响应（对照 Node 的 `void refreshModelCatalog()`）
     spawn_catalog_refresh(&state);
@@ -449,6 +442,10 @@ fn anthropic_models_view(body: &Value) -> Value {
 /// 按「字符数 ÷ 3.5」估（中英混排的经验值，与 Anthropic 官方「约 3.5 字符
 /// 一个 token」的量级一致）。
 ///
+/// 估算系数与流式 `message_start` 的输入锚点**共用**同一个函数
+/// （`protocol::anthropic::estimate_tokens_for_text`）：客户端会拿这两个数字
+/// 互相印证，对不上反而引出新的疑问（见 issue #437）。
+///
 /// ── 为什么不直接 404 ────────────────────────────────────────
 /// Claude Code 在网关模式下会调它做上下文预算；404 会让它按「网关不支持」
 /// 处理（行为随版本变化，可能是降级也可能是报错）。给一个量级正确的估算，
@@ -465,8 +462,7 @@ pub async fn count_tokens(State(state): State<ServerState>, body: Bytes) -> Resp
         Ok(chat) => serde_json::to_string(&chat).unwrap_or_default(),
         Err(_) => serde_json::to_string(&payload).unwrap_or_default(),
     };
-    let characters = text.chars().count();
-    let tokens = ((characters as f64) / 3.5).ceil().max(1.0) as i64;
+    let tokens = crate::server::core::protocol::anthropic::estimate_tokens_for_text(&text);
     let _ = state;
     json_response(json!({
         "input_tokens": tokens,

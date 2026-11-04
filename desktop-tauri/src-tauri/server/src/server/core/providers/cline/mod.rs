@@ -1,60 +1,29 @@
-//! Cline（官方 `api.cline.bot`）：账号管理 + 推理转发。
+//! Cline（官方 `api.cline.bot`）：**两个额度池 = 两家 provider** 的身份定义。
 //!
-//! ── 上游是什么（一句话）─────────────────────────────────────
-//! Cline 官方账号体系是一个**标准 OpenAI 兼容上游**：LLM 走
-//! `POST https://api.cline.bot/api/v1/chat/completions`，鉴权是
-//! `Authorization: Bearer workos:<JWT>`，模型名带**计费通道前缀**
-//! （`cline-pass/` 订阅池、`cline-free/` 免费池）。比 CatPaw 的自有
-//! conversation 协议与 Qoder 的 COSY 自签名都简单。
+//! **实现已整体搬到提供商插件**（`agent2api-providers`，不随本仓库发布）：
+//! 凭证格式、设备授权登录、续期、目录拉取、上游请求头（含伪装头默认值）、
+//! 余额、转发全在那边。网关只留身份与配置：
 //!
-//! ── 子模块 ──────────────────────────────────────────────────
 //! ```text
-//!   credentials.rs 凭证格式（workos: 前缀）+ 桌面端 providers.json 读取
-//!   login.rs       设备授权登录（WorkOS RFC 8628，四步含 /auth/register 换码）
-//!   refresh.rs     续期（POST /auth/refresh + 单飞 + 比较再写）
-//!   models.rs      模型目录（recommended-models + 两池 + 静态兜底 + 默认映射种子）
-//!   headers.rs     上游请求头（默认伪装头 + 设置页逐键覆盖的合并）
-//!   balance.rs     余额 / 订阅（credit 余额归一 + 套餐）
-//!   adapter.rs     ProviderAdapter 实现（无状态，OpenAI 兼容，**按池参数化**）
+//!   models.rs   池 ↔ provider id ↔ ProviderKind 的互查、通道前缀、短名规则
+//!   账号面      `account_store::cline_accounts`（存量记录的公开形态投影）
+//!   配置面      `clineUpstreamHeaders`（用户覆盖表）+ `api::cline_headers`
+//!               （默认值与合并后的生效值问插件要，见那里的说明）
 //! ```
 //!
-//! ── 三件必须记住的事（都是实测踩出来的）─────────────────────
-//!   1. **产品面头 `X-CLIENT-TYPE: cline-sdk`**：不带它免费池模型一律 403
-//!      （`only available via Cline product surfaces`）。见 `adapter.rs` 模块头。
-//!   2. **路径只有一个 `v1`**：`/api/v1/chat/completions`，不是 `/api/v1/v1/...`。
-//!   3. **响应形态不对称**：`stream:true` 是裸 chunk（可直传），非流式是
-//!      `{"data":{...}}` 信封。网关总是以流式请求上游，所以主链路只走前者；
-//!      管理接口（balance）要解信封。
+//! ── 为什么伪装头默认值也要搬走 ──────────────────────────────
+//! 那套头（产品面标识、平台、版本号）之所以长那样，是因为上游按「调用方是不是
+//! 自家产品」校验，缺了它免费池一律 403。它属于**上游协议知识**，与「怎么伪装
+//! 成官方客户端」是同一类内容 —— 按项目的风险隔离要求不留在主仓库。用户那份
+//! 覆盖表是纯配置，留在网关（它不揭示默认值是什么）。
 //!
-//! ── 凭证来源（两种，没有环境变量旁路）───────────────────────
-//!   - **账号记录**：`POST /api/login`（设备授权）或手填 token 添加；
-//!   - **桌面端实时登录态**：`~/.cline/data/settings/providers.json`，
-//!     每次实时读取（不回写 —— 那是 Cline 客户端自己的文件，见
-//!     `refresh::persist_refresh` 的说明）。
-//!
-//! ── 两个额度池 = 两家提供商（本模块的组织方式）───────────────
-//! `cline-free/` 与 `cline-pass/` 在上游是**同一个账号上的两个额度池**，
-//! 但本项目把它们当**两个 provider** 接入：`cline-free` 与 `cline-pass`
-//! 各有独立的账号、清单、启停规则与映射，界面上各占一个分组。
-//!
-//! 实现仍是**一套**：`adapter::ClineAdapter` 持有一个 `models::Pool`，两个
-//! 静态实例（`cline::CLINE_FREE_ADAPTER` / `CLINE_PASS_ADAPTER`）由
-//! `adapter::adapter_for` 按 kind 给出。池 → provider 的互查在 `models::Pool`
-//! （`kind` / `provider_id` / `from_provider_id`），别处不要再写 `"cline-free"`
-//! 这类字面量。
-//!
-//! 拆分的理由（以及「一家的一个选项」那套旧建模为什么说不通）见
-//! `models.rs` 的模块头。
+//! ── 两个池为什么是两家 ──────────────────────────────────────
+//! 完整理由见 `models.rs` 的模块头：池过滤要成为**身份的固有属性**，而不是随
+//! 「账号库里有哪个池」漂移的运行时判断。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：本模块绝不 unwrap/expect/panic。
+//! release 是 `panic=abort`：本模块零 unwrap/expect/panic。
 
-pub mod adapter;
-pub mod balance;
-pub mod credentials;
-pub mod headers;
-pub mod login;
 pub mod models;
-pub mod refresh;
 
-pub use adapter::{CLINE_FREE_ADAPTER, CLINE_PASS_ADAPTER};
+pub use models::Pool;

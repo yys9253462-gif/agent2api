@@ -77,7 +77,7 @@ pub async fn post_config(State(_state): State<ServerState>, body: Bytes) -> Resp
             // 失败沿用既有语义（内部已记日志、本次运行已生效，请求照常成功）
             Value::Null => {
                 let _ = config::set_api_key(None);
-                logging::log("[Config]", "API Key 已清除，接口恢复免鉴权（仅监听 127.0.0.1）");
+                logging::log("[Config]", "API Key 已清除；模型调用仍需携带启用的 Key");
             }
             Value::String(text) => {
                 if text.chars().count() < MIN_API_KEY_LENGTH {

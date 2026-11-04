@@ -83,26 +83,13 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
     // 缺省走旧版全局语义 —— 只有旧版前端（升级前）会这么传
     let provider = text_field(&object, "provider");
     let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
-    // 启用某一家时可能要把旧版的全局条目展开成「其余各家」，这里给出当前
-    // 清单里同样承载该模型的其他提供商（目录的匹配口径：先 id 后 name）。
-    // 返回值是 id 空间（内置家 + 自定义家同列，见 `providers_for_model`）；
-    // 自定义 id 进不了 modelRules 的启停状态（它们有自己的 enabled），
-    // `set_state` 对陌生 id 的处理由那一侧兜底，这里如实转出即可。
-    let others: Vec<String> = if enabled == Some(true) {
-        crate::server::core::providers::catalog::providers_for_model(&id)
-            .into_iter()
-            .filter(|kind_provider| Some(kind_provider.as_str()) != provider_opt)
-            .collect()
-    } else {
-        Vec::new()
-    };
     if let Some(provider) = provider_opt {
-        if crate::server::core::providers::kind_from_id(provider).is_none() {
-            return errors::management_error(400, format!("未知的内置提供商: {provider}"));
+        if !crate::server::core::providers::is_known_provider_id(provider) {
+            return errors::management_error(400, format!("未知的提供商: {provider}"));
         }
     }
-    if let Err(error) = model_rules::set_state(provider_opt, &id, enabled, &others) {
-        return errors::management_error(500, error);
+    if let Err(error) = model_rules::set_state(provider_opt, &id, enabled) {
+        return errors::management_error(error.status_code, error.message);
     }
     // 日志里把提供商带上：同名模型在多家同时存在时，单看 id 分不清动的是哪家
     let subject = match provider_opt {
@@ -116,11 +103,8 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
 
 /// POST /api/models/mappings
 ///
-/// 新增映射（照抄 OmniProxy 的模型映射）：`{alias, target, provider?, reasoning?}`。
-/// `alias` 是对外名，**自由命名** —— 允许与任何上游模型 id 同名（同名时该
-/// 上游的原生路由仍然优先，映射是追加的兜底路）；同一 alias 可以在不同提供商
-/// 各建一条，路由时一起进候选链主备切换。`provider` 是 target 所属的家；
-/// 旧版前端不传（全局语义：由所有承载 target 的家接收），行为不变。
+/// 同一提供商内的对外 ID 最多启用一条绑定；跨提供商允许同名主备。
+/// `create=true` 只新增，`create=false` 只编辑，缺省兼容旧调用方的保存语义。
 ///
 /// ── `reasoning` 的三态（与 `provider` 的二态写法不同，别简写）──────
 /// 前端在**改已有映射的等级**时走的也是这条接口（三元组相同 = 命中同一条），
@@ -139,9 +123,11 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
     let alias = text_field(&object, "alias");
     let target = text_field(&object, "target");
     let provider = text_field(&object, "provider");
-    if !model_rules::alias_valid(&alias) {
-        return errors::management_error(400, "映射名只能包含字母、数字与 - _ . / :，且不超过 128 个字符");
-    }
+    // 别名的合法性**不在这里**校验：这条接口同时承担「新建一条对外别名」与
+    // 「切开关 / 改思考等级」两种语义，后者的别名只是定位键、可能本就是上游的
+    // 非 ASCII id（千问办公的 `高级` / `标准`）。判据放在 `model_rules::add_mapping`
+    // 里按「这条别名是不是新建的」区分，新建时用的是 `alias_name_valid`
+    // （不限字符集，见那里的注释）。
     if target.is_empty() {
         return errors::management_error(400, "缺少目标上游模型");
     }
@@ -149,7 +135,7 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
     if let Some(kind) = provider_opt {
         // provider 必须是注册表里的家：它决定候选链里追加谁，写错名字会让
         // 映射悄悄变成一条永远路由不到的死路
-        if !crate::server::core::providers::kind_from_id(kind).is_some() {
+        if !crate::server::core::providers::is_known_provider_id(kind) {
             return errors::management_error(400, format!("未知的提供商: {kind}"));
         }
     }
@@ -178,12 +164,13 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
         Some(Value::Bool(value)) => Some(*value),
         Some(_) => return errors::management_error(400, "enabled 必须是布尔值"),
     };
-    let others = catalog::providers_for_model(&target).into_iter()
-        .filter(|id| crate::server::core::providers::kind_from_id(id).is_some())
-        .filter(|id| Some(id.as_str()) != provider_opt)
-        .collect::<Vec<_>>();
-    if let Err(error) = model_rules::add_mapping(&alias, &target, provider_opt, reasoning, enabled, &others) {
-        return errors::management_error(500, error);
+    let create = match object.get("create") {
+        None => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => return errors::management_error(400, "create 必须是布尔值"),
+    };
+    if let Err(error) = model_rules::add_mapping(&alias, &target, provider_opt, reasoning, enabled, create) {
+        return errors::management_error(error.status_code, error.message);
     }
     let subject = match provider_opt {
         Some(name) => format!("{alias} → {target}（{name}）"),
@@ -209,9 +196,7 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
 /// 删除一条映射。同名映射允许多条后按 alias 删会有歧义，所以按
 /// `{alias, target, provider?}` 三元组精确定位（与新增同一套键）。
 ///
-/// 旧版全局条目（provider 缺失）对任何家都命中（与展示同口径），指名某家
-/// 删除时由 `remove_mapping` 展开成其余承载家 —— 所以这里要传「当前清单里
-/// 同样承载 target 的其他提供商」，与 `set_state` 取 `others` 同一处。
+/// 指名一家删除旧版全局映射时，其余承载家的开关与思考等级保持不变。
 pub async fn remove_mapping(State(state): State<ServerState>, body: Bytes) -> Response {
     let object = match body_object(&body) {
         Ok(object) => object,
@@ -223,21 +208,22 @@ pub async fn remove_mapping(State(state): State<ServerState>, body: Bytes) -> Re
     if alias.is_empty() || target.is_empty() {
         return errors::management_error(400, "缺少映射名或目标上游模型");
     }
-    if alias.eq_ignore_ascii_case(&target) {
+    let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
+    // 自映射（默认绑定）正常**不能删** —— 它跟着模型行存在，要停用请关它的开关。
+    // 唯一的例外是**这条模型行已经不在了**（上游把模型下线、那家被移除或没有可用
+    // 账号）：这时开关没有落点，「关掉它」无从谈起，删除是唯一出路 —— 管理页的
+    // 「未挂载的模型映射」正是给这批条目留的入口。判据与视图里标记 `dangling`
+    // 的那一处同源（`catalog::host_row_exists`），免得出现「界面显示为未挂载、
+    // 点删除却被拒」的死锁。
+    if alias.eq_ignore_ascii_case(&target)
+        && catalog::host_row_exists(state.store(), provider_opt, &target)
+    {
         return errors::management_error(400, "原始 ID 的默认绑定不能删除，请关闭它的开关");
     }
-    let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
-    // 其余承载家（id 空间，见 `providers_for_model`；口径与 `set_state` 的
-    // others 同一处）
-    let others: Vec<String> = if provider_opt.is_some() {
-        crate::server::core::providers::catalog::providers_for_model(&target)
-            .into_iter()
-            .filter(|kind_provider| Some(kind_provider.as_str()) != provider_opt)
-            .collect()
-    } else {
-        Vec::new()
+    let removed = match model_rules::remove_mapping(&alias, &target, provider_opt) {
+        Ok((_, removed)) => removed,
+        Err(error) => return errors::management_error(error.status_code, error.message),
     };
-    let (_, removed) = model_rules::remove_mapping(&alias, &target, provider_opt, &others);
     if !removed {
         return errors::management_error(404, format!("映射不存在: {alias} → {target}"));
     }
@@ -274,7 +260,9 @@ pub async fn add_custom(State(state): State<ServerState>, body: Bytes) -> Respon
     if provider.is_empty() {
         return errors::management_error(400, "缺少提供商");
     }
-    if crate::server::core::providers::kind_from_id(&provider).is_none() {
+    // 插件家同样算已知（判据见 `providers::is_known_provider_id` 的说明）：
+    // 只问枚举会让已装入的插件家在模型规则页一律收到「未知的提供商」。
+    if !crate::server::core::providers::is_known_provider_id(&provider) {
         return errors::management_error(400, format!("未知的提供商: {provider}"));
     }
     if id.is_empty() {
@@ -292,7 +280,9 @@ pub async fn add_custom(State(state): State<ServerState>, body: Bytes) -> Respon
             "纯数字 ID 只对 CatPaw 有意义，且需要该家目录里的档位信息；请改用它自己的模型清单",
         );
     }
-    model_rules::add_custom(&provider, &id);
+    if let Err(error) = model_rules::add_custom(&provider, &id) {
+        return errors::management_error(error.status_code, error.message);
+    }
     logging::log("[Models]", &format!("登记自定义模型 [{provider}] {id}"));
     ok_json(catalog::manage_view(state.store()))
 }
@@ -317,7 +307,10 @@ pub async fn remove_custom(State(state): State<ServerState>, body: Bytes) -> Res
     if provider.is_empty() || id.is_empty() {
         return errors::management_error(400, "缺少提供商或上游模型 ID");
     }
-    let (_, removed) = model_rules::remove_custom(&provider, &id);
+    let removed = match model_rules::remove_custom(&provider, &id) {
+        Ok((_, removed)) => removed,
+        Err(error) => return errors::management_error(error.status_code, error.message),
+    };
     if !removed {
         return errors::management_error(
             404,
@@ -362,10 +355,10 @@ pub async fn set_capabilities(State(state): State<ServerState>, body: Bytes) -> 
     if provider.is_empty() || id.is_empty() {
         return errors::management_error(400, "缺少提供商或模型 id");
     }
-    if crate::server::core::providers::kind_from_id(&provider).is_none() {
+    if !crate::server::core::providers::is_known_provider_id(&provider) {
         return errors::management_error(
             400,
-            format!("未知的内置提供商: {provider}（自定义提供商的能力走整表保存接口）"),
+            format!("未知的提供商: {provider}（自定义提供商的能力走整表保存接口）"),
         );
     }
     let patch = match object.get("capabilities") {
@@ -387,7 +380,7 @@ pub async fn set_capabilities(State(state): State<ServerState>, body: Bytes) -> 
         }
     }
     if let Err(error) = model_rules::set_capabilities(&provider, &id, &patch) {
-        return errors::management_error(500, error);
+        return errors::management_error(error.status_code, error.message);
     }
     // 日志把每一项写成「键=值 / 键=恢复」，否则排查时只看得到「保存了能力」
     // 这一句，分不清清除了哪一项、改成了什么

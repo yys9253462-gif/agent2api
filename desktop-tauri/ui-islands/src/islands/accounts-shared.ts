@@ -1,5 +1,10 @@
 import { t } from '../i18n'
+import { type ProxyUsage } from '../../../ui-shared/proxy-usage'
 import type { BalanceQueryPublic } from './balance-query'
+import type { LimiterGroup, LimiterSnapshot } from './accounts-limiter-types'
+import type { AccountSorting, AccountSortRule as GroupSortRule } from '../../../ui-shared/account-sorting'
+export type { AccountSorting, AccountSortRule as GroupSortRule } from '../../../ui-shared/account-sorting'
+export type { LimiterGroup } from './accounts-limiter-types'
 
 /**
  * 账号页各文件共用的**类型与全局桥读取**（非岛：`.ts` 不被 import.meta.glob 当岛加载）。
@@ -50,6 +55,13 @@ export type RateLimitInfo = {
   status?: number | string
   code?: string | number
   resetAt?: number
+  /**
+   * **触发时刻**（毫秒）：`store_admin::mark_rate_limited` 每次落盘都会写。
+   * 与 `resetAt` 合起来才知道这条冷却是多长、走到了哪儿 —— 限流明细里那条
+   * 「冷却进度」线读的就是它。旧版本落盘的记录可能没有这个键，那时进度线不画
+   * （`progress: null`），其余读数照旧。
+   */
+  at?: number
   message?: string
 }
 
@@ -83,6 +95,36 @@ export type LimiterRule = {
   /** 停用中的规则不参与判定；后端归一化后恒显式给出 */
   enabled?: boolean
 }
+
+export type BatchLimiterMode = 'append' | 'replace' | 'enable' | 'disable' | 'clear'
+
+export type BatchAccountsPayload = {
+  action: string
+  ids: string[]
+  proxy?: unknown
+  maxConcurrent?: number
+  usageQuery?: { enabled: boolean; interval: number }
+  limiterGroups?: LimiterGroup[]
+  limiters?: LimiterRule[]
+  limiterMode?: BatchLimiterMode
+}
+
+export type BatchAccountsResult = {
+  ok?: Array<{ id?: string; name?: string; changes?: string[] }>
+  removed?: Array<{ id?: string }>
+  failed?: Array<{ id?: string; error?: string }>
+  skipped?: Array<{ id?: string; name?: string; reason?: string }>
+  list?: AccountsSnapshot
+}
+
+export type AccountUpdateResult = {
+  account?: AccountRecord
+  changes?: string[]
+  list?: AccountsSnapshot
+}
+
+/** 与后端 MAX_CONCURRENT_LIMIT 一致。 */
+export const ACCOUNT_CONCURRENCY_MAX = 999
 
 /**
  * 一个 Token 规则窗口在**当前窗口**的消耗读数（用量快照 `tokenUsage` 的行，
@@ -133,7 +175,25 @@ export type AccountRecord = {
   canClaim?: boolean
   /** ZCode：这一行当前走哪条上游通道（`coding-plan` / `start-plan`，见 accounts-domain 的 ZCODE_PLAN_*） */
   zcodePlan?: string
+  hasAccessToken?: boolean
+  accessTokenExpiresAt?: number | null
   hasRefreshToken?: boolean
+  refreshTokenLongLived?: boolean
+  refreshExpiresAt?: number | null
+  /** 刷新令牌本身的授权截止时间（毫秒），不同于临时访问凭据的 expiresAt。 */
+  refreshTokenExpiresAt?: number | null
+  /** 授权已到期或被撤销，无法继续自动续期；重新登录后清除。 */
+  needsRelogin?: boolean
+  /** 与 `needsRelogin` 成对：后端给出的原因文案（为空表示没有标记）。 */
+  needsReloginReason?: string
+  /**
+   * 智谱清言：这条账号是不是**访客**（后端只对本家注入这个键，见
+   * `store_view::public_account` 与 `chatglm_accounts::guest_of_record`）。
+   *
+   * 消费方是余额列与签到范围：访客没有积分体系（上游接口一律 401），
+   * 所以它既不参与余额查询，也不在签到范围内 —— 两处读的是同一份事实。
+   */
+  isGuest?: boolean
   hasBalanceToken?: boolean
   /**
    * 自定义账号：记录里有没有非空 `apiKey`（设置弹窗据此决定输入框的提示文案与
@@ -159,6 +219,7 @@ export type AccountRecord = {
    */
   balanceQuery?: BalanceQueryPublic
   maxConcurrent?: number
+  allowRouteSkip?: boolean
   checkinAt?: number
   /**
    * 每账号自动余额查询设置（后端公开形态恒为对象；**缺省 = 开启、1 分钟**，
@@ -176,6 +237,7 @@ export type AccountRecord = {
    * 限制器规则列表（后端公开形态恒为数组，未显式配置 = 由旧 lowBalance /
    * provider 缺省推导的有效规则；形状见 `LimiterRule`）。
    */
+  limiterGroups?: LimiterGroup[]
   limiters?: LimiterRule[]
   addedAt?: number
   updatedAt?: number
@@ -185,13 +247,37 @@ export type AccountRecord = {
   source?: string
   proxy?: ProxyConfig | null
   rateLimits?: Record<string, RateLimitInfo>
+  upstreamCooldownUntil?: number | null
+  upstreamBlockedReason?: string
   [key: string]: unknown
+}
+
+export type HiddenAccountReason = 'not_installed' | 'pack_disabled' | 'provider_disabled' | 'not_loaded'
+
+export type HiddenAccountProvider = {
+  id: string
+  label: string
+  count: number
+  reason: HiddenAccountReason
+}
+
+export type HiddenAccountsSummary = {
+  total: number
+  byProvider: Record<string, number>
+  providers: HiddenAccountProvider[]
 }
 
 /** `wbApp.getState()?.accounts` 的形状（providers 摘要 + 账号清单） */
 export type AccountsSnapshot = {
   accounts?: AccountRecord[]
   providers?: Array<{ id?: string; label?: string; count?: number }>
+  sorting?: AccountSorting
+  /** 插件未就绪而隐藏的账号，只含数量与提供商元数据，不含账号记录。 */
+  hiddenAccounts?: {
+    total?: number
+    byProvider?: Record<string, number>
+    providers?: HiddenAccountProvider[]
+  }
 }
 
 /** 余额缓存的四种形态：undefined 未查 / null 查询中 / string 失败 / 对象结果 */
@@ -200,43 +286,11 @@ export type UsageEntry = null | string | Record<string, unknown> | undefined
 /** 列的对齐档（与 table-col-settings 的 Align 同一套取值） */
 export type Align = 'left' | 'center' | 'right'
 
-/**
- * 行内明细面板的 kind。**只剩「限流明细」一种**：签到曾也有一个明细面板，
- * 已随表格化删除；账号页的签到按钮又整体迁去了「签到中心」，行内面板
- * 与签到从此互不相干。
- */
-export type PanelKind = 'limits'
-
-/* ─── Loomy 新手任务 ─────────────────────────
+/* ─── 新手任务 ───────────────────────────────
  *
- * 类型在这里、消费在签到中心（checkin-page.tsx / checkin-state.ts）：任务状态
- * 是上游查询，签到中心的快照刻意不带，按账号惰性查询后缓存。账号页曾有一个
- * 「签到后自动弹窗领取」的链路（accounts-dialog-onboarding），随账号页签到
- * 按钮一起移除 —— 签到后的自动处理由 checkin-state.ts 承接。 */
-
-/** 后端任务行的原始形状（`GET /api/accounts/{id}/onboarding` 的 tasks 数组元素） */
-export type OnboardingTaskRaw = {
-  key?: unknown
-  title?: unknown
-  group?: unknown
-  points?: unknown
-  done?: unknown
-  /** 前置没满足 ⇒ 这一条现在领不动（CodeArts 新人礼未到门槛 / 活动未开始） */
-  blocked?: unknown
-}
-
-/** 渲染用的归一形状（claiming / error 是前端运行态，后端没有） */
-export type OnboardingTask = {
-  key: string
-  title: string
-  group: string
-  points: number
-  done: boolean
-  /** 见 {@link OnboardingTaskRaw.blocked}：既不计入待领数，也不发领取 */
-  blocked: boolean
-  claiming?: boolean
-  error?: string
-}
+ * 这里的两个类型已随签到中心一起搬进插件包（包内 `ui/checkin/state.js` 自己
+ * 归一后端形状）。保留它们没有意义：签到页现在在 iframe 里，跨源，宿主的
+ * 类型系统碰不到它。 */
 
 /* ─── 全局桥 ─────────────────────────────────── */
 
@@ -250,11 +304,27 @@ type ConfirmOptions = {
   bodyClass?: string
 }
 
+export type AccountExportSelection = { id: string; provider?: never } | { provider: string; id?: never }
+
+export type AccountExportResult = {
+  canceled?: boolean
+  total?: number
+  count?: number
+  failed?: Array<{ id?: string; name?: string; error?: string }>
+  file?: string
+  saved?: boolean
+  downloadStarted?: boolean
+}
+
 export type AccountsBridge = {
+  platform?: string
+  exportAccountFiles(selection: AccountExportSelection): Promise<AccountExportResult | null | undefined>
   getAccountConnections(): Promise<{ counts?: Record<string, unknown> } | null | undefined>
-  updateAccount(id: string, patch: Record<string, unknown>): Promise<{ changes?: string[] } | null | undefined>
+  updateAccount(id: string, patch: Record<string, unknown>): Promise<AccountUpdateResult | null | undefined>
   /** 整队重排（分组模式）：把新队列整条交上去（从队首到队尾的 id 数组） */
   reorderAccounts(queue: string[]): Promise<unknown>
+  getAccountSorting(): Promise<AccountSorting>
+  saveAccountSorting(payload: { provider: string; rules: GroupSortRule[] | null; onlyIfUnset?: boolean }): Promise<AccountSorting>
   moveAccount(id: string, direction: 'up' | 'down'): Promise<unknown>
   clearRateLimits(id: string, model?: string | null): Promise<unknown>
   /**
@@ -271,16 +341,11 @@ export type AccountsBridge = {
   setRoutingConfig(patch: Record<string, unknown>): Promise<Record<string, unknown> | null | undefined>
   getRoutingQueue(model?: string): Promise<Record<string, unknown> | null | undefined>
   /**
-   * 批量操作（后端 `POST /api/accounts/batch`）。`proxy` 与 `maxConcurrent` 是
-   * 两个带参动作的载荷：前者对应 action=proxy（null = 改为直连），后者对应
-   * action=concurrency（0 = 不限）。**两条桥都按字段白名单转发**（bridge.rs /
-   * web_shim.rs），加参数时两处都要补 —— 漏了会静默丢参数，服务端只报「缺字段」。
+   * 批量操作（后端 `POST /api/accounts/batch`）。带参动作的字段必须在桌面
+   * bridge.rs 与网页 web_shim.rs 两份白名单里同时转发。
+   * `skipped` 是能力不适用的账号，与真正保存失败的 `failed` 分开。
    */
-  batchAccounts(payload: { action: string; ids: string[]; proxy?: unknown; maxConcurrent?: number }): Promise<{
-    ok?: Array<{ id?: string; changes?: string[] }>
-    removed?: unknown[]
-    failed?: Array<{ id?: string; error?: string }>
-  } | null | undefined>
+  batchAccounts(payload: BatchAccountsPayload): Promise<BatchAccountsResult | null | undefined>
   getAllBalances(id?: string): Promise<{ results?: Array<Record<string, unknown>> } | null | undefined>
   /**
    * 用量快照（后端 `usage_query::snapshot`）：余额结论之外还带 Token 限制器的
@@ -288,15 +353,14 @@ export type AccountsBridge = {
    * 按它判断要不要应用），`tokenUsage` 按账号给启用中的每个 Token 周期一条
    * `{period, windowStart, used}`（没配规则的账号不出现）。
    */
-  getBalancesSnapshot(): Promise<{
+  getBalancesSnapshot(): Promise<LimiterSnapshot & {
     at?: number
     results?: Array<Record<string, unknown>>
     tokenAt?: number
     tokenUsage?: Record<string, unknown>
+    sorting?: AccountSorting
   } | null | undefined>
-  getProxies(): Promise<{ clash?: ClashSnapshot } | null | undefined>
-  /** 代理池列表（「网络代理」页维护的命名代理）：账号代理表单的
-   *  「已保存的代理」下拉读它；写侧（增删改）只有那一页用，不在这份桥里 */
+  getProxies(): Promise<{ clash?: import('../../../ui-shared/clash-proxy').ClashProxySnapshot } | null | undefined>
   getProxyPool(): Promise<{ items?: PoolItem[] } | null | undefined>
   /** 测一条池条目（账号表单里选中池引用时的「测试出口」）：
    *  结果会记进那条代理的「上次测试」，与代理页那颗按钮同一个动作 */
@@ -316,17 +380,17 @@ export type AccountsBridge = {
   switchAccount(id: string): Promise<{ changed?: boolean } | null | undefined>
   refreshAccountToken(id: string): Promise<unknown>
   removeAccount(id: string): Promise<unknown>
-  /**
-   * ZCode 活动套餐通道的**验证码令牌池**概况（见后端 `providers/zcode/captcha.rs`）。
-   *
-   * 活动套餐的推理端点每条请求都要一个当次铸的阿里云验证码令牌，令牌由界面后台
-   * 静默铸造（`ui/zcode-captcha-pool.js`）。这里读的是「当前库存 / 目标 / 是否
-   * 正在缺货」—— 账号设置里选活动套餐时用它给用户一个可查的状态，
-   * 否则「转发失败但不知道为什么」只能靠日志。
-   */
+  /** 套餐池模型请求的验证状态与库存；读取不发起验证码。 */
   zcodeCaptchaStats?(): Promise<{
     ready?: number
     target?: number
+    required?: boolean
+    needsTokens?: boolean
+    demandActive?: boolean
+    lastSyncAt?: number
+    configError?: string
+    captchaAccountId?: string
+    error?: string
     startPlanAccounts?: number
     rejected?: number
     minted?: number
@@ -335,78 +399,36 @@ export type AccountsBridge = {
   } | null | undefined>
 }
 
-/** `/api/proxies` 里 clash 那一段（出口列表 + 可用性） */
-export type ClashSnapshot = {
-  available?: boolean
-  error?: string
-  dir?: string
-  options?: Array<{
-    uid?: string
-    name?: string
-    port?: number
-    profileActive?: boolean
-    enabled?: boolean
-  }>
-}
-
 /**
  * 「网络代理」页（代理池）的一条条目 —— 只列账号表单用到的字段，
  * 完整形态见 ui-islands/src/islands/proxies-page.tsx 的 PoolItem。
  * 账号的 proxy 可以按 id 引用它（`{source:'pool', proxyId}`）。
  */
-export type PoolItem = {
+export type PoolItem = ProxyUsage & {
   id: string
   name?: string
-  /** manual | clash（表单里按它标「手动 / Clash Verge」） */
   source?: string
   enabled?: boolean
-  /** 订阅节点的监听端口；null = 未分配（lazy listeners，见网络代理页） */
+  protocol?: string
+  host?: string
   port?: number | null
-  /** 解析后的出口（Clash 条目的端口在这里是实时值）；不受控字段按 unknown 收 */
   resolved?: { protocol?: string; host?: string; port?: number | null; label?: string } | null
-  /** 解析失败的原因（引用了已删除的 Clash 监听器等） */
   resolveError?: string | null
-  /** 引用它的账号（后端在池列表里带的） */
-  usedBy?: Array<{ id?: string; name?: string; enabled?: boolean }>
 }
 
-/**
- * 池条目的地址串：`HTTP 127.0.0.1:7910`（协议大写 + 主机 + 端口）。
- *
- * 与 OmniProxy 的名称列第二行同一口径（它的 ProxiesPage 就在名字下面写
- * `${protocol.toUpperCase()} ${host}:${port}`）。用解析后的 host/port 而不是
- * `resolved.label`：label 对 Clash 条目是「监控器名（:端口）」、对混合端口是
- * 「Clash 混合端口 7892」—— 都不含主机，且形态随来源变。这里统一成同一串，
- * 用户在下拉里能直接核对「这条连的是哪儿」。
- *
- * 取不到（解析失败 / 字段缺失）时回落 `resolved.label`，再没有就是空串。
- */
+/** 代理统一展示实时解析出的协议地址，供列表与下拉核对。 */
 export function poolItemAddress(item: PoolItem): string {
-  // lazy listeners：订阅节点可能还没有分配监听端口（未引用 / 引用刚保存
-  // 内核还没重建完）—— 在这里标注出来，下拉与地址列都能看到原因
-  if (item.source === 'subscription' && (item.port === null || item.port === undefined)) {
-    return t('未分配端口')
+  const proxy = item.resolved || item
+  if (proxy.protocol && proxy.host && proxy.port) {
+    const host = proxy.host.includes(':') && !proxy.host.startsWith('[') ? `[${proxy.host}]` : proxy.host
+    return `${String(proxy.protocol).toLowerCase()}://${host}:${proxy.port}`
   }
-  const resolved = item.resolved
-  if (resolved?.protocol && resolved.host && resolved.port) {
-    return `${String(resolved.protocol).toUpperCase()} ${resolved.host}:${resolved.port}`
-  }
-  return resolved?.label || ''
+  return item.resolved?.label || ''
 }
 
-/**
- * 池条目在下拉里的展示名：`香港HK-A（HTTP 127.0.0.1:7909）` /
- * `香港HK-A（HTTP 127.0.0.1:7909 · 已禁用）` / `香港HK-A（解析失败）`。
- *
- * 三个地方共用（账号表代理列 / 账号弹窗的代理表单 / 更新设置的出网线路）——
- * 各写一份迟早会漂移成本次这种事（有一处忘了写地址，用户下拉里只能看到名字）。
- * 条目的来源（手动 / Clash）不在这里标：下拉里已经有地址可比对，来源在
- * 「网络代理」页的类型列上。
- */
 export function poolItemLabel(item: PoolItem): string {
   const name = item.name || item.id
-  const address = item.resolveError ? t('解析失败') : poolItemAddress(item)
-  const parts = [address, item.enabled === false ? t('已禁用') : ''].filter(Boolean)
+  const parts = [item.source === 'clash' ? 'Clash Verge' : '', item.resolveError ? t('解析失败') : poolItemAddress(item), item.enabled === false ? t('已禁用') : ''].filter(Boolean)
   return parts.length ? t('{name}（{parts}）', { name, parts: parts.join(' · ') }) : name
 }
 
@@ -432,9 +454,15 @@ export type SharedWindow = {
     toast?: (message: string, kind?: 'err' | 'ok') => void
     formatTime?: (value: unknown) => string
     showPage?: (page: string) => void
-    refresh?: () => Promise<unknown> | unknown
+    refresh?: () => Promise<boolean>
+    getRefreshStatus?: () => { pending: boolean; error: string }
+    subscribeRefresh?: (listener: () => void) => () => void
     runAccountAction?: (action: string, id: string) => void
-    getState?: () => { accounts?: AccountsSnapshot } | null | undefined
+    getState?: () => {
+      accounts?: AccountsSnapshot
+      /** 插件申报的账号行渲染参数（`/api/session` 的 `accountFeatures`，键为 provider id） */
+      accountFeatures?: Record<string, unknown>
+    } | null | undefined
     /** 顶栏状态区重画：余额结论会翻转「已限流」计数，应用完读数后调它跟上 */
     renderTopbarStatus?: () => void
     readonly currentPage?: string
@@ -443,6 +471,7 @@ export type SharedWindow = {
   wbProviders?: {
     labelOf?: (id: string) => string
     all?: () => Array<{ id?: string; label?: string }>
+    refreshCustom?: () => Promise<unknown>
     customList?: () => Array<{
       id?: string; name?: string; protocol?: string; baseUrl?: string
       /** 客户端形态伪装（`'opencode'` = 按 OpenCode 官方 CLI 形状补齐请求）。
@@ -484,10 +513,15 @@ export type SharedWindow = {
    */
   wbZcodeClaim?: {
     preview?: (accountId: string) => Promise<unknown>
-    claim?: (accountId: string, planId: string) => Promise<unknown>
+    claim?: (accountId: string, planId: string, signal?: AbortSignal, onPhase?: (phase: string) => void) => Promise<unknown>
   }
   /** ZCode 套餐明细弹窗（zcode-plans-modal.tsx）：可领取 + 名下已有的套餐，逐份领取 */
   wbZcodePlans?: { open?: (options: { id: string; name?: string }) => void }
+  wbZcodeCaptchaPool?: {
+    status?(): { state: 'idle' | 'verifying' | 'paused' | 'error' | 'disabled' | 'needs_verification'; error: string }
+    refresh?(): ReturnType<NonNullable<AccountsBridge['zcodeCaptchaStats']>>
+    verify?(accountId: string, signal?: AbortSignal, onPhase?: (phase: string) => void): Promise<boolean>
+  }
   /** CodeArts「领福利」流程（ui/codearts-welfare.js：只读探测 → 确认 → 领取 → 回读） */
   wbCodeArtsWelfare?: { start?: (account: AccountRecord | undefined) => Promise<unknown> }
   /** 「添加账号」弹窗（归另一个代理，本页只调它的 open） */
@@ -543,4 +577,24 @@ export function formatTime(value: unknown): string {
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * 数值字段 → 展示串：**最多两位小数**，取不到给「—」。
+ *
+ * ── 为什么要有小数上限 ──────────────────────────────────────
+ * 上游有几家给的是 `*Precise` 这类**高精度浮点**（WorkBuddy 国内版的
+ * `CycleCapacityRemainPrecise` 实测回 `3547.430000335`），后端按「缺键不写、
+ * 给什么写什么」如实透传，于是那串尾巴会铺满悬停提示与积分明细。积分读到两位
+ * 小数已经比上游自己面板上给的还细，再多就是噪声。收口只在这里一处
+ * （余额读数 / 余量 / 总量 / 明细行 / 限制器实况都走它），别在十来处各写一遍。
+ *
+ * 整数不受影响（`1500.00` → `1500`，尾随零由 `Number` 归掉）；解析不出数字的值
+ * **原样透出** —— 上游偶尔给「不限」这类文案串，不能把一个有内容的值改写成「—」。
+ */
+export function numberText(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '—'
+  const number = Number(value)
+  if (!Number.isFinite(number)) return String(value)
+  return String(Number(number.toFixed(2)))
 }

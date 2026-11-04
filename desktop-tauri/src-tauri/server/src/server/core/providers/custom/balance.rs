@@ -200,7 +200,7 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
     // 而不是方案名 —— 同一种方案的两个人可能有完全不同的名字
     let what = |kind: &str| format!("{label} {kind}");
 
-    match scheme {
+    let mut report = match scheme {
         Scheme::Sub2api => {
             let key = require_api_key(&credential, scheme, label)?;
             let url = build_url(&base_url, Api::Usage)?;
@@ -224,7 +224,9 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
         Scheme::Zhipu => query_zhipu(&query, proxy, label).await,
         Scheme::ZhipuZai => query_zhipu_zai(&credential, proxy, label).await,
         Scheme::Sensenova => query_sensenova(store, &credential, &query, proxy, label).await,
-    }
+    }?;
+    report["quotaSources"] = Value::Array(super::quota::sources(&provider_id, scheme, &report));
+    Ok(report)
 }
 
 /// NewAPI：账户余额（`/api/user/self`）+ 显示口径（`/api/status`）。

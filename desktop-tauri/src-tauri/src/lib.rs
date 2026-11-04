@@ -21,14 +21,20 @@
  * window.workbuddyDesktop 装好，因此渲染层代码无需感知 Tauri。
  */
 
+mod account_export;
+mod assistant_image;
 mod backend;
 mod bridge;
 mod commands;
+mod deepseek_login;
+mod doubaowork_login;
 mod gateway;
 mod legacy_install;
 mod login;
 mod login_profile;
+mod panel_session;
 mod settings;
+mod startup;
 mod state;
 mod tray;
 mod update;
@@ -265,6 +271,7 @@ pub fn run() {
             commands::api_request,
             commands::api_request_text,
             commands::backend_status,
+            commands::wait_for_backend,
             commands::port_occupant,
             commands::end_port_occupant,
             commands::restart_app,
@@ -272,6 +279,9 @@ pub fn run() {
             commands::change_port,
             commands::panel_admin_status,
             commands::panel_register,
+            commands::panel_session_status,
+            commands::panel_session_store,
+            commands::panel_session_clear,
             commands::change_lan_access,
             // 界面直连网关时的凭证头（AI 助手页不经桥发请求，见 commands.rs）
             commands::direct_credentials,
@@ -287,10 +297,16 @@ pub fn run() {
             commands::get_app_settings,
             commands::save_app_settings,
             commands::export_accounts,
+            account_export::export_account_files,
+            assistant_image::save_assistant_image,
             commands::import_accounts,
             commands::export_database,
             commands::import_database,
+            commands::cloud_sync_upload,
+            commands::cloud_sync_download,
+            commands::cloud_sync_import_key,
             commands::check_update,
+            commands::system_info,
             commands::download_update,
             commands::update_progress,
             commands::cancel_update,
@@ -432,7 +448,8 @@ pub fn run() {
 
             // 后端负责维护任务的持久化排期，桌面壳不额外触发刷新。
             tauri::async_runtime::spawn(async move {
-                if let Err(failure) = backend::ensure_ready(&handle).await {
+                let started = backend::ensure_ready(&handle).await;
+                if let Err(failure) = &started {
                     eprintln!("[backend] 启动失败: {}", failure.message);
                     // 存一份到 AppState：事件是一次性的，界面可能在事件发出之后
                     // 才订阅（窗口还在加载、WebView 被刷新），那时只能靠主动查
@@ -442,8 +459,11 @@ pub fn run() {
                             guard.failure = Some(failure.clone());
                         }
                     }
+                    startup::complete(&started);
                     let _ = handle.emit("backend:error", failure);
-                    return;
+                } else {
+                    startup::complete(&started);
+                    let _ = handle.emit("backend:ready", ());
                 }
             });
 

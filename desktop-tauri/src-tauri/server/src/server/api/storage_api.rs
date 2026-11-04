@@ -30,8 +30,6 @@
 //! 保留 `configDir` 字段：前端用它拼「库在配置目录下」这句提示，
 //! 也是排障时第一眼要看的位置。
 
-use std::path::Path;
-
 use axum::extract::State;
 use axum::response::Response;
 use serde_json::{json, Value};
@@ -40,23 +38,9 @@ use crate::server::config;
 use crate::server::http::ok_json;
 use crate::server::ServerState;
 
-/// 文件大小；不存在（还没写过盘）按 0 算
-fn file_size(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
-}
-
-/// GET /api/storage —— 统一库的位置、大小与各表条数（设置页渲染用）。
-///
-/// `bytes` 是**库主文件**的大小。WAL 里的页不算在内（`RequestStats::flush`
-/// 在停机时把 WAL 并回主库，正是为了让「占用多大」只有一个文件是真相）——
-/// 所以运行期间这个数字可能略小于实际占用，属预期。
-///
-/// 条数一律取各 store 现有的计数入口，没有硬凑：
-///   - `accounts` / `logs` / `requests` / `dailyDays` / `debug` 分别来自
-///     `AccountStore` 的账号快照、`LogStore::stats()`、`RequestStats::stats()`
-///     与 `debug_traffic::count()`；
-///   - 库不可用时各计数回落 0（与各 store 自己的降级值一致），
-///     `file` 给空串 —— 让界面显示「不可用」，而不是一个看着正常的 0 条。
+/// GET /api/storage —— 统一库的位置、主文件 + WAL 占用与各表条数。
+/// 两侧报文条数来自 RequestStats::stats；`debug` 保留为上游条数的兼容字段。
+/// 库不可用时 `available` 为 false，界面不把降级的 0 当作真实读数。
 pub async fn get_storage(State(state): State<ServerState>) -> Response {
     let config_dir = config::config_dir();
     // 库路径的事实来源是 `Db::file()`（打开失败时用约定路径兜底：排障时
@@ -84,15 +68,18 @@ pub async fn get_storage(State(state): State<ServerState>) -> Response {
         .unwrap_or(0);
 
     // 请求明细与聚合天数：`RequestStats::stats()` 一次给全（它自己会取锁读库）
-    let stats = state.request_stats().stats();
+    let request_stats = state.request_stats();
+    let stats = request_stats.stats();
     let requests = stats.get("total").and_then(Value::as_u64).unwrap_or(0);
     let daily_days = stats.get("dailyDays").and_then(Value::as_u64).unwrap_or(0);
+    let downstream_raw = stats.get("downstreamRaw").and_then(Value::as_u64).unwrap_or(0);
+    let upstream_raw = stats.get("upstreamRaw").and_then(Value::as_u64).unwrap_or(0);
 
     ok_json(json!({
         "configDir": config_dir.to_string_lossy(),
         "database": {
             "file": db_file.to_string_lossy(),
-            "bytes": if available { file_size(&db_file) } else { 0 },
+            "bytes": if available { request_stats.db_bytes() } else { 0 },
             // 条数只在库可用时才可信（不可用时各 store 都回落 0，与「真的没有
             // 数据」在数字上无法区分）—— 这个布尔让界面能说「不可用」而不是
             // 显示一排看着正常的 0
@@ -101,7 +88,9 @@ pub async fn get_storage(State(state): State<ServerState>) -> Response {
             "logs": logs,
             "requests": requests,
             "dailyDays": daily_days,
-            "debug": crate::server::core::debug_traffic::count(),
+            "debug": upstream_raw,
+            "downstreamRaw": downstream_raw,
+            "upstreamRaw": upstream_raw,
         },
     }))
 }

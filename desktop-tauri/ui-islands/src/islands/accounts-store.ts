@@ -1,59 +1,48 @@
-/**
- * 账号页的**状态 store**（非岛：`.ts` 不被 import.meta.glob 当岛加载）：快照、筛选、
- * 勾选、行内面板展开态、账号名隐藏、以及从快照派生的各种读法。
- *
- * ── 从 accounts-data.ts 拆出来的理由 ──────────────────────────
- * 「状态怎么存」与「动作怎么发」是两件事，混在一个文件里已经九百多行（约定单文件 ≤800）。
- * 拆开之后：本文件只回答「现在是什么状态、怎么改」，actions（余额 / 连接数 /
- * Clash 缓存 / 行内动作 / 弹窗 / 对外契约）在 accounts-data.ts —— 那个文件再
- * `export * from './accounts-store'`，于是视图侧的 import 路径一行不用改。
- *
- * ── 为什么是模块级 store + useSyncExternalStore ────────────────
- * 对外契约（`wbAccountsView.render()` / `refreshCaches()` / `syncConnections()` /
- * `syncBalancesSnapshot()`）从 React 之外调用，且必须与界面共用同一份状态 ——
- * 组件内部的 useState 做不到这一点。所以状态是一份模块级快照，改动一律走 patch()
- * （换新对象再通知订阅者）。
- *
- * ── 两种持有方式（刻意不同）──────────────────────────────
- *   · 高频小改动（连接数每 2 秒一轮）走 `patch({...})` 换新 Map / Set；
- *   · 少量原地可变的结构由各自的动作层维护（见 accounts-data.ts 的说明）。
- * 两条路都经过同一个订阅者集合，React 侧看不出差别。
- *
- * （签到相关状态曾在这里：`checkinBusy` 与新手任务弹窗 `onboarding`。签到动作
- * 迁到「签到中心」后两样都随之离开 —— 新手任务的查询 / 领取缓存现在在
- * checkin-state.ts，签到完成后自动处理的那条链也在那边。）
- */
 
-import { shared, type AccountRecord, type AccountsSnapshot, type ClashSnapshot, type PanelKind } from './accounts-shared'
+
 import {
-  accountGroups, byPriorityOrder, filterCounts, matchesFilter, positionMap, providerSummaries,
-  visibleAccounts, type AccountFilter, type AccountGroup, type TokenUsageLookup, type UsageLookup,
+  shared, type AccountRecord, type AccountsSnapshot, type AccountSorting,
+  type HiddenAccountProvider, type HiddenAccountsSummary,
+} from './accounts-shared'
+import {
+  accountGroups, filterCounts, matchesFilter, positionMap, providerSummaries,
+  defaultGroupSortRules,
+  type AccountFilter, type AccountGroup, type GroupSortRule, type TokenUsageLookup, type UsageLookup,
 } from './accounts-domain'
 
-/** 弹窗状态：账号设置（单个）/ 批量操作（多选 + 动作），关闭即 null */
+/** 弹窗状态：账号设置（单个）/ 批量操作（多选 + 动作）/ 分组设置（单组），关闭即 null */
 export type AccountsDialog =
   | { kind: 'settings'; id: string }
   | { kind: 'batch'; ids: string[]; action: string }
+  | { kind: 'group'; provider: string }
   | null
 
 export type AccountsStore = {
   /** 每次变更 +1；React 靠它判断「该重画了」（快照对象同时被换掉） */
   version: number
+  listBusy: boolean
+  listError: string
   filter: AccountFilter
   /** 折叠起来的分组（provider id）。列表长了之后「只看某几家」靠它，见页头那颗按钮 */
   collapsed: ReadonlySet<string>
   selected: ReadonlySet<string>
-  panels: ReadonlyMap<string, ReadonlySet<PanelKind>>
   connections: ReadonlyMap<string, number>
-  /** Clash 出口列表缓存（`null` = 还没读到）；**只有代理表单的 Clash 直引档用**
-   *  （存量配置专用）—— 账号页的代理下拉列的是「网络代理」页的池条目 */
-  clash: ClashSnapshot | null
   dialog: AccountsDialog
   namesHidden: boolean
   /** 批量查询余额在途（工具条按钮的文案与禁用态） */
   usageBusy: boolean
   /** 余额查询在途的账号（行上那颗「余额」按钮的去重闸） */
   usageInflight: ReadonlySet<string>
+  /**
+   * 组头读数（可用合计 / 可用最低）是否只统计**当前筛选 / 搜索后可见的行**。
+   * 默认关闭（= 按整组统计，见 accounts-panels 的 groupBalanceOf）；开关在
+   * 设置 → 显示 → 账号列表里。与 namesHidden 同属「怎么看这张表」的偏好。
+   */
+  groupTotalFiltered: boolean
+  /** 全局消耗规则由网关保存；本地值仅用于旧设置迁移。 */
+  groupSort: Readonly<Record<string, GroupSortRule[]>>
+  sorting: AccountSorting | null
+  sortBusy: boolean
 }
 
 /* ─── 跨次启动的记忆键 ───────────────────────── */
@@ -64,6 +53,44 @@ const COLLAPSED_KEY = 'workbuddy-desktop-accounts-collapsed'
 /** 账号名隐藏开关（表头「账号」旁边那颗眼睛）：打开后账号列的名字整体显示成星号。
  *  这是「怎么看这张表」的偏好，与列宽同一档，存 localStorage 跨次启动保留 */
 const NAMES_HIDDEN_KEY = 'workbuddy-desktop-accounts-names-hidden'
+/**
+ * 组头读数的口径开关：`'1'` = 只统计当前筛选后的可见行，缺省 / 其它 = 整组统计。
+ *
+ * 这个键是账号页与设置页**共用的契约**：两边都经本文件的 `readGroupTotalFiltered` /
+ * `setGroupTotalFiltered` 读写，不各自写一份字面量 —— 分开写的话，改键名时漏一处
+ * 就是「开关拨了不生效」。
+ */
+export const GROUP_TOTAL_FILTERED_KEY = 'workbuddy-desktop-accounts-group-total-filtered'
+
+/** 旧版浏览器排序设置的迁移来源，不再写入新规则。 */
+export const GROUP_SORT_KEY = 'workbuddy-desktop-accounts-group-sort'
+
+/** 读回组内排序规则（坏数据整段丢弃，不让一个手改坏的键把整页排序拖垮） */
+function loadGroupSort(): Record<string, GroupSortRule[]> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GROUP_SORT_KEY) || '{}') as unknown
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const out: Record<string, GroupSortRule[]> = {}
+    for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!Array.isArray(value)) continue
+      const rules: GroupSortRule[] = []
+      for (const item of value) {
+        if (!item || typeof item !== 'object') continue
+        const entry = item as Record<string, unknown>
+        if (entry.key === 'credit') {
+          rules.push({ key: 'credit', on: entry.on !== false, dir: entry.dir === 'late' ? 'late' : 'soon' })
+        } else if (entry.key === 'added') {
+          rules.push({ key: 'added', on: entry.on !== false, dir: entry.dir === 'old' ? 'old' : 'new' })
+        }
+      }
+      // 两条规则都没了的记录不入表：那是「回到默认」而不是「一条规则都不参与」
+      if (rules.length) out[provider] = rules
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
 
 /**
  * 读回筛选档位。
@@ -96,9 +123,28 @@ function loadCollapsed(): Set<string> {
   }
 }
 
+/** 账号名掩码的当前偏好（设置页也要读同一份，故与 loadNamesHidden 同源导出） */
+export function readNamesHidden(): boolean {
+  return loadNamesHidden()
+}
+
+/** 组头合计口径的当前偏好（设置页读它摆开关） */
+export function readGroupTotalFiltered(): boolean {
+  return loadGroupTotalFiltered()
+}
+
 function loadNamesHidden(): boolean {
   try {
     return localStorage.getItem(NAMES_HIDDEN_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/** 组头合计口径：只有明确存过 '1' 才算「按筛选」，没存过 / 存坏都按整组（默认关闭） */
+function loadGroupTotalFiltered(): boolean {
+  try {
+    return localStorage.getItem(GROUP_TOTAL_FILTERED_KEY) === '1'
   } catch {
     return false
   }
@@ -108,16 +154,20 @@ function loadNamesHidden(): boolean {
 
 let store: AccountsStore = {
   version: 0,
+  listBusy: false,
+  listError: '',
   filter: loadFilter(),
   collapsed: loadCollapsed(),
   selected: new Set<string>(),
-  panels: new Map<string, ReadonlySet<PanelKind>>(),
   connections: new Map<string, number>(),
-  clash: null,
   dialog: null,
   namesHidden: loadNamesHidden(),
   usageBusy: false,
   usageInflight: new Set<string>(),
+  groupTotalFiltered: loadGroupTotalFiltered(),
+  groupSort: loadGroupSort(),
+  sorting: null,
+  sortBusy: false,
 }
 
 const listeners = new Set<() => void>()
@@ -131,7 +181,6 @@ export function getStore(): AccountsStore {
   return store
 }
 
-/** 换一份快照并通知订阅者（React 侧 getSnapshot 的引用比较靠它） */
 export function patch(partial: Partial<AccountsStore>): void {
   store = { ...store, ...partial, version: store.version + 1 }
   listeners.forEach(listener => listener())
@@ -153,6 +202,42 @@ export function allAccounts(): AccountRecord[] {
   return Array.isArray(list) ? list : []
 }
 
+/** 插件未就绪的账号摘要；旧后端只有数量时使用中性的「未加载」原因。 */
+export function hiddenAccounts(): HiddenAccountsSummary {
+  const hidden = snapshot()?.hiddenAccounts
+  const raw = hidden?.byProvider
+  const byProvider: Record<string, number> = {}
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [provider, count] of Object.entries(raw)) {
+      const value = Number(count)
+      if (Number.isFinite(value) && value > 0) byProvider[provider] = value
+    }
+  }
+  const details = new Map<string, HiddenAccountProvider>()
+  for (const item of Array.isArray(hidden?.providers) ? hidden.providers : []) {
+    if (!item || typeof item.id !== 'string' || !item.id) continue
+    const reason = item.reason === 'not_installed' || item.reason === 'pack_disabled'
+      || item.reason === 'provider_disabled' ? item.reason : 'not_loaded'
+    details.set(item.id, {
+      id: item.id,
+      label: typeof item.label === 'string' && item.label ? item.label : item.id,
+      count: Number(item.count) || 0,
+      reason,
+    })
+  }
+  const providers = Object.entries(byProvider).map(([id, count]): HiddenAccountProvider => {
+    const detail = details.get(id)
+    return {
+      id,
+      count,
+      label: detail?.label || shared().wbProviders?.labelOf?.(id) || id,
+      reason: detail?.reason || 'not_loaded',
+    }
+  }).sort((a, b) => b.count - a.count)
+  const total = Number(hidden?.total)
+  return { total: Number.isFinite(total) && total > 0 ? total : 0, byProvider, providers }
+}
+
 export function findAccount(id: string): AccountRecord | null {
   return allAccounts().find(account => account.id === id) || null
 }
@@ -162,7 +247,7 @@ export function findAccount(id: string): AccountRecord | null {
  *  注入：限流维度把「余额不足已跳过 / Token 限额已跳过」都算进已限流，而两份缓存
  *  都在 accounts-data（本文件不反向依赖它，避免 store⇄data 成环） */
 export function visibleList(usageOf?: UsageLookup, tokenUsageOf?: TokenUsageLookup): AccountRecord[] {
-  return visibleAccounts(allAccounts(), store.filter, usageOf, tokenUsageOf).slice().sort(byPriorityOrder)
+  return groupView(usageOf, tokenUsageOf).groups.flatMap(group => group.accounts)
 }
 
 export type GroupView = {
@@ -197,9 +282,27 @@ export function groupView(
     account => matchesFilter(account, store.filter, usageOf, tokenUsageOf),
     usageOf,
     tokenUsageOf,
+    groupSortRules,
+    store.sorting || snapshot()?.sorting,
   )
   const groups = allGroups.filter(group => group.accounts.length > 0)
   return { groups, allGroups }
+}
+
+/** 已保存的选择优先；未配置的家按当前申报能力生成默认规则。 */
+export function groupSortRules(provider: string): GroupSortRule[] {
+  const effective = store.sorting?.rules[provider] || snapshot()?.sorting?.rules[provider]
+  const saved = effective || store.groupSort[provider]
+  if (saved) {
+    const rules = saved.map(rule => ({ ...rule }))
+    return [...rules, ...defaultGroupSortRules(provider).filter(rule => !rules.some(current => current.key === rule.key)).map(rule => ({ ...rule, on: false }))]
+  }
+  return defaultGroupSortRules(provider)
+}
+
+/** 这一家有没有**显式改过**规则（设置弹窗据此决定「恢复默认」是否可点） */
+export function hasCustomGroupSort(provider: string): boolean {
+  return Object.prototype.hasOwnProperty.call(store.sorting?.configured || store.groupSort, provider)
 }
 
 export function providerSummaryList(): Array<{ id: string; label: string; count: number }> {
@@ -210,9 +313,9 @@ export function segmentCounts(usageOf?: UsageLookup, tokenUsageOf?: TokenUsageLo
   return filterCounts(allAccounts(), store.filter, usageOf, tokenUsageOf)
 }
 
-/** 该账号在**全局队列**里的位置（序号与 ↑/↓ 的边界同源） */
+/** 全局有效消耗队列的位置，不受筛选影响。 */
 export function seats(): Map<string, { position: number; total: number }> {
-  return positionMap(allAccounts())
+  return positionMap(allAccounts(), store.sorting || snapshot()?.sorting)
 }
 
 /* ─── 筛选 ─────────────────────────────────── */
@@ -351,42 +454,39 @@ export function clearSelection(): void {
   patch({ selected: new Set<string>() })
 }
 
-/* ─── 行内明细面板的展开态 ─────────────────────
- * 这一份 Map 是「面板开着没」的**唯一判据来源**：单账号按钮、批量展开、渲染三处都只读它，
- * 谁都不自己另存一份布尔量。以后再加入口也必须走这里的函数，否则这条保证就断了。
- * 余额没有明细行（读数直接落在余额列上），所以只有 limits / checkin 两种 kind。 */
-
-export function panelOpen(id: string, kind: PanelKind): boolean {
-  return store.panels.get(id)?.has(kind) === true
-}
-
-export function setPanelOpen(id: string, kind: PanelKind, open: boolean): void {
-  if (!id) return
-  const panels = new Map(store.panels)
-  const set = new Set(panels.get(id) || [])
-  if (open) set.add(kind)
-  else set.delete(kind)
-  if (set.size) panels.set(id, set)
-  else panels.delete(id)
-  patch({ panels })
-}
-
-export function openPanelsFor(ids: string[], kind: PanelKind): void {
-  const panels = new Map(store.panels)
-  for (const id of ids) {
-    const set = new Set(panels.get(id) || [])
-    set.add(kind)
-    panels.set(id, set)
-  }
-  patch({ panels })
-}
-
 /* ─── 账号名隐藏 ─────────────────────────────── */
 
 export function toggleNamesHidden(): void {
   const next = !store.namesHidden
   try { localStorage.setItem(NAMES_HIDDEN_KEY, next ? '1' : '0') } catch { /* 存不了只影响下次启动 */ }
   patch({ namesHidden: next })
+}
+
+/** 显式写入账号名掩码（设置页的开关用它；账号页表头那颗眼睛走 toggle） */
+export function setNamesHidden(next: boolean): void {
+  try { localStorage.setItem(NAMES_HIDDEN_KEY, next ? '1' : '0') } catch { /* 存不了只影响下次启动 */ }
+  patch({ namesHidden: next })
+}
+
+/* ─── 组头合计口径 ───────────────────────────── */
+
+/**
+ * 从存储里重读合计口径并同步到本页（只在**别的文档 / 窗口**改过时用得上）。
+ *
+ * 同一个文档内设置页与账号页共用这一份 store，设置页的写入直接走
+ * `setGroupTotalFiltered`，本页不需要再读盘。这条路径留给「另一个窗口 / 另一份
+ * 面板」改了偏好之后的 `storage` 事件 —— 不跟的话，那个窗口里拨的开关要刷新
+ * 整页才生效。没变化时不 patch，免得每次存储事件都白白重画一遍表格。
+ */
+export function syncGroupTotalPreference(): void {
+  const next = loadGroupTotalFiltered()
+  if (next === store.groupTotalFiltered) return
+  patch({ groupTotalFiltered: next })
+}
+
+export function setGroupTotalFiltered(next: boolean): void {
+  try { localStorage.setItem(GROUP_TOTAL_FILTERED_KEY, next ? '1' : '0') } catch { /* 存不了只影响下次启动 */ }
+  patch({ groupTotalFiltered: next })
 }
 
 /**

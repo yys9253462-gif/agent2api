@@ -52,15 +52,14 @@
 //!     proxies.rs    /api/proxies*（Clash 实时读取 + 出口连通性测试）
 //!     billing.rs    /api/usage、/api/checkin*、/api/activity/*（对照 server.mjs 871-911）
 //!     chat.rs       POST /v1/chat/completions、GET /v1/models（对话主链路）
-//!     sanitize.rs   /api/sanitize（出站指纹脱敏开关）
+//!     sanitize.rs   /api/sanitize（出站脱敏开关、词表与提供商范围）
 //!     auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
 //!     scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务：开关 / 间隔 / 立即执行）
 //!     update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
-//!     endpoints.rs  GET /api/endpoints（接口清单）
 //!     storage_api.rs GET /api/storage（统一库的位置、大小与各表条数，只读）
 //!     upgrade_api.rs GET /api/upgrade、POST /api/upgrade/run（旧数据 → SQLite 库）
 //!   core/
-//!     endpoints.rs 端点/版本/UA/上下文（唯一事实来源）
+//!     endpoints.rs 版本（edition）标识：cn / intl（落盘值与展示名）
 //!     account_store/  账号存储（优先级、迁移、CRUD、限额标记）。
 //!                 持久化已从 `{config_dir}/accounts.json` 换到
 //!                 `agent2api.db` 的 `accounts` 表；`sql.rs` 是行级访问层，
@@ -73,7 +72,7 @@
 //!     clash.rs     Clash Verge 配置读取与快照缓存
 //!     egress.rs    出网点（按出口缓存 reqwest Client）+ 出口连通性测试
 //!     billing/     积分 / 签到（checkin.rs） / 运营活动
-//!     models/      模型目录（workbuddy 单家：内置清单 + /v3/config 远程刷新）
+//!     models/      模型条目的出口形状（/v1/models 的条目与信封翻译，各家共用）
 //!     routing.rs   账号选路（严格优先级 + 限额冷却判定）
 //!     auto_checkin.rs 定时签到调度（30 秒轮询 + 当天去重 + 启动补签）
 //!     credential_maintenance.rs 凭证自动维护（遍历账号 → 刷新临期凭证；
@@ -84,7 +83,7 @@
 //!       mod.rs       管理器句柄 / 下载状态机 / 进度与取消
 //!       version.rs   版本比较、域名白名单、资产挑选、文件名安全化（纯函数）
 //!       client.rs    出网候选（直连 → Clash）与 GitHub 请求头
-//!     sanitize.rs  出站请求体指纹脱敏（硬编码规则集，纯函数）
+//!     sanitize.rs  出站请求体指纹脱敏（可配置规则，纯文本变换）
 //!     prompt.rs    网关自有系统提示词（透传 / 替换 / 追加三模式，纯函数）
 //!     degrade.rs   内容拦截降级状态机（撞审核误报后到次日 00:00 用中性提示词）
 //!     upstream/    对话转发：
@@ -100,9 +99,10 @@
 //!     即可自动带 API Key 检查；免鉴权路由放 `public` 分组。
 //!     管理 API 已全部就位（切片 1-6），切片 7 只剩打包收尾。
 //!   - 账号与鉴权：`ServerState::store()` / `auth()` / `login()` 三个克隆句柄。
-//!   - 模型目录与转发：`ServerState::models()` / `upstream()`。
-//!   - 指纹脱敏：无句柄，转发层每次出站前读 `config::current().sanitize_fingerprints()`
-//!     决定要不要调 `core::sanitize::sanitize_body`（纯函数，无状态）。
+//!   - 模型目录与转发：目录走 `core::providers::catalog`（每次读取时聚合各家
+//!     适配器的清单，没有本进程的目录对象）；转发走 `ServerState::upstream()`。
+//!   - 指纹脱敏：转发层逐请求取 `config::current().sanitize_settings()`，
+//!     按提供商范围执行词表；规则已编译，变换过程无 IO。
 //!   - 系统提示词：同样无句柄，转发层逐请求取一次 `config::current().prompt_plan()`
 //!     交给 `core::prompt` 落到出站副本上；撞内容拦截时由转发层触发
 //!     `core::degrade`（进程级原子状态，无句柄）并就地换中性提示词重试一次。
@@ -140,6 +140,7 @@ pub mod access;
 pub mod altcha;
 pub mod config;
 pub mod config_migration;
+mod compression;
 pub mod core;
 pub mod db;
 pub mod errors;
@@ -162,7 +163,6 @@ use crate::server::core::auth::AuthService;
 use crate::server::core::auto_checkin::AutoCheckin;
 use crate::server::core::billing::BillingService;
 use crate::server::core::login::LoginService;
-use crate::server::core::models::ModelCatalog;
 use crate::server::core::update::UpdateManager;
 use crate::server::core::upstream::UpstreamService;
 use crate::server::db::Db;
@@ -210,7 +210,6 @@ pub struct ServerState {
     /// 计费服务句柄（积分 / 签到 / 运营活动；出网按 session.proxy 挂出口）
     billing: BillingService,
     /// 模型目录句柄（内置清单 + /v3/config 远程刷新；内部 RwLock）
-    models: ModelCatalog,
     /// 对话转发器句柄（选路 / 429 轮换 / SSE 透传 / 去重排队）
     upstream: UpstreamService,
     /// 定时签到句柄（轮询调度 + 启动补签；内部 Mutex + 后台任务）
@@ -248,6 +247,14 @@ pub struct ServerState {
     /// 不会被感知**（要下次启动才发现）—— 这是可接受的：手工放回文件的人
     /// 本来就知道自己在做什么。
     upgrade_pending: Arc<AtomicBool>,
+    /// 启动期的历史统计整理（模型维度回填 / 来源维度回填 / 保留期裁剪）是否
+    /// 还在后台跑。
+    ///
+    /// 这三件事都可能扫描整张 `requests` 表：库大时几十秒起步，而它们的结果
+    /// 只影响报表与历史清理，不影响面板能不能打开、账号能不能用。所以从
+    /// `bootstrap` 里挪到监听端口成功之后（见 [`Self::start_background_maintenance`]）。
+    /// 字段对外只读，供 `/api/session` 告诉界面「历史数据还在整理」。
+    startup_maintenance: Arc<AtomicBool>,
 }
 
 impl ServerState {
@@ -292,18 +299,13 @@ impl ServerState {
         if let Some(reason) = config_migration::pending_reason() {
             return Err(reason);
         }
-        // Accio 的 OAuth 回调要落在本机端口上，而授权地址由**适配器**拼
-        // （`ProviderAdapter::build_login_url` 是同步无参的，拿不到 ServerState）。
-        // 端口在进程生命周期内不变，这里写一次、之后只读 —— 与各家 models 的
-        // 进程级缓存同一手法（见 `providers::accio::oauth::set_loopback_port`）。
-        crate::server::core::providers::accio::oauth::set_loopback_port(port);
-        // CodeArts 同理：授权地址由适配器拼（同步无参），而 portal 只认 `port`，
-        // 所以端口要在发起登录之前就写在进程级常量里（见该模块 `set_loopback_port`）。
-        crate::server::core::providers::codearts::oauth::set_loopback_port(port);
-        // Antigravity 的网页登录同理：Google 授权页完成后要回到
-        // `http://localhost:{port}/oauth-callback`（redirect_uri 由适配器在发起
-        // 登录时本地拼），端口必须在第一次发起之前就位（见该模块 `set_loopback_port`）。
-        crate::server::core::providers::antigravity::oauth::set_loopback_port(port);
+        // 进程启动时刻：设置页「版本信息」的「已运行」由它算。记录点放在
+        // 最前面 —— 后面每一步都可能耗时（开库、迁移、模型清单预热），
+        // 那些时间同样是「这个进程已经跑了多久」的一部分。
+        crate::server::core::system_info::record_start();
+        // 网页登录的端口不在网关里设了：各家的实现（含授权地址拼接与回调监听）
+        // 都在插件里，插件自己 bind 空闲端口，或从握手的 `HostEnv.loopback_port`
+        // 读端口。
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开
         // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），
@@ -368,6 +370,10 @@ impl ServerState {
         // `core::billing::checkin::run_checkin`（唯一），台账全量保留 ——
         // 清历史走签到记录页自己的「清空 / 按筛选删除」（见 checkin_records 模块头）。
         core::checkin_records::install(db.clone());
+        // AI 助手的对话会话（左边那列历史会话）：装句柄即可，写入发生在每轮
+        // 回答之后（见 `core::assistant_sessions` 的模块头）。
+        core::assistant_sessions::install(db.clone());
+        core::assistant_images::install(db.clone());
         // 定时签到的「签到范围」一次性补齐：把加入版本晚于配置里那一版的家补进
         // 每条条目的范围（用户的期望是 OfficeAce 果办 / CodeArts 默认开启）。
         // 放在这里是因为它要读写配置快照（`config::init` 已在上方就位），且必须早于
@@ -387,25 +393,13 @@ impl ServerState {
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
         core::proxy_pool::install(db.clone());
-        // 代理设置（节点监听端口范围 + 出口测试网址，「网络代理」页的设置
-        // 弹窗）：与 proxyPool 同一形态的 kv 固定键。内核端口分配与出口
-        // 测试在运行期直接读它，位置只要求早于第一次内核启动 / 测试请求。
         core::proxy_settings::install(db.clone());
-        // 订阅存储（「订阅管理」维护的订阅链接）：同一个 `Db`（与 proxyPool
-        // 同一形态）。位置只要求早于任何一次 `/api/subscriptions*` 请求。
-        core::subscriptions::install(db.clone());
-        // 订阅内核（mihomo sidecar）的命令 worker：单条队列串行消费内核操作
-        // （下载 / 重建配置 / 重启 / 停止），见 `core::sub_kernel` 的模块头。
-        core::sub_kernel::spawn_worker();
-        // 内核已安装且有启用的订阅 → 自动拉起（清理上次运行遗留的进程后
-        // 重建配置）。**未安装时不自动下载**：二进制 ~20-40MB，下载必须有
-        // 用户的手势（界面上的「下载内核」按钮），启动时静默拉网不合适。
-        if core::subscriptions::should_autostart() {
-            let providers = core::subscriptions::enabled_provider_inputs();
-            crate::spawn_task(async move {
-                core::sub_kernel::request_restart(providers);
-            });
-            logging::console_line("[Subscription]", "检测到已安装的代理内核与启用的订阅，后台自动拉起");
+        // 云同步（设置页「数据 → 云同步」）：设置与状态落在 kv 的保留键
+        // `cloudSync`，装库句柄即可。自动同步的工作线程在下面 spawn ——
+        // 必须先装句柄再起线程，否则第一轮读设置会拿到默认值。
+        core::cloud_sync::install(db.clone());
+        if let Some(db) = db.clone() {
+            core::cloud_sync::auto_sync::spawn_worker(db);
         }
         // 模型清单的持久化缓存：把**同一个 `Db`** 传进去（与配置 / 日志库 /
         // 账号库同一形态）。各家的远程清单在进程重启后由它读回，不再回落到
@@ -413,11 +407,8 @@ impl ServerState {
         // 位置必须在这里：它得早于下面那次 `restore_cached_catalogs` 预热 ——
         // 各家的目录句柄首次初始化时才读缓存，句柄先被碰到就再也读不回来了。
         core::providers::catalog_cache::install(db.clone());
-        // OfficeAce 模型可用性探测的结论也落同一个库（kv 的 `officeaceModelProbe`
-        // 键）：目录刷新后探一轮、把「这个号打不通」的模型从对外清单里收窄掉。
-        // 与 catalog_cache 同一形态（kv 固定键 + 整份读写），位置只需早于
-        // 第一次 `advertise_models`（那是纯读，未 install 时给空结论 = 不藏）。
-        core::providers::officeace::probe::install(db.clone());
+        // OfficeAce 的模型可用性探测随实现搬到了插件（探测结论在插件进程内，
+        // 收窄也由插件在 `models.list` 里做）—— 网关这边不再有这份状态。
         // models.dev 模型元数据（能力位 / 思考档位）的刷新结果也落同一个库
         // （kv 的 `modelsDevCatalog` 键）。与 catalog_cache 同一形态：未 install
         // 时只读内嵌快照（功能仍在，只是拿不到上次的刷新结果），所以位置不敏感；
@@ -491,26 +482,23 @@ impl ServerState {
         // 的其余部分（日志、模型目录、健康检查、配置页）不依赖账号，让它们继续
         // 可用比整体拒绝启动更有用 —— 用户能在界面上看到那条 ❌ 日志并处理磁盘问题。
         let store = AccountStore::with_db(db.clone());
-        // 账号存储句柄给订阅内核（lazy listeners：内核 runtime 读「哪些订阅节点
-        // 需要监听器」决定给谁开 —— 账号引用 ∪ 被「测试」钉住的节点，见
-        // `sub_kernel::runtime::listener_node_keys`）。AccountStore 是轻量 Arc
-        // 句柄，clone 与 ServerState 里那份同实例。
-        core::sub_kernel::install_store(Some(store.clone()));
-        let context = core::endpoints::default_context();
-        let auth = AuthService::new(store.clone(), context);
-        let login = LoginService::new(auth.clone(), store.clone());
+        // 插件家的登录回调要把账号落库，而那条链路拿不到 ServerState（它是
+        // trait 方法，签名里只有一个插件不用的 &AccountStore）。装一个进程级
+        // 句柄，见 `account_store::plugin_accounts::shared`。
+        core::account_store::plugin_accounts::install_shared(store.clone());
+        let auth = AuthService::new(store.clone());
+        let login = LoginService::new(store.clone());
         let billing = BillingService::new(auth.clone());
-        // 模型目录：**进程级单例，按地区各一份**（Agent2API 改造 W2a-T2；
-        // WorkBuddy 拆家后国内版与国际版各持一份，见 `core::models` 模块头）。
-        // 聚合模型目录（core::providers::catalog）只收 &AccountStore，不该让
-        // 调用方层层传目录，因此目录自身也做成进程级句柄（与 config /
-        // auto_checkin 同一模式）：`core::models::global_catalog(region)` 与
-        // 这里的 `models` 是**同一实例**（共享同一把 RwLock），刷新对两边同时可见。
-        let models = core::models::global_catalog(core::providers::workbuddy::Region::Cn);
-        // 恢复各家的持久化清单缓存：各家的目录句柄在这一步**首次初始化**
-        // （`OnceLock`），缓存也只在这一刻读得回来（见 `providers::catalog_cache`
-        // 的模块头）。必须在上面那次 `install` 之后 —— 句柄先被别处碰到的话，
-        // 它就固化在「没有缓存」的空状态上，这次预热也补不回来。
+        // 模型目录：**没有本进程的目录对象了**。原先这里持一份 WorkBuddy 的
+        // `ModelCatalog`（内置清单 + `/v3/config` 远程刷新 + 按地区分槽的持久化
+        // 缓存），随该家的实现整体搬到提供商插件 —— 拉清单是「怎么打上游」，
+        // 网关不再需要知道。
+        //
+        // 现在清单的唯一来源是各家的适配器（内置家的 `list_models` / 插件家的
+        // `models.list` RPC），由 `core::providers::catalog` 在每次读取时聚合。
+        // 下面是那次聚合的**预热**：它把所有适配器的清单缓存初始化一遍（插件家
+        // 的 RPC 缓存在这里首次填充），于是首个 `/v1/models` 请求不必等一次 RPC。
+        // 必须在上面那次 `install` 之后 —— 账号库先就绪，插件才能读到记录。
         core::providers::adapter::restore_cached_catalogs();
         let upstream = UpstreamService::new(store.clone(), auth.clone());
 
@@ -541,11 +529,13 @@ impl ServerState {
             let settings = config::retention_settings();
             Retention {
                 request_days: settings.request_days,
+                request_count: settings.request_count,
                 daily_days: settings.daily_days,
             }
         }));
         // 启动即收尾上次运行遗留的进行中行（详情见方法注释）：不等到第一条
         // 请求进来才清理，界面打开时看到的就已经是「已中断」的终态
+        core::billing::keepalive::install_stats(request_stats.clone());
         request_stats.sweep_stale_running();
         // ── 僵尸行的主动周期清扫（每 5 分钟一次）─────────────────────
         // 清扫的判定（1 小时阈值）此前只在「下一条请求进来」时顺带跑：
@@ -575,11 +565,11 @@ impl ServerState {
         // 值得一个能被直接找到的位置，所以整组搬到了那个文件。
         if !upgrade_pending {
             account_bootstrap::run(&store);
-            // 统计侧的一次性口径订正：模型维度从「请求名（映射别名）」重算成
-            // 「上游真名」（见 `RequestStats::remap_model_dimension_once`）。
-            // 与 account_bootstrap 同一模式：待迁移旧数据没导入时跳过 ——
-            // 跑了会把幂等标记打早，升级完成后由 `api::upgrade_api` 补调。
-            request_stats.remap_model_dimension_once();
+            // 统计侧的三件历史整理**不在这里**：它们可能扫描整张 requests 表
+            // （模型维度回填 / 来源维度回填 / 保留期裁剪），库大时会把「面板
+            // 打开」一起拖慢。改由 `start()` 在监听端口成功之后调
+            // `start_background_maintenance` 放进阻塞线程池跑；待迁移数据导入
+            // 之后的那一次仍由 `api::upgrade_api` 补调，顺序不变。
         }
 
         let state = Self {
@@ -593,13 +583,13 @@ impl ServerState {
             auth,
             login,
             billing,
-            models,
             upstream,
             auto_checkin,
             update,
             request_stats,
             db,
             upgrade_pending: Arc::new(AtomicBool::new(upgrade_pending)),
+            startup_maintenance: Arc::new(AtomicBool::new(false)),
         };
         logging::log("[Server]", "Agent2API 多提供商本地网关（Rust 进程内服务）启动中…");
         logging::log("[Config]", &format!("API 端口: {}", port));
@@ -613,16 +603,17 @@ impl ServerState {
         );
         logging::log("[Config]", &format!("默认模型: {}", snapshot.default_model()));
         logging::log("[Config]", &format!("计费语言: {}", snapshot.locale()));
-        // 出站指纹脱敏一行：开着时说明「出站会剥离审核指纹」，关着时点明后果
-        // （客户端 system 模板会原样发上游，可能被 400 code=11128 误拦）
+        let sanitize = snapshot.sanitize_settings();
         logging::log(
             "[Config]",
             &format!(
-                "出站指纹脱敏: {}",
-                if snapshot.sanitize_fingerprints() {
-                    "✅ 已启用（剥离上游审核黑名单指纹）"
+                "出站指纹脱敏: {} · {} 条启用规则 · 应用范围={}",
+                if sanitize.enabled { "✅ 已启用" } else { "❌ 已关闭" },
+                sanitize.rules.entries().iter().filter(|rule| rule.enabled).count(),
+                if sanitize.providers.is_empty() {
+                    "全部提供商".to_string()
                 } else {
-                    "❌ 已关闭（客户端 system 模板原样发送，可能被上游误拦）"
+                    sanitize.providers.join(", ")
                 },
             ),
         );
@@ -769,16 +760,26 @@ impl ServerState {
         // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
-        // ZCode 活动套餐的「推理要不要验证码令牌」由上游配置说，每 5 分钟同步一次
-        // （判据、代价与三条口径见 `providers::zcode::config_sync` 的模块头）。
-        // 不进上面那张定时任务表：它没有「用户可配的间隔」、也不产生任何运行状态
-        // 要展示，硬塞进去只会多一条没人会去动的设置行。
-        core::providers::zcode::config_sync::spawn(state.store.clone());
+        // 配置更新和插件热加载会唤醒排程，关闭时保持等待而不是省掉调度循环。
+        core::growth_scheduler::spawn(state.store.clone());
+        // ZCode 活动套餐的「推理要不要验证码令牌」由上游配置说 —— 那份同步
+        // 循环随实现搬到插件了（它挂在插件的转发钩子上，见插件侧
+        // `zcode::config_sync::maybe_sync`）。网关这边不再有常驻任务。
 
         // 每账号自动余额查询的心跳循环：与上面的间隔型任务同一形态（一个进程
         // 一个循环，到点判定全在「记录 + 配置」上），只是排期按账号各自算，
         // 不再是全局任务（见 `core::usage_query` 的模块头）。
         core::usage_query::spawn_sweeper(state.store.clone());
+
+        // ── 提供商插件（用户安装的包）─────────────────────────────
+        // 后台启动：握手要 spawn 子进程，可能要等几秒。这里不 await ——
+        // 插件是可选增强，没装/装坏了网关都必须照常跑（内置家仍然工作），
+        // 所以整条路径的错误都只记日志（见 `plugin_host::bootstrap`）。
+        // 真正用到插件家时 `RpcAdapter::call` 会 `ensure()` 等它就绪。
+        // 插件侧的网页登录回调地址同样要指向本机端口（LobsterAI / Accio 那几家
+        // 的 `redirect_uri` 由插件自己拼），所以先登记端口再起宿主。
+        core::plugin_host::set_loopback_port(port);
+        core::plugin_host::spawn_bootstrap(state.store.clone());
 
         Ok(state)
     }
@@ -801,11 +802,6 @@ impl ServerState {
     /// 计费服务句柄（积分 / 签到 / 运营活动）
     pub fn billing(&self) -> &BillingService {
         &self.billing
-    }
-
-    /// 模型目录句柄（/v1/models、/api/session、/health 与聊天路由的模型校验共用）
-    pub fn models(&self) -> &ModelCatalog {
-        &self.models
     }
 
     /// 对话转发器句柄
@@ -868,6 +864,69 @@ impl ServerState {
             return Vec::new();
         }
         db::migrate::pending_items(&self.config_dir)
+    }
+
+    /// 启动期的历史统计整理是否还在后台跑（`/api/session` 的
+    /// `maintenance.running`；界面可据此提示「历史数据整理中」）。
+    pub fn startup_maintenance_running(&self) -> bool {
+        self.startup_maintenance.load(Ordering::Relaxed)
+    }
+
+    /// 在监听端口成功之后启动历史统计整理（由 [`start`] 调用，只生效一次）。
+    ///
+    /// ── 为什么放在这里而不是 `bootstrap` ────────────────────────
+    /// `bootstrap` 返回之前不能 bind 端口，而这三件事（模型维度回填 / 来源
+    /// 维度回填 / 保留期裁剪）都可能扫描整张 `requests` 表。库大的升级场景里，
+    /// 它们会让「程序启动了、网页却打不开」持续几十秒 —— 用户看到的就是转圈。
+    /// 现在先让 HTTP 服务可用，这三件事在阻塞线程池里慢慢跑。
+    ///
+    /// ── 为什么不跟账号迁移一起挪 ────────────────────────────────
+    /// `account_bootstrap` 的结果直接被账号页与选路读取，且量级小（账号通常
+    /// 几十条）；统计整理只影响报表数字与历史清理，允许短暂落后。两者对
+    /// 「能不能立刻看到正确账号」的敏感度不同，所以只挪后者。
+    ///
+    /// ── 待迁移数据还没导入时 ────────────────────────────────────
+    /// 与 `bootstrap` 的判据一致：整块跳过。用户点完升级后，`api::upgrade_api`
+    /// 会按原顺序补调这三件事（那时 HTTP 早已在跑，慢也不会挡住面板）。
+    pub fn start_background_maintenance(&self) {
+        if self.upgrade_pending() {
+            logging::log(
+                "[Stats]",
+                "⏳ 待迁移旧数据尚未导入，历史统计整理跳过（升级完成后补做）",
+            );
+            return;
+        }
+        // swap 保证重复调用（桌面壳重启后端时 start 可能被再次调用）只跑一轮。
+        if self.startup_maintenance.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let state = self.clone();
+        crate::spawn_task(async move {
+            logging::log("[Stats]", "历史统计整理已在后台开始（不阻塞面板打开）");
+            let started = std::time::Instant::now();
+            let stats = state.request_stats();
+            let outcome = tokio::task::spawn_blocking(move || {
+                stats.remap_model_dimension_once();
+                stats.backfill_source_dimensions();
+                stats.prune();
+            })
+            .await;
+            state.startup_maintenance.store(false, Ordering::SeqCst);
+            match outcome {
+                Ok(()) => logging::log(
+                    "[Stats]",
+                    &format!(
+                        "✅ 历史统计整理完成（用时 {} 秒）",
+                        started.elapsed().as_secs()
+                    ),
+                ),
+                Err(error) => logging::log(
+                    "[Stats]",
+                    &format!("⚠️  历史统计整理任务异常退出: {error}"),
+                ),
+            }
+        });
     }
 
     /// 打开 headless 形态的管理界面托管：`ui_dir` 指向 `ui/` 静态目录，
@@ -990,20 +1049,27 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
     // watch 置位，两个 serve 各拿一份 receiver；watch 发送端 drop 也会让
     // `wait_for` 返回，停机语义与单 oneshot 一致。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut stop_requested = stop_rx.clone();
+    let stop_from_signal = stop_tx.clone();
     crate::spawn_task(async move {
-        let _ = shutdown_rx.await;
-        let _ = stop_tx.send(true);
+        tokio::select! {
+            _ = shutdown_rx => {}
+            _ = stop_requested.wait_for(|stop| *stop) => {}
+        }
+        stop_from_signal.send_replace(true);
     });
 
     // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能
     // 随 async move 一起走）
     let request_stats = state.request_stats();
     let stop_main = stop_rx.clone();
+    let stop_from_main = stop_tx.clone();
     crate::spawn_task(async move {
         // 运行时上下文在这里必然成立，from_std 不会 panic
         let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(listener) => listener,
             Err(error) => {
+                stop_from_main.send_replace(true);
                 logging::log("[Server]", &format!("❌ 创建异步监听失败: {error}"));
                 return;
             }
@@ -1021,7 +1087,10 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
             // 已在处理中的请求会跑完再退出
             let _ = stop.wait_for(|stop| *stop).await;
         });
-        match server.await {
+        let result = server.await;
+        // 正常/异常退出均通知同一轮面板停止 accept。
+        stop_from_main.send_replace(true);
+        match result {
             Ok(()) => logging::log("[Server]", "服务已停止"),
             Err(error) => logging::log("[Server]", &format!("❌ 服务异常退出: {error}")),
         }
@@ -1038,10 +1107,12 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
     // 统计收尾只归主 serve（上面那个任务），这里只管转发请求。
     if let Some(listener) = panel_listener {
         let router = panel_router.expect("panel_port 与 panel_router 必须成对");
+        let stop_from_panel = stop_tx;
         crate::spawn_task(async move {
             let listener = match tokio::net::TcpListener::from_std(listener) {
                 Ok(listener) => listener,
                 Err(error) => {
+                    stop_from_panel.send_replace(true);
                     logging::log("[Server]", &format!("❌ 面板监听创建失败: {error}"));
                     return;
                 }
@@ -1054,11 +1125,18 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
                 let mut stop = stop_rx;
                 let _ = stop.wait_for(|stop| *stop).await;
             });
-            if let Err(error) = server.await {
+            let result = server.await;
+            stop_from_panel.send_replace(true);
+            if let Err(error) = result {
                 logging::log("[Server]", &format!("❌ 面板服务异常退出: {error}"));
             }
         });
     }
+
+    // 端口都已 bind、两个 serve 任务都已派出：此时面板已经可以打开，再开始
+    // 跑可能很慢的历史统计整理（整表扫描 / 保留期裁剪）。放在 serve 之前会让
+    // 大库升级后的第一次打开一直转圈（见 start_background_maintenance 的说明）。
+    state.start_background_maintenance();
 
     Ok(shutdown_tx)
 }

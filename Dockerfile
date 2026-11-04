@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Agent2API headless 网关镜像（多阶段构建，amd64 + arm64）
 #
 # ── 为什么只构建 server crate ────────────────────────────────
@@ -5,11 +6,11 @@
 # 与网关本体（server/，无 GUI 依赖）。容器里只需要网关本体 ——
 # `cargo build -p agent2api-server` 明确只编它。
 #
-# ── 多架构：交叉编译而不是 QEMU ─────────────────────────────
+# ── 多架构：Rust 原生交叉编译 ────────────────────────────────
 # builder 固定跑在构建机的原生架构（$BUILDPLATFORM）：buildx 构建 arm64
-# 时不进 QEMU 模拟（Rust 编译会慢几十倍），而是 rustup 加一个 aarch64
-# target + 装 aarch64 的 C 工具链交叉编译。转发链路全是 rustls（纯 Rust），
-# 唯一的 C 代码是 rusqlite bundled 的 SQLite 源码，gcc-aarch64 工具链足够。
+# 时 Rust 不进 QEMU（会慢几十倍），而是 rustup 加一个 aarch64 target
+# + 装 aarch64 的 C 工具链交叉编译。转发链路全是 rustls（纯 Rust），
+# rusqlite bundled 的 SQLite 与 ring 的 C/汇编使用该交叉工具链。
 #
 # ── 依赖缓存层 ──────────────────────────────────────────────
 # 先用空的 lib/bin 桩把全部依赖编一遍（首次几分钟），之后只改源码重新
@@ -17,7 +18,6 @@
 # 编译时刻，cargo 的增量判断会误判「没变」而跳过重编，所以真源码层先
 # find touch 再编。
 
-# syntax=docker/dockerfile:1
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 WORKDIR /build
 
@@ -32,6 +32,12 @@ ARG HTTPS_PROXY=""
 # arm64 分支永远不会命中，交叉编译退化成原生 amd64 编译，arm64 镜像里
 # 装进 amd64 二进制（v2.7.1 及之前线上镜像的 bug 根因）。
 ARG TARGETARCH
+ARG BUILDARCH
+# 保留现有 amd64 → arm64 主链；arm64 构建机可原生出 arm64，不伪装成 amd64。
+RUN case "$BUILDARCH/$TARGETARCH" in \
+        amd64/amd64|amd64/arm64|arm64/arm64) ;; \
+        *) printf '%s\n' "Rust 构建只支持 amd64 → amd64/arm64 或 arm64 → arm64，实际 $BUILDARCH → $TARGETARCH" >&2; exit 1 ;; \
+    esac
 # arm64 需要 aarch64 的 C 工具链与 glibc 开发头文件（rusqlite bundled 的
 # SQLite、ring 的 C/汇编源码用）。注意 libc6-dev-arm64-cross 只是
 # gcc-aarch64-linux-gnu 的 Recommends，--no-install-recommends 下必须显式
@@ -67,12 +73,24 @@ RUN mkdir -p src-tauri/server/src/bin src-tauri/src \
     && echo "fn main() {}" > src-tauri/server/src/bin/agent2api-server.rs \
     && echo "" > src-tauri/src/lib.rs \
     && echo "fn main() {}" > src-tauri/src/main.rs
-# 桩依赖层：整棵依赖树编一遍，命中后成为之后每次构建的缓存底座
+# 整棵依赖树编一遍，命中后成为之后每次构建的缓存底座。
 RUN /build/cargo-build.sh
 
 COPY desktop-tauri/src-tauri/server/src src-tauri/server/src
+COPY desktop-tauri/src-tauri/server/build.rs src-tauri/server/
+# ── 为什么构建阶段也要 ui/ ──────────────────────────────────
+# `server/src/server/api/plugin_theme.rs` 用 `include_str!` /
+# `include_bytes!` 把几份静态资源编进二进制（宿主设计令牌、组件库产物、
+# 提供商图标），路径是相对该源码文件往上五层 —— 即 `desktop-tauri/ui/`。
+# 只 COPY `server/src` 时那些文件不存在，编译直接失败：
+#   error: couldn't read `.../ui/css/tokens.css`: No such file or directory
+#
+# 放在这一层而不是桩依赖层：这些文件与源码一起变，缓存失效的时机一致；
+# 放进桩层会让「只改了一行 Rust」也把整棵依赖树重编一遍。
+COPY desktop-tauri/ui ui
 RUN cd src-tauri \
     && find server/src -type f -exec touch {} + \
+    && touch server/build.rs \
     && /build/cargo-build.sh
 
 # ── 服务端更新包（CI 的 linux-server job 用它出 Release 资产）──────
@@ -99,6 +117,8 @@ RUN cd src-tauri \
 FROM scratch AS bundle
 COPY --from=builder /build/agent2api-server /bundle/agent2api-server
 COPY desktop-tauri/ui /bundle/ui
+COPY LICENSE /bundle/LICENSE
+COPY licenses/ /bundle/licenses/
 
 # ── 运行时 ──────────────────────────────────────────────────
 # bookworm-slim + ca-certificates（出站 HTTPS）+ curl（HEALTHCHECK）。
@@ -110,6 +130,8 @@ RUN apt-get update \
 
 COPY --from=builder /build/agent2api-server /usr/local/bin/agent2api-server
 COPY desktop-tauri/ui /app/ui
+COPY LICENSE /app/LICENSE
+COPY licenses/ /app/licenses/
 
 # 容器内的默认形态：全网卡监听 + 数据落卷 + 自托管面板。
 # 鉴权：面板需要管理员（登录页注册或 env 预置）；未配置任何 API Key 时

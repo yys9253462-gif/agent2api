@@ -1,26 +1,27 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "3.0.8"
-description = "Agent2API 桌面端 — 多提供商本地网关与会话管理"
-authors = ["aimod-cc"]
+version = "3.4.1"
+description = "Agent2API 桌面端 — AI 路由网关与 Agent 客户端接管"
+authors = ["Agent2API"]
 edition = "2021"
 # MSRV 由 rusqlite 0.40 → libsqlite3-sys 0.38 决定（它的声明值是 1.88）。
 # 本机工具链是 1.95，能编；但声明值必须与实际要求一致 —— 声明 1.77 却
 # 要求 1.88，会让「照着 rust-version 装旧工具链」的构建直接失败。
 rust-version = "1.88"
-# 许可：LICENSE 正文是逐字的标准 MIT 条款，但文件末尾附有「使用声明」，
-# 其第 3 条禁止商业用途 / 二次分发牟利，属于 MIT 之外的附加限制；
-# 根 README「许可」一节也写明两者共同构成完整的授权与使用约定。
-# 因此不单独声明 SPDX 的 "MIT"（会漏掉附加限制），改为指向实际的 LICENSE 文件。
-license-file = "../../LICENSE"
-repository = "https://github.com/aimod-cc/agent2api"
-homepage = "https://github.com/aimod-cc/agent2api"
+license = "AGPL-3.0-only"
+repository = "https://github.com/aimod-cc/Agent2API"
+homepage = "https://github.com/aimod-cc/Agent2API"
 
 # ── workspace ───────────────────────────────────────────────
 # 网关本体拆成了独立 crate（`server/`，桌面与 headless 二进制共用）。
 # workspace 让两个 crate 共享一个 target/ 与 Cargo.lock，公共依赖
 # （tokio / reqwest / rusqlite…）只编译一次。[profile.release] 由
 # workspace root（本文件）统一提供。
+#
+# 提供商插件化（2026-10 起）：契约库与插件实现已搬到独立仓库
+# `ProvidersPlugin/Agent2Providers`，网关按 **git tag** 引用它的
+# `agent2api-provider-protocol`（见 `server/Cargo.toml`）。
+# 本 workspace 只剩网关本体；插件作者用的 trait / serve 主循环也在那个仓库里。
 [workspace]
 members = ["server"]
 
@@ -64,8 +65,6 @@ axum = "0.8"
 # socks：账号出网代理支持 socks5（切片 3）—— 没有它 `http://` 之外的代理
 # URI 会被 reqwest 拒绝（unknown proxy scheme），自定义 socks5 出口直接不可用。
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
-# 解析 Clash Verge 的 verge.yaml / profiles.yaml（切片 3：出网代理可选项）
-serde_yaml = "0.9"
 # 请求体去重键（后续切片：转发链路）
 sha2 = "0.10"
 # 签到调度时刻、token 过期时间的本地时间处理（后续切片）

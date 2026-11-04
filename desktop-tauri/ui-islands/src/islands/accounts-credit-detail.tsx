@@ -28,6 +28,8 @@
  *   unit          与主读数不同单位时才在（Trae 的套餐包 vs 积分包）
  *   daily         每日重置的包（到期字段对它是「今天 24 点」的意思）
  *   grantReason   WorkBuddy 的发放原因（官方活动 / 拉新奖励…），可无
+ *   snapshot      钱包余额 / 计数器读数，不参与积分包的耗尽 / 到期分组
+ *   balance       snapshot 的钱包余额（调用计数用 used），数字缺失时为 null
  * ```
  * 这里只读不猜：谁缺键谁就不显示那一段。`null` 与 `0` 的区别在这一层就得守住 ——
  * `Number(null) === 0`，把"没读到"当 0 会画出「剩 0 / 共 0」这种看起来像读到了的
@@ -47,9 +49,10 @@
  */
 
 import * as React from 'react'
-import { Popover, PopoverContent, PopoverTrigger } from '@ui'
+import { Meter, Popover, PopoverContent, PopoverTrigger, Button } from '@ui'
 import { t } from '../i18n'
-import { formatTime, type UsageEntry } from './accounts-shared'
+import { formatTime, numberText, type UsageEntry } from './accounts-shared'
+import { creditPacksOf, snapshotReadingOf, usageUnitLabel, type UsageAggregate } from '../../../ui-shared/usage-readings'
 
 /** 明细里的一行（`creditRowsOf` 的产物；渲染输入与 `usageDetailOf` 的行同形） */
 export type CreditRow = {
@@ -70,8 +73,22 @@ export type CreditRow = {
    *
    * 两种"看着像用完、其实没完"的必须留在主列表：**每日重置**的包明天回满
    * （`remain` 现在就是 0），**不限量**的（`-1` 哨兵）本来就花不完。
+   *
+   * **流水行恒为 false**（见 {@link CreditRow.amount}）：一笔已经发生的收支没有
+   * "还能不能花"可言，一条 `-0.96` 的消耗也不是"用完了的积分包"。
    */
   spent: boolean
+  /** 钱包余额 / 计数器快照，不表示一份会被耗尽或过期的积分包。 */
+  snapshot?: boolean
+  /**
+   * 这一行是**流水一笔**（`record: true`）而不是积分包：有它时右侧读数是带符号
+   * 的金额（`+1000` / `-0.96`），没有「剩 / 共」那套措辞、也不画比例条。
+   *
+   * 判据走**后端给的标记**而不是「有没有 total」这类形状探测：上游给一笔
+   * 没有剩余概念的记录，和给一份没写面额的包，在形状上可以长得一样，
+   * 只有产出它的那一端知道它是哪一种。
+   */
+  amount: number | null
 }
 
 /**
@@ -105,9 +122,7 @@ function shortTime(value: number): string {
  * 的回落同一取向）。
  */
 function unitLabel(unit: string): string {
-  if (unit === '积分') return t('积分')
-  if (unit === '额度') return t('额度')
-  return unit
+  return usageUnitLabel(unit, t)
 }
 
 /**
@@ -118,12 +133,65 @@ function unitLabel(unit: string): string {
  * 的口径分叉。
  */
 export function creditRowsOf(entry: UsageEntry): CreditRow[] {
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
-  const data = entry as Record<string, unknown>
-  const packs = Array.isArray(data.credits) ? data.credits as Array<Record<string, unknown>> : []
+  const packs = creditPacksOf(entry)
   const now = Date.now()
   return packs.map(pack => {
+    const snapshot = snapshotReadingOf(pack, t, numberText)
+    if (snapshot) {
+      const window = snapshot.daily ? t('每日重置') : null
+      return {
+        name: snapshot.name,
+        view: snapshot.view,
+        tone: snapshot.tone,
+        percent: null,
+        window,
+        title: [snapshot.name, snapshot.view, window].filter(Boolean).join(' · '),
+        spent: false,
+        snapshot: true,
+        amount: null,
+      }
+    }
     const name = String(pack?.name || '').trim() || t('积分包')
+
+    // ── 流水一笔：另一套读法（见 CreditRow.amount）──────────────
+    // 右侧读数是**带符号的金额**，不是「剩 x / y」：一笔已经发生的收支没有
+    // 剩余可言。符号必须留着 —— 取掉绝对值后，「获得 1000」与「消耗 1000」
+    // 在屏幕上长得一模一样，而这一列恰恰就是靠符号读的。
+    if (pack?.record === true) {
+      const amount = numberOrNull(pack?.amount)
+      const unit = String(pack?.unit || '').trim()
+      const at = numberOrNull(pack?.at)
+      const expireAt = numberOrNull(pack?.expireAt)
+      const value = amount === null ? '—' : `${amount > 0 ? '+' : ''}${numberText(amount)}`
+      const view = unit && value !== '—' ? `${value} ${unitLabel(unit)}` : value
+      const parts: string[] = []
+      if (at !== null && at > 0) parts.push(shortTime(at))
+      if (expireAt !== null && expireAt > 0) {
+        parts.push(expireAt <= now ? t('已过期') : t('{time} 到期', { time: shortTime(expireAt) }))
+      }
+      const remark = String(pack?.remark || '').trim()
+      return {
+        name,
+        view,
+        // 获得是这一列的"进项"，消耗不该抢同样的注意力；两者都不用红
+        tone: amount !== null && amount < 0 ? 'muted' : 'ok',
+        percent: null,
+        window: parts.length ? parts.join(' · ') : null,
+        title: [
+          name,
+          view,
+          at !== null && at > 0 ? formatTime(at) : '',
+          expireAt !== null && expireAt > 0
+            ? t('到期 {time}', { time: formatTime(expireAt) })
+            : '',
+          remark,
+        ].filter(Boolean).join(' · '),
+        // 流水恒不进「已用完 / 已过期」那组（见 CreditRow.spent）
+        spent: false,
+        amount,
+      }
+    }
+
     const unit = String(pack?.unit || '').trim()
     const total = numberOrNull(pack?.total)
     const used = numberOrNull(pack?.used)
@@ -133,6 +201,9 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
     const startAt = numberOrNull(pack?.startAt)
     const expireAt = numberOrNull(pack?.expireAt)
     const daily = pack?.daily === true
+    const rolling = pack?.rolling === true
+    const resetAt = numberOrNull(pack?.resetAt)
+    const declaredPercent = numberOrNull(pack?.remainingPercent)
     const reason = String(pack?.grantReason || '').trim()
     const expired = expireAt !== null && expireAt > 0 && expireAt <= now
 
@@ -140,21 +211,24 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
     // 「不限」写在读数里而不是画一个数：-1 那种哨兵值摆上屏会被读成"欠费"。
     // 单位贴在整串末尾（「剩 400 / 500 额度」），不夹在中间 —— 中间那一版读起来
     // 像「剩 400 额度 / 共 500 额度」的省略写法，数字与单位的归属全靠猜。
+    // 三个数都过 `numberText`：上游给的是高精度浮点（`39.430000335` 这种），
+    // 照直拼会把小数尾巴铺满弹层（口径见 accounts-shared 那个函数）。
     const hasTotal = total !== null && total > 0
     const amount = unlimited
       ? t('不限')
       : remain !== null
         ? hasTotal
-          ? t('剩 {remaining} / {total}', { remaining: remain, total })
-          : t('剩 {remaining}', { remaining: remain })
+          ? t('剩 {remaining} / {total}', { remaining: numberText(remain), total: numberText(total) })
+          : t('剩 {remaining}', { remaining: numberText(remain) })
         : used !== null
-          ? t('已用 {used}', { used: used })
-          : '—'
+          ? t('已用 {used}', { used: numberText(used) })
+          : declaredPercent !== null
+            ? t('剩余 {percent}%', { percent: Math.round(declaredPercent) })
+            : '—'
     const view = !unlimited && unit && amount !== '—' ? `${amount} ${unitLabel(unit)}` : amount
-    // 剩余比例：只在有真总量时算（画不出比例就不装作有）
     const percent = hasTotal && remain !== null
       ? Math.max(0, Math.min(100, (remain / total) * 100))
-      : null
+      : declaredPercent === null ? null : Math.max(0, Math.min(100, declaredPercent))
 
     // ── 还能不能花（分组用，见 CreditRow.spent）────────────────
     // 「用完」认两个读数：剩余读到 0；剩余读不到但「已用 ≥ 总量」也认 ——
@@ -162,7 +236,7 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
     // 两者都读不到时**不猜**（宁留在主列表让人看见，也不凭空的把它折叠起来）。
     const exhausted = (remain !== null && remain <= 0)
       || (remain === null && used !== null && hasTotal && used >= total)
-    const spent = !unlimited && !daily && (exhausted || expired)
+    const spent = !unlimited && !daily && !rolling && (exhausted || expired)
 
     // ── 领取 → 到期 ─────────────────────────────────────────
     // 左边那一半两个来源，**名字必须跟着来源变**：`grantAt`（上游的发放时刻）
@@ -178,6 +252,8 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
       // 日额度包的「到期」是今天 24 点（周期边界），不是这笔钱作废 ——
       // 照「到期」写会让人以为额度明天就没了（实际是重置回满）
       parts.push(t('每日重置'))
+    } else if (rolling && resetAt !== null && resetAt > 0) {
+      parts.push(t('重置 {date}', { date: shortTime(resetAt) }))
     } else if (expireAt !== null && expireAt > 0) {
       parts.push(expired ? t('已过期') : t('{time} 到期', { time: shortTime(expireAt) }))
     }
@@ -207,9 +283,9 @@ export function creditRowsOf(entry: UsageEntry): CreditRow[] {
       daily ? t('每日重置（额度按周期回满，不是作废）') : '',
       reason,
       percent === null && remain !== null ? t('上游未给总量，画不出剩余比例') : '',
-      used !== null && total !== null ? t('已用 {used} / 共 {total}', { used, total }) : '',
+      used !== null && total !== null ? t('已用 {used} / 共 {total}', { used: numberText(used), total: numberText(total) }) : '',
     ].filter(Boolean).join(' · ')
-    return { name, view, tone, percent, window: parts.length ? parts.join(' · ') : null, title, spent }
+    return { name, view, tone, percent, window: parts.length ? parts.join(' · ') : null, title, spent, amount: null }
   })
 }
 
@@ -223,9 +299,8 @@ function CreditRowView({ row }: { row: CreditRow }) {
       </div>
       {row.window ? <div className='usage-pop-window'>{row.window}</div> : null}
       {row.percent !== null ? (
-        <span className='usage-pop-track'>
-          <i style={{ width: `${row.percent}%` }} aria-label={t('剩余 {percent}%', { percent: Math.round(row.percent) })} />
-        </span>
+        <Meter value={row.percent} variant={row.tone === 'ok' ? 'success' : row.tone === 'warn' ? 'warning' : 'muted'}
+          className='mt-1.5' trackClassName='h-[3px]' aria-label={t('剩余 {percent}%', { percent: Math.round(row.percent) })} />
       ) : null}
     </div>
   )
@@ -243,9 +318,10 @@ function CreditRowView({ row }: { row: CreditRow }) {
  * `subscriptionLine` 由调用方用 `subscriptionText` 拼好递进来（套餐 / 到期 /
  * 余量那一行）：那份措辞是悬停提示的既有产物，两处各写一份迟早会漂。
  */
-export function CreditDetailButton({ rows, subscriptionLine, variant, kind, title, children }: {
+export function CreditDetailButton({ rows, subscriptionLine, aggregate, variant, kind, title, children }: {
   rows: CreditRow[]
   subscriptionLine: string
+  aggregate: UsageAggregate | null
   variant: 'sum' | 'pool'
   /** 语义档（ok / warn / …）：`.usage-toggle` 按它上色，与读数本来的档同一套 */
   kind: string
@@ -263,6 +339,7 @@ export function CreditDetailButton({ rows, subscriptionLine, variant, kind, titl
   const [spentOpen, setSpentOpen] = React.useState(false)
   const liveRows = rows.filter(row => !row.spent)
   const spentRows = rows.filter(row => row.spent)
+  const detailLabel = rows.length > 0 && rows.every(row => row.snapshot) ? t('余额详情') : t('积分明细')
   const className = variant === 'pool' ? `usage-toggle usage-pool-line ${kind}` : `usage-toggle ${kind}`
 
   /**
@@ -314,36 +391,44 @@ export function CreditDetailButton({ rows, subscriptionLine, variant, kind, titl
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
-        render={<button type='button' className={className} title={title}
-          aria-label={t('积分明细')} />}
+        render={<Button size='default' variant='ghost' type='button' className={className} title={title}
+          aria-label={detailLabel} />}
       >
         {variant === 'pool' ? children : <span className='val'>{children}</span>}
         <span className='caret' aria-hidden>▾</span>
       </PopoverTrigger>
-      <PopoverContent align='end' sideOffset={6} className='w-[320px]' initialFocus={initialFocus}>
-        {/* ⚠️ 这一层 div 不是装饰，是**滚动容器本身**：组件库给 PopoverContent 编出的
-            `overflow-hidden` / `max-h-[min(70vh,560px)]` 都带 `!important`，把
-            max-height / overflow-y 写在弹层自己身上会被它们压掉（明细一多就既滚不动
-            又被裁掉）。写在弹层里的这一层没有对手，明细的滚动归它。
-            `tabIndex={-1}` 是为了能被上面的 `initialFocus` 聚焦（见那段注释）。
-            动这段结构前先看 page-accounts-table.css 里 .usage-pop-credit 的说明。 */}
+      {/* `align='center'`：浮层以读数按钮为中心展开。原来是 'end'（右缘对齐），
+          而这一列的按钮本身就靠右，弹层再向右贴齐就整个甩到表格右外侧，读起来像
+          挂在了「操作」列下面。居中后它落在自己的格子上，与哪一行是哪一行对得上。 */}
+      <PopoverContent align='center' sideOffset={6} className='w-[320px]' initialFocus={initialFocus}>
+
         <div className='usage-pop-credit' ref={attachBox} tabIndex={-1}>
           {subscriptionLine ? <div className='usage-pop-sub'>{subscriptionLine}</div> : null}
-          <div className='usage-pop-group'>{t('积分明细')}</div>
+          {aggregate ? <div className='usage-pop-total'>
+            <span className='k'>{aggregate.label}</span>
+            <span className='v'>{aggregate.unlimited ? t('不限') : numberText(aggregate.remaining)}
+              {!aggregate.unlimited && aggregate.unit ? <> <small>{aggregate.unit}</small></> : null}
+            </span>
+          </div> : null}
+          <div className='usage-pop-group'>{detailLabel}</div>
           {liveRows.map((row, index) => <CreditRowView key={`${row.name}-${index}`} row={row} />)}
           {spentRows.length > 0 ? (
             <div className='usage-pop-spent'>
-              <button
+              <Button size='default' variant='ghost'
                 type='button'
                 className='usage-pop-spent-head'
                 aria-expanded={spentOpen}
                 title={t('展开或收起（默认收起）')}
                 onClick={() => setSpentOpen(value => !value)}
               >
-                <span className='caret' aria-hidden>▾</span>
+                {/* ⚠️ 这个 span 必须**空着**：三角由 CSS 的 border 画
+                    （见 page-accounts-table.css 的 .usage-pop-spent-head .caret），
+                    里面再塞一个 ▾ 字形就会叠出两个箭头 —— 一个 border 画的、
+                    一个字形溢出的（width/height 是 0，字形照样画得出来）。 */}
+                <span className='caret' aria-hidden />
                 <span>{t('已用完 / 已过期')}</span>
                 <span className='n'>{t('{count} 份', { count: spentRows.length })}</span>
-              </button>
+              </Button>
               {spentOpen
                 ? spentRows.map((row, index) => (
                   <CreditRowView key={`spent-${row.name}-${index}`} row={row} />

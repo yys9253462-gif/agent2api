@@ -7,11 +7,16 @@
 //! 领成功还是没领、失败错误是什么、领了多少（收益文案）—— 这张表就是那个落点。
 //!
 //! ── 来源（source）的字面集合 ─────────────────────────────────
-//! `schedule` 定时条目轮次 / `startup` 启动补签 / `manual` 手动批量与条目
-//! 立即执行 / `single` 单账号签到 / `activity` 国际版活动的手动领取与保活。
-//! 前四种都从 `run_checkin` 的唯一记账点进来（`source` 参数原样透传），
-//! `activity` 从 `api::billing::run_activity` 进来（那条路径不走 run_checkin，
-//! 但行的形状同构，见 `record_activity`）。
+//! `schedule` 定时条目轮次 / `makeup` 定时补签轮 / `startup` 启动补签 /
+//! `manual` 手动批量与条目立即执行 / `single` 单账号签到 / `activity`
+//! 国际版活动的手动领取与保活。前五种都从 `run_checkin` 的唯一记账点进来
+//! （`source` 参数原样透传），`activity` 从 `api::billing::run_activity`
+//! 进来（那条路径不走 run_checkin，但行的形状同构，见 `record_activity`）。
+//!
+//! 记录页的「签到类型」筛选把来源归成三档（见 [`Query::clause`]）：手动 =
+//! `manual` / `single` / `activity`，定时 = `schedule`，定时补签 = `makeup` /
+//! `startup`；`makeup` 这一档上线前的历史补签行没有独立来源，按 reason 的
+//! 「补签」前缀归入同一档（见那里的说明）。
 //!
 //! ── 结果判据只此一份 ────────────────────────────────────────
 //! outcome 的判定复用签到执行体的同一对函数
@@ -103,10 +108,10 @@ pub fn record_row(row: &Value, provider: &str, source: &str, reason: &str) {
             OUTCOME_ALREADY
         };
         (outcome, None)
-    } else if claim_pending(&claim) {
-        (OUTCOME_PENDING, None)
     } else if activity_report_ok(row) || web_conversation_ok(row) {
         (OUTCOME_ALREADY, None)
+    } else if claim_pending(&claim) {
+        (OUTCOME_PENDING, None)
     } else {
         // 失败且行上没有 error：失败文案在 claim.msg 里（claim_result 的
         // Err 分支已经把 message 放进行 error，这里兜的是直接给出
@@ -177,12 +182,10 @@ pub fn record_activity(row: &Value, provider: &str, mode: &str) {
             OUTCOME_ALREADY
         };
         (outcome, None, true)
+    } else if report_ok {
+        (OUTCOME_ALREADY, None, true)
     } else if claim_pending(&claim) {
         (OUTCOME_PENDING, None, false)
-    } else if report_ok {
-        // full / claim 模式「活动未开启但活跃上报成功」：与 record_row 同款，
-        // 这一天的国际版日活实际完成了，不落 failed。
-        (OUTCOME_ALREADY, None, true)
     } else {
         (
             OUTCOME_FAILED,
@@ -283,6 +286,8 @@ fn text_or(value: Option<&Value>, fallback: &str) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct Query {
     pub outcome: Option<String>,
+    /// 签到类型三档：`manual` / `schedule` / `makeup`（空 = 全部）
+    pub kind: Option<String>,
     pub provider: Option<String>,
     pub keyword: Option<String>,
     pub start: Option<i64>,
@@ -293,6 +298,7 @@ impl Query {
     /// 是否带了任一筛选条件（DELETE 的护栏判据：一个都没带 = 全清）
     pub fn has_filters(&self) -> bool {
         self.outcome.as_deref().is_some_and(|text| !text.is_empty())
+            || self.kind.as_deref().is_some_and(|text| !text.is_empty())
             || self.provider.as_deref().is_some_and(|text| !text.is_empty())
             || self.keyword.as_deref().is_some_and(|text| !text.is_empty())
             || self.start.is_some()
@@ -306,6 +312,26 @@ impl Query {
         if let Some(outcome) = self.outcome.as_deref().filter(|text| !text.is_empty()) {
             conditions.push("outcome = ?".to_string());
             params_json.push(json!(outcome));
+        }
+        match self.kind.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+            // 手动签到：手动批量 / 条目立即执行、单账号签到、国际版活动的手动
+            // 领取与保活 —— 三者都是人在面板上点的
+            Some("manual") => conditions.push("source IN ('manual', 'single', 'activity')".to_string()),
+            // 定时签到：定时条目主轮与窗口重试。补签行在 `makeup` 来源上线
+            // 之前也记成 schedule，按 reason 的「补签」前缀排除掉（那条轮次
+            // 的 reason 固定是「补签（条目名）」）；上线之后的新行不会命中
+            // 这条兜底
+            Some("schedule") => conditions.push(
+                "source = 'schedule' AND reason NOT LIKE '补签%'".to_string(),
+            ),
+            // 定时补签：补签轮（`makeup`）与旧的启动补签（`startup`），外加
+            // 按旧口径记成 schedule 的历史补签行
+            Some("makeup") => conditions.push(
+                "(source IN ('makeup', 'startup')
+                  OR (source = 'schedule' AND reason LIKE '补签%'))"
+                    .to_string(),
+            ),
+            _ => {}
         }
         if let Some(provider) = self.provider.as_deref().filter(|text| !text.is_empty()) {
             conditions.push("provider = ?".to_string());
@@ -380,7 +406,14 @@ pub fn query(query: &Query, limit: usize, offset: usize) -> Value {
                         "reason": row.get::<_, String>("reason")?,
                         "accountId": row.get::<_, String>("account_id")?,
                         "accountName": row.get::<_, String>("account_name")?,
-                        "provider": row.get::<_, String>("provider")?,
+                        // 存的是 provider id，读出来换成展示名（`qoder-intl`
+                        // → 「Qoder 国际版」）：界面上直接展示这一列，而 id
+                        // 只有开发者认得出。历史记录同样受益 —— 转换在读侧做，
+                        // 不改库（改库要迁移，且旧行本来也只需换名字）。
+                        "provider": crate::server::core::providers::label_of(
+                            &row.get::<_, String>("provider")?
+                        ),
+                        "providerId": row.get::<_, String>("provider")?,
                         "outcome": row.get::<_, String>("outcome")?,
                         "ok": row.get::<_, i64>("ok").unwrap_or(0) != 0,
                         "message": row.get::<_, Option<String>>("message")?,

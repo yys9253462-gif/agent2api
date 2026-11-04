@@ -2,114 +2,25 @@ import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot, type Root } from 'react-dom/client'
 import { t } from '../i18n'
+import { Tooltip, TooltipContent, TooltipProvider } from '@ui'
 
 /**
- * Agent2API · 请求日志「重试 / 敏感词」两枚标签的悬停面板（React 岛）。
+ * 请求日志「重试 / 敏感词」标签的只读悬停面板。
  *
- * 替换 ui/request-hover.js（旧文件由迁移负责人删除）。对外接口与原实现**完全一致**：
- *   window.wbRequestHover = { bind, close, hasProcessFacts, beforeListRedraw, afterListRedraw }
- * 调用点只有 ui/requests-panel.js（bind 在加载期把委托挂到列表上、hasProcessFacts 在 retryCell
- * 决定那枚「重试」标签显不显示、before/afterListRedraw 在 paintList 通知整表重绘），一行都不用改。
- *
- * ── 这两枚标签承载的「逐请求事实」（文案与分组口径的唯一去处）──────
- * 改造前，一次转发的过程事实散在运行日志里（换号顺延、退避重试、401 刷新、限额降级、上游报错、
- * 代理回退各自一行，有的按请求刷屏），请求日志这边只看得到「换了几次号」与最后一次的结果。现在
- * 这些事实全部收进尝试明细（`attemptDetails` 的 `account` / `retries` / `notice`），由本模块渲染
- * —— 排障时**只看这一处**就够：谁承载了每一轮（提供商 + 账号）、每轮成没成与失败原因、每轮内部
- * 退避重试的次数 / 原因 / 等待时长、出口有没有降级（代理不可用 → 直连，落在提示行 notice 上）。
- * 所以这里的**文案、分组与上限**（MAX_TERM_ROWS 等）一律照抄旧实现：它是排障的唯一口径，多一套
- * 说法就等于有两个事实源。
- *
- * ── 形态：常驻的委托（命令式）+ 按需的浮层（React）────────────────
- *   · 常驻部分本次**不动**：`bind(list)` 把事件委托挂在列表**容器**上。宿主是 legacy 渲染的表格
- *     DOM（requests-panel.js 默认 1 秒一拍、每次整表重绘 `innerHTML`），委托挂在容器上不随重绘
- *     失效；而 React 管不到那些节点，契约 `bind({host, entryOf})` 收的本来就是一个现成元素 ——
- *     这一半留在命令式一侧是必然的。
- *   · 浮层部分（本次换掉）：内容改由 React 渲染。打开时就地建宿主 div 挂到 body、createRoot 渲染，
- *     量完尺寸落位；收起时 `root.unmount()` + `host.remove()`，不留常驻节点（旧实现是一个常驻
- *     body 的 div + innerHTML 拼内容）。
- *
- * ── 为什么外壳自绘（Tailwind）而不是用组件库的浮层件 ──────────────
- * ui-kit 里没有 Popover / 非模态浮层件：Dialog 与 AlertDialog 都是**模态**（遮罩、焦点陷阱、滚动
- * 锁定），而这里要的恰好相反 —— 跟着鼠标、不抢焦点、连指针事件都不接收（旧 `.req-hover` 是
- * `pointer-events: none`）的只读说明。所以外壳按旧 CSS 的取值映射组件库令牌自绘（见 SHELL_CLASS），
- * 并把「缺一个非模态 Popover」反馈给 ui-kit。面板内容是纯文本结构（分组 / 列表 / 键值对），没有
- * 按钮也没有徽章 —— 因此这一版**没有**用到 Button / Badge：把「× N」这类计数换成徽章会改掉旧设计
- * 刻意的「词左次数右、次数竖着能比大小」两列排布，属于无谓的观感回归。
- *
- * ── 定位与整表重绘的锚点迁移（两条不能丢的行为）─────────────────
- * 定位照抄旧算法（不引入浮层库 / 拖拽库）：面板 `position: fixed` 挂 body（`.panel` 是
- * overflow:hidden，absolute 的浮层会被卡片裁掉），用 max-content 量宽 → 夹进下限与两个上限 →
- * 默认贴锚点下方、下方放不下且上方更宽裕时翻到上方 → 贴边夹进视口。关键在时序：渲染、量尺寸、
- * 落位必须**在同一个任务内**完成，否则会闪出一帧未定位的面板（旧实现是 innerHTML + place() 同
- * 任务）。React 19 的 root.render 默认并发调度（提交可能落在下一个宏任务），所以这里用 `flushSync`
- * 把提交压成同步 —— 这是与旧实现等价的时序保证，不是可选项。
- *
- * 锚点迁移：本页 1 秒重绘一次、重绘换掉全部标签节点，而打开有 150ms 延迟 —— 重绘落在延迟窗口里时
- * 面板会拿**游离节点**定位（rect 全 0 → 面板落在视口左上角），且游离节点收不到 pointerout、开了就
- * 不会自己关（实测的 bug）。宿主在替换 innerHTML 前后各通知一次，本模块按「标签种类 + 行身份键」
- * 把锚点迁到新节点上；迁不走（行被挤出当前页 / 反查不到数据）一律收起，于是不会留下死锚点。
- *
- * ── 与旧实现的两处显式差异 ───────────────────────────────────
- *   ① 全局监听（click 捕获 / scroll 捕获 / resize）只在面板开着时绑、收起即解 —— 旧实现是加载期
- *      常驻三条。行为等价（关着的时候它们本来就什么都不做），但不留悬挂监听。
- *   ② 深色样式走组件库的 `dark:` 变体（跟 data-theme 走），旧实现的
- *      `@media (prefers-color-scheme: dark)` 不认 data-theme，会在「显式浅色主题 + 深色系统」下
- *      把面板刷成深色。
+ * 数据判据只在本模块维护，宿主通过 bind / hasProcessFacts / beforeListRedraw /
+ * afterListRedraw 协作。浮层使用组件库 Tooltip，不抢焦点、不接收指针事件。
+ * 列表刷新前后需要按标签种类和行身份键迁移锚点，找不到新节点时关闭面板，
+ * 避免用已经脱离文档的元素定位。
  */
 
 /* ─── 常量 ───────────────────────────────────── */
-/** 悬停进入 / 离开的延迟（ms）：与 tooltip.js 同一组值，手感一致 */
+/** 悬停进入 / 离开的延迟（ms）：与 desktop-tooltip.tsx 同一组值，手感一致 */
 const SHOW_DELAY = 150
 const HIDE_DELAY = 80
-/** 距视口边缘的安全距离，以及浮层与锚点的间距 */
-const EDGE = 8
-const GAP = 8
-/**
- * 面板宽度的下限（px）：内容再短也至少这么宽。重试链面板最长的一行是「尝试 N · 提供商
- * 账号 → 失败（状态码）：错误摘要」，头部加常见长度的摘要就有 400–600px —— 下限给足，
- * 常见场景整行显示。敏感词面板是「词 × 次数」列表，内容不长，基准宽度给小的（铺太宽会
- * 让词与次数隔得老远，反而难读）。
- */
-const MIN_PANEL_WIDTH = 520
-const MIN_PANEL_WIDTH_SENSITIVE = 220
-/**
- * 敏感词面板在量出宽度上的宽裕系数（1.1 = 放宽一成）：量出的 max-content 恰恰好「放得下
- * 最长一行」，系统缩放非整数倍时（Windows 125% / 150%）文字实际排布会宽零点几像素，长敏感词
- * 就在最后一个词处折行，而面板右边还空着一截。重试链面板不加：那几行是长文本流，宽窄只影响
- * 换行位置。
- */
-const SENSITIVE_WIDTH_SLACK = 1.1
-/** 面板宽度的上限（px，还要再夹进视口可用宽度）：铺满整屏的一行 12px 字很难读，超出的交给内部换行 */
-const MAX_PANEL_WIDTH = 900
 /** 命中词列表最多显示几行：这一块是「命中了什么」的快照，不是词表编辑器 */
 const MAX_TERM_ROWS = 12
 /** 面板节点 id：锚点用 aria-describedby 指过来（与旧实现同一个 id） */
 const PANEL_ID = 'req-hover-panel'
-
-/**
- * 面板外壳的类名。定位那几条（position / left / top / width / max-width）**不在这里**：它们要
- * 量完尺寸才知道，由 place() 写成内联样式 —— 也不该由 React 管，否则每次重渲染都可能把落位
- * 结果推回原样。
- *
- * 逐条对应旧 `.req-hover`（ui/css/page-requests.css），取值映射到组件库令牌：z-index 35 /
- * max-height min(360px,60vh) / padding 10px 12px / overflow / 12px + 1.6 行高 /
- * pointer-events:none / word-break:normal；radius --r-md ↔ rounded-md（两边都由 --radius: 1rem
- * 派生，值相同）、bg --surface 96% ↔ bg-surface-2（旧值是把 --surface 压暗 4% 的抬升面，
- * 组件库最接近的是 surface-2；深色下旧值就是 --surface-3，两边同名同值）、color --text ↔
- * text-foreground、--shadow-3 ↔ shadow-3；深色下 --surface-3 + --border-strong 描边。
- *
- * `pointer-events-none` 是行为的一部分：面板不接收指针事件，指针落到它上面时命中的仍是下面的
- * 标签/行 —— 于是「移到面板上」等价于「移开标签」，按 HIDE_DELAY 收起，这正是旧实现「面板不可
- * 交互」的语义（也因此这里没有任何可点控件）。
- */
-const SHELL_CLASS = [
-  'fixed z-[35] pointer-events-none',
-  'max-h-[min(360px,60vh)] overflow-x-hidden overflow-y-auto',
-  'rounded-md p-[10px_12px] text-[12px] leading-[1.6] break-normal',
-  'bg-surface-2 text-foreground shadow-3',
-  'border-0 dark:border dark:border-border-strong dark:bg-surface-3',
-].join(' ')
 
 /** 淡色说明行的类（旧 `.rh-row` + `.rh-dim` 的组合，出现多处，口径只写一处） */
 const DIM_ROW = 'rh-row rh-dim min-w-0 break-words text-muted-foreground'
@@ -432,24 +343,22 @@ function SensitivePanel({ entry }: { entry: RequestEntry }) {
   )
 }
 
-/**
- * 面板根：外壳（外观 + 内容）在这里，内容按 kind 分派。`panelRef` 由命令式外壳在挂载时现建：
- * place() 要拿真实节点量尺寸，而节点由 React 创建 —— 一个 ref 就够，不必 portal 或全局查询。
- */
+/** 组件库处理定位与边界碰撞，业务只提供锚点和面板内容。 */
 function HoverPanel({
   kind,
   entry,
-  panelRef,
 }: {
   kind: PanelKind
   entry: RequestEntry
-  panelRef: React.RefObject<HTMLDivElement | null>
 }) {
-  return (
-    <div ref={panelRef} id={PANEL_ID} role='tooltip' data-kind={kind} className={SHELL_CLASS}>
+  return <TooltipProvider><Tooltip open disableHoverablePopup>
+    <TooltipContent anchor={anchor} id={PANEL_ID} side='bottom' variant='plain' data-kind={kind}
+      className={kind === 'sensitive'
+        ? 'pointer-events-none w-max min-w-[220px] max-w-[min(900px,calc(100vw-16px))] text-[12px]'
+        : 'pointer-events-none w-[min(520px,calc(100vw-16px))] max-w-[min(900px,calc(100vw-16px))] text-[12px]'}>
       {kind === 'sensitive' ? <SensitivePanel entry={entry} /> : <ChainPanel entry={entry} />}
-    </div>
-  )
+    </TooltipContent>
+  </Tooltip></TooltipProvider>
 }
 
 /* ─── 模块状态 ───────────────────────────────── */
@@ -474,7 +383,6 @@ let remap: Remap | null = null
 /** 浮层的宿主 div / React root / 面板节点引用 / 当前面板类型（收起时全部清空） */
 let panelHost: HTMLElement | null = null
 let panelRoot: Root | null = null
-let panelRef: React.RefObject<HTMLDivElement | null> | null = null
 let panelKind: PanelKind = 'chain'
 
 function cancelTimers(): void {
@@ -483,52 +391,6 @@ function cancelTimers(): void {
   showTimer = 0
   hideTimer = 0
   pendingTag = null
-}
-
-/* ─── 定位 ───────────────────────────────────── */
-/**
- * 按锚点位置摆面板：默认下方，下方放不下且上方更宽裕时翻到上方。
- *
- * 宽度按内容自适应再夹进视口：切换路径那行可能很长（三家的中文名 + 箭头），错误摘要更长。用
- * max-content 量出理想宽度，再夹到下限（MIN_PANEL_WIDTH）与两个上限（视口可用宽度、
- * MAX_PANEL_WIDTH），放不下的交给面板内部的换行与滚动；敏感词面板另外放宽一成（见
- * SENSITIVE_WIDTH_SLACK）并把宽度**直接定到**上限 —— max-width 只是上限，内容比它窄时面板仍
- * 会缩回 max-content，放宽的一成就落不到实处。
- *
- * 三步（量自然宽 → 定宽 → 量高定坐标）在同一任务内跑完，浏览器只绘制最终结果，不会闪出「先落在
- * 上一处」的一帧（与 tooltip.js 同法）。夹进视口后仍放不下（面板比可用高度还高）时贴边显示，
- * 超出部分由 max-height + overflow 接管（见 SHELL_CLASS）。
- */
-function place(): void {
-  const panel = panelRef?.current
-  const tag = anchor
-  if (!panel || !tag) return
-
-  const rect = tag.getBoundingClientRect()
-  const avail = window.innerWidth - EDGE * 2
-
-  panel.style.maxWidth = 'none'
-  panel.style.width = 'max-content'
-  const natural = panel.offsetWidth
-  const sensitive = panelKind === 'sensitive'
-  const minWidth = sensitive ? MIN_PANEL_WIDTH_SENSITIVE : MIN_PANEL_WIDTH
-  const base = Math.max(minWidth, natural) * (sensitive ? SENSITIVE_WIDTH_SLACK : 1)
-  const cap = Math.min(base, avail, MAX_PANEL_WIDTH)
-  panel.style.maxWidth = `${cap}px`
-  panel.style.width = sensitive ? `${cap}px` : 'auto'
-
-  const width = panel.offsetWidth
-  const height = panel.offsetHeight
-  const below = window.innerHeight - rect.bottom - GAP - EDGE
-  const above = rect.top - GAP - EDGE
-  const flip = below < height && above > below
-
-  const centerX = rect.left + rect.width / 2
-  const left = Math.max(EDGE, Math.min(centerX - width / 2, window.innerWidth - EDGE - width))
-  const top = flip ? rect.top - GAP - height : rect.bottom + GAP
-
-  panel.style.left = `${Math.round(left)}px`
-  panel.style.top = `${Math.round(Math.max(EDGE, Math.min(top, window.innerHeight - EDGE - height)))}px`
 }
 
 /* ─── 全局监听（按需绑 / 收起即解）────────────── */
@@ -543,7 +405,7 @@ function onDocumentClick(event: MouseEvent): void {
 }
 
 /**
- * 滚动 / 缩放时**收起**而不是重新定位（与 tooltip.js 相反）：面板挂在列表内的行上，而列表自身可滚
+ * 滚动 / 缩放时**收起**而不是重新定位（与 desktop-tooltip.tsx 相反）：面板挂在列表内的行上，而列表自身可滚
  *（`.log-list`），滚动时行在动、面板是 fixed 的，追随会让面板在屏幕上拖着走、干扰正在滚动的手。
  * 收起之后指针还停在标签上，轻微一动就会重新弹出。
  */
@@ -585,34 +447,21 @@ function unmountPanel(): void {
     panelHost.remove()
     panelHost = null
   }
-  panelRef = null
 }
 
-/**
- * 把面板内容渲染出来并立刻落位。
- *
- * `flushSync` 是时序的关键：React 19 的 `root.render` 默认并发调度，提交可能落在下一个宏任务 ——
- * 那样「渲染 → 量尺寸 → 落位」就跨了任务，中间会闪出一帧未定位的面板。旧实现是 `innerHTML` +
- * place() 同任务，这里必须等价，所以把提交压成同步。
- *
- * 复用时直接重渲染（锚点迁移路径：内容一并重算，而不是沿用上一拍的旧内容 —— 进行中的行每秒都在变），
- * 宿主与 root 留着；首次打开才建宿主 div 挂到 body（同旧实现）。
- */
+/** 同步提交使锚点迁移与面板更新在同一轮完成；仅首次打开创建宿主。 */
 function renderPanel(kind: PanelKind, entry: RequestEntry): void {
   panelKind = kind
-  if (!panelHost || !panelRoot || !panelRef) {
+  if (!panelHost || !panelRoot) {
     panelHost = document.createElement('div')
     document.body.append(panelHost)
-    panelRef = React.createRef<HTMLDivElement>()
     panelRoot = createRoot(panelHost)
   }
   const root = panelRoot
-  const ref = panelRef
   flushSync(() => {
-    root.render(<HoverPanel kind={kind} entry={entry} panelRef={ref} />)
+    root.render(<HoverPanel kind={kind} entry={entry} />)
   })
   bindGlobals()
-  place()
 }
 
 /** 展开锚点的面板（数据由 entryOf 反查；反查不到就什么都不显示） */

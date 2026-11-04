@@ -93,6 +93,15 @@ pub enum SecretScope {
     UpdateToken,
     /// 账号表（`accounts`）。预留：支持 `AGENT2API_ACCOUNT_KEY` 兜底
     Accounts,
+    /// 云同步的「同步密码」（`core::cloud_sync`）。
+    ///
+    /// ── 为什么必须是独立密钥域 ──────────────────────────────────
+    /// 同步密码要用来加解密**远端那份 `account.key`**，而本机的账号域密钥本身
+    /// 也在同步范围里。若拿账号域密钥去封同步密码，下载并替换 `account.key`
+    /// 之后，本机保存的那份同步密码就再也解不开了 —— 用户会看到「密码明明
+    /// 没改，却说密码错」。独立一把 `cloud-sync.key` 只属于这台机器、不参与
+    /// 同步，这条死循环才不存在。
+    CloudSync,
 }
 
 impl SecretScope {
@@ -100,10 +109,11 @@ impl SecretScope {
     ///
     /// `update-token.key` **必须逐字保持**：改名字等于换了密钥文件，已发布用户
     /// 机器上的 GitHub 令牌会全部解不开，而用户不会想到「升级一次就丢了令牌」。
-    fn key_file(self) -> &'static str {
+    pub(crate) fn key_file(self) -> &'static str {
         match self {
             SecretScope::UpdateToken => "update-token.key",
             SecretScope::Accounts => "account.key",
+            SecretScope::CloudSync => "cloud-sync.key",
         }
     }
 
@@ -115,6 +125,7 @@ impl SecretScope {
         match self {
             SecretScope::UpdateToken => "重存一次令牌即可自愈",
             SecretScope::Accounts => "重新保存一次账号即可自愈",
+            SecretScope::CloudSync => "在「设置 → 数据 → 云同步」里重新输入同步密码即可自愈",
         }
     }
 }
@@ -131,9 +142,12 @@ fn cache_for(scope: SecretScope) -> &'static std::sync::Mutex<Option<[u8; KEY_LE
         std::sync::OnceLock::new();
     static ACCOUNTS: std::sync::OnceLock<std::sync::Mutex<Option<[u8; KEY_LEN]>>> =
         std::sync::OnceLock::new();
+    static CLOUD_SYNC: std::sync::OnceLock<std::sync::Mutex<Option<[u8; KEY_LEN]>>> =
+        std::sync::OnceLock::new();
     match scope {
         SecretScope::UpdateToken => UPDATE_TOKEN.get_or_init(|| std::sync::Mutex::new(None)),
         SecretScope::Accounts => ACCOUNTS.get_or_init(|| std::sync::Mutex::new(None)),
+        SecretScope::CloudSync => CLOUD_SYNC.get_or_init(|| std::sync::Mutex::new(None)),
     }
 }
 
@@ -143,7 +157,7 @@ fn cache_for(scope: SecretScope) -> &'static std::sync::Mutex<Option<[u8; KEY_LE
 /// **不存在就现场生成**，生成失败（目录不可写等）不能把失败缓存成永久状态 ——
 /// 下次保存还能重试；同时首次并发的两个保存要串行（各自生成不同的密钥、互相
 /// 覆盖文件，先存的那份密文就再也解不开了）。
-fn secret_key(scope: SecretScope) -> Result<[u8; KEY_LEN], String> {
+pub(crate) fn secret_key(scope: SecretScope) -> Result<[u8; KEY_LEN], String> {
     let cell = cache_for(scope);
     let Ok(mut guard) = cell.lock() else {
         return Err("密钥锁中毒".to_string());
@@ -315,6 +329,69 @@ fn short_fingerprint(bytes: &[u8]) -> String {
     text
 }
 
+/// 公开的指纹口径：任意字节 → 前 16 位十六进制。
+///
+/// 云同步要用它给**远端那份 `account.key.enc` 里封装的密钥**算指纹（与
+/// [`key_fingerprint`] 对本地密钥算的是同一口径），才能回答「远端那把钥匙是不是
+/// 我现在这把」。不暴露这个函数的话调用方会自己写一遍 sha256 截断 —— 两处口径
+/// 一旦漂移，指纹比对就会给出错误的「一致 / 不一致」结论。
+pub fn fingerprint_of(bytes: &[u8]) -> String {
+    short_fingerprint(bytes)
+}
+
+// ─── 缓存重置（云同步专用）───────────────────────────────────
+
+/// 丢掉某个域的进程内密钥缓存，下一次 `seal` / `open` 重新从磁盘（或环境变量）解析。
+///
+/// ── 唯一调用方是云同步下载 ────────────────────────────────────
+/// 下载会**替换 `account.key`**（把远端那份装到本机）。而 `secret_key` 把密钥缓存在
+/// 进程内，不重置的话本次运行剩下的时间里账号表用的还是**旧密钥** —— 新写进去的
+/// 密文用旧钥匙封、下一次启动用新钥匙开，账号全部解不开。这是云同步最容易踩的
+/// 一个坑，所以重置入口放在 crypto 自己这里（而不是让调用方去碰私有缓存）。
+///
+/// `Accounts` 之外的域不会被替换，重置它们只是多一次读文件，但**不做**：调用方
+/// 只该传真的换过密钥的那个域，保留「重置 = 我确实换了文件」的语义。
+pub fn reset_cache(scope: SecretScope) {
+    if let Ok(mut guard) = cache_for(scope).lock() {
+        *guard = None;
+    }
+    if matches!(scope, SecretScope::Accounts) {
+        crate::server::core::providers::catalog::invalidate();
+    }
+}
+
+/// 该域密钥文件的**路径**（不读、不生成）。云同步据此做备份 / 替换。
+pub fn key_file_path(scope: SecretScope) -> std::path::PathBuf {
+    crate::paths::config_dir().join(scope.key_file())
+}
+
+/// 只读地取该域密钥的原始 32 字节（不生成新密钥，见 [`existing_key`]）。
+///
+/// 云同步上传时用它取 `account.key` 的字节去加密上云；本机还没有密钥
+/// （从未保存过账号）时返回 `None`，那种情况不需要同步密钥文件。
+pub fn existing_key_bytes(scope: SecretScope) -> Option<[u8; KEY_LEN]> {
+    existing_key(scope)
+}
+
+pub(crate) fn backup_key(scope: SecretScope) -> Result<Option<[u8; KEY_LEN]>, String> {
+    let guard = cache_for(scope).lock().map_err(|_| "密钥锁不可用".to_string())?;
+    if let Some(key) = *guard {
+        return Ok(Some(key));
+    }
+    drop(guard);
+    if let Some(key) = env_key(scope) {
+        return Ok(Some(key));
+    }
+    let path = key_file_path(scope);
+    match std::fs::read(&path) {
+        Ok(bytes) => <[u8; KEY_LEN]>::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| format!("密钥文件 {} 长度异常", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读取密钥文件 {} 失败: {error}", path.display())),
+    }
+}
+
 // ─── 加密 / 解密（对外）─────────────────────────────────────
 
 /// 加密明文 → `enc1:<base64(nonce||密文+tag)>`。
@@ -323,12 +400,16 @@ fn short_fingerprint(bytes: &[u8]) -> String {
 /// 会互相泄底），随机性来自系统熵源；不用计数器 —— 进程重启后计数没有持久化，
 /// 随机 nonce 才是这里站得住的选择。
 pub fn seal(plaintext: &[u8], scope: SecretScope) -> Result<String, String> {
+    let key = secret_key(scope)?;
+    seal_with_key(plaintext, &key)
+}
+
+pub(crate) fn seal_with_key(plaintext: &[u8], key: &[u8; KEY_LEN]) -> Result<String, String> {
     use aes_gcm::aead::{consts::U12, Aead as _};
     use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
 
-    let key = secret_key(scope)?;
     let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|_| "密钥长度不受 AES-256 支持".to_string())?;
+        Aes256Gcm::new_from_slice(key).map_err(|_| "密钥长度不受 AES-256 支持".to_string())?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce_bytes).map_err(|error| format!("系统随机源不可用: {error}"))?;
     let nonce =
@@ -348,6 +429,21 @@ pub fn seal(plaintext: &[u8], scope: SecretScope) -> Result<String, String> {
 /// 密钥不匹配那句会把**具体密钥文件名**带出去 —— 用户要知道该去找哪个文件，
 /// 这句会经 `status_json` 显示到界面上。
 pub fn open(envelope: &str, scope: SecretScope) -> Result<Vec<u8>, String> {
+    decrypt_envelope(envelope, || secret_key(scope), &format!(
+        "AES-GCM 解密失败（密钥文件 {} 是否被删除或更换？{}）",
+        scope.key_file(), scope.recovery_hint(),
+    ))
+}
+
+pub(crate) fn open_with_key(envelope: &str, key: &[u8; KEY_LEN]) -> Result<Vec<u8>, String> {
+    decrypt_envelope(envelope, || Ok(*key), "AES-GCM 解密失败（密文与备份密钥不匹配）")
+}
+
+fn decrypt_envelope(
+    envelope: &str,
+    resolve: impl FnOnce() -> Result<[u8; KEY_LEN], String>,
+    failure: &str,
+) -> Result<Vec<u8>, String> {
     use aes_gcm::aead::{consts::U12, Aead as _};
     use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
 
@@ -363,18 +459,13 @@ pub fn open(envelope: &str, scope: SecretScope) -> Result<Vec<u8>, String> {
         return Err("密文长度异常".to_string());
     }
     // 密钥在长度校验之后才取：坏信封不该触发「现场生成密钥文件」这类副作用
-    let key = secret_key(scope)?;
+    let key = resolve()?;
     let cipher =
         Aes256Gcm::new_from_slice(&key).map_err(|_| "密钥长度不受 AES-256 支持".to_string())?;
     let nonce = Nonce::<U12>::try_from(&blob[..NONCE_LEN])
         .map_err(|_| "密文 nonce 长度异常".to_string())?;
-    let plaintext = cipher.decrypt(&nonce, &blob[NONCE_LEN..]).map_err(|_| {
-        format!(
-            "AES-GCM 解密失败（密钥文件 {} 是否被删除或更换？{}）",
-            scope.key_file(),
-            scope.recovery_hint()
-        )
-    })?;
+    let plaintext = cipher.decrypt(&nonce, &blob[NONCE_LEN..])
+        .map_err(|_| failure.to_string())?;
     // UTF-8 闸门：旧实现 `token.rs::decrypt` 的这条文案会被界面原样展示，
     // 属于对外行为，不能因为返回值换成字节就漏掉（见模块头）
     std::str::from_utf8(&plaintext).map_err(|_| "解密结果不是合法 UTF-8 文本".to_string())?;

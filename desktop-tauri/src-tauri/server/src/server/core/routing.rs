@@ -424,7 +424,7 @@ pub fn accounts_of(snapshot: &Value) -> Vec<Value> {
 fn compare_by_priority(a: &Value, b: &Value) -> std::cmp::Ordering {
     let key = |account: &Value| {
         (
-            normalize_priority(account.get("priority"), crate::server::core::account_store::priority::DEFAULT_PRIORITY),
+            normalize_priority(account.get("routingPriority").or_else(|| account.get("priority")), crate::server::core::account_store::priority::DEFAULT_PRIORITY),
             js_number(account.get("addedAt").unwrap_or(&Value::Null)).unwrap_or(0.0),
         )
     };

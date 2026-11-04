@@ -4,16 +4,11 @@
 //! 改造前的写入是「内存 `VecDeque` 快照 + 追加写 / 超限整文件重写」，读取是
 //! 「在内存快照里倒着找」。进数据库后那套双份状态整体消失：写入是一条 UPSERT、
 //! 淘汰是一条 DELETE、读取是一次主键查询 —— 本文件承接这些语句，上层
-//! （`debug_traffic.rs`）只做截断、脱敏、降级与 API 形状。
+//! （`debug_traffic.rs`）只做采集、脱敏、降级与 API 形状。
 //!
-//! ── `size` 列与两道闸的口径 ─────────────────────────────────
-//! 列里存 [`payload_bytes`] 的结果：**这一条落库后实际占的文本字节合计**。
-//! 旧实现的 `entry_size` 是「序列化后的 JSON 行 + 换行」——两者量级相同
-//! （都是「这条占多大」），但口径的参照物变了：闸门守的是**这张表实际占多大**，
-//! 所以要用截断**后**的体积。用「截断前的原始大小」会让一条被截成 2 MiB 的
-//! 报文仍按 3 MiB 记账，闸门提前收紧且与实际占用脱钩。
-//! 不计 SQLite 的页/行开销（每行几十字节），它与 64 MiB 的闸门量级差着六个
-//! 数量级，计进来只会让数字难解释。
+//! ── `size` 列 ────────────────────────────────────────────
+//! 保存完整报文落库后的文本字节合计，不含 SQLite 页与行开销。
+//! 留存只按条数裁剪，不按该字段删除大报文。
 //!
 //! ── 排序键：`ts DESC, rowid DESC` ────────────────────────────
 //! 「最新」按 **ts** 判（`idx_debug_traffic_ts` 正为此存在），同 ts 时用 `rowid`
@@ -34,7 +29,7 @@
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, Connection};
 
-use super::{TrafficEntry, MAX_ENTRIES, MAX_TOTAL_BYTES};
+use super::{TrafficEntry, MAX_ENTRIES};
 
 /// 全部列（所有 SELECT 都按这个顺序取，[`decode_row`] 依赖它；
 /// 不写 `SELECT *` 是为了「加列时读侧要显式跟上」这件事在 diff 里可见）
@@ -185,7 +180,7 @@ pub(super) fn upsert_entry(conn: &Connection, entry: &TrafficEntry) -> rusqlite:
     Ok(())
 }
 
-/// 条数与字节合计（两道闸的判据；`(条数, size 之和)`）
+/// 存储概况：条数与已保存文本字节合计。
 pub(super) fn count_and_bytes(conn: &Connection) -> rusqlite::Result<(usize, i64)> {
     let (count, bytes): (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM debug_traffic",
@@ -207,59 +202,14 @@ pub(super) fn select_one(conn: &Connection, id: &str) -> rusqlite::Result<Option
     }
 }
 
-/// 清空全表
-pub(super) fn delete_all(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM debug_traffic", [])
-}
-
-/// 两道闸：**先条数、后字节**（顺序与改造前逐字一致）。
-///
-/// 每次调用都要跑到两条都满足为止 —— 但它们各自是一条语句，不需要循环：
-///
-///   ① 条数：只保留 ts 最大的 [`MAX_ENTRIES`] 条。
-///      改造前 `record` 里的做法是「丢最旧的一半」（为了省整文件重写的代价），
-///      现在淘汰是一条 DELETE、成本与删多少无关，所以改成**精确删到上限**：
-///      容量可预期，不会出现「刚过 500 就掉到 250」的跳变
-///      （见 `MAX_ENTRIES` 的说明）。
-///   ② 字节：从最旧的开始删，直到合计回到 [`MAX_TOTAL_BYTES`] 以内。
-///      用窗口函数算「从最新往旧累加」的前缀和，一次删掉所有让累加超过上限的行。
-///      这一条对应改造前**启动载入**里那个 `while bytes > MAX { pop_front() }`
-///      循环（那里是逐条弹到合规为止），而不是 `record` 里的「丢一半」——
-///      两种旧行为在「丢多少」上本来就不同，本函数的取法是「删到刚好合规」，
-///      与旧载入路径同口径（也是两道闸语义上的正确做法）。
-///      **最新那条不特殊对待**：若它自己就超过整个预算，会被删掉（表变空）——
-///      旧载入循环的 `!is_empty()` 是防死循环、不是保底一行，这里保持同一结果
-///      （正常写入路径下单条最多 `MAX_ENTRY_BYTES` 的两倍 = 4 MiB，远小于
-///      64 MiB，只有手改旧文件/库才能造出这种行）。
-///
-/// 为什么先判再删：`record` 每次记账都调它，而超限是**少数**情况
-/// （500 条 / 64 MiB 都要攒很久）。不判就每次记账都发两条带子查询的 DELETE，
-/// 而 `record` 跑在请求路径上（流式响应结束时触发）。
+/// 只按留存条数淘汰旧记录，不因单条报文过大删除它。
 pub(super) fn enforce_limits(conn: &Connection) -> rusqlite::Result<()> {
-    let (count, bytes) = count_and_bytes(conn)?;
-    if count <= MAX_ENTRIES && bytes <= MAX_TOTAL_BYTES as i64 {
-        return Ok(());
-    }
-    if count > MAX_ENTRIES {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM debug_traffic", [], |row| row.get(0))?;
+    if count > MAX_ENTRIES as i64 {
         conn.execute(
             "DELETE FROM debug_traffic WHERE id NOT IN \
              (SELECT id FROM debug_traffic ORDER BY ts DESC, rowid DESC LIMIT ?1)",
             params![MAX_ENTRIES as i64],
-        )?;
-    }
-    // 条数闸过完再算一次字节：上面那次删除可能已经把字节也带下来了
-    let (_, bytes) = count_and_bytes(conn)?;
-    if bytes > MAX_TOTAL_BYTES as i64 {
-        conn.execute(
-            "DELETE FROM debug_traffic WHERE id IN (
-               SELECT id FROM (
-                 SELECT id, SUM(size) OVER (
-                   ORDER BY ts DESC, rowid DESC ROWS UNBOUNDED PRECEDING
-                 ) AS running
-                 FROM debug_traffic
-               ) WHERE running > ?1
-             )",
-            params![MAX_TOTAL_BYTES as i64],
         )?;
     }
     Ok(())

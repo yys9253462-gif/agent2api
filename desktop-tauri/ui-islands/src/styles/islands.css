@@ -1,18 +1,12 @@
-/* ─────────────────────────────────────────────
-   React 岛的样式入口 —— 组件库的消费方。
-
-   `@source` 是必须的：组件库的类名都写在它的 tsx 里，Tailwind 的自动内容检测
-   只扫「样式表所在项目」的范围，扫不到 ui-kit 目录。globals.css 里已经用
-   source(none) 关掉了自动检测，所以下面两条声明就是全部的扫描范围 ——
-   漏一条，对应目录里的类名就不会生成，组件静默失去样式。
-
-   产物落到 ui/islands/ui.css，由 index.html 以 <link> 引入（Tauri 打包的是
-   ui/ 静态目录，样式必须是构建好的成品）。加载顺序要排在 ui/css/*.css 之后。
-   ───────────────────────────────────────────── */
-
 @import '../../../ui-kit/styles/globals.css';
+@import '../../../ui-kit/styles/aliases.css';
+@import '../../../ui-kit/styles/desktop.css';
+@import '../../../ui-kit/styles/shell.css';
+@import '../../../ui-kit/styles/responsive.css';
+@import '../../../ui-kit/styles/request-status.css';
+@import '../../../ui-shared/provider-docs.css';
+@import '../../../ui/css/page-checkin-schedule.css';
 
-/* 组件库源码（相对本文件：src/styles/ → 回到 desktop-tauri/ 再进 ui-kit） */
 @source '../../../ui-kit/src';
-/* 岛自己的源码：挂载点与岛组件里也有类名 */
+@source '../../../ui-shared';
 @source '../';

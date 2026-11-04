@@ -1,62 +1,28 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
-import { Input, SegmentedControl, type SegmentedControlOption } from '@ui'
+import { Badge, Empty, SegmentedControl, type SegmentedControlOption, Card, CardHeader, CardContent, CardFooter } from '@ui'
 import {
   RANGES, DEFAULT_RANGE, RANGE_KEY, RANGE_LABEL, RANGE_OPTION_LABEL,
-  CUSTOM_RANGE, DAY_KEY_RE,
-  readRange, readCustomRange, saveCustomRange, dayKey, round1,
-  modelColorMap, TIP_DOT_FALLBACK,
+  CUSTOM_RANGE,
+  readRange, readCustomRange, saveCustomRange,
+  modelColorMap,
   overviewCells, rankRows, rankTotalText, donutView,
   heatmapView, heatLegendItems, heatThresholdsOf, cacheRateCells,
-  cacheTrendView, dailyTrendView,
-  type CacheTrendView, type ChartText, type CustomRange, type DailyTrendView, type HeatmapView,
+  type CustomRange, type HeatmapView,
   type RankRowView, type DonutView,
   type StatsDay, type StatsGroup, type StatsHour, type StatsSummary,
 } from './report-charts'
 import { t } from '../i18n'
+import { MetricCard, MetricGrid, Meter } from '@ui'
+import { CacheTrendChart, UsageDonut } from './report/report-recharts'
+import { SourceStatsPanel } from './report/source-stats'
+import { ApiKeyUsageDialog } from './report/api-key-detail'
+import { ReportDailyTrend } from './report/daily-trend-panel'
+import { DateRangeFields } from './date-range-fields'
+import { updateCustomRange } from '../../../ui-shared/date-range'
 
-/**
- * Agent2API · 报表页（时间范围 / 统计概览 / 两张排行 / 两张环形图 / 热力图 / 缓存命中率 /
- * 两条趋势）—— React 岛，替换 ui/report.js。
- *
- * 对外接口与原实现**完全一致**（见文件末尾）：`window.wbReport = { load, render,
- * lastSummary, applyAutoRefresh }`，调用点一行都不用改 —— app.js:117（切到本页时 load）/
- * upgrade-panel.js:73（升级完成后 load）/ tasks-panel.tsx:323（改完间隔推 applyAutoRefresh）。
- *
- * ── 边界：页面骨架照抄 index.html，控件换组件库 ────────────────
- * 本岛接管 `<section class="page" data-page="overview">`，清空子节点后把 React root 直接建在
- * **这个 section 上**（不套宿主 div：页面 CSS 用 `.page[data-page="overview"] .field .value`
- * 这组直接子选择器分配样式，中间插一层会打断它）。布局类名原样保留 —— `.panel` `.panel-head`
- * `.panel-body` `.panel-foot` `.field-grid` `.field` `.report-rank-grid` `.rank-shares`
- * `.rank-row` `.report-donut-grid` `.donut-layout` `.heat-wrap` `.heat-legend` `.chart-wrap`
- * `.spacer` 等（样式在 ui/css/page-report.css 与 components.css / layout.css），换成 Tailwind
- * 会让这一页与其它页长得不一样。控件只换了一处：时间档位从 `wbSegmented.mount('#report-range')`
- * 换成组件库的 `SegmentedControl`（那个 `.island` 宿主随本次迁移一并消失）。
- *
- * ── 四张图仍然是手写 SVG ──────────────────────────────────────
- * 项目没有也不为一个页面引图表库。几何全部收在 report-charts.ts（纯函数，逐条可对着旧
- * report.js 核对），本文件只负责把算出来的坐标铺进 JSX。图表上的读数提示仍是 `data-tip`
- * （热力图 365 格 + 折线 24 格 + 柱状图最多上千格，逐格挂组件库 Tooltip 的开销不可接受；
- * tooltip.js 用 MutationObserver 接住 React 插入的节点，行为与旧实现一致）。
- *
- * ── 尺寸自适应 ────────────────────────────────────────────────
- * 三张图的坐标是按容器宽度算出来的像素值，窗口一变就得重算，所以容器宽度是 React state
- * （useContainerWidth 里的 ResizeObserver），宽度变了自然重绘 —— 与旧实现的
- * 「watch(id) + renderAll」等价，但只重绘那一张图。只认**宽度**变化：重绘会改容器高度，
- * 若连高度也响应就会自激循环。页面被藏起来时 clientWidth 是 0，跳过并沿用上一次的宽度。
- *
- * ── 自动刷新 ──────────────────────────────────────────────────
- * 间隔由「定时任务」页配置（`scheduledTasks.reportAutoRefresh`），本页启动时自读一次
- * （syncAutoRefresh），之后接受那边推送（applyAutoRefresh）。定时器长在组件里（配置一变
- * 就重排、卸载即清表），只在**本页可见时**才请求（`document.hidden` 与 `wbApp.currentPage`
- * 都判），离开页面完全静默。兜底 1 秒 = 后端的默认间隔。
- *
- * ── 坑：带 Tailwind display 工具类的元素上 hidden 无效 ─────────
- * 组件库的工具类是分层 + !important 的，tokens.css 的 `[hidden] { display:none !important }`
- * 未分层；按 Cascade 5，important 的层序反转 —— 分层压过未分层。所以「字段缺失就整块藏起来」
- * 一律用**条件渲染**表达（旧实现是给 panel 挂 hidden 属性 + page-report.css 里的
- * `.panel[hidden] { display:none }` 补丁），那两条补丁规则自此变成死规则。
- */
+
 
 /* ─── 类型 ─────────────────────────────────── */
 
@@ -99,6 +65,19 @@ function shared(): SharedWindow {
   return window as unknown as SharedWindow
 }
 
+/** 错误响应可能包含凭据，只取文字字段，不序列化整个对象。 */
+function errorMessage(error: unknown, depth = 0): string {
+  if (typeof error === 'string') return error.trim()
+  if (error instanceof Error) return error.message.trim()
+  if (!error || typeof error !== 'object' || depth > 3) return ''
+  const record = error as Record<string, unknown>
+  for (const key of ['message', 'error', 'msg', 'reason']) {
+    const text = errorMessage(record[key], depth + 1)
+    if (text) return text
+  }
+  return ''
+}
+
 /* ─── 常量 ─────────────────────────────────── */
 
 /**
@@ -115,14 +94,19 @@ const RANGE_OPTIONS: readonly SegmentedControlOption<string>[] = RANGES.map(valu
 /**
  * 各面板头上那枚小问号的说明（原文逐字照抄 index.html 的 data-tip，一条都不能少、
  * 不能改：每一条都是踩过的边界）。仍是 `.tip-q` + data-tip 的既有形态 —— 与定时任务页
- * 同一处理，由 tooltip.js 的 MutationObserver 增强 React 插入的节点。
+ * 同一处理，由 desktop-tooltip.tsx 的 MutationObserver 增强 React 插入的节点。
  */
 const TIP_ACCOUNTS = t('所选范围内每个账号各消耗了多少 Token，按 Token 用量从多到少排。账号是比提供商更细的一维：同一家可以挂多个账号，转发时按优先级在候选链上依次尝试，所以这里反映的是「具体哪个登录态在出力」。百分比按本区间的总 Token 数算（这一块只看用量，请求次数与成功率在概览卡片里）。「未知账号」是指那批请求没有账号身份：走默认登录态转发（未配置账号列表）时会这样；这一维上线前写出的旧聚合行也没有账号明细，但它们会在升级导入旧数据时按明细自动补算回来 —— 只有明细已被手动清理掉的那几天补不回来，仍留在「未知账号」里，那是确实无从恢复的部分。')
 const TIP_PROVIDERS = t('所选范围内每个提供商各消耗了多少 Token，按 Token 用量从多到少排。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。百分比按本区间的总 Token 数算（这一块只看用量，请求次数与成功率在概览卡片里）。「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了（请求体非法、模型不存在、没有可用账号）。这一维与账号那一维不同：旧明细里根本没有「哪家承载」的信息（早期版本只有单一上游，但那是配置事实而非逐条记录），所以无法回算，旧数据会一直留在「未知」里；此后新产生的请求都会记上具体的提供商。')
 const TIP_MODELS = t('所选范围内每个模型各消耗了多少 Token，按用量从多到少排，扇区角度即占比。中心是这一维的合计（等于概览里的总 Token），右侧每行给出该模型的 Token 用量与百分比。扇区内的百分比只在 ≥3% 时标出，更小的会挤成一团 —— 完整读数在右侧列表与悬停气泡里。颜色按用量排名分配：最大的那段是红色，依次往后；同一份报表里换个维度看，配色口径不变。')
 const TIP_PROVIDERS_PIE = t('所选范围内每个提供商各消耗了多少 Token，按用量从多到少排，扇区角度即占比。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。中心是这一维的合计（等于概览里的总 Token），右侧每行给出该提供商的 Token 用量与百分比。「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了。')
 const TIP_CACHE_RATES = t('命中率 = 缓存读取 Token / 输入 Token（promptTokens）。窗口越短越贴近「此刻」：上游把缓存读取与输入分开上报时，该比值合法地可能超过 100%，此处不夹取值、如实展示。')
-const TIP_DAILY_TREND = t('每天的总 Token 用量（输入 + 输出）。柱顶标出当天的读数；区间很长、柱子挤到放不下时只标最高的那几天，其余悬停柱子即可读到。')
+/**
+ * 时间范围控件旁的小问号。两个容易误读的口径都在这里说清：
+ * 「近 N 天」是含今天在内往前数 N 天（所以是 N-1 天前到今天），不是「前 N 天」；
+ * 「昨天」是本地自然日的昨天一整天，与「今天」共用同一套日界线。
+ */
+const TIP_RANGE = t('时间范围。「今天」是本地自然日今天 0 点到现在；「昨天」是昨天一整天（0 点到 24 点）；「近 7 天 / 近 30 天」含今天在内往前数，即今天与之前的 6 / 29 天，不是「不含今天的 7 / 30 天」。')
 
 /* ─── 模块级状态（跨渲染的守卫、缓存与入口登记）────── */
 
@@ -167,10 +151,10 @@ type LoadOptions = { silent?: boolean }
 
 /** 统一的空态 / 错误态文案：与组件层 .empty 同档留白 */
 function placeholder(text: string, className = 'empty') {
-  return <div className={className} style={{ padding: '14px 0' }}>{text}</div>
+  return <Empty className={className} style={{ padding: '14px 0' }}>{text}</Empty>
 }
 
-/** 面板头上的小问号：内容由 tooltip.js 增强（见 TIP_* 的说明），这里只留空壳 */
+/** 面板头上的小问号：内容由 desktop-tooltip.tsx 增强（见 TIP_* 的说明），这里只留空壳 */
 function TipQ({ text }: { text: string }) {
   return <span className='tip-q' data-tip={text} />
 }
@@ -192,7 +176,7 @@ function ProviderBadge({ accountId }: { accountId: string }) {
   const label = shared().wbProviders?.labelOf?.(provider) || provider
   const suffix = (account && shared().wbAccountsModel?.editionSuffix?.(account)) || ''
   const text = suffix ? `${label} ${suffix}` : label
-  return <span className={`pbadge p-${provider}`} title={t('提供商：{text}', { text })}>{text}</span>
+  return <Badge variant='outline' shape='tag' className={`pbadge p-${provider}`} title={t('提供商：{text}', { text })}>{text}</Badge>
 }
 
 /* ─── 板块一：统计概览 ────────────────────── */
@@ -202,13 +186,13 @@ function OverviewCells({ summary, range }: { summary: StatsSummary; range: strin
   return (
     <>
       {overviewCells(summary.overview, range, trend.length).map(cell => (
-        <div className='field' key={cell.key}>
+        <MetricCard className='field' key={cell.key}>
           <div className='label'>{cell.label}</div>
           <div className={cell.mono ? 'value mono' : 'value'}>
             {cell.value}
             {cell.sub ? <div className='sub'>{cell.sub}</div> : null}
           </div>
-        </div>
+        </MetricCard>
       ))}
     </>
   )
@@ -232,13 +216,13 @@ function RankPanel({ panelId, listId, labelId, title, tip, rows, totalText, with
   emptyText: string
 }) {
   return (
-    <section className='panel' id={panelId}>
-      <div className='panel-head'>
+    <Card render={<section />} className='panel' id={panelId}>
+      <CardHeader className='panel-head'>
         <h2>{title}</h2>
         <TipQ text={tip} />
         <span className='panel-sub' id={labelId}>{totalText}</span>
-      </div>
-      <div className='panel-body'>
+      </CardHeader>
+      <CardContent className='panel-body'>
         <div className='rank-shares' id={listId}>
           {rows.length ? rows.map(row => (
             <div className='rank-row' data-tip={row.tip} key={row.key}>
@@ -246,14 +230,14 @@ function RankPanel({ panelId, listId, labelId, title, tip, rows, totalText, with
                 {withBadge ? <ProviderBadge accountId={row.id} /> : null}
                 {row.name}
               </span>
-              <span className='track'><span className='bar' style={{ width: row.barWidth }} /></span>
+              <Meter value={Number.parseFloat(row.barWidth) || 0} className='track' trackClassName='h-2.5' aria-label={row.full} />
               <span className='num' title={`${row.tokensText} tokens`}>{row.tokensText}</span>
               <span className='pct'>{row.percentText}</span>
             </div>
           )) : placeholder(emptyText)}
         </div>
-      </div>
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -266,52 +250,17 @@ function DonutPanel({ panelId, listId, title, tip, ariaLabel, view, emptyText }:
   emptyText: string
 }) {
   return (
-    <section className='panel' id={panelId}>
-      <div className='panel-head'>
+    <Card render={<section />} className='panel' id={panelId}>
+      <CardHeader className='panel-head'>
         <h2>{title}</h2>
         <TipQ text={tip} />
-      </div>
-      <div className='panel-body'>
+      </CardHeader>
+      <CardContent className='panel-body'>
         <div id={listId}>
-          {view ? (
-            <div className='donut-layout'>
-              <div className='donut-wrap'>
-                <svg className='donut-svg' width={view.size} height={view.size}
-                  viewBox={`0 0 ${view.size} ${view.size}`} role='img' aria-label={ariaLabel}>
-                  {view.slices.map(slice => (
-                    <React.Fragment key={slice.key}>
-                      {/* fillRule 只在整圆那一支挂上：nonzero 下内外两圈同向、内圈不会挖空，
-                          会渲染成实心圆盘把中心读数盖住（见 report-charts 的说明） */}
-                      <path className='donut-slice' d={slice.d} fill={slice.fill}
-                        fillRule={slice.evenOdd ? 'evenodd' : undefined}
-                        tabIndex={-1} data-tip={slice.tip} />
-                      {slice.label ? (
-                        <text className='donut-label' x={slice.label.x} y={slice.label.y}
-                          textAnchor='middle' dominantBaseline='central'>{slice.label.text}</text>
-                      ) : null}
-                    </React.Fragment>
-                  ))}
-                </svg>
-                <div className='donut-center'>
-                  <div className='donut-center-value'>{view.totalText}</div>
-                  <div className='donut-center-label'>{t('总 Token')}</div>
-                </div>
-              </div>
-              <div className='donut-legend'>
-                {view.legend.map(row => (
-                  <div className='donut-legend-row' data-tip={row.tip} key={row.key}>
-                    <span className='donut-dot' style={{ background: row.fill }} />
-                    <span className='donut-legend-name' title={row.name}>{row.name}</span>
-                    <span className='donut-legend-tokens'>{row.tokensText}</span>
-                    <span className='donut-legend-percent'>{row.percentText}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : placeholder(emptyText)}
+          {view ? <UsageDonut view={view} ariaLabel={ariaLabel} /> : placeholder(emptyText)}
         </div>
-      </div>
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -330,142 +279,11 @@ function HeatmapChart({ view }: { view: HeatmapView }) {
       ))}
       {view.cells.map(cell => (
         // tabindex="-1"：不进 Tab 序列（否则键盘用户要按几百次 Tab 才能走到下一个控件），
-        // 同时仍然享受 data-tip 的气泡 —— tooltip.js 只在元素**不**匹配 [tabindex] 时才补 0
+        // 同时仍然享受 data-tip 的气泡 —— desktop-tooltip.tsx 只在元素**不**匹配 [tabindex] 时才补 0
         <rect className={`hm-cell l${cell.level}`} x={cell.x} y={cell.y} width={cell.size}
           height={cell.size} rx={2} tabIndex={-1} data-tip={cell.tip} key={cell.key} />
       ))}
     </svg>
-  )
-}
-
-/* ─── 板块六 / 七：两条折线与柱状图 ───────── */
-
-/** 一条折线 + 它的点：线色由 cls 对应的 CSS 规则决定（.chart-line.rate / .tokens），
- *  两条线的颜色因此只在 CSS 里各定义一次 */
-function ChartLineShape({ line, cls, radius }: {
-  line: { points: string; dots: { key: string; cx: number; cy: number }[] }
-  cls: string
-  radius: number
-}) {
-  return (
-    <>
-      <polyline className={`chart-line ${cls}`} points={line.points} />
-      {line.dots.map(dot => (
-        <circle className={`chart-dot ${cls}`} cx={dot.cx} cy={dot.cy} r={radius} key={dot.key} />
-      ))}
-    </>
-  )
-}
-
-/** 点上的读数标注（命中率 / Token 各一串，颜色与所属那条线同源）。
- *  `rotate` 的读数竖排（柱状图的密区间）：绕自己的锚点转 -90°、自下而上读；锚点的 x
- *  是这一列的中线，靠 dominantBaseline='central' 把字身在列内摆正（手工加半个字高的
- *  偏移会在不同字号 / 字体下偏，交给渲染器算更稳）。 */
-function ChartLabels({ items, cls }: { items: ChartText[]; cls: string }) {
-  return (
-    <>
-      {items.map(item => (
-        <text className={`chart-label ${cls}`} x={item.x} y={item.y}
-          textAnchor={item.anchor} key={item.key}
-          transform={item.rotate ? `rotate(-90 ${item.x} ${item.y})` : undefined}
-          dominantBaseline={item.rotate ? 'central' : undefined}>{item.text}</text>
-      ))}
-    </>
-  )
-}
-
-function CacheTrendChart({ view }: { view: CacheTrendView }) {
-  const { width, height, plotLeft, plotW, plotTop, plotH } = view
-  return (
-    <>
-      <svg className='report-svg' width={width} height={height}
-        viewBox={`0 0 ${width} ${height}`} role='img'
-        aria-label={t('近 24 小时缓存命中率与总 Token 趋势')}>
-        {view.grid.map(item => (
-          <line className='chart-grid' x1={plotLeft} y1={item.y}
-            x2={round1(plotLeft + plotW)} y2={item.y} key={item.key} />
-        ))}
-        {view.rateTicks.map(item => (
-          <text className='chart-axis' x={item.x} y={item.y} textAnchor={item.anchor}
-            dominantBaseline='middle' key={item.key}>{item.text}</text>
-        ))}
-        {view.tokenTicks.map(item => (
-          <text className='chart-axis' x={item.x} y={item.y} textAnchor={item.anchor}
-            dominantBaseline='middle' key={item.key}>{item.text}</text>
-        ))}
-        {/* 一条用量都没记时不画这条线（见 report-charts 的说明：画一条贴地的直线会让人
-            以为「用量就是 0」，而事实是「这份数据里没有」） */}
-        {view.tokenLine
-          ? <ChartLineShape line={view.tokenLine} cls='tokens' radius={view.dotR} />
-          : null}
-        <ChartLineShape line={view.rateLine} cls='rate' radius={view.dotR} />
-        <ChartLabels items={view.tokenLabels} cls='tokens' />
-        <ChartLabels items={view.rateLabels} cls='rate' />
-        {view.hourTicks.map(item => (
-          <text className='chart-axis' x={item.x} y={item.y} textAnchor={item.anchor}
-            key={item.key}>{item.text}</text>
-        ))}
-      </svg>
-      {/* 热区单独一层 SVG 覆盖在图形之上（.chart-hit-layer），指针事件只落在这里 ——
-          柱子 / 折线自身不必承担 hover 语义，零值日也能有读数。
-          `data-tip-variant='plain'`：这两张图的读数是「日期 / 总量 / 每模型一行」的
-          表格形态，气泡用浅底卡片样式而不是默认的品牌蓝底（见 tooltip.css 的变体段） */}
-      {view.hits ? (
-        <svg className='report-svg chart-hit-layer' width={width} height={height}
-          viewBox={`0 0 ${width} ${height}`} aria-hidden='true'>
-          {view.hits.map(hit => (
-            <rect className='chart-hit' x={hit.x} y={plotTop} width={hit.width}
-              height={round1(plotH)} tabIndex={-1} data-tip={hit.tip}
-              data-tip-variant='plain' key={hit.key} />
-          ))}
-        </svg>
-      ) : null}
-    </>
-  )
-}
-
-function DailyTrendChart({ view }: { view: DailyTrendView }) {
-  const { width, height, plotLeft, plotW, plotTop, plotH } = view
-  return (
-    <>
-      <svg className='report-svg' width={width} height={height}
-        viewBox={`0 0 ${width} ${height}`} role='img' aria-label={t('按天 Token 趋势')}>
-        {view.grid.map(item => (
-          <line className='chart-grid' x1={item.x1} y1={item.y} x2={item.x2} y2={item.y} key={item.key} />
-        ))}
-        {view.valueTicks.map(item => (
-          <text className='chart-axis' x={item.x} y={item.y} textAnchor={item.anchor}
-            dominantBaseline='middle' key={item.key}>{item.text}</text>
-        ))}
-        {view.bars.map(bar => (bar.nativeTip ? (
-          // 超长区间不挂 data-tip 时改用 SVG 原生 <title>：提示成本降到零，hover 仍有读数
-          <rect className='bar' x={bar.x} y={bar.y} width={bar.width} height={bar.height}
-            rx={bar.rx} key={bar.key}><title>{bar.tip}</title></rect>
-        ) : (
-          <rect className='bar' x={bar.x} y={bar.y} width={bar.width} height={bar.height}
-            rx={bar.rx} key={bar.key} />
-        )))}
-        <ChartLabels items={view.barLabels} cls='tokens' />
-        {view.dateTicks.map(item => (
-          <text className='chart-axis' x={item.x} y={item.y} textAnchor={item.anchor}
-            key={item.key}>{item.text}</text>
-        ))}
-        {view.blank ? (
-          <text className='chart-empty' x={round1(plotLeft + plotW / 2)}
-            y={round1(plotTop + plotH / 2)} textAnchor='middle'>{t('所选范围内暂无请求')}</text>
-        ) : null}
-      </svg>
-      {view.hits ? (
-        <svg className='report-svg chart-hit-layer' width={width} height={height}
-          viewBox={`0 0 ${width} ${height}`} aria-hidden='true'>
-          {view.hits.map(hit => (
-            <rect className='chart-hit' x={hit.x} y={plotTop} width={hit.width}
-              height={round1(plotH)} tabIndex={-1} data-tip={hit.tip}
-              data-tip-variant='plain' key={hit.key} />
-          ))}
-        </svg>
-      ) : null}
-    </>
   )
 }
 
@@ -567,6 +385,7 @@ function ReportPage() {
   const [range, setRange] = React.useState<string>(readRange)
   /** 自定义区间（起止本地自然日）：只有档位选中「自定义」时随请求发出 */
   const [custom, setCustom] = React.useState<CustomRange>(readCustomRange)
+  const [inspectedKey, setInspectedKey] = React.useState<StatsGroup | null>(null)
   /** 自动刷新配置：挂载前的推送已经写在模块级变量里，这里取的就是最新的那份 */
   const [auto, setAuto] = React.useState(() => ({ ms: autoRefreshMs, enabled: autoEnabled }))
   /** 单位口径（中文亿/万 ⇄ 英文 M/k）变了就整页重算：数值一个都没变，变的只是「怎么写成字」，
@@ -629,7 +448,7 @@ function ReportPage() {
       return summaryValue
     } catch (error) {
       if (token !== seq) return summaryValue
-      const message = error instanceof Error ? error.message : ''
+      const message = errorMessage(error)
       summaryValue = null
       // silent：只压掉控制台噪音（首屏自持加载 / 轮询用），错误态照常显示在页面上
       if (!options.silent) console.warn('读取报表数据失败:', message)
@@ -670,14 +489,8 @@ function ReportPage() {
    *   - 只有当前档位就是「自定义」时才重拉（在别的档位上改日期不影响正在看的数据）。
    */
   const changeCustomDate = React.useCallback((patch: Partial<CustomRange>): void => {
-    const next: CustomRange = { ...customRef.current, ...patch }
-    if (!DAY_KEY_RE.test(next.start) || !DAY_KEY_RE.test(next.end)) return
-    // 两端交叉时「谁被改就把另一端拉到同一天」，不报错也不静默失败
-    const normalized: CustomRange = next.start <= next.end
-      ? next
-      : patch.start
-        ? { start: next.start, end: next.start }
-        : { start: next.end, end: next.end }
+    const normalized = updateCustomRange(customRef.current, patch)
+    if (normalized === customRef.current) return
     customRef.current = normalized
     setCustom(normalized)
     saveCustomRange(normalized)
@@ -732,8 +545,6 @@ function ReportPage() {
   /* ─── 渲染 ─────────────────────────────── */
 
   const heatWidth = useContainerWidth()
-  const trendWidth = useContainerWidth()
-  const dailyWidth = useContainerWidth()
 
   const { summary, error } = data
   // 概览小格的说明文字用后端回显的档位（与这份数据同一轮），后端没回显才退回本地档位
@@ -741,7 +552,6 @@ function ReportPage() {
 
   const heatmapDays: StatsDay[] = summary && Array.isArray(summary.heatmap) ? summary.heatmap : []
   const cacheTrendHours: StatsHour[] = summary && Array.isArray(summary.cacheTrend24h) ? summary.cacheTrend24h : []
-  const dailyDays: StatsDay[] = summary && Array.isArray(summary.dailyTrend) ? summary.dailyTrend : []
   // 契约里没有这一维（undefined）就整块隐藏；空数组是「这一维没数据」（给空态）
   const providerList: StatsGroup[] | null = summary && Array.isArray(summary.providers) ? summary.providers : null
   const accountList: StatsGroup[] | null = summary && Array.isArray(summary.accounts) ? summary.accounts : null
@@ -752,59 +562,33 @@ function ReportPage() {
   const loadingBlock = placeholder(t('正在加载…'))
   const loading = errorBlock ?? loadingBlock
 
-  /** 模型 → 色（环形图与图表气泡共用一份，见 modelColorMap）：气泡里模型行前那枚
-   *  色点与环形图扇区、图例上的颜色因此说的是同一个模型。
-   *  `modelList` 在 summary 不变时是同一个数组引用，这个映射只在换了一批数据后重算 */
   const modelColors = React.useMemo(() => modelColorMap(modelList || []), [modelList])
-  /** 查色：区间级汇总里没有的模型（极端数据）给中性灰兜底，不借色板色（会撞色） */
-  const colorOf = React.useCallback(
-    (label: string) => modelColors.get(label) || TIP_DOT_FALLBACK,
-    [modelColors],
-  )
-
-  // 图表的坐标全靠容器宽度，所以视图只在这里算一次（同一个 view 传给判断与渲染两处）
   const heatView = summary ? heatmapView(heatmapDays, heatWidth[1]) : null
-  const trendView = summary ? cacheTrendView(cacheTrendHours, trendWidth[1], colorOf) : null
-  const dailyView = summary ? dailyTrendView(dailyDays, dailyWidth[1], colorOf) : null
-
-  /** 日期输入框的上限（不许选未来：后端聚合里本来也没有未来的行） */
-  const today = dayKey(new Date())
 
   return (
     <>
       {/* ── 统计概览 ──
            时间范围控件住在这一块的面板头里：它控制的就是这一页的统计口径，与旁边的读数
            同处一行最直观。选中「自定义」时右端展开两个日期输入（起止本地自然日） */}
-      <section className='panel'>
-        <div className='panel-head'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'>
           <h2>{t('统计概览')}</h2>
+          {/* 「近 N 天」是否含今天，光看选项文案有歧义（含今天 = 往前数 N-1 天）。
+              说明挂成小问号而不是写进选项：控件里已有 7 段，再加后缀会把整行撑开 */}
+          <TipQ text={TIP_RANGE} />
           <span className='panel-sub' id='report-range-label'>{RANGE_LABEL[rangeKey] || ''}</span>
           <div className='head-actions'>
             <SegmentedControl options={RANGE_OPTIONS} value={range}
               onValueChange={changeRange} aria-label={t('报表时间范围')} />
-            {range === CUSTOM_RANGE ? (
-              <span className='report-date-range'>
-                {/* 宽度走 Tailwind 类（覆盖 Input 的 w-full）：在 flex 行里 w-full
-                    会各撑一半，两个日期框会被拉得很宽 */}
-                <Input type='date' className='report-date-input w-[132px]' value={custom.start}
-                  max={custom.end || today} aria-label={t('开始日期')}
-                  title={t('起始日期（含当天）')}
-                  onChange={event => changeCustomDate({ start: event.target.value })} />
-                <span className='report-date-sep' aria-hidden='true'>～</span>
-                <Input type='date' className='report-date-input w-[132px]' value={custom.end}
-                  min={custom.start || undefined} max={today} aria-label={t('结束日期')}
-                  title={t('结束日期（含当天）')}
-                  onChange={event => changeCustomDate({ end: event.target.value })} />
-              </span>
-            ) : null}
+            {range === CUSTOM_RANGE ? <DateRangeFields dates={custom} onChange={changeCustomDate} /> : null}
           </div>
-        </div>
-        <div className='panel-body'>
-          <div className='field-grid' id='report-overview'>
+        </CardHeader>
+        <CardContent className='panel-body'>
+          <MetricGrid className='field-grid' id='report-overview'>
             {summary ? <OverviewCells summary={summary} range={rangeKey} /> : loading}
-          </div>
-        </div>
-      </section>
+          </MetricGrid>
+        </CardContent>
+      </Card>
 
       {/* ── Top 提供商 / Top 账号（并排两张卡，各自独立判断显隐）── */}
       <div className='report-rank-grid'>
@@ -835,19 +619,19 @@ function ReportPage() {
       </div>
 
       {/* ── 热力图（固定 365 天，与时间范围筛选解耦）── */}
-      <section className='panel'>
-        <div className='panel-head'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'>
           <h2>{t('活跃热力图')}</h2>
           <span className='panel-sub'>{t('近 365 天，按天 Token 用量着色（档位按本窗口峰值自动定）')}</span>
-        </div>
-        <div className='panel-body'>
+        </CardHeader>
+        <CardContent className='panel-body'>
           <div className='heat-wrap' id='report-heatmap' ref={heatWidth[0]}>
             {summary
               ? (heatView ? <HeatmapChart view={heatView} /> : placeholder(t('暂无热力图数据')))
               : loading}
           </div>
-        </div>
-        <div className='panel-foot'>
+        </CardContent>
+        <CardFooter className='panel-foot'>
           <span className='heat-scale-label'>{t('Token')}</span>
           {/* 图例与热力图共用同一份阈值：它随窗口峰值变，所以每次重绘都要跟着刷新，
               否则图例上的数字会停在上一批数据上 */}
@@ -860,46 +644,44 @@ function ReportPage() {
           </span>
           <div className='spacer' />
           <span>{t('方格为本地自然日，无请求显示为空槽')}</span>
-        </div>
-      </section>
+        </CardFooter>
+      </Card>
 
       {/* ── 缓存命中率四窗口 ── */}
-      <section className='panel'>
-        <div className='panel-head'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'>
           <h2>{t('缓存命中率')}</h2>
           <TipQ text={TIP_CACHE_RATES} />
-        </div>
-        <div className='panel-body'>
-          <div className='field-grid' id='report-cache-rates'>
+        </CardHeader>
+        <CardContent className='panel-body'>
+          <MetricGrid className='field-grid' id='report-cache-rates'>
             {summary ? cacheRateCells(summary.cacheRates).map(cell => (
-              <div className='field rate' key={cell.key}>
+              <MetricCard className='field rate' key={cell.key}>
                 <div className='label'>{cell.label}</div>
                 <div className='value big'>
                   {cell.value}
                   <div className='sub'>{cell.sub}</div>
                 </div>
-              </div>
+              </MetricCard>
             )) : loading}
-          </div>
-        </div>
-      </section>
+          </MetricGrid>
+        </CardContent>
+      </Card>
 
       {/* ── 近 24 小时缓存命中率趋势（固定 24 个整点）── */}
-      <section className='panel'>
-        <div className='panel-head'>
+      <Card render={<section />} className='panel'>
+        <CardHeader className='panel-head'>
           <h2>{t('近 24 小时缓存命中率趋势')}</h2>
           <span className='panel-sub'>{t('按本地整点，无请求的整点不标注')}</span>
-        </div>
-        <div className='panel-body'>
-          <div className='chart-wrap' id='report-cache-trend' ref={trendWidth[0]}>
-            {summary
-              ? (trendView ? <CacheTrendChart view={trendView} /> : placeholder(t('暂无缓存趋势数据')))
-              : loading}
+        </CardHeader>
+        <CardContent className='panel-body'>
+          <div className='chart-wrap' id='report-cache-trend'>
+            {summary ? <CacheTrendChart series={cacheTrendHours} colors={modelColors} /> : loading}
           </div>
-        </div>
+        </CardContent>
         {/* 图例：两条线各配一条纵轴（左=命中率，右=总 Token），颜色是「读数属于哪条轴」
             的唯一线索，所以必须标出来 */}
-        <div className='panel-foot'>
+        <CardFooter className='panel-foot'>
           <span className='chart-legend'>
             <span className='swatch rate' />{t('缓存命中率')}<span className='axis-hint'>{t('左轴')}</span>
           </span>
@@ -908,26 +690,15 @@ function ReportPage() {
           </span>
           <div className='spacer' />
           <span>{t('无请求的整点按 0% 计，但不写读数')}</span>
-        </div>
-      </section>
+        </CardFooter>
+      </Card>
 
-      {/* ── 按天 Token 趋势（随时间范围变化）── */}
-      <section className='panel'>
-        <div className='panel-head'>
-          <h2>{t('按天 Token 趋势')}</h2>
-          <TipQ text={TIP_DAILY_TREND} />
-          <span className='panel-sub' id='report-trend-label'>
-            {summary ? `${summary.startDate || '—'} ～ ${summary.endDate || '—'}` : '—'}
-          </span>
-        </div>
-        <div className='panel-body'>
-          <div className='chart-wrap tall' id='report-daily-trend' ref={dailyWidth[0]}>
-            {summary
-              ? (dailyView ? <DailyTrendChart view={dailyView} /> : placeholder(t('暂无趋势数据')))
-              : loading}
-          </div>
-        </div>
-      </section>
+      <ReportDailyTrend summary={summary} loading={loading} />
+
+      {summary?.clients ? <SourceStatsPanel kind='clients' rows={summary.clients} summary={summary} /> : null}
+      {summary?.apiKeys ? <SourceStatsPanel kind='apiKeys' rows={summary.apiKeys} summary={summary} onInspect={setInspectedKey} /> : null}
+      {inspectedKey ? <ApiKeyUsageDialog target={inspectedKey} range={range}
+        dates={range === CUSTOM_RANGE ? custom : undefined} onClose={() => setInspectedKey(null)} /> : null}
     </>
   )
 }
@@ -993,11 +764,8 @@ function mount(): void {
   createRoot(section).render(<ReportPage />)
 }
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('overview', PAGE_SELECTOR, mount)
 
-// 自动刷新：启动时自读一次配置（失败就按兜底值跑），随后由组件的定时器接管。
-// 不依赖「定时任务」页推 —— 用户完全可能一次都没进过那一页。
-void syncAutoRefresh()
+// 自动刷新的间隔配置不在模块求值时读：页面第一次被切到时 loadPanel 会自己兜一次
+// （见 loadPanel 里的 syncAutoRefresh），没打开过报表页就不该发这个请求。

@@ -12,7 +12,7 @@ import { InputControl, type InputControlProps } from './input-control'
  *    再加 `data-island-icon="⌕"` 就升级成 InputGroup（图标走标准的 InputGroupAddon），
  *    业务侧原本为图标准备的 `.input-affix` 外壳会被就地转正、无需改动调用方。
  *    弹窗、表格、代理表单里动态生成的输入框由 MutationObserver 接住，页面无需
- *    任何手动调用 —— 与 select.js / tooltip.js 的「自动增强」是同一个约定。
+ *    任何手动调用 —— 与 select.js / desktop-tooltip.tsx 的「自动增强」是同一个约定。
  *
  * 2. **命令式挂载**：`mount(host, options)` —— 宿主元素整个交给岛渲染，初值由
  *    业务侧以参数带进去（如 models 页的搜索框，它的宿主是 `<div class="island">`）。

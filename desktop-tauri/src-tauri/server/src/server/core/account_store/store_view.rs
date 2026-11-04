@@ -27,6 +27,34 @@ use crate::server::core::custom_providers;
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
 
+/// 这条账号所属的家，此刻是否出现在管理界面上。
+///
+/// 本体与真实插件有执行体就显示；旧身份缺插件仍隐藏，数据留在库里。
+/// 自定义提供商独立直连，不经插件；其它账号只认真实执行体，缺插件的
+/// 存量记录继续隐藏而不删除。
+pub(crate) fn account_visible(provider: &str) -> bool {
+    provider.starts_with(custom_providers::ID_PREFIX)
+        || crate::server::core::providers::is_executable_provider(provider)
+}
+
+/// 快照的两种用途：内部逻辑要全部账号，界面只要此刻能用的。
+///
+/// ── 为什么必须是两个入口而不是一个布尔参数 ────────────────────
+/// 内部逻辑（冷却记账、凭证维护、目录刷新、余额查询）读的是**库里的数据**，
+/// 插件在不在都得看得见 —— 插件卸载期间把这些读写掐掉，用户的冷却记录、
+/// 刷新进度会跟着一起坏，而那是没有任何提示的数据损坏。界面相反：插件不在，
+/// 这家就不该出现（用户明确要求）。
+///
+/// 两者用同一个 `snapshot` 保证形状一致（`providers` 摘要与 `accounts` 永远
+/// 同步过滤），区别只在传进来的这个值。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Visibility {
+    /// 全部账号（内部逻辑用）。
+    All,
+    /// 只含此刻能用的家（界面用，判据见 [`account_visible`]）。
+    UserFacing,
+}
+
 impl AccountStore {
     // ─── 公开形态 ────────────────────────────────────────────
 
@@ -87,19 +115,30 @@ impl AccountStore {
                     .unwrap_or(false),
             ),
         );
+        // 「需要重新登录」标记（issue #215）：上游注销了会话、refresh token 一并
+        // 作废时由刷新链路落。界面据此把「刷新失败」显示成「需要重新登录」——
+        // 两者对用户的下一步动作完全不同（前者再点一次，后者必须去登录）。
+        // 键恒在（false 表示正常），前端不必判「键缺失」。
         public.insert(
-            "prefixPath".to_string(),
-            value_or_nullish(
-                fields.get("prefixPath"),
-                Value::String(edition.prefix_path.to_string()),
+            "needsRelogin".to_string(),
+            Value::Bool(
+                fields
+                    .get("needsRelogin")
+                    .map(js_truthy)
+                    .unwrap_or(false),
             ),
         );
         public.insert(
+            "needsReloginReason".to_string(),
+            value_or(fields.get("needsReloginReason"), Value::String(String::new())),
+        );
+        public.insert(
+            "prefixPath".to_string(),
+            value_or_nullish(fields.get("prefixPath"), Value::String(String::new())),
+        );
+        public.insert(
             "endpoint".to_string(),
-            value_or(
-                fields.get("endpoint"),
-                Value::String(edition.endpoint.to_string()),
-            ),
+            value_or(fields.get("endpoint"), Value::String(String::new())),
         );
         public.insert("edition".to_string(), Value::String(edition.id.to_string()));
         public.insert(
@@ -126,13 +165,18 @@ impl AccountStore {
         Value::Object(public)
     }
 
-    /// 账号列表快照 `{ currentAccountId, currentAccountIds, accounts: [...], providers: [...] }`。
+    /// 全部账号的快照（**不做展示过滤**）。
     ///
     /// accounts 按**存储顺序**返回（与 Node 版按文件顺序返回一致）—— 界面自己按
     /// 优先级排序，不要在这里改成优先级序，否则与 Node 版的行为就分叉了。
     /// 「存储顺序」在 SQLite 下是 `rowid` 升序，它与旧的 accounts.json 数组顺序
     /// 在三类场景下逐字对应（迁移按序导入、新增落到末尾、原地修改不改位置），
     /// 推演见 `sql.rs` 模块头「顺序」一节。
+    ///
+    /// ── 这个入口是**内部**用的，别拿去渲染界面 ──────────────────
+    /// 冷却记账、目录刷新、余额查询这些逻辑必须看得见全部账号 —— 插件没装时
+    /// 它们照样要能读写已有数据，否则「插件不在」会连带把冷却记录、凭证维护
+    /// 一起弄坏。**界面要走 [`Self::list_visible_accounts`]**（按插件在位过滤）。
     ///
     /// ── 「当前账号」的两个字段 ──────────────────────────────
     ///   · `currentAccountId`：**全局队首**（`pick_current`：启用 + 有可用凭证 +
@@ -147,9 +191,18 @@ impl AccountStore {
     /// 上就给出**，前端不必再发第二个请求。计数是各 provider 的账号**总数**
     /// （含禁用账号）—— 与分组标题显示的「N 个账号」口径一致。
     pub fn list_accounts(&self) -> Value {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
-        self.snapshot(&state)
+        let state = self.read_state();
+        self.snapshot(&state, Visibility::All)
+    }
+
+    /// 界面用的账号快照：**只含此刻真的能用的那些家**（判据见 [`account_visible`]）。
+    ///
+    /// 所有面向用户的账号入口都应走这一条（`/api/session`、`/api/accounts`、
+    /// 签到中心、成长页…）。没装插件时插件家的账号不出现 —— 用户明确要的是
+    /// 「插件不在，这家就不存在」；数据仍在库里，装上插件原样回来。
+    pub fn list_visible_accounts(&self) -> Value {
+        let state = self.read_state();
+        self.snapshot(&state, Visibility::UserFacing)
     }
 
     /// 全部账号 proxy 指向的池条目 id 集合（去重）。
@@ -177,8 +230,7 @@ impl AccountStore {
     /// 节点，天然跳过）。这一条判据实现复用 `proxy_rotate::candidate_ids` ——
     /// 「哪些条目可能被用到」在取用与预建监听器两处必须是同一个答案。
     pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in &state.accounts {
             let proxy = record.proxy();
@@ -214,8 +266,7 @@ impl AccountStore {
     /// 按「记录变了就作废旧结论」处理，多作废一条失败提示，比留着一条过期结论
     /// 更轻 —— 用户手点一次查询就能得到新的（见 `usage_query` 的说明）。
     pub fn account_change_times(&self) -> HashMap<String, i64> {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         state
             .accounts
             .iter()
@@ -229,33 +280,61 @@ impl AccountStore {
     }
 
     /// 已持锁时的列表快照（CRUD 内部要在同一次锁里连做「写入 + 取快照」）
-    pub(crate) fn snapshot(&self, state: &AccountState) -> Value {
+    ///
+    /// ── 插件家的账号只在插件在位时出现（2026-10 用户决定）────────────
+    /// 各家反代的转发 / 账号 / 签到实现已整体搬进提供商插件。没装插件时，
+    /// 那些账号**留在库里但不出现在列表里** —— 用户要的是「插件不在就等于
+    /// 这家不存在」，而不是「看得见、点什么都没反应」。数据一个字节都不动：
+    /// 导出（`account_transfer::export_accounts`）直接读库、不经这里；
+    /// 装上插件后这些账号原样回来。
+    ///
+    /// 自定义提供商独立直连；本体订阅与真实插件按 `account_visible` 的执行体
+    /// 并集判定。旧身份缺插件仍隐藏，记录与导出内容不受展示过滤影响。
+    pub(crate) fn snapshot(&self, state: &AccountState, visibility: Visibility) -> Value {
+        // 过滤一次、克隆一次（两个队首派生函数都要 `&[StoredAccount]`）
+        let mut visible: Vec<StoredAccount> = Vec::with_capacity(state.accounts.len());
+        // 被隐藏的账号按 provider 聚合（界面用它说「哪几家等插件」）。
+        // 只在 `UserFacing` 时收集 —— `All` 的语义是「全都要」，那儿的
+        // 「隐藏」恒为空，算它只是白跑一遍。
+        let mut hidden: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for record in &state.accounts {
+            if visibility == Visibility::All || account_visible(record.provider().as_str()) {
+                visible.push(record.clone());
+            } else {
+                *hidden.entry(record.provider()).or_insert(0) += 1;
+            }
+        }
         // 逐家派生队首：provider 取值的来源就是账号数据里出现过的家
         // （含手工塞进来的未知 id —— 它们也有自己的队首，不该被静默忽略）
         let mut current_ids = Map::new();
-        for record in &state.accounts {
+        for record in &visible {
             let provider = record.provider();
             if current_ids.contains_key(&provider) {
                 continue;
             }
-            let head = Self::pick_current_for_provider(&state.accounts, &provider)
+            let head = Self::pick_current_for_provider(&visible, &provider)
                 .map(|record| Value::String(record.id().to_string()))
                 .unwrap_or(Value::Null);
             current_ids.insert(provider, head);
         }
-        let global_current = Self::pick_current(&state.accounts)
+        let global_current = Self::pick_current(&visible)
             .map(|record| Value::String(record.id().to_string()))
             .unwrap_or(Value::Null);
-        json!({
+        // 隐藏摘要独立于可见账号数量，混有自定义账号时也必须能解释缺失的部分。
+        let hidden = super::hidden_accounts::summary(hidden);
+        let mut snapshot = json!({
             "currentAccountId": global_current,
             "currentAccountIds": Value::Object(current_ids),
-            "accounts": state
-                .accounts
+            "accounts": visible
                 .iter()
                 .map(|record| self.public_account(record))
                 .collect::<Vec<_>>(),
-            "providers": self.provider_summary(state),
-        })
+            "providers": self.provider_summary(&visible),
+            "hiddenAccounts": hidden,
+        });
+        crate::server::core::account_order::enrich_snapshot(&mut snapshot);
+        snapshot
     }
 
     /// 记录 → 公开形态（**按 provider 分派**）。
@@ -292,7 +371,18 @@ impl AccountStore {
     ///
     /// 纯新增字段：各家的既有字段一个不动，旧客户端忽略它即可。
     pub(crate) fn public_account(&self, record: &StoredAccount) -> Value {
-        let shaped = if record.provider() == super::RACCOON_PROVIDER_ID {
+        // ── 插件记录优先（必须排在所有内置分支之前）─────────────────
+        // 内置家装上插件后，新账号由插件落库（凭证在 `pluginSecret` 里，顶层
+        // 没有任何内置字段）。若继续按 provider id 走下面的内置投影，那条
+        // 记录会被渲染成「uid 空、tokenTail 空、hasRefreshToken false」的空行
+        // —— 账号明明能用，界面上却像坏了。
+        //
+        // 判据是**记录上的 `pluginSecret`** 而不是「这个 id 由插件服务」：
+        // 环境里还没装插件时，存量内置记录（没有 `pluginSecret`）照旧走内置
+        // 投影，升级路径因此不受影响。
+        let shaped = if record.has_plugin_secret() {
+            self.to_plugin_public_account(record)
+        } else if record.provider() == super::RACCOON_PROVIDER_ID {
             self.to_raccoon_public_account(record)
         } else if record.provider() == super::CATPAW_PROVIDER_ID {
             self.to_catpaw_public_account(record)
@@ -324,6 +414,8 @@ impl AccountStore {
             // Trae 只有一家（国内 SOLO）：国际版是**另一套协议**而不是一个地区，
             // 所以这里没有 `is_trae_family` —— 将来接国际版时另立 kind、
             // 另开一个分支，不要往本家的记录上挂 `region` 字段。
+            // 这一支只服务**存量内置记录**：插件新落的账号有 `pluginSecret`，
+            // 上面第一条分支已经带走（`account_view` 由插件给）。
             self.to_trae_public_account(record)
         } else if record.provider() == super::LOOMY_PROVIDER_ID {
             // Loomy（讯飞）：单一入口（手机验证码登录），公开形态带 userId /
@@ -361,6 +453,22 @@ impl AccountStore {
             // tokenTail / tokenExpireAt（续期是否在工作可被肉眼校验，见
             // `orcaterm_accounts.rs`）
             self.to_orcaterm_public_account(record)
+        } else if super::is_modelscope_family(&record.provider()) {
+            // ModelScope（魔搭）的两个站点（`modelscope` / `modelscope-intl`）共用
+            // 这一份公开形态：账号字段两地完全一致，差别只在域名（那是转发与凭证
+            // 层的事，公开形态不体现）。去掉令牌本体，只留尾 4 位与「有没有令牌」
+            // （见 `modelscope_accounts.rs`）。
+            self.to_modelscope_public_account(record)
+        } else if record.provider() == super::ATOMCODE_PROVIDER_ID {
+            // AtomCode（AtomGit）：公开形态要摘掉**两个**令牌本体
+            // （accessToken 与 refreshToken）—— 只摘前者的那套在这里是漏的，
+            // refreshToken 是长期有效的续期凭据，不能随账号列表下发。
+            self.to_atomcode_public_account(record)
+        } else if record.provider() == super::LOBSTERAI_PROVIDER_ID {
+            // LobsterAI：公开形态要摘掉**令牌本体 + 载荷件三件套**
+            // （refreshToken / uuid / 两个 keyfrom）。它们都是「能续期」的条件，
+            // 一起下发等于把账号的续期能力送出去；界面要的只是 canRefresh 布尔。
+            self.to_lobsterai_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -376,9 +484,47 @@ impl AccountStore {
         };
         match shaped {
             Value::Object(mut fields) => {
+                for key in ["upstreamCooldownUntil", "upstreamBlockedReason"] {
+                    if let Some(value) = record.get(key) { fields.insert(key.to_string(), value.clone()); }
+                    else { fields.remove(key); }
+                }
+                if !record.has_plugin_secret() {
+                    super::plugin_public::credential_fields(record, &mut fields);
+                }
                 fields.insert(
                     "hasCredentials".to_string(),
                     Value::Bool(record.has_credentials()),
+                );
+                // 「需要重新登录」标记（issue #215）：上游注销了会话、refresh token
+                // 一并作废时由刷新链路落。界面据此把「刷新失败」显示成「需要重新
+                // 登录」—— 两者对用户的下一步动作完全不同（前者再点一次，后者必须
+                // 去登录）。
+                //
+                // ── 为什么在这一段统一注入 ──────────────────────────────
+                // 内置家的 `to_public_account` 早就写了自己那一份，但**插件家不走
+                // 那条投影**（它们的形状由插件的 `account_view` 给，见上面第一条
+                // 分支）—— 于是插件家即使记录上落了 `needsRelogin`，界面也读不到。
+                // 而「登录态失效」是**账号级事实**，与形状由谁拼无关：Loomy 这类
+                // 无续期家尤其只能靠它表达失效（上游回 020002 / 100002 时由
+                // `upstream::provider_loop` 落这个键，见那里的说明）。
+                // 键恒在（false 表示正常），前端不必判「键缺失」；插件申报的同名键
+                // 被这里覆盖也无妨 —— 网关的判定比插件自己的猜测更接近事实。
+                fields.insert(
+                    "needsRelogin".to_string(),
+                    Value::Bool(
+                        record
+                            .fields()
+                            .get("needsRelogin")
+                            .map(js_truthy)
+                            .unwrap_or(false),
+                    ),
+                );
+                fields.insert(
+                    "needsReloginReason".to_string(),
+                    value_or(
+                        record.fields().get("needsReloginReason"),
+                        Value::String(String::new()),
+                    ),
                 );
                 // 没有转发能力的家：界面据此说明「启用了也不会被转发」，
                 // 而不是把一个失效的启用开关当成正常账号展示。
@@ -400,7 +546,35 @@ impl AccountStore {
                 //
                 // 恒为数字（无记录时 0）而不是缺键：界面按 `Number(...) || 0` 读，
                 // 两种形态都能吃，但恒定的形状让「字段缺失」与「值为 0」不再需要分开判。
+                if super::is_zcode_family(&record.provider()) {
+                    let plan = crate::server::core::providers::zcode::normalize_plan(&record.zcode_plan())
+                        .unwrap_or(crate::server::core::providers::zcode::PLAN_CODING);
+                    fields.insert(crate::server::core::providers::zcode::PLAN_FIELD.to_string(), Value::String(plan.to_string()));
+                }
+                for key in ["claimAt", "claimPlanId", "claimPlans"] {
+                    if let Some(value) = record.get(key) {
+                        fields.insert(key.to_string(), value.clone());
+                    }
+                }
                 fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
+                fields.insert("checkedInToday".to_string(), Value::Bool(super::checkin_state::completed(record)));
+                fields.insert("dailyCheckin".to_string(), super::checkin_state::record_status(record)
+                    .cloned().unwrap_or(Value::Null));
+                // 成长中心连登天数（WorkBuddy 国内版；签到后回读落库，见
+                // `AccountStore::mark_streak_days`）。恒为数字键（0 = 还没读到过），
+                // 与 checkinAt 同一理由：界面按数字读，不必判「字段缺失」。
+                // 只有国内版会写这个字段，别家恒 0 —— 不按 provider 分支是刻意的：
+                // 形状恒定，读侧不必查表。
+                fields.insert(
+                    "streakDays".to_string(),
+                    Value::from(
+                        record
+                            .fields()
+                            .get("streakDays")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0),
+                    ),
+                );
                 // 单账号并发上限（所有家通用的账号属性）：跨家统一注入的理由与上面
                 // 三条相同 —— 选路（`routing::max_concurrent_of`）与前端账号菜单读的
                 // 是**同一份事实**。恒为数字键（0 = 不限），且**只在这里写一次**：
@@ -414,6 +588,10 @@ impl AccountStore {
                         &record.provider(),
                         record.get("maxConcurrent"),
                     )),
+                );
+                fields.insert(
+                    "allowRouteSkip".to_string(),
+                    Value::Bool(record.get("allowRouteSkip").and_then(Value::as_bool).unwrap_or(true)),
                 );
                 // 用户显式设置过备注名（update_account 真正改到 name 时打的标，
                 // 见 apply_patch）。恒为布尔而不是缺键：界面据此决定「备注名赢过
@@ -450,6 +628,10 @@ impl AccountStore {
                     "limiters".to_string(),
                     crate::server::core::limiter::effective_rules_json_in(record.fields()),
                 );
+                fields.insert(
+                    "limiterGroups".to_string(),
+                    crate::server::core::limiter::types::json_of(&crate::server::core::limiter::effective_groups_in(record.fields())),
+                );
                 // 跨家统一注入的**账号展示名**：与前端 `displayNameOf` 同口径的
                 // 唯一后端实现（规则见本文件底部的 `display_name_of`）。
                 // 恒为非空字符串（`displayName` 全兜底失效时退 id），请求日志 /
@@ -460,6 +642,21 @@ impl AccountStore {
                     "displayName".to_string(),
                     Value::String(display_name_of(&fields, &record.id().to_string())),
                 );
+                // 智谱清言的**访客标记**：签到范围判定
+                // （`billing::checkin::supports_checkin`）与签到中心的「范围外」
+                // 原因都读它，两处必须看到同一份事实 —— 而访客形态只存在记录
+                // 里（公开形态是逐个字段组装的，不会自动带上 `isGuest`）。
+                //
+                // 只对本家注入：别的家没有访客形态，给所有账号加一个恒 false 的
+                // 键只会让读侧多一个「要不要判它」的疑问。判据见
+                // `chatglm_accounts::guest_of_record`（只认确凿的访客证据，
+                // 与新手任务列表那边的兜底方向刻意相反）。
+                if record.provider() == super::CHATGLM_PROVIDER_ID && !record.has_plugin_secret() {
+                    fields.insert(
+                        "isGuest".to_string(),
+                        Value::Bool(super::chatglm_accounts::guest_of_record(record)),
+                    );
+                }
                 Value::Object(fields)
             }
             // 各家形状恒为对象；真出现异常形态时原样透出，不在这里改语义
@@ -469,27 +666,29 @@ impl AccountStore {
 
     /// provider 摘要：注册表顺序 + 各 provider 的账号总数。
     ///
-    /// 计数在已读出的账号列表上跑（不再次访问数据库、不再取锁）——
-    /// `snapshot` 的调用方已经持锁，且已经把那份列表读在手上了。
-    fn provider_summary(&self, state: &AccountState) -> Value {
-        let counts: Vec<(String, usize)> = state
-            .accounts
-            .iter()
-            .fold(Vec::new(), |mut acc, record| {
-                let provider = record.provider();
-                match acc.iter_mut().find(|(id, _)| *id == provider) {
-                    Some((_, count)) => *count += 1,
-                    None => acc.push((provider, 1)),
-                }
-                acc
-            });
-        let value = crate::server::core::providers::summary_json(|id| {
-            counts
-                .iter()
-                .find(|(known, _)| known == id)
-                .map(|(_, count)| *count)
-                .unwrap_or(0)
+    /// `records` 传**已经按用途过滤过**的那份（`snapshot` 里就是 `visible`）：
+    /// 界面视图与内部视图的口径因此天然一致 —— 不会出现「分组标题写 3 个
+    /// 账号、列表里一个都没有」。
+    fn provider_summary(&self, records: &[StoredAccount]) -> Value {
+        let counts: Vec<(String, usize)> = records.iter().fold(Vec::new(), |mut acc, record| {
+            let provider = record.provider();
+            match acc.iter_mut().find(|(id, _)| *id == provider) {
+                Some((_, count)) => *count += 1,
+                None => acc.push((provider, 1)),
+            }
+            acc
         });
+        let ids: Vec<String> = counts.iter().map(|(id, _)| id.clone()).collect();
+        let value = crate::server::core::providers::summary_json(
+            |id| {
+                counts
+                    .iter()
+                    .find(|(known, _)| known == id)
+                    .map(|(_, count)| *count)
+                    .unwrap_or(0)
+            },
+            &ids,
+        );
         Value::Array(value)
     }
 
@@ -509,8 +708,7 @@ impl AccountStore {
     /// auth.json，同样算「有凭证」，见 `state.rs` 的说明）。返回值是**排序后**的：
     /// 调用方按序尝试即可，不必自己再排一遍 —— 优先级的相对顺序就是主备顺序。
     pub fn accounts_for_provider(&self, provider: &str) -> Vec<Value> {
-        let _guard = self.guard();
-        let records = self.records_for_provider(&_guard, provider);
+        let records = self.read_provider(provider);
         let mut records: Vec<StoredAccount> = records
             .into_iter()
             .filter(|record| record.enabled() && record.has_credentials())

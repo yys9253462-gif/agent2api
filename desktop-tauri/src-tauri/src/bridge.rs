@@ -156,30 +156,31 @@ const BRIDGE_JS: &str = r#"
     // 同时跑时界面上一眼能分清。
     title: '__AGENT2API_TITLE__',
 
-    // ── 直连网关的凭证（AI 助手页专用）────────────────────────
-    // 助手页为了流式对话直接 fetch 网关基址、不经桥（见 ui-islands 的
-    // assistant-state.ts）。桌面形态下页面来自 Tauri 自定义协议、网关在
-    // 127.0.0.1:{port}：跨源 + 不带 cookie，那条请求里一个凭证都没有；
-    // 面板认证开启后（设置页开过局域网访问就会注册管理员）会被 401
-    // `panel_login_required` 挡下，界面只能显示「请先登录管理面板」——
-    // 而桌面上并没有登录页。桥的其它方法不受影响，是因为壳统一给它们补了
-    // 第一把 Key（见 gateway::request_builder）；这里把**同一把**交给页面。
-    // 返回 `{ 头名: 值 }`：网页端 shim 的同名方法回面板令牌 / 用户输入的
-    // Key（见 web_shim.rs），助手页对两端一视同仁，只负责合并进请求头。
+    // ── 界面直连网关的管理凭证 ────────────────────────────────
+    // 桌面页面与 HTTP 网关跨源，不能靠 cookie；桥返回本机壳的短效会话。
+    // 模型调用仍由界面显式选择 Key，管理会话不能替代模型授权。
     directCredentials: () => invoke('direct_credentials'),
+    saveAssistantImage: id => invoke('save_assistant_image', { id: String(id || '') }),
 
     // ── 会话 ──
     getState: () => call('GET', '/api/session'),
-    startLogin: (edition, mode, provider, socialRestore) =>
+    startLogin: (edition, mode, provider, socialRestore, options) =>
       invoke('start_login', {
         edition: edition || 'cn',
         mode: mode || 'embedded',
         // provider 缺省留给 Rust 侧兜底成 workbuddy：老界面（或将来别处的调用点）
         // 不传它时必须走原来那条链，这里不做猜测式整形
         provider: provider || null,
-        // 第三方登录入口恢复（Google / GitHub / X）。缺省 false 与界面默认不勾选一致：
-        // 不传就照官方登录页的形态走，不额外放宽域名白名单
+        // 第四参仍是第三方入口开关；动态登录 options 只能占第五参，不能挤掉它。
         socialRestore: socialRestore === true,
+        ...(options === undefined ? {} : { options }),
+      }),
+    // URL / 裸 code 都原样交给网关；accepted / pending 不是登录完成，startLogin
+    // 仍须等 /wait 的 done 才返回成功。
+    submitLoginCallback: (state, callbackUrl) =>
+      call('POST', '/api/session/login/callback', {
+        state: String(state ?? ''),
+        callbackUrl: String(callbackUrl ?? ''),
       }),
     getLoginState: () => invoke('login_state'),
     cancelLogin: () => invoke('cancel_login'),
@@ -249,6 +250,8 @@ const BRIDGE_JS: &str = r#"
     pushZcodeCaptchaTokens: tokens =>
       call('POST', '/api/zcode/captcha', { tokens: Array.isArray(tokens) ? tokens : [] }),
     onLoginState: callback => on('login:state', callback),
+    // 动态登录说明与 /wait 的 pending.hint；不含授权地址或用户输入。
+    onLoginProgress: callback => on('login:progress', callback),
     // KukuAI 短信登录的窗口进度（壳侧监视任务推送，见 `start_kuku_sms`）：
     // {status: 'opening'|'filling'|'sending'|'sent'|'captcha'|'timeout'}。
     // 面板提示行据此实时显示，用户不会「点了没反应」。
@@ -295,10 +298,11 @@ const BRIDGE_JS: &str = r#"
     // 那是一次静默的数据丢失。
     getModelManage: () => call('GET', '/api/models/manage'),
     setModelState: payload => call('POST', '/api/models/state', payload),
-    addModelMapping: (alias, target, provider, reasoning, enabled) => call('POST', '/api/models/mappings', {
+    addModelMapping: (alias, target, provider, reasoning, enabled, create) => call('POST', '/api/models/mappings', {
       alias, target, provider,
       ...(reasoning === undefined ? {} : { reasoning }),
       ...(enabled === undefined ? {} : { enabled }),
+      ...(create === undefined ? {} : { create }),
     }),
     removeModelMapping: (alias, target, provider) => call('POST', '/api/models/mappings/remove', { alias, target, provider }),
     // 自定义模型（手动登记上游目录里没有的模型）。「移除」而不是「隐藏」——
@@ -319,7 +323,10 @@ const BRIDGE_JS: &str = r#"
     // `terminateStatsRequest(id)` 把它掐掉（桌面壳的 invoke 没有 abort，
     // 这是前端唯一能中止在途测试的手段，见后端那段说明）。
     // 结论失败也返回 2xx：上游的错误在返回值的 status / error 里
-    testModel: payload => call('POST', '/api/models/test', payload || {}),
+    testModel: (payload, apiKey) => invoke('api_request', { request: {
+      method: 'POST', path: '/api/models/test', body: payload || {}, apiKey: String(apiKey || ''),
+    } }),
+    getModelApiKeys: () => call('GET', '/api/model-access/keys'),
 
     // ── 网关 API Key（多把）──
     getKeys: () => call('GET', '/api/keys'),
@@ -328,6 +335,9 @@ const BRIDGE_JS: &str = r#"
     deleteKey: id => call('DELETE', '/api/keys/' + encodeURIComponent(id)),
 
     // ── 多账号 ──
+    getAccounts: () => call('GET', '/api/accounts'),
+    getAccountSorting: () => call('GET', '/api/accounts/sorting'),
+    saveAccountSorting: payload => call('PUT', '/api/accounts/sorting', payload || {}),
     // switchAccount 仅把账号移到全局队列第一位，不改变启用状态
     switchAccount: id => call('POST', '/api/accounts/current', { id }),
     refreshAccountToken: id => call('POST', '/api/accounts/refresh', id ? { id } : {}),
@@ -350,6 +360,14 @@ const BRIDGE_JS: &str = r#"
         model ? { model } : {}),
     // ── 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断 + 队列可见化）──
     getRoutingConfig: () => call('GET', '/api/routing'),
+    getRoutingWorkspace: model => call('GET', '/api/routing/workspace' + toQuery({ model })),
+    saveRoutingProfile: payload => call('PUT', '/api/routing/profile', payload || {}),
+    getRoutingSticky: model => call('GET', '/api/routing/sticky' + toQuery({ model })),
+    clearRoutingSticky: payload => call('POST', '/api/routing/sticky/clear', payload || {}),
+    getRoutingReplays: query => call('GET', '/api/routing/replays' + toQuery(query)),
+    getRoutingFlow: query => call('GET', '/api/routing/flow' + toQuery(query)),
+    getRoutingTrace: query => call('GET', '/api/routing/trace' + toQuery(query)),
+    getRoutingTraceRequest: query => call('GET', '/api/routing/trace/request' + toQuery(query)),
     setRoutingConfig: patch => call('PUT', '/api/routing', patch || {}),
     // 候选队列可见化（账号页「路由」面板的数据源）：model 缺省 = 不限模型的全局队列
     getRoutingQueue: model =>
@@ -364,6 +382,18 @@ const BRIDGE_JS: &str = r#"
         ...(payload && Object.prototype.hasOwnProperty.call(payload, 'maxConcurrent')
           ? { maxConcurrent: payload.maxConcurrent }
           : {}),
+        ...(payload && Object.prototype.hasOwnProperty.call(payload, 'usageQuery')
+          ? { usageQuery: payload.usageQuery }
+          : {}),
+        ...(payload && Object.prototype.hasOwnProperty.call(payload, 'limiterGroups')
+          ? { limiterGroups: payload.limiterGroups }
+          : {}),
+        ...(payload && Object.prototype.hasOwnProperty.call(payload, 'limiters')
+          ? { limiters: payload.limiters }
+          : {}),
+        ...(payload && Object.prototype.hasOwnProperty.call(payload, 'limiterMode')
+          ? { limiterMode: payload.limiterMode }
+          : {}),
       }),
 
     // ── 出网代理 ──
@@ -377,28 +407,29 @@ const BRIDGE_JS: &str = r#"
       }
       return call('POST', '/api/proxies/test', body);
     },
+    // ── Agent（本机 AI 客户端的配置接管）──
+    // 与 `server/src/web_shim.rs` 的同名方法成对存在（教训同上）。契约见
+    // `api::agents` 的模块头：
+    //   · getAgents           全部客户端 + 用户配置 + 安装状态 + 派生读数
+    //   · saveAgentProfiles   保存一个客户端的配置列表（不写客户端文件）
+    //   · applyAgentProfile   写进客户端文件（单配置整段覆写 / 多配置只改
+    //                         enabled），写前自动备份；响应带 `applied`
+    //   · previewAgentProfile 写入预览（不落盘），响应带 `changed` 行号
+    //   · restoreAgentClient  按最近一次备份还原
+    //   · importAgentClient   从客户端现有文件里读回一套配置
+    //   写操作都返回整份 `{clients}`（就地替换，页面不必再拉一次）。
+    getAgents: () => call('GET', '/api/agents'),
+    saveAgentProfiles: payload => call('POST', '/api/agents/profiles', payload || {}),
+    applyAgentProfile: payload => call('POST', '/api/agents/apply', payload || {}),
+    previewAgentProfile: payload => call('POST', '/api/agents/preview', payload || {}),
+    restoreAgentClient: payload => call('POST', '/api/agents/restore', payload || {}),
+    importAgentClient: payload => call('POST', '/api/agents/import', payload || {}),
+
     // ── 代理池（「网络代理」页）──
     // 与 `server/src/web_shim.rs` 的同名方法成对存在（那个文件是 headless
     // 面板的桥）：只加一边时，另一形态下的页面会报「桥接方法缺失」——
     // 标题栏那一族方法有同样的教训，见 zcode-claim 那段的说明。
-    // 契约（详见 `api::proxies` 的模块头）：
-    //   · getProxyPool           列表 `{items, clash}`；item 带 `usedBy`
-    //                            （引用它的账号）与 `lastTest`（上次测试结果）。
-    //                            **进来时后端会自动同步一次 Clash 出口**
-    //   · create/update/remove   写操作都返回同一份最新列表（就地替换）；
-    //                            Clash 同步来的条目是只读镜像，update/remove
-    //                            会被后端拒绝（400 + 一句可读的中文）
-    //   · setProxyPoolItemEnabled 启用 / 禁用一条（三种来源都放行：manual 写它
-    //                            自己的 enabled，镜像条目写本地禁用位）。订阅
-    //                            节点禁用时后端走「关闭监听端口」流程、启用时
-    //                            走补建，响应里多一个 `listener`
-    //                            （none / closing / opening）—— 页面按它轮询列表
-    //                            看端口落地，不在请求里等内核重建
-    //   · testProxyPoolItem      测一条并把结果记进条目；测试失败也是**成功响应**
-    //                            （`success:false` + error 文案）
-    //   · syncClashToProxyPool   手动同步 Clash Verge 出口，返回里多一个
-    //                            `changes`（本次变更数）与 `syncError`
-    //                            （Clash 不可用时的原因；那不算失败）
+    // 写操作返回最新代理列表；测试失败以 success:false 表达。
     getProxyPool: () => call('GET', '/api/proxies/pool'),
     createProxyPoolItem: payload => call('POST', '/api/proxies/pool', payload || {}),
     updateProxyPoolItem: payload => call('POST', '/api/proxies/pool/update', payload || {}),
@@ -406,50 +437,13 @@ const BRIDGE_JS: &str = r#"
     removeProxyPoolItem: id => call('POST', '/api/proxies/pool/remove', { id: String(id || '') }),
     testProxyPoolItem: id => call('POST', '/api/proxies/pool/test', { id: String(id || '') }),
     syncClashToProxyPool: () => call('POST', '/api/proxies/pool/sync-clash', {}),
-    // ── 代理设置（「网络代理」页的设置弹窗：节点端口范围 + 测试网址）──
+    // ── 代理设置（「网络代理」页的设置弹窗：测试目标网址）──
     // 与 web_shim.rs 的同名方法成对存在（教训同上）。契约见 `api::proxies`
     // 的模块头 settings 两条：GET 带 `defaults`（弹窗的默认值读它），
     // POST 是整份表单、非法形状 400 + 一句可读的中文。
     getProxySettings: () => call('GET', '/api/proxies/settings'),
     saveProxySettings: payload => call('POST', '/api/proxies/settings', payload || {}),
 
-    // ── 订阅（「网络代理」页的订阅区块）──
-    // 与 web_shim.rs 的同名方法成对存在（教训同上）。契约（详见
-    // `api::subscriptions` 的模块头）：
-    //   · getSubscriptions        列表 `{items, kernel}`；item 带 nodeCount，
-    //                             kernel 是内核状态（下载进度 / 运行状态）
-    //   · add/save/remove         写操作都返回同一份列表 + kernel（就地替换）；
-    //                             后端投一条内核命令（异步），节点数与运行状态
-    //                             由轮询 kernel 看结果
-    //   · refreshSubscription     强制拉取一条订阅的内容（节点变了后端自动
-    //                             重启内核）
-    //   · getKernelStatus         单独读内核状态（下载进度的轮询走它）
-    //   · downloadKernel          开始下载内核（后台任务，state=downloading →
-    //                             done/error/canceled）；下载完有启用的订阅会自动拉起。
-    //                             参数是下载弹窗的两个选择 `{proxy, dir}`（都可省；
-    //                             dir 空串 = 恢复默认目录），后端**先落配置再下载**
-    //   · cancelKernelDownload    停止正在进行的下载（删掉半截文件；不在下载中时
-    //                             回 `{canceled: false}`，不假装停成功了）
-    //   · restartKernel           手动启动 / 重启内核（重建配置）
-    //   · stopKernel              手动关闭内核（只停进程；订阅与端口注册表保留，
-    //                             「启动内核」后原位恢复 —— 与「最后一条订阅没了」
-    //                             那条自动停不同，那条会清空订阅节点镜像）
-    //   · removeKernel            删除已下载的内核（停进程 + 清内核目录；订阅
-    //                             与账号引用保留，订阅节点端口被回收成「未分配」）
-    //   · pickFolder              弹系统文件夹选择框（下载弹窗的「选择目录…」）
-    //   · decodeQrImage           从图片解二维码 `{imageBase64}` → `{url}`
-    getSubscriptions: () => call('GET', '/api/subscriptions'),
-    addSubscription: payload => call('POST', '/api/subscriptions/add', payload || {}),
-    saveSubscription: payload => call('POST', '/api/subscriptions/save', payload || {}),
-    refreshSubscription: id => call('POST', '/api/subscriptions/refresh', { id: String(id || '') }),
-    removeSubscription: id => call('POST', '/api/subscriptions/remove', { id: String(id || '') }),
-    decodeQrImage: payload => call('POST', '/api/subscriptions/decode-qr', payload || {}),
-    getKernelStatus: () => call('GET', '/api/subscriptions/kernel'),
-    downloadKernel: payload => call('POST', '/api/subscriptions/kernel/download', payload || {}),
-    cancelKernelDownload: () => call('POST', '/api/subscriptions/kernel/download/cancel', {}),
-    restartKernel: () => call('POST', '/api/subscriptions/kernel/restart', {}),
-    stopKernel: () => call('POST', '/api/subscriptions/kernel/stop', {}),
-    removeKernel: () => call('POST', '/api/subscriptions/kernel/remove', {}),
     // 桌面壳的文件夹选择框：参数名与命令签名一致（camelCase ← Rust 的 snake_case）
     pickFolder: defaultDir => invoke('pick_folder', { defaultDir: defaultDir == null ? null : String(defaultDir) }),
 
@@ -583,7 +577,12 @@ const BRIDGE_JS: &str = r#"
       call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/run', {}),
     // WorkBuddy 国际版日活保活的模型链（读 / 存；与 web_shim.rs 的同名方法成对）
     getCheckinKeepalive: () => call('GET', '/api/checkin-keepalive'),
-    saveCheckinKeepalive: models => call('POST', '/api/checkin-keepalive', { models }),
+    saveCheckinKeepalive: (models, apiKeyId) => call('POST', '/api/checkin-keepalive', { models, apiKeyId }),
+    // 猫猫旅行定时排程（国内版）：读 / 存开关与时刻 / 立即巡检全部
+    // （与 web_shim.rs 的同名方法成对；调度体在 core::growth_scheduler）
+    getTravelSchedule: () => call('GET', '/api/travel-schedule'),
+    saveTravelSchedule: patch => call('POST', '/api/travel-schedule', patch),
+    runTravelScheduleNow: () => call('POST', '/api/travel-schedule/run', {}),
     // WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive）
     runCheckinActivity: (id, mode) => call('POST', '/api/checkin-activity', { id, mode }),
     // 签到中心的聚合快照（每日签到分组 / 自动签到设置 / 签到历史 / 一次性项入口），
@@ -626,12 +625,22 @@ const BRIDGE_JS: &str = r#"
     // checkUpdate 走壳命令：当前版本号只有壳知道（后端是独立进程），
     // 由壳把版本带上去交给后端比较
     checkUpdate: () => invoke('check_update'),
+    // 设置页「版本信息」：一次取全（版本 / 环境 / 路径 / 开关 / 计数）。
+    // 桌面端另由壳命令补三件**只有壳知道**的事：运行时 package_info 版本
+    // （后端编译期常量在「装的是哪个包」这件事上不是权威）、WebView2 版本
+    // （界面白屏 / 渲染异常时它是决定性的）、是否 dev 构建。
+    // 与 `web_shim.rs` 的同名方法必须成对存在 —— 少一边时另一半形态会报
+    // 「桥接方法缺失」。
+    getSystemInfo: options =>
+      invoke('system_info', { hideUsername: options?.hideUsername === true }),
     // 最近一次「检查更新」的结果（定时任务写入；app.js 轮询它亮侧栏徽标）
     getUpdateStatus: () => call('GET', '/api/update/status'),
     // 「软件更新」的出网线路：null = 直连。更新面板「检查更新」左侧的下拉读写
     // （检查与下载安装包都走它，后端出口候选的第一优先级）
     getUpdateProxy: () => call('GET', '/api/update/proxy'),
     setUpdateProxy: payload => call('POST', '/api/update/proxy', payload),
+    getGithubAccess: () => call('GET', '/api/update/github'),
+    setGithubAccess: payload => call('POST', '/api/update/github', payload),
     // 「软件更新」的 GitHub 令牌：读只报 {filled, origin}（后端永不回显本体），
     // 写传 {token: '…' | null}（null = 清除）。加密落库在后端做
     getUpdateToken: () => call('GET', '/api/update/token'),
@@ -641,6 +650,8 @@ const BRIDGE_JS: &str = r#"
     // 写响应带 saved（false = 本次运行已生效、重启会回到原通道）
     getUpdateBeta: () => call('GET', '/api/update/beta'),
     setUpdateBeta: payload => call('POST', '/api/update/beta', payload),
+    getUpdateChannels: () => call('GET', '/api/update/channels'),
+    setUpdateChannels: payload => call('POST', '/api/update/channels', payload),
     downloadUpdate: payload => invoke('download_update', {
       url: String((payload && payload.url) || ''),
       name: (payload && payload.name) ? String(payload.name) : null,
@@ -651,11 +662,11 @@ const BRIDGE_JS: &str = r#"
       invoke('run_installer', { path: String(path || ''), restart: restart !== false }),
     openReleasePage: url => invoke('open_release_page', { url: String(url || '') }),
 
-    // ── 出站指纹脱敏开关 ──
-    // 与 getDebug / saveDebug 同形：GET 读、PUT 写，响应体就是新状态。
+    // ── 出站指纹脱敏 ──
+    // 部分更新；保留布尔签名以兼容缓存中的旧界面。
     getSanitize: () => call('GET', '/api/sanitize'),
-    saveSanitize: enabled =>
-      call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true }),
+    saveSanitize: patch => call('PUT', '/api/sanitize',
+      typeof patch === 'boolean' ? { sanitizeBlacklistFingerprints: patch } : patch),
 
     // ── 开发者角色兼容开关 ──
     // 与 getSanitize / saveSanitize 同形：GET 读、PUT 写，响应体就是新状态。
@@ -670,6 +681,13 @@ const BRIDGE_JS: &str = r#"
     getClineHeaders: () => call('GET', '/api/cline/headers'),
     saveClineHeaders: overrides => call('PUT', '/api/cline/headers', { overrides }),
 
+    // ── ZCode 客户端版本号 ──
+    // 上游按它决定活动套餐下不下发，落后时的症状是**静默空列表**（不是报错），
+    // 所以给用户一格自己能改的值；见 api::zcode_version 的模块头。
+    // 与 web_shim.rs 的同名方法逐字同形（漏一侧 = 设置页那一格读不到值）。
+    getZcodeVersion: () => call('GET', '/api/zcode/version'),
+    saveZcodeVersion: version => call('PUT', '/api/zcode/version', { version }),
+
     // ── 网关面跨域访问（/v1/*，默认关）──
     // 与 web_shim.rs 的 getCors / saveCors 逐字同形：桌面壳走 Tauri IPC 到
     // /api/cors，网页端走同源 fetch，两边接口名与签名必须一致（界面代码零改动
@@ -677,6 +695,26 @@ const BRIDGE_JS: &str = r#"
     // 于是设置页读不到值，卡在「未能读取网关跨域访问设置」。
     getCors: () => call('GET', '/api/cors'),
     saveCors: enabled => call('PUT', '/api/cors', { corsEnabled: enabled === true }),
+
+    // ── 机器人校验（两端各一个开关）与面板账户（设置页「账户」分类）──
+    // 与 web_shim.rs 的同名方法逐字同形。此前这组只存在于网页桥：桌面端
+    // 读不到 `getCaptchaSetting`，设置页那张开关一直是置灰的（这也是它后来
+    // 从「安全」搬到「账户」的原因之一）。
+    getCaptchaSetting: () => call('GET', '/api/captcha'),
+    // patch 是 `{captchaDesktop?, captchaWeb?}`（部分更新）；旧签名传布尔值时
+    // 视为「两端一起改」，兼容还没刷新的界面缓存（旧 islands/ui.js）。
+    saveCaptchaSetting: patch =>
+      call(
+        'PUT',
+        '/api/captcha',
+        typeof patch === 'boolean' ? { captchaEnabled: patch } : (patch || {}),
+      ),
+    getPanelAccount: () => call('GET', '/api/panel/account'),
+    changePanelPassword: (oldPassword, newPassword) =>
+      call('POST', '/api/panel/change-password', {
+        oldPassword: String(oldPassword || ''),
+        newPassword: String(newPassword || ''),
+      }),
 
     // ── models.dev 模型元数据（能力位与逐模型思考档位）──
     // 与 web_shim.rs 的同名方法逐字同形（桌面壳走 Tauri IPC，网页端走同源
@@ -714,20 +752,37 @@ const BRIDGE_JS: &str = r#"
     // ── 运行日志 ──
     getLogs: query => call('GET', '/api/logs' + toQuery(query)),
     getLogStats: () => call('GET', '/api/logs/stats'),
+    // ── 插件页面清单 ──
+    // 侧边栏要按插件申报的页面动态生成菜单（见 ui/app.js 的 adoptPluginPages）。
+    // 只读、只要 `packs[].ui[]` 与 `enabled` 两个字段，但仍然走完整端点：
+    // 另开一条「只给页面清单」的端点会让「菜单」与「插件状态」两个事实分开取，
+    // 装 / 卸之后两边可能对不上。
+    getPlugins: () => call('GET', '/api/plugins'),
+    // ── 侧边栏布局（分组 / 顺序 / 显隐）──
+    // 布局的权威副本在库里（`kv` 的 `sidebarLayout` 键），页面侧的
+    // localStorage 只是首帧缓存 —— 桌面壳与网页端是两个 origin，localStorage
+    // 互不相通，只有库那一份能让「在 WebUI 里隐藏的菜单，客户端也不显示」。
+    // 读回 `{layout}`，`layout: null` = 库里没存过（界面回落默认布局）。
+    // 写整份（null = 恢复默认）。规整（校验 / 补位）在前端做，后端只存不解释，
+    // 理由见 api::sidebar_layout 的模块头。
+    getSidebarLayout: () => call('GET', '/api/sidebar-layout'),
+    saveSidebarLayout: layout =>
+      call('PUT', '/api/sidebar-layout', { layout: layout === undefined ? null : layout }),
     // 清空支持筛选条件（可选对象，与 getLogs 同一套键）：带条件 = 只删命中的，
     // 不传 = 全部清空（后端两种语义不同，见 logs_api::clear_logs）
     clearLogs: query => call('DELETE', '/api/logs' + toQuery(query)),
-    exportLogs: () => invoke('export_logs'),
+    exportLogs: query => invoke('export_logs', { query: typeof query === 'string' ? query : toQuery(query).replace(/^\?/, '') }),
 
     // ── 请求统计报表 / 数据保留 ──
-    // range 只认 today / 7 / 30 / month / all / custom，非法值由后端返回 400
+    // range 只认 today / yesterday / 7 / 30 / month / all / custom，非法值由后端返回 400
     // （不在这里静默改口径：界面选了什么就该拿到什么，报错比默默换区间好排查）。
     // dates（`{start, end}`，`YYYY-MM-DD`）**只在 range=custom 时**给：
     // 后端对 custom 会强制要求这两个参数，其余档位带上反而是噪音
-    getStatsSummary: (range, dates) => call('GET', '/api/stats/summary' + toQuery({
+    getStatsSummary: (range, dates, options) => call('GET', '/api/stats/summary' + toQuery({
       range,
       startDate: dates && dates.start,
       endDate: dates && dates.end,
+      apiKey: options && options.apiKey,
     })),
     // 筛选条件是可选对象，复用上面 toQuery 的「空值跳过」语义：
     // 清空的输入框不该变成 `?model=` 这种永不命中的条件
@@ -787,6 +842,14 @@ const BRIDGE_JS: &str = r#"
     getQueue: () => call('GET', '/api/queue'),
     saveQueue: patch => call('PUT', '/api/queue', patch),
 
+    // ── 会话图片压缩（设置页「网关 → 图片压缩」）──
+    // 开关 + 长边 / 质量 / 阈值三项，存配置（/api/image-compress）。契约同
+    // saveQueue：PUT 允许部分字段，返回生效后的全量值。只作用在对话链路
+    // （生图 / 图片编辑走独立分支，不经过压缩）。与 web_shim.rs 的同名方法
+    // 逐字同形（漏一侧 = 设置页那一格读不到值）。
+    getImageCompress: () => call('GET', '/api/image-compress'),
+    saveImageCompress: patch => call('PUT', '/api/image-compress', patch),
+
     // ── 验证码令牌池（设置页「网关 → 验证码令牌池」）──
     // ZCode 活动套餐通道令牌池的补货节奏（目标 / 轮询间隔 / 单轮上限），
     // 存配置（/api/zcode/captcha-pool）。契约同 saveTimeouts。
@@ -809,12 +872,14 @@ const BRIDGE_JS: &str = r#"
     // { message, conflict, canEndOccupant }。事件只是「去查一次」的提醒，
     // 状态以 getBackendStatus 为准 —— 它可能在界面订阅之前就发出去了。
     onBackendError: callback => on('backend:error', callback),
+    onBackendReady: callback => on('backend:ready', callback),
 
     // ── 本壳特有：后端就绪状态与端口冲突处置（界面可选使用） ──
-    // 后端返回 { ready, port, portFromEnv, failure }：failure 为 null 表示
+    // 后端返回 { ready, phase, port, portFromEnv, failure }：failure 为 null 表示
     // 启动正常，非 null 时带 { message, conflict, canEndOccupant }，
     // 界面据此决定给不给「结束占用进程 / 更换端口」两个出口。
     getBackendStatus: () => invoke('backend_status'),
+    waitForBackend: () => invoke('wait_for_backend'),
     // 查 / 结束占用网关端口的进程（只动查到的那个 PID，不做无差别清理）
     getPortOccupant: () => invoke('port_occupant'),
     endPortOccupant: () => invoke('end_port_occupant'),
@@ -836,6 +901,16 @@ const BRIDGE_JS: &str = r#"
         username: String(username || '').trim(),
         password: String(password || ''),
       }),
+    // ── 本机管理会话 ──────────────────────────────────────────
+    // 登录相关方法保留给旧页面；本机壳不依赖网页管理员令牌。
+    panelSessionStatus: () => invoke('panel_session_status'),
+    panelSessionStore: (accessToken, refreshToken, expiresIn) =>
+      invoke('panel_session_store', {
+        accessToken: String(accessToken || ''),
+        refreshToken: String(refreshToken || ''),
+        expiresIn: Number.isFinite(Number(expiresIn)) ? Number(expiresIn) : 0,
+      }),
+    panelSessionClear: () => invoke('panel_session_clear'),
     changeLanAccess: (enabled, panel) =>
       invoke('change_lan_access', { enabled: enabled === true, panel: panel === true }),
     localIp: () => invoke('local_ip'),
@@ -891,12 +966,30 @@ const BRIDGE_JS: &str = r#"
     // 参数名 patch 必须与 Rust 侧 save_app_settings 的形参名一致
     saveAppSettings: patch => invoke('save_app_settings', { patch }),
     exportAccounts: () => invoke('export_accounts'),
+    exportAccountFiles: selection => invoke('export_account_files', { selection }),
     importAccounts: () => invoke('import_accounts'),
     // ── 整库备份 / 恢复（设置页「整库备份 / 恢复」）──
     // 文件由后端按壳选的路径直读直写（见 api/backup_api.rs），壳只负责
     // 系统对话框；参数名 includeLogs 必须与 Rust 侧 export_database 的形参一致
-    exportDatabase: includeLogs => invoke('export_database', { includeLogs }),
-    importDatabase: () => invoke('import_database'),
+    exportDatabase: (includeLogs, password) => invoke('export_database', { includeLogs, password }),
+    importDatabase: password => invoke('import_database', { password }),
+    // 恢复进度（设置页的不可关闭弹窗每 500ms 拉一次）。走通用 call 而不是
+    // invoke：这条是纯读、无参数，后端已经有 GET /api/backup/progress，
+    // 不必为它再加一条壳命令。
+    getBackupProgress: () => call('GET', '/api/backup/progress'),
+
+    // ── 云同步（设置页「数据 → 云同步」）──
+    // 上传 / 下载要打外网传几 MB，通用 call 的 60 秒超时不够，所以这两条走
+    // 壳命令（`cloud_sync_upload` / `cloud_sync_download`，内部放宽到 300 秒）；
+    // 其余四条都是小请求，走通用 call 即可。
+    // 密码类字段传空串 = 沿用后端已保存的那份（见 api::cloud_sync 的模块头）。
+    getCloudSync: () => call('GET', '/api/cloud-sync'),
+    saveCloudSync: payload => call('PUT', '/api/cloud-sync', payload || {}),
+    testCloudSync: payload => call('POST', '/api/cloud-sync/test', payload || {}),
+    getCloudSyncRemote: () => call('GET', '/api/cloud-sync/remote'),
+    cloudSyncUpload: () => invoke('cloud_sync_upload'),
+    cloudSyncDownload: () => invoke('cloud_sync_download'),
+    importCloudSyncKey: password => invoke('cloud_sync_import_key', { password }),
   };
 })();
 "#;

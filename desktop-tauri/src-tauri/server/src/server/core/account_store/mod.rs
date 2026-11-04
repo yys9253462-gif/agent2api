@@ -68,19 +68,12 @@
 //!   store_order.rs 队列顺序（分组模式）：按给定顺序整队重编号（`reorder_accounts`）
 //!   store_batch.rs 批量操作（batch_update / batch_remove）
 //!   store_admin.rs token 回写、限额标记、启动迁移（provider 补齐 + 优先级去重）
-//!   raccoon_accounts.rs 小浣熊账号（W3-T4）：手动添加、桌面端实时账号、
-//!                刷新回写、小浣熊公开形态
-//!   raccoon_import.rs   小浣熊旧数据一次性导入（旧网关 accounts.json +
-//!                桌面端登录态；架构文档 §3.3）
-//!   catpaw_accounts.rs  CatPaw 账号（W5-T-d4）：手动添加（扁平/auth.json/
-//!                原项目账号记录三种形态）、桌面端实时账号、CatPaw 公开形态
-//!   catpaw_import.rs    CatPaw 旧数据一次性导入（原项目 catpaw-proxy-accounts.json
-//!                + ~/.meituan-catpaw/auth.json；§9）
-//!   autoclaw_accounts.rs AutoClaw 账号（W4b-T-c2）：手动添加（扁平/auth.json 内容
-//!                两种形态，enc: 密文自动解密）、桌面端实时账号、刷新回写、
-//!                AutoClaw 公开形态（userId / deviceId / tokenTail）
-//!   autoclaw_import.rs   AutoClaw 旧数据一次性导入（~/.autoclaw-proxy/accounts.json
-//!                + 桌面端登录态；§10.2）
+//!   raccoon_accounts.rs 小浣熊账号（实现已搬到插件；这里只剩**存量内置记录**
+//!                的公开形态投影）
+//!   catpaw_accounts.rs  CatPaw 账号的公开形态与归属探测（实现已搬到插件；
+//!                这里只剩存量内置记录的投影）
+//!   autoclaw_accounts.rs AutoClaw 账号（实现已搬到插件；这里只剩**存量内置记录**
+//!                的公开形态投影 + 两个桌面端固定 id）
 //!   cline_accounts.rs    Cline 账号（两个额度池）：手动添加、桌面端登录态、
 //!                续期回写、Cline 公开形态
 //!   qoder_accounts.rs    Qoder 账号（地区 + userId 识别）：添加、凭证刷新回写、
@@ -97,26 +90,36 @@
 //!   antigravity_accounts.rs Antigravity 账号（单一 provider）：粘贴 Google
 //!                refresh token 添加、刷新回写（比较-再写）、公开形态（只给尾号）
 
+pub(crate) mod account_identity;
 pub mod accio_accounts;
 pub mod antigravity_accounts;
 pub mod autoclaw_accounts;
-pub mod autoclaw_import;
 pub mod catpaw_accounts;
-pub mod catpaw_import;
+pub mod chatglm_accounts;
+pub(crate) mod checkin_state;
 pub mod cline_accounts;
 pub mod codearts_accounts;
+pub mod atomcode_accounts;
 pub mod commandcode_accounts;
 pub mod custom_accounts;
+mod hidden_accounts;
 pub mod kuku_accounts;
+pub mod lobsterai_accounts;
 pub mod loomy_accounts;
+pub mod modelscope_accounts;
 pub mod monkeycode_accounts;
 pub mod officeace_accounts;
 pub mod orcaterm_accounts;
+pub mod plugin_accounts;
+mod plugin_identity;
+mod plugin_public;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
-pub mod raccoon_import;
+mod read_rows;
+mod read_state;
 pub mod sql;
+mod snapshot;
 pub mod state;
 pub mod store;
 pub mod store_admin;
@@ -126,7 +129,6 @@ pub mod store_order;
 pub mod store_util;
 pub mod store_view;
 pub mod trae_accounts;
-pub mod workbuddy_import;
 pub mod zcode_accounts;
 
 pub use store::{AccountStore, AccountStoreError};
@@ -174,11 +176,8 @@ pub(crate) const AUTOCLAW_INTL_PROVIDER_ID: &str = crate::server::core::provider
     crate::server::core::providers::ProviderKind::AutoClawIntl,
 );
 
-/// Qoder provider id（账号存储内部多处要用；**从注册表推导**，同
-/// [`RACCOON_PROVIDER_ID`] 的口径）。Qoder 的账号形态与推理转发见
-/// `qoder_accounts.rs` 与 `providers::qoder` 的模块头。
 /// Trae provider id（账号存储内部多处要用；**从注册表推导**，同
-/// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `trae_accounts.rs`。
+/// [`RACCOON_PROVIDER_ID`] 的口径）。存量记录的公开形态见 `trae_accounts.rs`。
 pub(crate) const TRAE_PROVIDER_ID: &str =
     crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Trae);
 
@@ -210,6 +209,20 @@ pub(crate) fn is_monkeycode_family(provider_id: &str) -> bool {
     provider_id == MONKEYCODE_PROVIDER_ID || provider_id == MONKEYCODE_INTL_PROVIDER_ID
 }
 
+/// 这个 provider 是不是 **ModelScope 系**（两个站点之一）。
+///
+/// 与 [`is_autoclaw_family`] / [`is_monkeycode_family`] 同一形态、同一理由：
+/// 账号层有几处判断只关心「是不是 ModelScope」（公开形态、令牌长度校验），
+/// 不关心哪个站点 —— 那些分支走本函数，于是加站点或改名时只改这里一处，
+/// 而不是散在各文件里的 `id == "modelscope"`（那种写法对国际版恒为假，
+/// 是个不会报错的静默失配）。
+///
+/// 判据从 `Region` 互查推导（同 [`is_accio_family`] / [`is_zcode_family`]），
+/// **不要**用 `starts_with("modelscope-")` —— 国际版的 id 也以它开头。
+pub(crate) fn is_modelscope_family(provider_id: &str) -> bool {
+    crate::server::core::providers::modelscope::Region::from_provider_id(provider_id).is_some()
+}
+
 /// Command Code provider id（账号存储内部多处要用；**从注册表推导**）。
 /// 账号形态见 `commandcode_accounts.rs`（单一 provider、没有地区之分）。
 pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
@@ -227,6 +240,30 @@ pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers:
 /// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `officeace_accounts.rs`。
 pub(crate) const OFFICEACE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::OfficeAce,
+);
+
+/// AtomCode（AtomGit / GitCode）provider id（**从注册表推导**，同
+/// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `atomcode_accounts.rs`。
+pub(crate) const ATOMCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Atomcode,
+);
+
+/// LobsterAI（网易有道「有道龙虾」）provider id（**从注册表推导**，同
+/// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `lobsterai_accounts.rs`。
+pub(crate) const LOBSTERAI_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::LobsterAi,
+);
+
+/// 智谱清言（`chatglm.cn`）provider id（**从注册表推导**，同
+/// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `chatglm_accounts.rs`。
+///
+/// 本家是唯一有**访客形态**的家（`guest/access` 免登录换证；实现已搬到插件），
+/// 所以**存量内置记录**的公开形态要多注入一个 `isGuest`
+/// （见 `store_view::public_account`），签到范围判定也按它把访客排除
+/// （见 `billing::checkin::supports_checkin`）。插件账号的 `isGuest` 由插件的
+/// `account_view` 提供，不经过这里。
+pub(crate) const CHATGLM_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Chatglm,
 );
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同
@@ -270,7 +307,7 @@ pub(crate) fn is_autoclaw_family(provider_id: &str) -> bool {
 /// 那些分支走本函数，于是加地区或改名时只改这里一处，而不是散在各文件里的
 /// `id == "accio"`（那种写法对国内版恒为假，是个不会报错的静默失配）。
 pub(crate) fn is_accio_family(provider_id: &str) -> bool {
-    crate::server::core::providers::accio::endpoints::Region::from_provider_id(provider_id).is_some()
+    matches!(provider_id, "accio" | "accio-cn")
 }
 
 /// 这个 provider 是不是 **ZCode 系**（两个地区之一）。
@@ -308,9 +345,9 @@ pub(crate) fn is_qoder_family(provider_id: &str) -> bool {
 /// `providers::PROVIDERS` 注册表），需要**枚举**全部 id 时直接遍历那张表。
 /// 于是以后加 provider（CatPaw / AutoClaw 已加）只改注册表，账号层零改动。
 ///
-/// 各家**专属**的分支（小浣熊的公开字段集、桌面端实时凭证、添加/导入路径）
-/// 仍然按 id 判定 —— 那是「这一家的特殊行为」，不是白名单，改动量随新家到来
-/// 天然增加（每一家都有自己的一套字段与凭证链路）。
+/// 各家**专属**的分支（小浣熊的公开字段集、桌面端实时凭证）仍然按 id 判定
+/// —— 那是「这一家的特殊行为」，不是白名单，改动量随新家到来天然增加
+/// （每一家都有自己的一套字段集）。
 pub(crate) const RACCOON_PROVIDER_ID: &str =
     crate::server::core::providers::kind_id(
         crate::server::core::providers::ProviderKind::Raccoon,

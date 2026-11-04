@@ -15,6 +15,8 @@
 //!            / cache_read_tokens / cache_read_input_tokens（Anthropic 风格）
 //!            / 驼峰的 cacheReadTokens / cachedInputTokens
 //!            / input_tokens_details.cached_tokens（Responses 系的新形态）
+//!   积分消耗：credit（WorkBuddy 的 `usage.credit`，可带小数）
+//!            / credits / credit_used / creditUsed / credit_cost 等常见别名
 //! 取到哪个算哪个：宁可少记一项，也不要因为字段名对不上而把整条记成 0。
 //!
 //! ── 为什么同一个含义的多个别名要「取第一个正数」而不是「取第一个存在」 ──
@@ -50,17 +52,28 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{Map, Value};
 
+mod attempt;
+pub use attempt::{
+    AttemptDetail, RetryEvent, MAX_ATTEMPT_DETAILS, MAX_ATTEMPT_ERROR_CHARS,
+    MAX_ATTEMPT_ACCOUNT_CHARS, MAX_ATTEMPT_RETRY_REASON_CHARS, MAX_ATTEMPT_NOTICE_CHARS,
+};
+
 use crate::server::logging;
 
-/// 一次上报的用量（四种 token 计数，字段名对应存储契约）。
+/// 一次上报的用量（四种 token 计数 + 可选的积分消耗，字段名对应存储契约）。
 ///
-/// 只有四槽是因为存储契约只有四列（见模块头部「为什么不设 cache_write」那条）。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 四类 token 是整数计数；`credit` 是**计费读数**（上游按请求计价的家才给，
+/// 例如 WorkBuddy 的 `usage.credit`），可以为小数，因此单独用 `Option<f64>`
+/// 表达 —— `None` = 这一家没上报，与「上报了 0」是两件事。
+///
+/// 只有这几槽是因为存储契约只有这几列（见模块头部「为什么不设 cache_write」那条）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UsageTokens {
     pub prompt: i64,
     pub completion: i64,
     pub total: i64,
     pub cache_read: i64,
+    pub credit: Option<f64>,
 }
 
 /// 「输入 token 数」的别名表（含驼峰形态）。**表序就是优先序**：多项都命中时按表序
@@ -103,6 +116,32 @@ const CACHE_READ_KEYS: &[&str] = &[
 /// `input_tokens_details` 是 Responses 系把 prompt 改叫 input 之后的同名容器。
 /// 两个容器都查：上游同时给两份、其中一份是废值的情况已经出现过（模块头部）。
 const CACHE_READ_CONTAINERS: &[&str] = &["prompt_tokens_details", "input_tokens_details"];
+/// 「积分消耗」的别名表（顺序即优先序）。
+///
+/// WorkBuddy 的 `usage.credit` 是已实测的一手形态；其余是兼容实现常见的
+/// 下划线 / 驼峰写法。`points_*` 一组来自 Loomy 生图的 `points_consumed`
+/// （同样是实测形态），也一并认，好让「上游把积分叫 points」的家不需要再改表。
+/// 末尾的 `cost` 来自 Cline 的 `usage.cost`：它是**美元成本**而不是积分，
+/// 按「积分列就是计费读数」的产品口径与积分共用一列（排在最后，同时存在时
+/// 仍优先取 credit）。与 token 的别名表同一条规矩：取**第一个正数**，避免
+/// 某个恒 0 的别名把真值挡在后面；一个别名都没有时才返回 None。
+const CREDIT_KEYS: &[&str] = &[
+    "credit",
+    "credits",
+    "credit_used",
+    "creditUsed",
+    "credits_used",
+    "creditsUsed",
+    "credit_cost",
+    "creditCost",
+    "credit_consumed",
+    "creditConsumed",
+    "points_consumed",
+    "pointsConsumed",
+    "points_used",
+    "pointsUsed",
+    "cost",
+];
 
 /// 从 usage 对象里提取 token 数（字段名兼容与「第一个正数」口径见模块头部）。
 ///
@@ -121,7 +160,17 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
         .find_map(|details| first_positive(details, CACHE_READ_KEYS))
         .or_else(|| first_positive(object, CACHE_READ_KEYS))
         .unwrap_or(0);
-    Some(UsageTokens { prompt, completion, total, cache_read })
+    let credit = first_amount(object, CREDIT_KEYS);
+    Some(UsageTokens { prompt, completion, total, cache_read, credit })
+}
+
+/// 从一个 JSON 对象里按积分别名取读数。
+///
+/// 给「本次消耗直接挂在响应顶层、不在 `usage` 里」的家用：Loomy 生图的
+/// `points_consumed` 就是这种形态（`{created, data:[…], points_consumed}`）。
+/// 与 [`extract_usage`] 共用同一张 [`CREDIT_KEYS`] 别名表，所以别名一改两边同时生效。
+pub fn credit_from_object(object: &Map<String, Value>) -> Option<f64> {
+    first_amount(object, CREDIT_KEYS)
 }
 
 /// 按别名表依次取**第一个正数**（口径见模块头部）。
@@ -161,6 +210,38 @@ fn positive_field(value: Option<&Value>) -> Option<i64> {
         _ => None,
     };
     raw.filter(|number| *number > 0)
+}
+
+/// 按别名表取**第一个正数**；全是 0 时返回显式的 0（「上报了 0」）。
+///
+/// 与 [`first_positive`] 的差别只有两处，都是为了计费读数：
+///   - **不截断小数**（`0.06` 必须原样保留，不能变成 0）；
+///   - 0 不再是废值：所有别名都显式给 0 时，这条请求确实「零积分」，
+///     与「一个别名都没有」（None = 这一家不提供该读数）必须分开。
+///
+/// 负数仍然当废值丢掉（手改的库 / 上游溢出）：它既不能当「有值」，
+/// 也不能当「零消耗」。
+fn first_amount(object: &Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    let mut zero = None;
+    for key in keys {
+        let Some(value) = amount_field(object.get(*key)) else { continue };
+        if value > 0.0 {
+            return Some(value);
+        }
+        zero = zero.or(Some(0.0));
+    }
+    zero
+}
+
+/// 取非负有限浮点数：认数字与「数字字符串」（与 [`positive_field`] 同一兼容面，
+/// 但不做 i64 截断）。
+fn amount_field(value: Option<&Value>) -> Option<f64> {
+    let raw = match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    raw.filter(|number| number.is_finite() && *number >= 0.0)
 }
 
 /// 在途请求当前所处的**转发阶段**（请求日志状态列的第一个读数）。
@@ -275,6 +356,13 @@ pub struct TelemetrySnapshot {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    /// 上游按请求上报的**积分消耗**（WorkBuddy 的 `usage.credit`；`None` = 这一家
+    /// 不提供该读数，落库为 NULL，前端显示「—」而不是 0）。
+    ///
+    /// 与 token 四件套同一「最后一次上报覆盖」口径：一次请求可能有多轮尝试，
+    /// 终态记账只保留最后那次上游 `usage` 里的值（与 prompt / completion 同源）。
+    pub credit: Option<f64>,
+    pub quota_channel: String,
     /// 上游首帧到达的**绝对时刻**（毫秒 Unix 时间戳；None = 全程没有帧到达，
     /// 例如转发前就失败 / 请求尚未开始下发）。
     ///
@@ -350,6 +438,8 @@ pub struct TelemetrySnapshot {
     /// 条数上限见 [`MAX_ATTEMPT_DETAILS`]：这是一条请求内的内存小数组，
     /// 落库时序列化成 JSON 文本，必须有上界。
     pub attempts_detail: Vec<AttemptDetail>,
+    pub route: Option<Value>,
+    route_revision: u64,
 }
 
 /// 一个被命中的敏感词及其次数（`TelemetrySnapshot::sensitive_hits` 的元素）。
@@ -365,140 +455,6 @@ pub struct SensitiveHit {
     /// 本次请求里命中的次数
     pub count: i64,
 }
-
-/// 单次上游尝试的明细（`TelemetrySnapshot::attempts_detail` 的元素）。
-///
-/// 字段刻意取窄：前端弹层要显示的就这几样（谁 → 成没成 → 为什么）。
-/// 不记时间戳与耗时：那是「每次尝试各花了多久」的另一个问题，转发链路上
-/// 没有现成的分段计时，为它加钩子要动 `send_with_retry` 的每一层 ——
-/// 收益不抵改动面（总耗时与首响已经在明细里给出）。
-///
-/// ── `account` / `retries` / `notice` 为什么在这里（逐请求日志收敛）──
-/// 改造前这三样各自在**运行日志**里打一行：「账号 X 转发失败按队列顺延」
-/// 带账号名、「5 秒后重试（第 n/N 次）」带退避次数、「账号代理不可用，本次
-/// 直连」带出口回退。它们全是**逐请求**的事实，却只能去「日志」页看，
-/// 而请求日志页的同一行请求那里恰好缺这几样（弹层里只有 provider）。
-/// 收进明细后，请求日志的一行 + 一次悬停就能回答「换了谁、每轮重试了几次、
-/// 为什么重试、出口有没有降级」，运行日志不再需要为每一次转发写行。
-///
-/// 三者都是**有采集才有值**：旧行没有这些键，`default` 读成空/None，
-/// 展示层对空值与旧数据一视同仁（不显示那一行），不给旧数据猜值。
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct AttemptDetail {
-    /// 这一轮实际发送的 provider id
-    pub provider: String,
-    /// 这一轮承载的**账号展示名**（账号名 → 会话昵称 → 账号 id 的兜底链，
-    /// 与 `note_attempt` 给 `account_name` 的口径完全一致）。
-    ///
-    /// 与 `provider` 并列而不是替代它：一家可以有多个账号，弹层里
-    /// 「WorkBuddy / aibjchat001@gmail.com」比只有家名更能定位到那一轮。
-    /// 空串 = 该轮没有账号记录（用默认登录态转发），展示层给占位文案。
-    #[serde(default)]
-    pub account: String,
-    /// 这一轮的 HTTP 状态码。
-    ///
-    /// `None` = 还在飞（请求尚未收尾，例如正在流式下发）或传输层失败
-    /// （DNS / 连接 / 代理，压根没拿到响应头）。两者的区别由 `error` 表达：
-    /// 有摘要 = 已定性为失败，没有摘要且 None = 这一轮还没定论。
-    #[serde(default)]
-    pub status: Option<i64>,
-    /// 这一轮的失败摘要（成功或还在飞时为 None）。
-    ///
-    /// 成功的那一轮**也留在链里**（带 status、不带 error）—— 「切换路径」要
-    /// 显示完整的一串（A → B → C），最后那个成功的 C 正是读者要找的答案。
-    #[serde(default)]
-    pub error: Option<String>,
-    /// 这一轮**内部**的退避重试（`[{reason, status, delayMs}]`，按发生顺序）。
-    ///
-    /// ── 为什么挂在明细里而不是追加新的明细 ────────────────────
-    /// 同账号内的退避重发**不算一次新尝试**（口径见 `TelemetrySnapshot::attempts`
-    /// 的说明：`attempts` 回答「换了几个账号」，不是「打了几次上游」）。
-    /// 若为它追加明细，弹层里的「切换路径」就会多出一串同名同账号的项，
-    /// 把真正的换号链埋掉。所以它作为**那一轮的下级事件**存在这里。
-    ///
-    /// 空表 = 这一轮没有重试（绝大多数请求）。
-    #[serde(default)]
-    pub retries: Vec<RetryEvent>,
-    /// 这一轮的**提示**（非失败、但值得记一笔的过程事实）。
-    ///
-    /// 目前只有一种来源：账号代理不可用、本次回退直连（改造前是
-    /// `[Upstream] ⚠️ 账号代理不可用…` 那行运行日志）。它是**每一条**用该
-    /// 账号的请求都会发生的事，正因如此更不该按请求往运行日志里灌。
-    #[serde(default)]
-    pub notice: Option<String>,
-    /// 这一轮**实际发给上游**的体字节数（None = 没发出去过：本地就拒 / 被尺寸门挡）。
-    ///
-    /// 为什么要记：上游有两道按**请求体字节**判的墙（见
-    /// `providers::codearts::chat::size_rejection` 的实测数），而库里那份
-    /// `request_raw.request_body` 在 131072 字节处截断 —— 于是下一次生产 413 我们
-    /// 仍然回答不出「它到底多大、撞的是哪道墙」。这里的数是发送点 `payload.len()`
-    /// 的**真值**，不是从 `Value` 估的。
-    ///
-    /// 只记体积、不记内容：体积是运维事实，正文是用户数据。
-    #[serde(rename = "bodyBytes", default)]
-    pub body_bytes: Option<i64>,
-}
-
-/// 一次**尝试内部**的退避重试（`AttemptDetail::retries` 的元素）。
-///
-/// 三个字段回答三个问题：为什么重试（`reason`）、上游当时怎么回的
-/// （`status`）、等了多久（`delay_ms`）。不记重试序号：数组顺序就是发生顺序，
-/// 前端按下标 +1 即可（与 `attempts_detail` 的序号同一手法）。
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RetryEvent {
-    /// 重试原因（适配器给的 provider 专属措辞，或编排层的通用兜底措辞）
-    pub reason: String,
-    /// 触发重试的 HTTP 状态码；`None` = 传输层失败（压根没有响应头）
-    #[serde(default)]
-    pub status: Option<i64>,
-    /// 本次退避时长（毫秒）
-    ///
-    /// 键名 camelCase：这个结构整体序列化进 `attemptDetails` 那个 JSON 列，
-    /// 前端直接读它 —— 与本项目其余跨端字段（`attemptDetails` / `sensitiveHits`
-    /// / `firstResponseMs`）同一写法。
-    #[serde(rename = "delayMs", default)]
-    pub delay_ms: u64,
-}
-
-/// `attempts_detail` 的长度上限。
-///
-/// 选路循环本身有 `MAX_ROUTE_ATTEMPTS`（32）兜底，但那只在**账号轮换**这条
-/// 路径上生效；同账号内的退避重试（`send_with_retry` 的循环）不计入 attempts，
-/// 也不会往这里追加。所以 32 已经是理论上界，这里再取一个更小的值作为
-/// **落库体积**的上限：每条明细最多几行文本，24 条 × 几条 ≈ 几 KB，
-/// 对一条请求日志来说是合理的。
-///
-/// 为什么是「保头」而不是「保尾」：链的开头是「第一次打给谁、为什么失败」，
-/// 那正是排障最需要的（尾部几轮往往是同一个错误的重复）。
-/// 截断不在数据里补标记项 —— 前端手上本来就有 `attempts`（总数），
-/// 判 `attempts_detail.length < attempts` 即可显示「只保留前 N 条」，
-/// 比在 JSON 里塞一条结构不同的伪明细更干净（那种伪项会让所有读侧都要先判类型）。
-pub const MAX_ATTEMPT_DETAILS: usize = 24;
-
-/// 单条尝试明细里错误摘要的字符上限。
-///
-/// 取值与请求日志那列的 `ERROR_SUMMARY_CHARS`（`api::pipeline`）**有意相同**：
-/// 同一个失败在两个地方（列表的「错误」列、重试弹层里的某一次尝试）显示成长度
-/// 不同的两段文案，会让读者以为它们说的是两件事。两处是独立常量而不是共享一个
-/// —— 本模块在 `core` 下，不能反向依赖 `api`（见 `core/mod.rs` 的约定），
-/// 修改其中一处时**必须**同步另一处，这条注释就是那个提醒。
-pub const MAX_ATTEMPT_ERROR_CHARS: usize = 200;
-
-/// 明细里账号展示名的字符上限。
-///
-/// 账号名是用户自己填的自由文本（导入的账号名可能是邮箱、昵称、一长串备注），
-/// 而弹层里它与 provider 名同处一行。60 个字符足够放一个邮箱加中文昵称，
-/// 再长就让它省略 —— 明细是「一眼看清谁承载了这一轮」的读数，不是账号名片。
-pub const MAX_ATTEMPT_ACCOUNT_CHARS: usize = 60;
-
-/// 单条重试原因的字符上限。
-///
-/// 比错误摘要短：重试原因是一句「为什么再试一次」（如「上游敏感词拦截（11128）」），
-/// 不是完整的上游报文 —— 后者在 `error` 与调试模式的原始报文里都有。
-pub const MAX_ATTEMPT_RETRY_REASON_CHARS: usize = 120;
-
-/// 单条明细里提示文案的字符上限。
-pub const MAX_ATTEMPT_NOTICE_CHARS: usize = 200;
 
 /// 按字符截断（超出部分用 `…` 收尾）。
 ///
@@ -569,6 +525,9 @@ struct LiveStamp {
     last_error: bool,
     last_retries: usize,
     last_notice: bool,
+    last_response_at: Option<i64>,
+    last_finished_at: Option<i64>,
+    route_revision: u64,
     sensitive: usize,
 }
 
@@ -589,6 +548,9 @@ impl LiveStamp {
             last_error: last.map(|item| item.error.is_some()).unwrap_or(false),
             last_retries: last.map(|item| item.retries.len()).unwrap_or(0),
             last_notice: last.map(|item| item.notice.is_some()).unwrap_or(false),
+            last_response_at: last.and_then(|item| item.response_at),
+            last_finished_at: last.and_then(|item| item.finished_at),
+            route_revision: snapshot.route_revision,
             sensitive: snapshot.sensitive_hits.len(),
         }
     }
@@ -628,10 +590,6 @@ pub struct RequestTelemetry {
     /// 轮询）手上只有 telemetry，令牌放这里它们才够得着；接线在入口 handler
     /// （`api::chat` / `api::protocol` 在 `record_started` 之后装入）。
     cancel: Mutex<Option<Arc<super::cancellation::CancelToken>>>,
-    /// 本次请求的**选路决策快照**（`rotate::select_target_account` 产出，
-    /// 转发层每次选路后覆盖 —— 最后一次为准）。请求日志「路由回放」的数据源；
-    /// None = 没走到账号选路（转发前就失败、候选集合为空）。
-    route: Mutex<Option<Value>>,
 }
 
 impl Default for RequestTelemetry {
@@ -647,25 +605,7 @@ impl RequestTelemetry {
             capture: Mutex::new(None),
             live: Mutex::new(LiveWrite::default()),
             cancel: Mutex::new(None),
-            route: Mutex::new(None),
         }
-    }
-
-    /// 挂本次请求的选路决策快照（选路层每次覆盖，最后一次 = 最终承载那次）。
-    pub fn set_route_decision(&self, decision: Value) {
-        let mut guard = self
-            .route
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(decision);
-    }
-
-    /// 取选路决策快照（记账点在请求收尾时取走落库；没走到选路时为 None）。
-    pub fn route_decision(&self) -> Option<Value> {
-        self.route
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
     }
 
     /// 建一个已带关联 id 的槽位（三个对话入口都走这条：转发开始前生成一次）。
@@ -855,45 +795,8 @@ impl RequestTelemetry {
         self.flush_live(&guard);
     }
 
-    /// 追加一条**尝试明细**（这一轮发给了谁；结果稍后由
-    /// [`Self::finish_last_attempt`] 补）。
-    ///
-    /// ── 为什么分两步写（先起头、后补结果）────────────────────────
-    /// 一次尝试的「谁」在发送**之前**就确定了（那时才决定发送体、才有 provider），
-    /// 而「成没成」要等上游响应头到手才知道。如果只在结果处记一条，那么
-    /// **传输层失败**（`send_chat_request` 报错、压根没有响应）这条路径就永远
-    /// 记不上 —— 而那恰恰是最需要看到的一类失败（DNS / 代理 / 连接被拒）。
-    /// 分两步之后，任何一条走完的路径都至少留下「谁 + 结果」，不存在漏记。
-    ///
-    /// 与 [`Self::note_attempt`] 配对调用（同一次发送前），所以两者条数一致；
-    /// 调用顺序必须是 `note_attempt` → `note_attempt_started`。
-    ///
-    /// `account` 与 `note_attempt` 的 `account_name` 传**同一个值**（调用方算
-    /// 一次、两处用），于是弹层里「这一轮是谁在承载」与报表的账号列不可能对不上。
-    ///
-    /// 超过 [`MAX_ATTEMPT_DETAILS`] 时**丢弃**新条目（保头，理由见那个常量的说明）。
-    /// 调用方不要靠本方法表达「截断了」——那是 `snapshot()` 的职责。
-    pub fn note_attempt_started(&self, provider: &str, account: &str) {
-        let mut guard = self.lock();
-        if guard.attempts_detail.len() >= MAX_ATTEMPT_DETAILS {
-            return;
-        }
-        guard.attempts_detail.push(AttemptDetail {
-            provider: provider.to_string(),
-            account: truncate_chars(account, MAX_ATTEMPT_ACCOUNT_CHARS),
-            status: None,
-            error: None,
-            retries: Vec::new(),
-            notice: None,
-            body_bytes: None,
-        });
-        // 阶段：新一轮的请求**即将发出** → 等待响应（含模型思考）。
-        // 位置与 OmniProxy 的「连接已建立、请求即将发出」同一时点：本函数就在
-        // 发送之前被调用（选路与凭证已就绪），所以「连接中」覆盖的是
-        // 排队 / 选路 / 取凭证 / 建连这一段 —— 与那边的分界一致。
-        self.enter_phase(&mut guard, LogPhase::Waiting);
-        // 在途回写：新的一轮进了尝试链（换号时这一步就让「重试」列出现）
-        self.flush_live(&guard);
+    pub fn note_quota_channel(&self, account: Option<&Value>) {
+        self.lock().quota_channel = account.map(crate::server::core::limiter::counter::channel_of).unwrap_or_default();
     }
 
     /// 给**最后一条**尝试明细补上实际发出的体字节数。
@@ -906,7 +809,7 @@ impl RequestTelemetry {
     /// 不该反过来影响转发结论。
     pub fn note_attempt_body_bytes(&self, bytes: i64) {
         let mut guard = self.lock();
-        if let Some(last) = guard.attempts_detail.last_mut() {
+        if let Some(last) = guard.current_attempt_mut() {
             last.body_bytes = Some(bytes.max(0));
             self.flush_live(&guard);
         }
@@ -918,16 +821,17 @@ impl RequestTelemetry {
     /// 空 `reason` 直接丢弃：明细里出现一条「重试了，但不知道为什么」，
     /// 对排障没有任何价值，还会让弹层多一行噪音。
     pub fn note_attempt_retry(&self, reason: &str, status: Option<i64>, delay_ms: u64) {
+        let debug = self.capture().is_some();
         let reason = reason.trim();
         if reason.is_empty() {
             return;
         }
         let mut guard = self.lock();
-        let Some(last) = guard.attempts_detail.last_mut() else {
+        let Some(last) = guard.current_attempt_mut() else {
             return;
         };
         last.retries.push(RetryEvent {
-            reason: truncate_chars(reason, MAX_ATTEMPT_RETRY_REASON_CHARS),
+            reason: if debug { reason.to_string() } else { truncate_chars(reason, MAX_ATTEMPT_RETRY_REASON_CHARS) },
             status,
             delay_ms,
         });
@@ -954,12 +858,13 @@ impl RequestTelemetry {
         wait_number: usize,
         max_waits: usize,
     ) {
+        let debug = self.capture().is_some();
         let reason = reason.trim();
         if reason.is_empty() {
             return;
         }
         let mut guard = self.lock();
-        let Some(last) = guard.attempts_detail.last_mut() else {
+        let Some(last) = guard.current_attempt_mut() else {
             return;
         };
         // 序号与总数拼进原因里：详情弹窗那一列直接显示它，用户能看出
@@ -970,7 +875,7 @@ impl RequestTelemetry {
             reason.to_string()
         };
         last.retries.push(RetryEvent {
-            reason: truncate_chars(&label, MAX_ATTEMPT_RETRY_REASON_CHARS),
+            reason: if debug { label } else { truncate_chars(&label, MAX_ATTEMPT_RETRY_REASON_CHARS) },
             status,
             delay_ms,
         });
@@ -984,16 +889,17 @@ impl RequestTelemetry {
     /// 后来的（例如重试时又算了一次）不该覆盖先到的那条根因。
     /// 空串不写，理由同 [`Self::note_attempt_retry`]。
     pub fn note_attempt_notice(&self, notice: &str) {
+        let debug = self.capture().is_some();
         let notice = notice.trim();
         if notice.is_empty() {
             return;
         }
         let mut guard = self.lock();
-        let Some(last) = guard.attempts_detail.last_mut() else {
+        let Some(last) = guard.current_attempt_mut() else {
             return;
         };
         if last.notice.is_none() {
-            last.notice = Some(truncate_chars(notice, MAX_ATTEMPT_NOTICE_CHARS));
+            last.notice = Some(if debug { notice.to_string() } else { truncate_chars(notice, MAX_ATTEMPT_NOTICE_CHARS) });
         }
         // 在途回写：提示同样是「这一轮怎么走的」的一部分
         self.flush_live(&guard);
@@ -1011,22 +917,26 @@ impl RequestTelemetry {
     /// 于是那一条明细显示成「A → 失败（无状态码）：连接被拒绝」，
     /// 而不是显示一个凭空捏造的状态码。
     ///
-    /// 错误摘要与请求日志的 `error` 用同一个截断上限（[`MAX_ATTEMPT_ERROR_CHARS`]），
-    /// 截断在**这里**做而不是靠调用方：入口只有这一个，把上限钉在写入侧才能保证
-    /// 「无论谁调用都不会写进一条超长的明细」。
+    /// 调试请求保留完整错误，普通请求按列表摘要上限保存。
     pub fn finish_last_attempt(&self, status: Option<i64>, error: Option<&str>) {
+        let debug = self.capture().is_some();
         let mut guard = self.lock();
-        let Some(last) = guard.attempts_detail.last_mut() else {
+        let Some(last) = guard.current_attempt_mut() else {
             return;
         };
         if status.is_some() {
             last.status = status;
         }
+        if last.response_at.is_none() && error.is_none()
+            && status.is_none_or(|status| (200..300).contains(&status))
+        {
+            last.response_at = Some(logging::now_ms());
+        }
         // 空串摘要按「没有错误」处理（与 RequestEntry.error 的归一同一口径）：
         // 上游返回空 body 时 read_upstream_error 会给出空 message，
         // 那不该渲染成「失败：」后面跟着一片空白
         if let Some(text) = error.filter(|text| !text.is_empty()) {
-            last.error = Some(truncate_chars(text, MAX_ATTEMPT_ERROR_CHARS));
+            last.error = Some(if debug { text.to_string() } else { truncate_chars(text, MAX_ATTEMPT_ERROR_CHARS) });
         }
         // 阶段：这一轮**失败**收场 → 重试中（退避 / 换号前的过渡）。
         // 紧随其后的三种出口都由下一轮或收尾接管：换号走 `note_attempt_started`
@@ -1034,6 +944,9 @@ impl RequestTelemetry {
         // 整个请求失败则收尾把阶段清空（终态行没有阶段）。
         // 成功收场（`error` 为空）不动阶段：那一轮的成功就是这条请求的结局，
         // 收尾紧接着就会到，中间没有可展示的过渡态。
+        if last.error.is_some() || status.is_some_and(|status| !(200..300).contains(&status)) {
+            last.finished_at = Some(logging::now_ms());
+        }
         if last.error.is_some() {
             self.enter_phase(&mut guard, LogPhase::Retrying);
         }
@@ -1052,6 +965,7 @@ impl RequestTelemetry {
         }
         let mut guard = self.lock();
         guard.upstream_model = model.to_string();
+        if let Some(last) = guard.current_attempt_mut().filter(|last| last.finished_at.is_none()) { last.model = model.to_string(); }
         // 在途回写：上游真名是发送体定稿那一刻就确定的，比请求真正发出去还早
         // —— 模型列因此能在转发期间就显示「⬆️ 上游 / ⬇️ 下游」两行
         self.flush_live(&guard);
@@ -1059,15 +973,12 @@ impl RequestTelemetry {
 
     /// 记录「这一次尝试实际随请求发给上游的思考等级」（覆盖式，最后一次为准）。
     ///
-    /// 与 [`Self::note_upstream_model`] 同点调用、同一口径；`None` / 空串不写
-    /// （空串 = 没有等级随行，槽位初始值就是它 —— 「没有」不能覆盖「已采到」，
-    /// 与模型名那条注释同理）。
+    /// 与模型名同点采集；None 表示本次没有等级随行，清除上一次尝试的等级。
     pub fn note_upstream_reasoning(&self, level: Option<String>) {
-        let Some(level) = level.filter(|text| !text.is_empty()) else {
-            return;
-        };
+        let level = level.filter(|text| !text.is_empty()).unwrap_or_default();
         let mut guard = self.lock();
-        guard.upstream_reasoning = level;
+        guard.upstream_reasoning = level.clone();
+        if let Some(last) = guard.current_attempt_mut().filter(|last| last.finished_at.is_none()) { last.reasoning = level; }
         // 在途回写：与模型名同一时刻定稿，进行中行的模型列一并显示等级
         self.flush_live(&guard);
     }
@@ -1085,6 +996,7 @@ impl RequestTelemetry {
         guard.completion_tokens = tokens.completion;
         guard.total_tokens = tokens.total;
         guard.cache_read_tokens = tokens.cache_read;
+        guard.credit = tokens.credit;
     }
 
     /// 记一次「上游首帧已到达」。

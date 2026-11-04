@@ -1,7 +1,9 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
-import { Badge, Button, Input, Switch } from '@ui'
+import { Badge, Button, Input, Switch , Label, Card, CardHeader, CardContent, CardFooter } from '@ui'
 import { t } from '../i18n'
+import { Empty } from '@ui'
 // 「把检查结果交给更新弹窗」与 app.js 的轮询同一条出口，实现在更新家族的共享模块里
 
 /**
@@ -489,7 +491,7 @@ function TasksPanel() {
    *
    * 类名结构与旧模板一一对应（.task-item / .task-main / .task-title / .task-state /
    * .task-actions / .task-interval …），只把控件换成组件库；问号说明仍是
-   * `.tip-q` + `data-tip`（tooltip.js 用 MutationObserver 接住新插入的节点，
+   * `.tip-q` + `data-tip`（desktop-tooltip.tsx 用 MutationObserver 接住新插入的节点，
    * React 渲染出来的也会被增强）。
    *
    * 输入框**不带** `data-island-input`：那是另一个岛（输入框就地升级）的钩子，
@@ -506,14 +508,14 @@ function TasksPanel() {
             {/* 开关与任务名同在一个 label 里（与旧模板同构）：组件库的 Switch 是自绘
                 控件，但 DOM 里带一个真实的隐藏 checkbox，label 的原生激活行为照样
                 把点击转给它 —— 点名字也能拨动开关，与旧实现一致。 */}
-            <label className='switch'>
+            <Label className='switch'>
               <Switch
                 checked={task.enabled === true}
                 onCheckedChange={next => void saveTask(task.id, { enabled: next }, t('{name}开关', { name: t(task.label) }))}
               />
               {/* 任务名 / 描述由后端随任务下发（固定中文常量），走 t() 让词典能翻 */}
               <span className='task-name'>{t(task.label)}</span>
-            </label>
+            </Label>
             <span className='tip-q' data-tip={t(task.description)}></span>
             <Badge className='task-badge' variant={task.enabled ? 'success' : 'outline'}>
               {task.enabled ? t('已开启') : t('已关闭')}
@@ -529,14 +531,7 @@ function TasksPanel() {
         <div className='task-actions'>
           <span className='task-interval'>
             <span className='task-interval-label'>{t('每')}</span>
-            {/* 单位是后端的固定属性（'seconds' | 'minutes'），不是一个可选字段：
-                PATCH 只受理 {enabled?, interval?}，做成下拉会「看着能改、其实不生效」。
 
-                宽度 / 对齐 / 等宽数字写成工具类（组件库的工具类带 !important，能盖过
-                ui/css 里的老规则）：旧实现靠 page-tasks.css 的
-                `.task-interval input[type="number"]` 收窄到 74px 并居中，那条规则随
-                控件迁移会变成死规则被清掉，尺寸得由本岛自己带 —— 否则组件库 Input 的
-                `w-full` 会让输入框撑满整行。 */}
             <Input
               type='number'
               inputMode='numeric'
@@ -604,8 +599,8 @@ function TasksPanel() {
   const rest = cards.slice(LEAD_CARDS)
 
   return (
-    <section className='panel'>
-      <div className='panel-head'>
+    <Card render={<section />} className='panel'>
+      <CardHeader className='panel-head'>
         <h2>{t('任务清单')}</h2>
         {/* id 保留：app.js 的 renderTopbarStatus 会按 id 镜像这枚徽标的文案与配色
             （配色经 data-tone 传，见 badgeTone） */}
@@ -619,15 +614,15 @@ function TasksPanel() {
             {t('刷新')}
           </Button>
         </div>
-      </div>
-      <div className='panel-body'>
+      </CardHeader>
+      <CardContent className='panel-body'>
         <div className='task-list'>
           {empty ? (
-            <div className='log-empty'>
+            <Empty className='log-empty'>
               {loaded
                 ? t('没有可显示的定时任务。后端未返回任务清单，请确认网关正在运行。')
                 : t('正在加载定时任务…')}
-            </div>
+            </Empty>
           ) : (
             <>
               {cards.slice(0, LEAD_CARDS)}
@@ -635,15 +630,15 @@ function TasksPanel() {
             </>
           )}
         </div>
-      </div>
-      <div className='panel-foot'>
+      </CardContent>
+      <CardFooter className='panel-foot'>
         {/* 路径 / 字段名是配置契约、不进词典；两边的中文碎片各走 t()（片段式与 docs-page 脚注同一手法） */}
         <span>
           {t('任务配置保存在 ')}<code>~/.agent2api/config.json</code>{t(' 的 ')}<code>scheduledTasks</code>{t(' 字段')}
         </span>
         <span>{t('改动立即生效，不需要重启程序')}</span>
-      </div>
-    </section>
+      </CardFooter>
+    </Card>
   )
 }
 
@@ -668,10 +663,8 @@ function mount() {
   createRoot(section).render(<TasksPanel />)
 }
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('tasks', PAGE_SELECTOR, mount)
 
 declare global {
   interface Window {

@@ -30,9 +30,10 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Number, Value};
 
+use super::date_range::date_bounds;
 use crate::server::http::{ok_json, parse_query_ms, raw_json};
 use crate::server::logging;
-use crate::server::logs_store::{self, Query as LogQuery};
+use crate::server::logs_store::{self, LogView, Query as LogQuery};
 use crate::server::ServerState;
 
 /// `/api/logs*` 上未匹配子路径的 404：Node 版这些路由模块自己发的 404
@@ -87,6 +88,28 @@ fn effective_limit(raw: Option<&String>) -> usize {
     base.max(1.0).min(logs_store::MAX_ENTRIES as f64) as usize
 }
 
+fn log_query(params: &Params) -> Result<LogQuery, Response> {
+    let mut query = LogQuery {
+        limit: Some(effective_limit(params.get("limit"))),
+        offset: parse_number(params.get("offset")).unwrap_or(0.0).max(0.0) as usize,
+        aggregate: params.get("aggregate").map_or(false, |value| value == "1" || value == "true"),
+        view: params.get("view").map_or(LogView::All, |value| LogView::parse(value)),
+        until_id: parse_number(params.get("untilId")).map(|value| value.max(0.0) as u64),
+        level: params.get("level").cloned(),
+        category: params.get("category").cloned(),
+        keyword: params.get("keyword").cloned(),
+        since_id: parse_number(params.get("sinceId")).map(|value| value.max(0.0) as u64),
+        start: parse_query_ms(params.get("start")),
+        end: parse_query_ms(params.get("end")),
+    };
+    if let Some((start, end)) = date_bounds(params)
+        .map_err(|message| crate::server::errors::management_error(400, message))? {
+        query.start = Some(start);
+        query.end = Some(end);
+    }
+    Ok(query)
+}
+
 /// GET /api/logs
 pub async fn query_logs(State(_state): State<ServerState>, Query(params): Query<Params>) -> Response {
     let store = match store_or_error() {
@@ -94,17 +117,7 @@ pub async fn query_logs(State(_state): State<ServerState>, Query(params): Query<
         Err(response) => return response,
     };
 
-    let query = LogQuery {
-        limit: Some(effective_limit(params.get("limit"))),
-        // level/category 的合法性校验在 LogStore 内（未知值不参与过滤）
-        level: params.get("level").cloned(),
-        category: params.get("category").cloned(),
-        keyword: params.get("keyword").cloned(),
-        since_id: parse_number(params.get("sinceId")).map(|value| value.max(0.0) as u64),
-        // 时间筛选：非法值解析成 None（= 该边界不生效），与 Node 版「有则用、无则忽略」同调
-        start: parse_query_ms(params.get("start")),
-        end: parse_query_ms(params.get("end")),
-    };
+    let query = match log_query(&params) { Ok(query) => query, Err(response) => return response };
 
     let result = store.query(&query);
     let mut data = match serde_json::to_value(&result) {
@@ -151,12 +164,15 @@ pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<
         Ok(store) => store,
         Err(response) => return response,
     };
-    let non_empty = |key: &str| params.get(key).map_or(false, |value| !value.trim().is_empty());
-    let has_filters = non_empty("level")
-        || non_empty("category")
-        || non_empty("keyword")
-        || non_empty("start")
-        || non_empty("end");
+    let query = match log_query(&params) { Ok(query) => query, Err(response) => return response };
+    let has_filters = query.level.as_deref().map_or(false, |level| logs_store::LEVELS.contains(&level.trim().to_lowercase().as_str()))
+        || query.category.as_deref().map_or(false, |category| logs_store::CATEGORIES.iter().any(|(key, _)| *key == category.trim().to_lowercase()))
+        || query.keyword.as_deref().map_or(false, |keyword| !keyword.trim().is_empty())
+        || query.start.is_some()
+        || query.end.is_some()
+        || query.until_id.is_some()
+        || query.since_id.is_some()
+        || query.view != LogView::All;
 
     if !has_filters {
         // ── 护栏：无筛选参数时必须显式声明 all=1 才全清 ──────────────
@@ -181,16 +197,6 @@ pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<
         };
     }
 
-    let query = LogQuery {
-        // 删除没有分页概念：limit 不参与（过滤链在 Query::matches，不含 limit）
-        limit: None,
-        level: params.get("level").cloned(),
-        category: params.get("category").cloned(),
-        keyword: params.get("keyword").cloned(),
-        since_id: None,
-        start: parse_query_ms(params.get("start")),
-        end: parse_query_ms(params.get("end")),
-    };
     let (removed, stats) = store.clear_where(&query);
     logging::log(
         "[Logs]",
@@ -212,12 +218,13 @@ pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<
 }
 
 /// GET /api/logs/download —— 直接回 JSONL 附件
-pub async fn download_logs(State(_state): State<ServerState>) -> Response {
+pub async fn download_logs(State(_state): State<ServerState>, Query(params): Query<Params>) -> Response {
     let store = match store_or_error() {
         Ok(store) => store,
         Err(response) => return response,
     };
-    let body = store.to_jsonl();
+    let query = match log_query(&params) { Ok(query) => query, Err(response) => return response };
+    let body = if params.is_empty() { store.to_jsonl() } else { store.to_jsonl_where(&query) };
     let filename = format!("workbuddy-logs-{}.jsonl", file_stamp());
 
     let mut response = Response::builder()
@@ -245,10 +252,20 @@ fn attach_dictionary(object: &mut serde_json::Map<String, Value>) {
         categories.insert(key.to_string(), Value::String(label.to_string()));
     }
     object.insert("categories".to_string(), Value::Object(categories));
-    object.insert(
-        "max".to_string(),
-        Value::Number(Number::from(logs_store::MAX_ENTRIES as u64)),
-    );
+    let capacity = logs_store::retention_capacity();
+    let warn = logs_store::level_capacity(capacity, "warn");
+    let error = logs_store::level_capacity(capacity, "error");
+    object.insert("max".to_string(), Value::Number(Number::from(capacity as u64)));
+    object.insert("fetchMax".to_string(), json!(logs_store::MAX_ENTRIES));
+    object.insert("retention".to_string(), json!({
+        "events": logs_store::level_capacity(capacity, "info"),
+        "alerts": warn + error,
+        "warn": warn,
+        "error": error,
+        "debug": logs_store::level_capacity(capacity, "debug"),
+        "debugDays": logs_store::DEBUG_RETENTION_DAYS,
+    }));
+    object.insert("debugEnabled".to_string(), json!(logging::is_verbose()));
 }
 
 /// 导出文件名的时间戳：对应 Node 版

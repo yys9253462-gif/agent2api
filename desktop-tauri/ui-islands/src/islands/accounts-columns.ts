@@ -61,7 +61,7 @@ export const ACCOUNT_COLUMNS: AccountColumn[] = [
   { key: 'account', label: t('账号'), align: 'center', legacyAlign: 'left' },
   {
     key: 'proxy', label: t('代理'),
-    title: t('该账号出网走的代理（Clash 出口 / 自定义 / 直连）；点击可修改'),
+    title: t('该账号出网走的代理（已保存的代理 / 自定义 / 直连）；点击可修改'),
     align: 'center',
   },
   {
@@ -90,13 +90,14 @@ const STORE_KEY = 'agent2api-accounts-col-widths'
  * 默认列宽（px）：与 page-accounts-table.css 的 `.cell-*` 一一对应。
  *
  * 改这里**必须**同时改 CSS 与那份文件头的列宽预算说明 —— 三处是同一组数字。
- * 预算：九个固定列合计 1013px（勾选 47 / 顺序 84 / 代理 186 / 连接数 56 / 状态 80 /
- * 限流 148 / 有效期 80 / 余额 132 / 操作 200）。
+ * 预算：九个固定列合计 1241px（勾选 47 / 顺序 84 / 代理 186 / 连接数 56 / 状态 80 /
+ * 限流 148 / 有效期 132 / 余额 308 / 操作 200）。
+ * 有效期 132 是双凭证（仅 CodeArts）同排放「Refresh Token · 317 天后」的最小宽度；
+ * 单凭证的家只占一行，多出来的空间由居中排布吸收，不会显得空。
  * 顺序列 84 是「拖动把手（20）+ 组内序号（如 #12，约 30）+ 间隔」的宽度：它替代了
  * 原先 132px 的优先级列（数字输入 + 两枚箭头），窄了 48px；
  * 代理列 186 是「节点名 :端口」的常见形态 + 选择器自带的约 41px 固定开销；
- * 余额列 132 是「主额度桶两行形态」的最小值（套餐名一行要放得下
- * 「ZCode Trust Build」，被省略号砍成「ZCode Tr…」这一列就白给了）；
+ * 余额列 308 供模型组或三个额度窗口并排显示；用户拖窄后改为纵向，不隐藏窗口；
  * 操作列 200 是四颗按钮并排的最坏情况（「已签到 / 余额 / 设置 / ⋯」），
  * 改按钮文案或增删按钮时重算一遍。
  *
@@ -109,8 +110,8 @@ const DEFAULTS: Record<string, number> = {
   connections: 56,
   status: 80,
   limits: 148,
-  expiry: 80,
-  usage: 132,
+  expiry: 132,
+  usage: 308,
   actions: 200,
 }
 

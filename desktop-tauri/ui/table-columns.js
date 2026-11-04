@@ -101,7 +101,7 @@
       id: 'models',
       mode: 'table',
       root: '.page[data-page="gateway"] table.models-table',
-      columns: ['check', 'model', 'rate', 'source', 'budget', 'caps', 'alias', 'act'].map(key => ({ key })),
+      columns: ['check', 'model', 'rate', 'visibility', 'source', 'budget', 'caps', 'alias', 'act'].map(key => ({ key })),
       columnsOf: visibleColumnsOf(() => window.wbModelsPanel?.visibleColumns?.()),
     },
     {
@@ -139,7 +139,12 @@
         // 客户端（来源 UA 的归类，见后端 core::client）：同列的 track 与
         // page-requests.css 的 grid-template-columns 默认值必须同步
         { key: 'client', sel: '.req-client', track: '110px' },
+        { key: 'apiKey', sel: '.req-api-key', track: '140px' },
         { key: 'dur', sel: '.req-dur', track: '96px' },
+        { key: 'speed', sel: '.req-speed', track: '96px' },
+        // 积分消耗（WorkBuddy 的 usage.credit）：与 page-requests.css 的默认
+        // grid-template-columns 同步；数值右对齐，宽度只够放「0.06」这类读数。
+        { key: 'credit', sel: '.req-credit', track: '72px' },
         { key: 'usage', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
         { key: 'error', sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
         { key: 'detail', sel: '.req-detail', track: '60px' },
@@ -152,10 +157,6 @@
        */
       columnsOf: visibleColumnsOf(() => window.wbRequestsPanel?.visibleColumns?.()),
     },
-    // 签到记录（islands/checkin-records-tab.tsx）：table 模式里唯一**动态表头**的一张 ——
-    // 它的表头与表体都由 React 按列设置现渲染（标签页切走即卸载重建，就地重排那一路
-    // 跟不过重建），所以没有 syncStaticHead 的份；列集合变化由渲染方重画后调 repaint。
-    // root 只在「签到记录」标签页打开时存在（首次进页靠 awaitRoot 等它出现）。
     {
       id: 'checkin-records',
       mode: 'table',

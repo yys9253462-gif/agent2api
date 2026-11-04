@@ -55,16 +55,7 @@ pub fn record(summary: &Value, reason: &str) {
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| {
-                    let error = item.get("error").and_then(Value::as_str)?;
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|text| !text.is_empty())
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        .unwrap_or("未知账号");
-                    Some(format!("{name}（{error}）"))
-                })
+                .filter_map(crate::server::core::billing::checkin::failure_of)
                 .collect()
         })
         .unwrap_or_default();

@@ -35,7 +35,7 @@ function InputGroup({ className, ...props }: React.ComponentProps<'div'>) {
       data-slot='input-group'
       role='group'
       className={cn(
-        'group/input-group relative flex h-[30px] w-full min-w-0 items-center rounded-md border border-control-border bg-control',
+        'group/input-group relative flex h-[30px] w-full min-w-0 items-center rounded-md border border-control-border bg-control max-[767px]:h-10',
         'transition-[border-color,box-shadow] duration-150 ease-out',
         'outline-none',
         // 焦点环与描边跟着内部控件的 focus-visible 走（容器自己不是焦点元素）

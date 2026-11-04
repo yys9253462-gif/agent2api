@@ -1,6 +1,6 @@
 //! 账号批量操作（Agent2API W3-T4 从 `store_crud.rs` 拆出，单文件行数约定）。
 //!
-//!   batch_update  批量修改（启用状态 / 代理 / 并发上限；逐账号调 apply_patch）
+//!   batch_update  批量修改（启用状态 / 代理 / 并发 / 查询 / 限制器；逐账号调 apply_patch）
 //!   batch_remove  批量删除（不存在的 id 记入 failed，不中断整批）
 //!
 //! ── 与单账号操作的关系 ──────────────────────────────────────
@@ -18,14 +18,81 @@ use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::store_view::Visibility;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_crud::normalize_max_concurrent;
 use crate::server::core::account_store::store_util::truncate_chars;
 use crate::server::core::proxies::describe_account_proxy;
+use crate::server::core::{limiter, usage_query};
 use crate::server::logging;
 
+#[derive(Clone, Copy)]
+enum BatchLimiterMode {
+    Append,
+    Replace,
+    Enable,
+    Disable,
+    Clear,
+}
+
+impl BatchLimiterMode {
+    fn parse(value: &Value) -> Result<Self, AccountStoreError> {
+        match value.as_str() {
+            Some("append") => Ok(Self::Append),
+            Some("replace") => Ok(Self::Replace),
+            Some("enable") => Ok(Self::Enable),
+            Some("disable") => Ok(Self::Disable),
+            Some("clear") => Ok(Self::Clear),
+            _ => Err(AccountStoreError::bad_request(
+                "限制器操作必须是追加、替换、启用、停用或清空",
+            )),
+        }
+    }
+
+    fn needs_rules(self) -> bool {
+        matches!(self, Self::Append | Self::Replace)
+    }
+
+    fn apply(
+        self,
+        fields: &Map<String, Value>,
+        incoming: &[limiter::LimiterRule],
+    ) -> Value {
+        let mut current = limiter::effective_rules_in(fields);
+        match self {
+            Self::Append => {
+                // 重复执行同一批操作不能不断叠加相同规则。
+                for rule in incoming {
+                    if !current.contains(rule) {
+                        current.push(*rule);
+                    }
+                }
+            }
+            Self::Replace => current = incoming.to_vec(),
+            Self::Enable | Self::Disable => {
+                let enabled = matches!(self, Self::Enable);
+                for rule in &mut current {
+                    rule.enabled = enabled;
+                }
+            }
+            Self::Clear => current.clear(),
+        }
+        limiter::rules_to_json(&current)
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Append => "限制器 → 追加规则",
+            Self::Replace => "限制器 → 替换规则",
+            Self::Enable => "限制器 → 全部启用",
+            Self::Disable => "限制器 → 全部停用",
+            Self::Clear => "限制器 → 清空规则",
+        }
+    }
+}
+
 impl AccountStore {
-    /// 批量修改账号（目前支持启用状态、代理与并发上限）。
+    /// 批量修改账号；只开放无需逐账号指定身份的配置。
     ///
     /// 语义上是「对每个选中账号各跑一次 update_account」，但整批只落盘一次。
     /// 单个账号失败不中断整批：结果里分别记 ok / failed（含原因）。
@@ -40,8 +107,7 @@ impl AccountStore {
         let Some(patch_object) = patch.as_object() else {
             return Err(AccountStoreError::bad_request("批量修改内容必须是 JSON 对象"));
         };
-        // 批量场景只开放「启用状态」「代理」「并发上限」：优先级必须唯一，逐账号
-        // 指定才有意义，备注名逐个改也说不通，都留给单账号设置面板
+        // 备注名、凭证与优先级属于账号身份，不开放整组覆盖。
         let mut allowed = Map::new();
         let mut enabled_value = false;
         if let Some(value) = patch_object.get("enabled") {
@@ -61,12 +127,53 @@ impl AccountStore {
             let next = normalize_max_concurrent(value)?;
             allowed.insert("maxConcurrent".to_string(), Value::from(next));
         }
-        if allowed.is_empty() {
+        if let Some(value) = patch_object.get("usageQuery") {
+            if !value.is_object() {
+                return Err(AccountStoreError::bad_request("批量查询设置必须是 JSON 对象"));
+            }
+            allowed.insert("usageQuery".to_string(), Self::normalize_usage_query(value)?);
+        }
+        let limiter_mode = patch_object
+            .get("limiterMode")
+            .map(BatchLimiterMode::parse)
+            .transpose()?;
+        let incoming_groups = patch_object.get("limiterGroups")
+            .map(limiter::normalize_groups).transpose().map_err(AccountStoreError::bad_request)?;
+        if let Some(groups) = &incoming_groups {
+            if groups.iter().any(|group| group.conditions.iter().any(|condition| {
+                !matches!(condition.source_id.as_str(), "" | "account" | "local")
+            })) {
+                return Err(AccountStoreError::bad_request("套餐实例不能跨账号复制，请使用通用条件"));
+            }
+            if groups.is_empty() && limiter_mode.is_some_and(BatchLimiterMode::needs_rules) {
+                return Err(AccountStoreError::bad_request("请至少添加一个条件组"));
+            }
+        }
+        let incoming_rules = if incoming_groups.is_none() && limiter_mode.is_some_and(BatchLimiterMode::needs_rules) {
+            let value = patch_object
+                .get("limiters")
+                .filter(|value| value.is_array())
+                .ok_or_else(|| AccountStoreError::bad_request("追加或替换限制器时必须提供规则数组"))?;
+            let rules = limiter::normalize_rules(value, &Map::new())
+                .map_err(AccountStoreError::bad_request)?;
+            if rules.is_empty() {
+                return Err(AccountStoreError::bad_request("请至少添加一条限制规则；清空请使用清空操作"));
+            }
+            rules
+        } else {
+            Vec::new()
+        };
+        if allowed.is_empty() && limiter_mode.is_none() {
             return Err(AccountStoreError::bad_request(
-                "批量修改目前只支持启用状态、代理与并发上限",
+                "批量修改只支持启用状态、代理、并发上限、查询设置与限制器",
             ));
         }
 
+        let group_needs_usage = incoming_groups.as_ref().is_some_and(|groups| groups.iter().any(|group|
+            group.conditions.iter().any(|condition| !matches!(condition.metric, limiter::types::Metric::Tokens | limiter::types::Metric::Requests))));
+        let needs_usage = allowed.contains_key("usageQuery")
+            || (limiter_mode.is_some_and(BatchLimiterMode::needs_rules)
+                && (group_needs_usage || incoming_rules.iter().any(|rule| rule.kind == limiter::LimiterKind::Balance)));
         let _guard = self.guard();
         // 批量操作按语义要遍历**选中的那些账号**（逐条 apply_patch、逐条记
         // ok/failed），所以这里是「按需取那几条」而不是读全量：ids 里的每一项
@@ -74,6 +181,7 @@ impl AccountStore {
         // 全解析一遍。
         let mut ok: Vec<Value> = Vec::new();
         let mut failed: Vec<Value> = Vec::new();
+        let mut skipped: Vec<Value> = Vec::new();
         // 要写的行（在内存里改好，最后一次性进事务）：只有改动过的才写，于是
         // 「批量点了确定但没有任何字段真的变化」不会产生任何写入
         // （旧实现在那种情况仍会整份重写文件）。
@@ -89,11 +197,61 @@ impl AccountStore {
             };
             let name = record.name();
             let provider = record.provider();
+            // 访客账号与「这家没有余额查询」同一档（见 `usage_query::supports_usage`）：
+            // 它不参与余额查询，写一份查询设置进去只会得到一份永不生效的配置 ——
+            // 界面上还会因此多出「查询设置」段与自动查询的排期。
+            //
+            // 判据读**公开形态**：插件账号的 `isGuest` 在 `pluginPublic` 里，
+            // 直接 `record.get("isGuest")` 读不到（见 `plugin_accounts` 的说明）。
+            let guest = self
+                .public_account(&record)
+                .get("isGuest")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let has_usage = !needs_usage || (!guest && usage_query::supports_usage_provider(&provider));
+            let mut account_patch = allowed.clone();
+            if !has_usage {
+                account_patch.remove("usageQuery");
+            }
+            if let Some(mode) = limiter_mode {
+                if mode.needs_rules()
+                    && !has_usage
+                    && (group_needs_usage || incoming_rules.iter().any(|rule| rule.kind == limiter::LimiterKind::Balance))
+                {
+                    skipped.push(json!({
+                        "id": id, "name": name,
+                        "reason": "该提供商没有余额查询，不能应用余额限制规则",
+                    }));
+                    continue;
+                }
+                if incoming_groups.is_some() || record.fields().contains_key("limiterGroups") && !mode.needs_rules() {
+                    let mut groups = limiter::effective_groups_in(record.fields());
+                    match mode {
+                        BatchLimiterMode::Append => for group in incoming_groups.iter().flatten() {
+                            if !groups.contains(group) { groups.push(group.clone()); }
+                        },
+                        BatchLimiterMode::Replace => groups = incoming_groups.clone().unwrap_or_default(),
+                        BatchLimiterMode::Enable | BatchLimiterMode::Disable => for group in &mut groups {
+                            group.enabled = matches!(mode, BatchLimiterMode::Enable);
+                        },
+                        BatchLimiterMode::Clear => groups.clear(),
+                    }
+                    account_patch.insert("limiterGroups".to_string(), limiter::types::json_of(&groups));
+                } else {
+                    account_patch.insert("limiters".to_string(), mode.apply(record.fields(), &incoming_rules));
+                }
+            }
+            if account_patch.is_empty() {
+                skipped.push(json!({
+                    "id": id, "name": name, "reason": "该提供商没有余额查询",
+                }));
+                continue;
+            }
             let was_enabled = record.enabled();
             // 优先级冲突判定：批量入口刻意**不开放** priority（见上面的 allowed
             // 注释），所以这个回调不会被调用 —— 给一个必然成功的实现，
             // 保持 `apply_patch` 的签名统一（它要能表达"这个 patch 可能改优先级"）。
-            match Self::apply_patch(&mut record, &allowed, |_| Ok(None)) {
+            match Self::apply_patch(&mut record, &account_patch, |_| Ok(None)) {
                 Ok(changes) => {
                     if !changes.is_empty() {
                         record.set_updated_at(logging::now_ms());
@@ -123,6 +281,7 @@ impl AccountStore {
         }
         // 写库完成后再动注册表（放锁，见 `disabled_catpaw` 的说明）
         drop(_guard);
+        if limiter_mode.is_some() { limiter::counter::invalidate(); }
         for (id, provider) in disabled_catpaw {
             self.invalidate_catpaw_sessions(&id, &provider);
         }
@@ -135,7 +294,7 @@ impl AccountStore {
         // （批量本来就是低频、少量条目的操作）。
         let snapshot = {
             let guard = self.guard();
-            self.snapshot(&self.load(&guard))
+            self.snapshot(&self.load(&guard), Visibility::UserFacing)
         };
         // 摘要文案：与 Node 版逐字一致（enabled 与 proxy 两种说法）
         let mut summary: Vec<String> = Vec::new();
@@ -165,6 +324,12 @@ impl AccountStore {
                 format!("并发上限 → {value}")
             });
         }
+        if let Some(value) = allowed.get("usageQuery") {
+            summary.push(Self::describe_usage_query(value));
+        }
+        if let Some(mode) = limiter_mode {
+            summary.push(mode.summary().to_string());
+        }
         let changed_count = ok
             .iter()
             .filter(|item| {
@@ -177,17 +342,22 @@ impl AccountStore {
         logging::log(
             "[Accounts]",
             &format!(
-                "🔀 批量修改 {} 个账号（{}）: 成功 {changed_count} 个{}",
+                "🔀 批量修改 {} 个账号（{}）: 成功 {changed_count} 个{}{}",
                 ids.len(),
                 summary.join("，"),
                 if failed.is_empty() {
                     String::new()
                 } else {
                     format!("，失败 {} 个", failed.len())
+                },
+                if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!("，跳过 {} 个", skipped.len())
                 }
             ),
         );
-        Ok(json!({ "ok": ok, "failed": failed, "list": snapshot }))
+        Ok(json!({ "ok": ok, "failed": failed, "skipped": skipped, "list": snapshot }))
     }
 
     /// 批量删除账号。不存在的 id 记入 failed 而不是整体报错 —— 用户重复点删除
@@ -239,7 +409,7 @@ impl AccountStore {
         if targets.is_empty() {
             // 没有任何一条可删：不写库，直接给当前快照
             let state = self.load(&_guard);
-            return Ok(json!({ "removed": removed, "failed": failed, "list": self.snapshot(&state) }));
+            return Ok(json!({ "removed": removed, "failed": failed, "list": self.snapshot(&state, Visibility::UserFacing) }));
         }
         // 整批一个事务：删除要么全生效、要么一条都不删
         self.with_conn_mut(&_guard, |conn| {
@@ -250,7 +420,7 @@ impl AccountStore {
             tx.commit()
         })?;
         let state = self.load(&_guard);
-        let snapshot = self.snapshot(&state);
+        let snapshot = self.snapshot(&state, Visibility::UserFacing);
         let names: String = removed
             .iter()
             .filter_map(|item| item.get("name").and_then(Value::as_str))

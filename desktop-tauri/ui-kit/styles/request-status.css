@@ -1,0 +1,22 @@
+@layer components {
+  .badge.tag.running, .badge.tag.phase-connecting, .badge.tag.phase-streaming {
+    border-color: var(--ui-success-bd);
+    background: var(--ui-success-soft);
+    color: var(--ui-success);
+  }
+  .badge.tag.phase-waiting {
+    border-color: var(--ui-info-bd);
+    background: var(--ui-info-soft);
+    color: var(--ui-info);
+  }
+  .badge.tag.phase-retrying, .badge.tag.phase-queued {
+    border-color: var(--ui-warning-bd);
+    background: var(--ui-warning-soft);
+    color: var(--ui-warning);
+  }
+  .badge.tag.sensitive {
+    border-color: var(--ui-sensitive-bd);
+    background: var(--ui-sensitive-soft);
+    color: var(--ui-sensitive);
+  }
+}

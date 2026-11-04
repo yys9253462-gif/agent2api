@@ -1,23 +1,6 @@
-/* ─────────────────────────────────────────────
-   Agent2API · 组件库设计令牌
-
-   取值来源：omniui-react 设计稿的 theme.css。那份设计稿不进仓库 —— 它不是本项目的
-   产物、带 omniui-react 的私有版权头，且取值已全部承接到下面的 --ui-* 变量上
-   （本文件才是唯一事实来源，改令牌改这里）。
-   另补一层控件令牌（--ui-control-* / --ui-surface-3 / --ui-text-2 等），
-   取自 ui/css/tokens.css 里既有的控件观感 —— 组件库要能逐像素复刻现有界面。
-
-   为什么变量名统一加 `--ui-` 前缀：
-   ui/css/tokens.css 已经定义了 --primary / --border / --radius / --font-sans
-   等同名变量，且取值不同（例如 --border 那边是半透明黑 oklch(0.145 0 0 / 10%)，
-   设计稿是实色 oklch(0.93 0 0)）。两套同名变量在 :root 上会按加载顺序互相覆盖，
-   老页面所有 var(--border) 的描边颜色都会跟着变。前缀隔离后各用各的，
-   将来统一令牌只需把老 CSS 的引用逐处改指 --ui-*。
-
-   主题机制与 ui/css/tokens.css 保持一致：:root[data-theme="dark"] 显式深色，
-   :root[data-theme="system"] 在 prefers-color-scheme: dark 下取深色值
-   （app.js 的 applyTheme 写的是 data-theme，不是 .dark class）。
-   ───────────────────────────────────────────── */
+/* Agent2API · 桌面端、移动端与插件共享的唯一设计令牌源。
+   --ui-* 保存取值，aliases.css 兼容业务样式使用的旧变量名。
+   主题由 data-theme 控制，system 分支通过媒体查询跟随系统。 */
 
 /* dark: 变体跟着 data-theme 走，而不是 shadcn 默认的 .dark class。
    两个分支都要有：显式 dark 与 system 跟随，后者靠媒体查询兜住。 */
@@ -112,17 +95,13 @@
   /* 次级文字中间档（--text-2）：muted-foreground 是第三档（--text-3） */
   --color-subtle: var(--ui-text-2);
   --color-nav-hover: var(--ui-nav-hover);
-  /* 导航项 / 左栏的配色（NavItem 用）。
-     这几个是 ui/css/tokens.css 已经定好、并且随主题自动翻转的令牌 —— 组件库
-     不另立一份取值，而是**引用**它们（取不到时用同一档的兜底值）。
-     复制取值会有两处真源：主题一改就漂移，而这类「选中态底色」的漂移肉眼很难发现。
-     兜底值仅供组件库在宿主没加载 tokens.css 时单独使用。 */
-  --color-sidebar-fg: var(--sidebar-fg, oklch(0.43287 0.01676 258.37));
-  --color-sidebar-muted: var(--sidebar-muted, oklch(0.512 0.02088 261.29));
-  --color-rail-bg: var(--rail-bg, oklch(0.955 0.004 286));
-  --color-nav-selected-bg: var(--nav-selected-bg, oklch(0.89318 0.04237 253.82));
-  --color-nav-selected-border: var(--nav-selected-border, oklch(0.83311 0.05788 254.15));
-  --color-nav-selected-fg: var(--nav-selected-fg, oklch(0.42649 0.12275 255.6));
+  /* 导航项与侧栏共用同一套主题令牌。 */
+  --color-sidebar-fg: var(--ui-sidebar-fg);
+  --color-sidebar-muted: var(--ui-sidebar-muted);
+  --color-rail-bg: var(--ui-rail-bg);
+  --color-nav-selected-bg: var(--ui-nav-selected-bg);
+  --color-nav-selected-border: var(--ui-nav-selected-border);
+  --color-nav-selected-fg: var(--ui-nav-selected-fg);
 
   --color-chart-1: var(--ui-chart-1);
   --color-chart-2: var(--ui-chart-2);
@@ -140,14 +119,31 @@
   --color-skeleton-base: var(--ui-skeleton-base);
   --color-skeleton-highlight: var(--ui-skeleton-highlight);
 
-  --radius-xs: calc(var(--ui-radius) * 0.5);
-  --radius-sm: calc(var(--ui-radius) * 0.6);
-  --radius-md: calc(var(--ui-radius) * 0.8);
-  --radius-lg: var(--ui-radius);
-  --radius-xl: calc(var(--ui-radius) * 1.4);
-  --radius-2xl: calc(var(--ui-radius) * 1.8);
-  --radius-3xl: calc(var(--ui-radius) * 2.2);
-  --radius-4xl: calc(var(--ui-radius) * 2.6);
+  /* ── 圆角阶梯（全站唯一一份，别再往页面样式表里写 px）──────────────
+     依据 Apple 26 一代设计规范：
+       · 26 一代（Liquid Glass，WWDC 2025）把圆角整体调大，并立了**同心**
+         （concentric）这条规矩 —— 嵌套的圆角矩形共用同一个圆心，内层圆角 = 外层
+         圆角 − 两者间距；间距超过外层圆角时内层退化成直角。Apple 为此专门发了
+         `ConcentricRectangle`（SwiftUI）与 `UICornerConfiguration.containerConcentric`
+         （UIKit 26），HIG 的原文是「分组用更大的圆角，去对齐系统里控件的曲率」。
+       · 公开可查的取值：iOS 26 的按钮默认是胶囊、写死圆角的档位是 8pt
+         （`buttonBorderShape(.roundedRectangle(radius: 8))`）；macOS 26 的系统窗口
+         圆角 26pt、浮动侧栏 19pt、26 之前的老窗口 10pt。
+
+     所以这份阶梯的取法是：
+       · 小档 6 / 8 / 10 逐档相差 2px —— 容器内缩 2px 的内嵌块（分段控件的选项与
+         滑块就是这一种）正好落在下一档上，天然同心，不用一处一处算；
+       · 8 = Apple 那个按钮档位，10 = 本项目的控件档（按钮 / 输入 / 卡片 / 分组框）；
+       · 14 = 弹窗与面板；26 = 与 macOS 26 的系统窗口同圆（用到「跟系统窗口一样圆」
+         的地方才取它）；更小的图形细节（头像角标、图表图例点）不在这条线上，别硬套。 */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-2xl: 22px;
+  --radius-3xl: 26px;
+  --radius-4xl: 30px;
   --radius-pill: 999px;
 
   --shadow-1: var(--ui-shadow-1);
@@ -159,7 +155,9 @@
 }
 
 :root {
-  --ui-radius: 1rem;
+  /* 基准圆角 = 弹窗 / 面板那一档（与上面的 --radius-lg 同一取值；保留这个变量名
+     是因为旧样式表里 `var(--radius)` / `var(--r-lg)` 还在用）。 */
+  --ui-radius: 14px;
   /* 字体栈首位的 Public Sans 与设计稿一致，但项目尚未引入字体文件
      （@fontsource-variable/public-sans），当前实际落在系统字体上 —— 与
      既有界面同款。装上字体包即自动切换，无需改这里。 */
@@ -167,7 +165,7 @@
     system-ui, sans-serif;
   --ui-font-mono: Consolas, 'Cascadia Mono', 'Courier New', monospace;
 
-  --ui-background: oklch(1 0 0);
+  --ui-background: oklch(0.978 0.00265 286.35);
   --ui-foreground: oklch(0.145 0 0);
   --ui-card: oklch(1 0 0);
   --ui-card-foreground: oklch(0.145 0 0);
@@ -193,7 +191,7 @@
   --ui-info-foreground: oklch(0.985 0 0);
   --ui-neutral: oklch(0.708 0 0);
   --ui-neutral-foreground: oklch(0.145 0 0);
-  --ui-border: oklch(0.93 0 0);
+  --ui-border: oklch(0.145 0 0 / 10%);
   --ui-input: oklch(0.93 0 0);
   --ui-ring: oklch(0.708 0.16 249.003);
 
@@ -225,9 +223,7 @@
   --ui-intl: oklch(0.52 0.16 268);
   --ui-intl-soft: color-mix(in srgb, var(--ui-intl) 10%, white);
   --ui-intl-bd: color-mix(in srgb, var(--ui-intl) 28%, white);
-  /* 敏感词命中标签的紫：它是**第三类**状态，不能借用 cn（红，读起来像失败）或
-     intl（靛蓝，与「国际版」语义绑着）。取值与 ui/css/page-requests.css 里
-     那套手写紫逐字一致 —— 迁移期间两处并存，改一处必须改另一处。 */
+  /* 敏感词是独立状态，不能借用失败或地区标签的颜色。 */
   --ui-sensitive: oklch(0.45 0.18 305);
   --ui-sensitive-soft: oklch(0.55 0.18 305 / 14%);
   --ui-sensitive-bd: oklch(0.55 0.18 305 / 32%);
@@ -238,19 +234,30 @@
   --ui-surface-3: oklch(0.95 0 0);
   --ui-text-2: oklch(0.37 0 0);
   --ui-nav-hover: oklch(0.145 0 0 / 5%);
+  --ui-sidebar-bg: oklch(0.92123 0.0046 258.33);
+  --ui-sidebar-fg: oklch(0.43287 0.01676 258.37);
+  --ui-sidebar-muted: oklch(0.512 0.02088 261.29);
+  --ui-rail-bg: oklch(0.955 0.004 286);
+  --ui-nav-selected-bg: var(--ui-primary);
+  --ui-nav-selected-border: var(--ui-primary);
+  --ui-nav-selected-fg: var(--ui-primary-foreground);
+  --ui-nav-count-bg: oklch(0.84405 0.05294 251.09);
+  --ui-table-bg: var(--ui-surface);
+  --ui-table-head-bg: var(--ui-surface);
+  --ui-row-hover: var(--ui-surface-2);
 
   --ui-chart-1: oklch(0.72 0.18 250);
   --ui-chart-2: oklch(0.65 0.15 200);
   --ui-chart-3: oklch(0.7 0.12 280);
   --ui-chart-4: oklch(0.68 0.19 325);
   --ui-chart-5: oklch(0.68 0.16 155);
-  --ui-sidebar: color-mix(in oklch, var(--ui-foreground) 0.5%, var(--ui-background));
-  --ui-sidebar-foreground: oklch(0.145 0 0);
+  --ui-sidebar: var(--ui-sidebar-bg);
+  --ui-sidebar-foreground: var(--ui-sidebar-fg);
   --ui-sidebar-primary: oklch(0.64 0.197 253.892);
   --ui-sidebar-primary-foreground: oklch(1 0 0);
   --ui-sidebar-accent: color-mix(in srgb, var(--ui-primary) 10%, white);
   --ui-sidebar-accent-foreground: oklch(0.579 0.196 255.909);
-  --ui-sidebar-border: oklch(0.93 0 0);
+  --ui-sidebar-border: var(--ui-border-strong);
   --ui-sidebar-ring: oklch(0.58 0.2 250);
   --ui-skeleton-base: oklch(0.97 0 0);
   --ui-skeleton-highlight: oklch(0.985 0 0);
@@ -265,11 +272,11 @@
 }
 
 :root[data-theme='dark'] {
-  --ui-background: oklch(0.235 0 0);
+  --ui-background: oklch(0 0 0);
   --ui-foreground: oklch(0.965 0 0);
-  --ui-card: oklch(0.285 0 0);
+  --ui-card: oklch(0.19212 0.00399 286.02);
   --ui-card-foreground: oklch(0.965 0 0);
-  --ui-popover: oklch(0.305 0 0);
+  --ui-popover: oklch(0.3 0.005 286);
   --ui-popover-foreground: oklch(0.965 0 0);
   --ui-primary: oklch(0.623 0.206 255.3);
   --ui-primary-foreground: oklch(1 0 0);
@@ -332,19 +339,27 @@
   --ui-surface-3: oklch(0.32737 0.0105 285.81);
   --ui-text-2: oklch(0.85 0 0);
   --ui-nav-hover: oklch(1 0 0 / 6%);
+  --ui-sidebar-bg: oklch(0.19212 0.00399 286.02);
+  --ui-sidebar-fg: oklch(0.79794 0.01342 266.68);
+  --ui-sidebar-muted: oklch(0.67832 0.0176 262.73);
+  --ui-rail-bg: oklch(0.24 0.005 286);
+  --ui-nav-selected-bg: var(--ui-primary);
+  --ui-nav-selected-border: var(--ui-primary);
+  --ui-nav-selected-fg: var(--ui-primary-foreground);
+  --ui-nav-count-bg: oklch(0.43273 0.06483 250.27);
 
   --ui-chart-1: oklch(0.76 0.14 250);
   --ui-chart-2: oklch(0.76 0.13 200);
   --ui-chart-3: oklch(0.76 0.13 285);
   --ui-chart-4: oklch(0.75 0.16 325);
   --ui-chart-5: oklch(0.76 0.14 155);
-  --ui-sidebar: oklch(0.225 0 0);
-  --ui-sidebar-foreground: oklch(0.95 0 0);
+  --ui-sidebar: var(--ui-sidebar-bg);
+  --ui-sidebar-foreground: var(--ui-sidebar-fg);
   --ui-sidebar-primary: oklch(0.588 0.123 246.488);
   --ui-sidebar-primary-foreground: oklch(1 0 0);
   --ui-sidebar-accent: oklch(1 0 0 / 9%);
   --ui-sidebar-accent-foreground: var(--ui-primary);
-  --ui-sidebar-border: oklch(1 0 0 / 11%);
+  --ui-sidebar-border: var(--ui-border-strong);
   --ui-sidebar-ring: oklch(0.7 0.17 250);
   --ui-skeleton-base: oklch(0.335 0 0);
   --ui-skeleton-highlight: oklch(0.44 0 0);
@@ -366,11 +381,11 @@
    在白底上几乎看不见 —— 改这里时请整块对照，别只补单个变量。 */
 @media (prefers-color-scheme: dark) {
   :root[data-theme='system'] {
-    --ui-background: oklch(0.235 0 0);
+    --ui-background: oklch(0 0 0);
     --ui-foreground: oklch(0.965 0 0);
-    --ui-card: oklch(0.285 0 0);
+    --ui-card: oklch(0.19212 0.00399 286.02);
     --ui-card-foreground: oklch(0.965 0 0);
-    --ui-popover: oklch(0.305 0 0);
+    --ui-popover: oklch(0.3 0.005 286);
     --ui-popover-foreground: oklch(0.965 0 0);
     --ui-primary: oklch(0.623 0.206 255.3);
     --ui-primary-foreground: oklch(1 0 0);
@@ -432,19 +447,27 @@
     --ui-surface-3: oklch(0.32737 0.0105 285.81);
     --ui-text-2: oklch(0.85 0 0);
     --ui-nav-hover: oklch(1 0 0 / 6%);
+    --ui-sidebar-bg: oklch(0.19212 0.00399 286.02);
+    --ui-sidebar-fg: oklch(0.79794 0.01342 266.68);
+    --ui-sidebar-muted: oklch(0.67832 0.0176 262.73);
+    --ui-rail-bg: oklch(0.24 0.005 286);
+    --ui-nav-selected-bg: var(--ui-primary);
+    --ui-nav-selected-border: var(--ui-primary);
+    --ui-nav-selected-fg: var(--ui-primary-foreground);
+    --ui-nav-count-bg: oklch(0.43273 0.06483 250.27);
 
     --ui-chart-1: oklch(0.76 0.14 250);
     --ui-chart-2: oklch(0.76 0.13 200);
     --ui-chart-3: oklch(0.76 0.13 285);
     --ui-chart-4: oklch(0.75 0.16 325);
     --ui-chart-5: oklch(0.76 0.14 155);
-    --ui-sidebar: oklch(0.225 0 0);
-    --ui-sidebar-foreground: oklch(0.95 0 0);
+    --ui-sidebar: var(--ui-sidebar-bg);
+    --ui-sidebar-foreground: var(--ui-sidebar-fg);
     --ui-sidebar-primary: oklch(0.588 0.123 246.488);
     --ui-sidebar-primary-foreground: oklch(1 0 0);
     --ui-sidebar-accent: oklch(1 0 0 / 9%);
     --ui-sidebar-accent-foreground: var(--ui-primary);
-    --ui-sidebar-border: oklch(1 0 0 / 11%);
+    --ui-sidebar-border: var(--ui-border-strong);
     --ui-sidebar-ring: oklch(0.7 0.17 250);
     --ui-skeleton-base: oklch(0.335 0 0);
     --ui-skeleton-highlight: oklch(0.44 0 0);

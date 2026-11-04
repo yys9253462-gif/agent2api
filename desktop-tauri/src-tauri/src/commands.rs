@@ -24,12 +24,17 @@ pub struct ApiRequest {
     pub path: String,
     #[serde(default)]
     pub body: Option<Value>,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// 统一的管理 API 入口：返回后端 data，出错时返回可读消息。
 #[tauri::command]
 pub async fn api_request(request: ApiRequest) -> Result<Value, String> {
-    gateway::call(&request.method, &request.path, request.body.as_ref()).await
+    match request.api_key.as_deref() {
+        Some(key) => gateway::call_with_api_key(&request.method, &request.path, request.body.as_ref(), key).await,
+        None => gateway::call(&request.method, &request.path, request.body.as_ref()).await,
+    }
 }
 
 /// 取原始文本（导出日志用）
@@ -49,7 +54,8 @@ pub async fn api_request_text(method: String, path: String) -> Result<String, St
 #[tauri::command]
 pub async fn backend_status(app: AppHandle) -> Result<Value, String> {
     let port = gateway::proxy_port();
-    let ready = backend::is_ready(port).await;
+    let phase = crate::startup::phase();
+    let ready = phase == "ready" && backend::is_ready(port).await;
     // 失败详情存在 AppState 里（由 ensure_ready 的失败分支写入）；
     // 端口已被显式指定过（环境变量）时，界面不该再提供「更换端口」——
     // 改设置也不会生效，只会让用户白忙一场
@@ -61,10 +67,17 @@ pub async fn backend_status(app: AppHandle) -> Result<Value, String> {
         .and_then(|guard| guard.failure.clone());
     Ok(json!({
         "ready": ready,
+        "phase": phase,
         "port": port,
         "portFromEnv": gateway::port_from_env().is_some(),
         "failure": failure,
     }))
+}
+
+#[tauri::command]
+pub async fn wait_for_backend() -> Result<Value, String> {
+    crate::startup::wait().await?;
+    Ok(json!({ "ready": true, "port": gateway::proxy_port() }))
 }
 
 /// 重启整个应用。
@@ -237,7 +250,8 @@ pub async fn change_port(app: AppHandle, port: u16) -> Result<Value, String> {
 
 /// 查面板管理员是否已注册（设置页据此决定「开启局域网访问」要不要先走注册步）。
 #[tauri::command]
-pub fn panel_admin_status() -> Result<Value, String> {
+pub async fn panel_admin_status() -> Result<Value, String> {
+    crate::startup::wait().await?;
     Ok(json!({ "registered": crate::server::access::admin_registered() }))
 }
 
@@ -247,6 +261,7 @@ pub fn panel_admin_status() -> Result<Value, String> {
 /// 管理员」，重复注册（两台设备同时走流程之类的竞态）不该让用户看到失败。
 #[tauri::command]
 pub async fn panel_register(username: String, password: String) -> Result<Value, String> {
+    crate::startup::wait().await?;
     let username = username.trim();
     if username.is_empty() || username.chars().count() > 64 {
         return Err("请填写管理员账号（64 字符以内）".to_string());
@@ -275,6 +290,44 @@ pub async fn panel_register(username: String, password: String) -> Result<Value,
     }
 }
 
+// ── 本机管理会话 ────────────────────────────────────────────
+// 桌面壳始终使用独立会话；网页管理员的注册状态不决定桌面端是否需要登录。
+
+/// 后端与本机会话准备好后返回状态；连接失败原样上报，不能当成未登录。
+#[tauri::command]
+pub async fn panel_session_status() -> Result<Value, String> {
+    crate::startup::wait().await?;
+    crate::gateway::call("GET", "/api/session", None).await?;
+    Ok(json!({
+        "registered": crate::server::access::admin_registered(),
+        "authenticated": true,
+    }))
+}
+
+/// 兼容旧页面的令牌保存入口；网页令牌不再作为本机壳的管理凭证。
+#[tauri::command]
+pub async fn panel_session_store(
+    access_token: String,
+    refresh_token: String,
+    expires_in: Option<i64>,
+) -> Result<Value, String> {
+    crate::startup::wait().await?;
+    if access_token.is_empty() || refresh_token.is_empty() {
+        return Err("令牌为空".to_string());
+    }
+    let _ = expires_in;
+    crate::panel_session::ensure_local_access()?;
+    Ok(json!({ "saved": true }))
+}
+
+/// 撤销本机壳的会话；下一次管理操作会自动建立新的本机会话。
+#[tauri::command]
+pub async fn panel_session_clear() -> Result<Value, String> {
+    crate::startup::wait().await?;
+    crate::panel_session::clear();
+    Ok(json!({ "cleared": true }))
+}
+
 /// 切换局域网访问：校验 →（需要时补首把 Key）→ 写设置 → 重启应用。
 ///
 /// ── 开启前必须有面板管理员 ──────────────────────────────────
@@ -283,16 +336,14 @@ pub async fn panel_register(username: String, password: String) -> Result<Value,
 /// 后开启」，这里再挡一道防绕过。
 ///
 /// ── 为什么在开启时补一把默认 Key ────────────────────────────
-/// 闸门与桌面壳自身的管理通道都建立在「至少一把启用的 Key」上：壳对管理 API
-/// 的请求靠自动携带第一把 Key 认证（`gateway::read_api_key`），一把启用的
-/// Key 都没有时，注册过管理员的世界里壳会被自己的闸门挡在外面（用户还没
-/// 来得及建 Key）。开启流程顺手补一把名为「默认」的 Key，并通过返回值告诉
-/// 界面去提示 —— 用户在「网关 Key」页能看到它。
+/// 局域网模型调用必须携带启用的 Key；尚未配置时补一把并提示用户。
+/// 桌面管理使用独立的本机会话，不依赖这把 Key。
 ///
 /// 重启用 [`schedule_app_restart`]：监听地址在 bind 之后就改不了，
 /// 与 `change_port` 同一条铁律。
 #[tauri::command]
-pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<Value, String> {
+pub async fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<Value, String> {
+    crate::startup::wait().await?;
     if enabled && !crate::server::access::admin_registered() {
         return Err("尚未注册面板管理员：请先完成注册再开启局域网访问".to_string());
     }
@@ -325,28 +376,11 @@ pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<V
     }))
 }
 
-/// 界面直连网关时该带的凭证头（AI 助手的配置读写与流式对话）。
-///
-/// ── 为什么需要单独一条命令 ──────────────────────────────────
-/// 助手页为了流式对话/不受桥 60 秒超时限制，直接 fetch 网关基址（见
-/// ui-islands/src/islands/assistant-state.ts）。桌面形态下页面来自 Tauri
-/// 自定义协议、网关在 `127.0.0.1:{port}`：跨源 + 不带 cookie，请求里没有
-/// 任何凭证；面板认证一旦开启（设置页开过局域网访问就会注册管理员），
-/// `/api/*` 要求「面板会话或一把启用的 Key」，那条裸请求就会被 401
-/// `panel_login_required` 拒绝 —— 用户看到的就是「加载助手设置失败：请先
-/// 登录管理面板」，而桌面上并没有登录页。把壳自己用的那把 Key 交给页面，
-/// 直连通道与桥通道的凭证口径就一致了。
-///
-/// 返回 `{ 头名: 值 }`（桌面端只有 `x-api-key`）：网页端 shim 的同名方法回
-/// 面板令牌 / 用户输入的 Key，助手页对两端一视同仁，只负责合并。面板认证
-/// 没开启时多带一个头也不会被拒 —— 中间件的鉴权分支只在开启后才看它。
+/// 界面直连网关时的管理凭证；模型调用必须另外选择并携带模型 Key。
 #[tauri::command]
-pub fn direct_credentials() -> Result<Value, String> {
-    let mut headers = serde_json::Map::new();
-    if let Some(key) = crate::gateway::management_key() {
-        headers.insert("x-api-key".to_string(), Value::String(key));
-    }
-    Ok(Value::Object(headers))
+pub async fn direct_credentials() -> Result<Value, String> {
+    crate::startup::wait().await?;
+    Ok(Value::Object(crate::panel_session::credential_headers()?))
 }
 
 /// 本机在局域网里的地址（给「局域网访问」面板显示 `http://<IP>:<端口>/v1` 用）。
@@ -385,6 +419,8 @@ pub fn local_ip() -> Result<Option<String>, String> {
 /// 主窗口 —— 于是「拿地址」这一步在渲染层完成，壳只负责开窗口。因此它走
 /// [`start_autoclaw_oauth_login`]（入参是已经拿到的 state + authUrl），
 /// 不走这里。
+/// `options` 是新增的可选第五参（methodIndex / inputs / proxy / manualCallback），
+/// 不改变第四参 social_restore。没有 methodIndex 时继续走旧登录支路。
 #[tauri::command]
 pub async fn start_login(
     app: AppHandle,
@@ -392,13 +428,15 @@ pub async fn start_login(
     mode: String,
     provider: Option<String>,
     social_restore: Option<bool>,
+    options: Option<Value>,
 ) -> Result<Value, String> {
-    login::start(
+    login::start_with_options(
         &app,
         edition,
         mode,
         provider.unwrap_or_default(),
         social_restore.unwrap_or(false),
+        options,
     )
     .await
 }
@@ -478,8 +516,11 @@ pub async fn cancel_login(app: AppHandle) -> Result<Value, String> {
 
 /// 导出运行日志：拉取 JSONL 原文，弹系统保存框落盘。
 #[tauri::command]
-pub async fn export_logs(app: AppHandle) -> Result<Value, String> {
-    let text = gateway::call_text("GET", "/api/logs/download").await?;
+pub async fn export_logs(app: AppHandle, query: Option<String>) -> Result<Value, String> {
+    let query = query.unwrap_or_default();
+    let query = query.trim_start_matches('?');
+    let path = if query.is_empty() { "/api/logs/download".to_string() } else { format!("/api/logs/download?{query}") };
+    let text = gateway::call_text("GET", &path).await?;
     let count = text.lines().filter(|line| !line.trim().is_empty()).count();
     if count == 0 {
         return Ok(json!({ "count": 0 }));
@@ -539,7 +580,8 @@ pub async fn pick_folder(app: AppHandle, default_dir: Option<String>) -> Result<
 /// 用户可能在任务管理器的「启动」页里单独禁用了本应用，
 /// 那种情况下配置文件仍是 true，界面会显示成「已开启」，与实际不符。
 #[tauri::command]
-pub fn get_app_settings(app: AppHandle) -> AppSettings {
+pub async fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
+    crate::startup::wait().await?;
     let mut current = settings::load();
     if let Ok(enabled) = app.autolaunch().is_enabled() {
         current.autostart = enabled;
@@ -547,7 +589,7 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
     // 顺手把缓存与磁盘对齐：拦截关窗时要用到最新值
     app.state::<AppState>().window.set_close_to_tray(current.close_to_tray);
     app.state::<AppState>().window.set_lightweight(current.lightweight_mode);
-    current
+    Ok(current)
 }
 
 /// 覆盖保存应用设置，返回保存后的结果。
@@ -562,7 +604,8 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
 /// 「更换端口」设过的端口悄悄抹掉，下次开机又回到 3065 上撞冲突。
 /// 端口不归这个命令管，就原样保留磁盘上的值。
 #[tauri::command]
-pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettings, String> {
+pub async fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettings, String> {
+    crate::startup::wait().await?;
     let mut saved = patch;
     // 端口由 change_port 专门负责，这里保持磁盘现值不被覆盖
     saved.proxy_port = settings::load().proxy_port;
@@ -640,8 +683,8 @@ pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
 
 /// 从文件导入账号（merge 语义：按身份匹配，命中更新、未命中追加）。
 ///
-/// 兼容两种形态：整体导出文件 `{ version, exportedAt, customProviders, accounts }`
-/// 与直接的账号数组 `[...]`。`customProviders` 段（v2 起的自定义提供商定义）
+/// 兼容整体导出文件 `{ version, exportedAt, customProviders, accounts }`、
+/// 单账号对象与直接的账号数组 `[...]`。`customProviders` 段（v2 起的自定义提供商定义）
 /// 原样透传给后端 —— 账号的 provider 字段指向这些定义，丢了它们自定义账号
 /// 就导不回。
 #[tauri::command]
@@ -667,15 +710,15 @@ pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
         .map_err(|error| format!("文件不是有效 JSON: {error}"))?;
     let document = unwrap_envelope_file(parsed);
     let accounts = match &document {
-        // 整体导出文件
-        Value::Object(map) => map
+        Value::Object(map) if map.contains_key("accounts") => map
             .get("accounts")
             .and_then(Value::as_array)
             .cloned()
-            .ok_or("文件中缺少 accounts 字段")?,
-        // 直接就是账号数组
+            .ok_or("文件中缺少 accounts 数组")?,
+        Value::Object(map) if map.get("id").and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty()) => vec![document.clone()],
         Value::Array(items) => items.clone(),
-        _ => return Err("文件内容既不是导出文件也不是账号数组".to_string()),
+        _ => return Err("文件内容既不是导出文件、单账号文件，也不是账号数组".to_string()),
     };
 
     let mut payload = json!({ "accounts": accounts, "mode": "merge" });
@@ -704,7 +747,7 @@ fn unwrap_envelope_file(parsed: Value) -> Value {
     }
 }
 
-/// 整库备份：弹系统保存框，后端把整库导出为 SQL 文本直接写到该路径。
+/// 整库备份：用户选择路径，后端直写密码加密完整包。
 ///
 /// 与账号导出（`export_accounts`）不同：**没有「空库不导」分支** —— 整库
 /// 语义下 kv 表至少有配置项，空库同样值得备份。文件内容不经壳中转，
@@ -713,16 +756,19 @@ fn unwrap_envelope_file(parsed: Value) -> Value {
 pub async fn export_database(
     app: AppHandle,
     #[allow(non_snake_case)] includeLogs: Option<bool>,
+    password: String,
 ) -> Result<Value, String> {
+    if password.chars().count() < 12 || password.len() > 1024 {
+        return Err("备份密码需要至少 12 位，且不能超过 1024 字节".into());
+    }
     let stamp = timestamp_for_filename();
-    let default_name = format!("agent2api-backup-{stamp}.sql");
+    let default_name = format!("agent2api-backup-{stamp}.a2ab");
     let file = app
         .dialog()
         .file()
         .set_title("整库备份")
         .set_file_name(&default_name)
-        .add_filter("SQL", &["sql"])
-        .add_filter("全部文件", &["*"])
+        .add_filter("Agent2API 加密备份", &["a2ab"])
         .blocking_save_file();
     let Some(target) = file else {
         return Ok(json!({ "canceled": true }));
@@ -734,25 +780,41 @@ pub async fn export_database(
         "filePath": path.to_string_lossy(),
         // 前端不传（旧壳直调）时按完整导出
         "includeLogs": includeLogs.unwrap_or(true),
+        "password": password,
     });
-    let mut data = gateway::call("POST", "/api/backup/export", Some(&payload)).await?;
+    let mut data = gateway::call_with_timeout(
+        "POST",
+        "/api/backup/export",
+        Some(&payload),
+        BACKUP_TRANSFER_TIMEOUT_MS,
+    )
+    .await?;
     if let Value::Object(map) = &mut data {
         map.insert("file".to_string(), Value::String(path.to_string_lossy().to_string()));
     }
     Ok(data)
 }
 
-/// 整库恢复：弹系统打开框，后端校验该 SQL 文件后整体替换数据库。
+/// 整库恢复 / 备份的请求预算：30 分钟。
+///
+/// 60 秒的通用预算对这两条完全不成立 —— 恢复要读整份 SQL、在暂存库上执行、
+/// 校验、拍安全备份、覆盖主库、重载内存态；几百 MB 的库在慢盘上跑几分钟很
+/// 正常（实测一台机器 61 秒就被壳掐断，后端其实还在跑）。**超时的那一方必须
+/// 是后端**：它自己失败会回一条带原因的 500，而壳提前掐断只会让用户看到
+/// 「连接本地代理超时」，还误以为数据没进去。
+const BACKUP_TRANSFER_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+/// 整库恢复：选择加密包或旧 SQL，后端校验后整体替换数据库。
 ///
 /// 覆盖前的确认弹窗由前端负责（文案里说明「本机数据会先自动备份到
 /// backups/ 目录」「恢复后需重新登录面板」）；这里只做选文件与转发。
 #[tauri::command]
-pub async fn import_database(app: AppHandle) -> Result<Value, String> {
+pub async fn import_database(app: AppHandle, password: Option<String>) -> Result<Value, String> {
     let file = app
         .dialog()
         .file()
         .set_title("整库恢复")
-        .add_filter("SQL", &["sql"])
+        .add_filter("Agent2API 备份", &["a2ab", "sql"])
         .add_filter("全部文件", &["*"])
         .blocking_pick_file();
     let Some(target) = file else {
@@ -761,8 +823,94 @@ pub async fn import_database(app: AppHandle) -> Result<Value, String> {
     let path = target
         .into_path()
         .map_err(|error| format!("文件路径无效: {error}"))?;
-    let payload = json!({ "filePath": path.to_string_lossy() });
-    gateway::call("POST", "/api/backup/import", Some(&payload)).await
+    let payload = json!({ "filePath": path.to_string_lossy(), "password": password.unwrap_or_default() });
+    // 即便放宽到 30 分钟，请求仍可能先于后端收尾而超时（超大库 / 极慢盘）。
+    // 那时**不能**报失败：后端照旧在跑，进度弹窗还在轮询。所以超时后去问一次
+    // 进度快照 —— 它带着真实阶段，界面据此继续显示「正在替换主数据库…」，
+    // 而不是弹出一条「恢复失败：连接本地代理超时」。
+    match gateway::call_with_timeout(
+        "POST",
+        "/api/backup/import",
+        Some(&payload),
+        BACKUP_TRANSFER_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(data) => Ok(data),
+        Err(message) if message.contains("超时") => {
+            let progress = gateway::call("GET", "/api/backup/progress", None).await;
+            match progress {
+                Ok(snapshot) if snapshot.get("active").and_then(Value::as_bool) == Some(true) => {
+                    // 后端仍在恢复：把错误换成一句「还在跑」，界面继续等
+                    Err("恢复仍在进行中，请等待进度弹窗里的结果".to_string())
+                }
+                Ok(snapshot) => {
+                    if snapshot.get("done").and_then(Value::as_bool) == Some(true) {
+                        if let Some(result) = snapshot.get("result") {
+                            return Ok(result.clone());
+                        }
+                    }
+                    let failed = snapshot.get("failed").and_then(Value::as_bool) == Some(true);
+                    let detail = snapshot
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if failed && !detail.is_empty() {
+                        Err(detail)
+                    } else {
+                        Err(message)
+                    }
+                }
+                Err(_) => Err(message),
+            }
+        }
+        Err(message) => Err(message),
+    }
+}
+
+/// 云同步上传 / 下载的请求预算。
+///
+/// 60 秒是管理 API 的通用超时，而这两条要打外网传几 MB：慢速云盘 / 家用上行
+/// 上 60 秒很容易不够，被壳提前掐断时后端其实还在传（用户看到「超时」，远端
+/// 却可能已经写了一半）。300 秒与后端传输层的单次超时（`cloud_sync::webdav`
+/// 的 `TRANSFER_TIMEOUT_SECS`）对齐 —— 两边预算一致，谁先到都不会造成
+/// 「壳说失败、后端还在跑」的分叉。
+const CLOUD_SYNC_TIMEOUT_MS: u64 = 300_000;
+
+/// 云同步上传（设置页「数据 → 云同步」的「上传」）。
+#[tauri::command]
+pub async fn cloud_sync_upload() -> Result<Value, String> {
+    gateway::call_with_timeout(
+        "POST",
+        "/api/cloud-sync/upload",
+        Some(&json!({})),
+        CLOUD_SYNC_TIMEOUT_MS,
+    )
+    .await
+}
+
+/// 云同步下载（下载成功会整体替换本机业务数据）。
+#[tauri::command]
+pub async fn cloud_sync_download() -> Result<Value, String> {
+    gateway::call_with_timeout(
+        "POST",
+        "/api/cloud-sync/download",
+        Some(&json!({})),
+        CLOUD_SYNC_TIMEOUT_MS,
+    )
+    .await
+}
+
+/// 用同步密码解出远端账号密钥并装到本机。
+///
+/// 走壳命令而不是通用 `call`：密码作为参数出现在 Tauri IPC 里，不经过
+/// HTTP 请求体（少一处可能被中间层记录的落点）。
+#[tauri::command]
+pub async fn cloud_sync_import_key(password: String) -> Result<Value, String> {
+    let payload = json!({ "password": password });
+    gateway::call("POST", "/api/cloud-sync/import-key", Some(&payload)).await
 }
 
 /// 检查新版本：把本应用版本作为 query 参数交给后端比较。
@@ -776,6 +924,53 @@ pub async fn check_update(app: AppHandle) -> Result<Value, String> {
     let current = app.package_info().version.to_string();
     let path = format!("/api/update/check?current={}", urlencoding(&current));
     gateway::call("GET", &path, None).await
+}
+
+/// 设置页「版本信息」：后端那份环境快照 + 壳侧独有的三项。
+///
+/// ── 为什么不让界面直接打 `/api/system-info` ──────────────────
+/// 桌面端的界面来自 Tauri 自定义协议、网关在 `127.0.0.1:{port}`：跨源，且
+/// 面板认证开启后裸 fetch 会被 401 挡下（与 `direct_credentials` 那段注释
+/// 说的是同一件事）。走壳命令由 `gateway::request_builder` 自动补凭证，
+/// 两种形态（开 / 没开面板认证）都不用界面操心。
+///
+/// ── 壳侧补的三项 ────────────────────────────────────────────
+///   · `app.version`：运行时 `package_info` 覆盖后端编译期常量 —— 与
+///     `check_update` 同一口径（版本号在 Cargo.toml 与 tauri.conf.json 各一份，
+///     装到机器上的那个包以 tauri.conf.json 为准）；
+///   · `runtime.webviewVersion`：WebView2 / WKWebView 的版本。界面白屏、
+///     CSS 不生效、`structuredClone` 之类的 API 缺失时，这是第一个要看的值；
+///     拿不到（Linux 上没装运行时等）就给空串，界面显示「—」；
+///   · `runtime.debugBuild`：后端那份说的是 **server crate** 的编译形态，
+///     而用户装的是壳 —— 桌面端以壳为准（`tauri dev` 与正式包都是同一个
+///     server crate，但壳一个带 `[Dev]` 一个不带）。
+#[tauri::command]
+pub async fn system_info(app: AppHandle, hide_username: Option<bool>) -> Result<Value, String> {
+    let path = if hide_username.unwrap_or(false) {
+        "/api/system-info?hideUsername=1"
+    } else {
+        "/api/system-info"
+    };
+    let mut info = gateway::call("GET", path, None).await?;
+
+    // 三处覆盖都做「有才写」：结构异常（老后端 / 响应被改）时保持后端那份，
+    // 不让整条命令因为少一个对象就失败。
+    if let Some(object) = info.as_object_mut() {
+        if let Some(app_section) = object.get_mut("app").and_then(Value::as_object_mut) {
+            app_section.insert(
+                "version".to_string(),
+                Value::String(app.package_info().version.to_string()),
+            );
+        }
+        if let Some(runtime) = object.get_mut("runtime").and_then(Value::as_object_mut) {
+            // wry 的 webview_version 只在运行时可用；Linux 缺 webkit2gtk 等
+            // 极端情形下会失败 —— 失败给空串，不把整条命令带崩。
+            let webview = tauri::webview_version().unwrap_or_default();
+            runtime.insert("webviewVersion".to_string(), Value::String(webview));
+            runtime.insert("debugBuild".to_string(), Value::Bool(cfg!(debug_assertions)));
+        }
+    }
+    Ok(info)
 }
 
 /// 下载安装包（后端负责联网与落盘，这里只转发参数）
@@ -820,6 +1015,16 @@ pub async fn cancel_update() -> Result<Value, String> {
 /// 本机网关就已经停了（而且 dmg 挂载后用户往往会先去看一眼再决定），
 /// 等于用一个没有必要的退出打断了正在服务的网关。所以这一支不关机、不退出，
 /// 只把映像挂上，并如实把 `restart: false` 回给界面（界面据此不提示「即将退出」）。
+///
+/// ── Linux 上为什么也不退出（与 macOS 同理，但两种包型不同）──────
+/// `.deb` 交给桌面环境的图形安装器（GNOME Software / Discover）：用户点「安装」
+/// 之后由包管理器往系统目录写文件 —— 与当前进程**不在同一个路径**（本程序跑在
+/// `~/.local/bin` 或 AppImage 自解目录这类用户目录里），没有文件占用冲突，
+/// 且安装动作的时机完全由用户决定。所以这一支同样不回收后端、不退出。
+///
+/// `.AppImage` 是个例外：它是自包含单文件，更新方式就是「用新的覆盖旧的」，
+/// 而本进程此刻正占着旧文件。因此要退回「先让出、再启动新的」那条老路
+/// （与 Windows 同一套顺序）。
 #[tauri::command]
 pub fn run_installer(app: AppHandle, path: String, restart: Option<bool>) -> Result<Value, String> {
     let target = crate::update::verify_installer(&path)?;
@@ -838,7 +1043,50 @@ pub fn run_installer(app: AppHandle, path: String, restart: Option<bool>) -> Res
         }));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    // Linux：deb 交给图形安装器（不退出），AppImage 走「让位 + 启动」（要退出）
+    #[cfg(target_os = "linux")]
+    {
+        let is_appimage = target
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("appimage"))
+            .unwrap_or(false);
+
+        if is_appimage {
+            // AppImage：新文件要覆盖本进程正占着的旧可执行文件，先让位
+            // （与 Windows 同一套顺序，理由见函数说明）
+            crate::backend::shutdown(&app.state::<AppState>());
+            crate::update::launch_installer(&target, true)?;
+
+            let restart = restart.unwrap_or(true);
+            if restart {
+                app.state::<AppState>().begin_exit();
+                let handle = app.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    handle.exit(0);
+                });
+            }
+            return Ok(json!({
+                "launched": true,
+                "path": target.to_string_lossy(),
+                "restart": restart,
+            }));
+        }
+
+        // deb：交给桌面环境的图形安装器，不回收后端、不退出（理由见函数说明）。
+        // 与 macOS 那一支同样显式消费掉未用的参数，避免 unused 告警。
+        let _ = &app;
+        let _ = restart;
+        crate::update::launch_installer(&target, false)?;
+        Ok(json!({
+            "launched": true,
+            "path": target.to_string_lossy(),
+            "restart": false,
+        }))
+    }
+
+    #[cfg(target_os = "windows")]
     {
         // 先让出 node.exe 的文件占用与 3065 端口，再让安装包去覆盖文件
         crate::backend::shutdown(&app.state::<AppState>());

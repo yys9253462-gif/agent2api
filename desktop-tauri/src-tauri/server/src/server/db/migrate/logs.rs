@@ -307,10 +307,7 @@ fn write_logs(conn: &Connection, entries: &[LogEntry]) -> rusqlite::Result<(usiz
         .map(|value| chrono::DateTime::timestamp_millis(&value))
         .unwrap_or(0);
     tx.execute("DELETE FROM logs WHERE ts < ?1", params![cutoff])?;
-    tx.execute(
-        "DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT ?1)",
-        params![logs_store::MAX_ENTRIES as i64],
-    )?;
+    logs_store::sql_trim_capacity(&tx)?;
     // 高水位抬到 MAX(id) + 1（理由见函数说明）。`raise_next_id` 只在更高时才写，
     // 所以这里给它「下一个可用 id」而不是「当前最大 id」。
     let max: Option<i64> = tx.query_row("SELECT MAX(id) FROM logs", [], |row| row.get(0))?;

@@ -162,23 +162,41 @@ pub(crate) fn max_concurrent_public(value: Option<&Value>) -> u64 {
 /// 「本家默认并发」的口径。
 ///
 /// 只有 CodeArts 一家有默认值：它**没有「不限」这个选项**，记录上的 0（含从未
-/// 设置过）由上游解释成「按默认并发」（`providers::codearts::session::
-/// DEFAULT_SESSION_LIMIT`，准入闸 `SessionGate::limit_for` 读的是同一个数），
-/// 所以公开形态要报出 3 而不是 0 —— 否则选路读到的 0 等于不限，
+/// 设置过）由上游解释成「按默认并发」（准入闸 `SessionGate::limit_for` 读的是
+/// 同一个数），所以公开形态要报出 3 而不是 0 —— 否则选路读到的 0 等于不限，
 /// `routing::at_concurrency_limit` 不会在本家满员时跳过这个账号，请求照发、
 /// 第 4 个被上游回 **409**，而 409 是账号级冲突、不触发降级换号，客户端拿到一个
 /// 「明明有别家空着却报错」的结果。
 ///
+/// ── 这两个数字为什么写在网关里 ──────────────────────────────
+/// 它们是**选路参数**（网关据此决定「这个账号还能不能进」），不是上游协议知识：
+/// 准入闸在插件里按同一个数拦，公开形态在这里按同一个数报，两边必须一致。
+///
+/// ── 只把 0 换成默认，不取大（曾经写成 `max(配置, 3)` 的教训）──────────
+/// 取大把**合法的 1 / 2** 也一起抬成了 3：库里存的是 1、准入闸按 1 拦，界面和
+/// 选路却读到 3。界面表现为「设成 1、保存后还是 3」；选路表现为在途 1 个仍被
+/// 选中、进门被 409 挡回，而有状态路径的 409 不换号 —— 设 1 反而比设 3 更容易
+/// 撞错误。同理要按准入闸的上限 [`MAX_SESSION_LIMIT`] 截断：存储层放行 0–999
+/// （所有家共用一条写入闸），闸门只认到 64，公开形态若报 999，选路会以为还有
+/// 935 个空位。
+///
 /// 别家 0 就是 0（不限）—— 两家的差别只在这一个函数里，各家的公开形态
 /// 不必各写一遍。
+/// CodeArts 的默认并发（上游对每账号只给 3 路会话；插件侧的准入闸读同一个数）。
+const CODEARTS_DEFAULT_SESSION_LIMIT: u32 = 3;
+/// CodeArts 的并发上限（准入闸只认到这个数；存储层放行 0–999，报原值会让选路
+/// 误判余量）。
+const CODEARTS_MAX_SESSION_LIMIT: u32 = 64;
+
 pub(crate) fn max_concurrent_public_for(provider: &str, value: Option<&Value>) -> u64 {
     let configured = max_concurrent_public(value);
-    if provider == super::codearts_accounts::CODEARTS_PROVIDER_ID {
-        configured.max(
-            crate::server::core::providers::codearts::session::DEFAULT_SESSION_LIMIT as u64,
-        )
+    if provider != super::codearts_accounts::CODEARTS_PROVIDER_ID {
+        return configured;
+    }
+    if configured == 0 {
+        u64::from(CODEARTS_DEFAULT_SESSION_LIMIT)
     } else {
-        configured
+        configured.min(u64::from(CODEARTS_MAX_SESSION_LIMIT))
     }
 }
 

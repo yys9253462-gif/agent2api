@@ -229,7 +229,16 @@ pub async fn save_keepalive(body: Bytes) -> Response {
             .collect(),
         _ => return GatewayError::new("models 必须是字符串数组或分隔符字符串").into_response(),
     };
-    match crate::server::core::billing::keepalive::set_models(&raw) {
+    let api_key_id = match payload.get("apiKeyId") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(id)) if id.trim().len() <= 128 => {
+            let id = id.trim();
+            Some((!id.is_empty()).then(|| id.to_string()))
+        }
+        Some(_) => return GatewayError::bad_request("apiKeyId 必须是 Key ID 或 null").into_response(),
+    };
+    match crate::server::core::billing::keepalive::set_models(&raw, api_key_id) {
         Ok(_) => ok_json(crate::server::core::billing::keepalive::state()),
         Err(message) => GatewayError::new(message).into_response(),
     }

@@ -1,24 +1,25 @@
-//! 聚合模型目录：内置提供商的原始清单、对外绑定及发送名解析。
+//! 聚合模型目录：提供商的原始清单、对外绑定及发送名解析。
 //!
 //! 原始模型 ID 是默认绑定，别名是额外绑定。各绑定独立开关；关闭默认绑定
 //! 不会禁用它指向的上游模型，也不会影响仍开启的别名。
 //! 清单来源在本文件，绑定解析在 routing.rs，对外与管理视图在 view.rs。
 
 mod routing;
+mod snapshot;
 mod view;
+
+pub(crate) use snapshot::{config_changed, generation, invalidate, validation_snapshot, ValidationCache};
 
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::model_meta;
 use crate::server::core::model_rules;
-use crate::server::core::models::{model_id, ModelCatalog};
-use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::models::model_id;
+use crate::server::core::providers::adapter::adapter_by_id;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
 
-use super::autoclaw::region::Region as AutoclawRegion;
-use super::workbuddy::Region as WorkBuddyRegion;
-
+pub(crate) use routing::entry_id_in_manifest;
 pub use routing::{
     default_model_catalog, default_model_usable, forwarding_providers, model_blocked_everywhere,
     providers_for_model, wire_target_for_provider, WireTarget,
@@ -27,200 +28,102 @@ pub use view::{
     advertised_manifest_contains, advertised_model_ids, has_available_providers, manage_view,
     models_by_provider, models_response, session_models, suggest_advertised,
 };
+/// 「这条映射在管理页上还有没有模型行可挂」——删除自映射时的放行判据（见函数说明）。
+/// 只服务写侧一个调用点，不进对外的 `pub use`。
+pub(crate) use view::host_row_exists;
+
+pub(crate) fn upstream_manifests() -> Vec<(String, Vec<Value>)> {
+    all_provider_ids().into_iter().map(|provider| {
+        let models = adapter_by_id(&provider).map(|adapter| adapter.list_models()).unwrap_or_default();
+        (provider, models)
+    }).collect()
+}
 
 /// 原始能力清单不应用绑定开关；关闭原始 ID 后，别名仍需解析到这条上游记录。
-///
-/// **models.dev 的补齐**（`core::model_meta`）在**这里**统一应用，分两步：
-///   ① 只填清单项里**上游没声明**的六个能力键（优先级见那个模块头：用户覆盖 >
-///      上游 > models.dev）；
-///   ② 把逐模型思考档位归一成出口那一对键（这家自己声明的 > models.dev 的）。
-/// 位置在用户覆盖**之前** —— 覆盖层是「用户明确指定」，永远最高，它顺带把被改
-/// 的键的来源标成 `user`（见 `model_rules::apply_capability_overrides`）。
-///
-/// 用户的能力位覆盖（`modelRules.capabilities`）同样在**这里**统一应用：本函数
-/// 是内置家全部出口（`/v1/models`、Anthropic 列表、管理视图）的清单源头，收在
-/// 一处就不会出现「管理页改了、下游没变」的分叉。覆盖只改元数据键，不参与
-/// 路由 / 启停（见 `model_rules` 模块头的能力位覆盖一节）。
-fn manifest_for(kind: ProviderKind) -> Vec<Value> {
-    let mut models = adapter_for(kind).list_models();
-    for item in model_rules::custom_models_for(kind_id(kind)) {
+/// 用户自建模型、models.dev 补齐与能力覆盖都在这一处应用，插件与内置身份共用。
+pub(crate) fn manifest_for_provider(provider: &str) -> Vec<Value> {
+    let Some(adapter) = adapter_by_id(provider) else {
+        return Vec::new();
+    };
+    let mut models = adapter.list_models();
+    for item in model_rules::custom_models_for(provider) {
         let id = model_id(&item);
         if !id.is_empty()
             && !models.iter().any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
         {
+            let mut item = item;
+            item["_manualModel"] = Value::Bool(true);
             models.push(item);
         }
     }
     for item in models.iter_mut() {
         model_meta::apply(item);
     }
-    model_rules::apply_capability_overrides(kind_id(kind), &mut models);
+    model_rules::apply_capability_overrides(provider, &mut models);
     models
 }
 
-fn advertised_manifest_for(store: &AccountStore, kind: ProviderKind) -> Vec<Value> {
-    adapter_for(kind).advertise_models(store, manifest_for(kind))
+/// 编译期身份的调用方仍按 kind 查询，执行体优先取已安装的插件。
+pub(crate) fn manifest_for(kind: ProviderKind) -> Vec<Value> {
+    manifest_for_provider(kind_id(kind))
 }
 
-fn workbuddy_catalog(region: WorkBuddyRegion) -> ModelCatalog {
-    crate::server::core::models::global_catalog(region)
+/// 旧内置目录已迁入插件，网关不再持有按 kind 划分的刷新元数据。
+pub(crate) fn refresh_meta(_kind: ProviderKind) -> (bool, i64) {
+    (false, 0)
 }
 
-fn autoclaw_catalog_state(region: AutoclawRegion) -> (bool, i64) {
-    (
-        !super::autoclaw::catalog::remote_models(region).is_empty(),
-        super::autoclaw::catalog::last_refreshed_at(region),
-    )
-}
-
-/// 这一家清单的「远程与否 + 拉取时刻」。
-///
-/// 两个消费方：本模块的对外视图（`meta.source` / 管理页的「来源」列）与
-/// **适配器层的手动刷新结果**（`adapter::refresh_implemented_forced` 的
-/// `refreshedAt`，界面「更新日期」列读它）—— 后者必须走这里而不是自己按
-/// kind 拼一遍：十家的取值路径（workbuddy 按地区分格、按地区分格的三家、
-/// Cline 的池）各不相同，抄一份就是一处会漂移的知识。
-pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
-    match kind {
-        // WorkBuddy 的两个地区各有自己的目录实例与缓存槽（见
-        // `providers::workbuddy::region` 的模块头）：这一处也是两家分开的
-        // 语义来源之一 —— 界面「更新日期」列因此如实显示各自那次拉取。
-        ProviderKind::WorkBuddy => {
-            let catalog = workbuddy_catalog(WorkBuddyRegion::Cn);
-            (catalog.remote_refreshed(), catalog.last_refreshed_at())
-        }
-        ProviderKind::WorkBuddyIntl => {
-            let catalog = workbuddy_catalog(WorkBuddyRegion::Intl);
-            (catalog.remote_refreshed(), catalog.last_refreshed_at())
-        }
-        ProviderKind::Raccoon => (
-            super::raccoon::models::remote_refreshed(),
-            super::raccoon::models::last_refreshed_at(),
-        ),
-        // 拆家后两个地区各查**自己那一格**缓存（「来源 / 更新日期」列如实分开，
-        // 不再取两地区的最大值 —— 那会让两家显示同一次拉取时刻）
-        ProviderKind::Qoder | ProviderKind::QoderIntl => {
-            let region = super::qoder::endpoints::Region::from_kind(kind)
-                .unwrap_or(super::qoder::endpoints::Region::Cn);
-            (
-                super::qoder::models::remote_refreshed(region),
-                super::qoder::models::last_refreshed_at(region),
-            )
-        }
-        ProviderKind::CodeArts => (
-            super::codearts::models::remote_refreshed(),
-            super::codearts::models::last_refreshed_at(),
-        ),
-        ProviderKind::CatPaw => (
-            !super::catpaw::catalog::remote_models().is_empty(),
-            super::catpaw::catalog::last_refreshed_at(),
-        ),
-        ProviderKind::AutoClaw => autoclaw_catalog_state(AutoclawRegion::Cn),
-        ProviderKind::AutoClawIntl => autoclaw_catalog_state(AutoclawRegion::Intl),
-        ProviderKind::ClineFree | ProviderKind::ClinePass => (
-            super::cline::models::remote_refreshed(),
-            super::cline::models::last_refreshed_at(),
-        ),
-        // Accio 两个地区各有自己的目录缓存（上游按 `x-package-region` 给清单）：
-        // 两家任一刷过就算「有远程来源」，时间取两者里更近的那次
-        ProviderKind::Accio | ProviderKind::AccioCn => {
-            let region = super::accio::endpoints::Region::from_kind(kind)
-                .unwrap_or(super::accio::endpoints::Region::Global);
-            (
-                !super::accio::models::remote_models(region).is_empty(),
-                super::accio::models::last_refreshed_at(region),
-            )
-        }
-        // ZCode 两个地区共用一份**静态**清单（上游没有列模型的公开接口，
-        // 见 `zcode::models` 的模块头）：永远不是远程来源，也没有刷新时刻。
-        // 这里如实回 `(false, 0)` 而不是编一个时间 —— 界面的「来源」列会显示成
-        // 内置清单，与事实相符。
-        ProviderKind::Zcode | ProviderKind::ZcodeIntl => (false, 0),
-        // Trae 只有一张表（SOLO 通道），刷过就是远程来源；没刷到时是**空清单**
-        // 而不是静态兜底 —— 目录由 `X-Ide-Version-Code` 决定给哪张表，抄成
-        // 常量就是把一个时间点的读数当契约（见 `trae::models` 模块头）。
-        ProviderKind::Trae => (
-            super::trae::models::remote_refreshed(),
-            super::trae::models::last_refreshed_at(),
-        ),
-        // Loomy 的清单来自 `GET {集成网关}/api/v1/models`（OpenAI 格式）。
-        // 上游**没有**内置兜底清单，所以「有内容」就等于「远程拉到过」。
-        ProviderKind::Loomy => (
-            super::loomy::models::remote_refreshed(),
-            super::loomy::models::last_refreshed_at(),
-        ),
-        // KukuAI 的清单来自远程目录（`/wenchain/genflowpro/model_list`）；
-        // 静态兜底只是离线保底，「有内容」才算远程来源（与 raccoon 同判据）。
-        ProviderKind::Kuku => (
-            super::kuku::models::remote_refreshed(),
-            super::kuku::models::last_refreshed_at(),
-        ),
-        // MonkeyCode 的两个站点各有一份独立清单（缓存按地区分格，见
-        // `monkeycode::models` 的模块头）：这里如实各查**自己那一格**。
-        ProviderKind::MonkeyCode | ProviderKind::MonkeyCodeIntl => {
-            let region = super::monkeycode::Region::from_kind(kind)
-                .unwrap_or(super::monkeycode::Region::Cn);
-            (
-                super::monkeycode::models::remote_refreshed(region),
-                super::monkeycode::models::last_refreshed_at(region),
-            )
-        }
-        // Command Code：清单来自 `GET /provider/v1/models`（单一域名、无地区），
-        // 拉不到时回落内置 26 项 —— 「有远程内容」才算远程来源（`remote_refreshed`
-        // 只看落地的那些，不看兜底表）。
-        ProviderKind::CommandCode => (
-            super::commandcode::models::remote_refreshed(),
-            super::commandcode::models::last_refreshed_at(),
-        ),
-        // Antigravity：清单来自 `POST {base}:fetchAvailableModels`（三个环境
-        // 轮流打，但只有**一格**缓存 —— 环境不是地区）。拉不到时回落内置的
-        // Gemini 兜底清单，所以同样「有远程内容」才算远程来源。
-        ProviderKind::Antigravity => (
-            super::antigravity::models::remote_refreshed(),
-            super::antigravity::models::last_refreshed_at(),
-        ),
-        // OfficeAce 的清单来自 `GET {网关}/v1/models`（OpenAI 格式，网关 Basic
-        // 凭据）。上游目录照收（可用性由转发时的 81004/81009 分类回答），
-        // 「有内容」就是「远程拉到过」。
-        ProviderKind::OfficeAce => (
-            super::officeace::models::remote_refreshed(),
-            super::officeace::models::last_refreshed_at(),
-        ),
-        // OrcaTerm 的清单来自客户端内置（上游没有列模型的接口，见
-        // `orcaterm::models` 的模块头）：永远不是远程来源，也没有刷新时刻。
-        // 与 ZCode 同一口径：如实回 `(false, 0)`，界面的「来源」列显示成内置清单。
-        ProviderKind::OrcaTerm => (false, 0),
+pub(crate) fn refresh_meta_for_provider(provider: &str) -> (bool, i64) {
+    if crate::server::core::plugin_host::serves_provider(provider) {
+        let meta = crate::server::core::plugin_host::model_catalog_meta(provider);
+        return (meta.remote, meta.refreshed_at);
     }
+    kind_from_id(provider).map(refresh_meta).unwrap_or_default()
 }
 
-fn all_kinds() -> Vec<ProviderKind> {
-    PROVIDERS.iter().filter_map(|meta| kind_from_id(meta.id)).collect()
+fn all_provider_ids() -> Vec<String> {
+    let mut ids = super::executable_provider_ids();
+    for provider in PROVIDERS {
+        if !ids.iter().any(|id| id.eq_ignore_ascii_case(provider.id)) {
+            ids.push(provider.id.to_string());
+        }
+    }
+    ids
 }
 
-pub fn provider_available(store: &AccountStore, kind: ProviderKind) -> bool {
-    !store.accounts_for_provider(kind_id(kind)).is_empty()
-        || adapter_for(kind).env_credentials_present()
+pub fn provider_available(store: &AccountStore, provider: &str) -> bool {
+    store.routing_snapshot().available_providers.contains(provider)
 }
 
 /// 管理视图需要完整清单；对外视图在此基础上再应用每条绑定的开关。
-pub fn active_manifests(store: &AccountStore) -> Vec<(ProviderKind, Vec<Value>)> {
-    all_kinds()
+pub(crate) fn managed_manifests(store: &AccountStore) -> Vec<(String, Vec<Value>)> {
+    let accounts = store.routing_snapshot();
+    all_provider_ids()
         .into_iter()
-        .filter(|kind| provider_available(store, *kind))
-        .filter_map(|kind| {
-            let manifest = advertised_manifest_for(store, kind);
-            (!manifest.is_empty()).then_some((kind, manifest))
+        .filter(|provider| accounts.available_providers.contains(provider))
+        .map(|provider| {
+            let manifest = manifest_for_provider(&provider);
+            (provider, manifest)
         })
         .collect()
 }
 
-fn aggregate_source(active: &[(ProviderKind, Vec<Value>)]) -> (&'static str, i64) {
+pub fn active_manifests(store: &AccountStore) -> Vec<(String, Vec<Value>)> {
+    managed_manifests(store).into_iter().filter_map(|(provider, manifest)| {
+        let manifest = adapter_by_id(&provider)
+            .map(|adapter| adapter.advertise_models(store, manifest))
+            .unwrap_or_default();
+        (!manifest.is_empty()).then_some((provider, manifest))
+    }).collect()
+}
+
+fn aggregate_source(active: &[(String, Vec<Value>)]) -> (&'static str, i64) {
     match active {
-        [(kind, _)] => {
-            let (remote, refreshed_at) = refresh_meta(*kind);
+        [(provider, _)] => {
+            let (remote, refreshed_at) = refresh_meta_for_provider(provider);
             (if remote { "remote" } else { "builtin" }, refreshed_at)
         }
         [] => ("none", 0),
-        _ => ("aggregate", active.first().map(|(kind, _)| refresh_meta(*kind).1).unwrap_or(0)),
+        _ => ("aggregate", active.first().map(|(provider, _)| refresh_meta_for_provider(provider).1).unwrap_or(0)),
     }
 }

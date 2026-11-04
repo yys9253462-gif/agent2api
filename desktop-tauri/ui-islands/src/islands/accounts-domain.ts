@@ -1,10 +1,16 @@
 /**
- * 账号页的**纯逻辑层**：provider 能力表、基础判定、筛选口径、全局队列位置、限流文案。
+ * 账号页的**纯逻辑层**：基础判定、筛选口径、全局队列位置、限流文案。
  *
  * 替换 ui/accounts-groups.js + ui/accounts-model.js 里的纯逻辑部分（那两个文件里的
  * 「标签 / 面板 HTML」字符串生成器随表格一起变成 React 组件，见 accounts-page.tsx）。
  * 本文件不碰 DOM、不读写模块状态，只依赖 window.wbProviders 的 label 与
  * window.wbUnits 的读数格式化（都是运行期读）。
+ *
+ * ── 能力表不在这里 ──────────────────────────────────────────
+ * 「这一家的账号行怎么画」（标识读哪个键、有效期读哪个键、有没有余额入口）
+ * 在 `accounts-features.ts`：那些参数由**插件握手时申报**，本文件只是转出
+ * `providerFeatures` 给既有调用点用。分出去是因为它们回答的是另一个问题，
+ * 而且事实来源已经从网关前端的常量表变成了插件。
  *
  * ── 对外契约（必须原样保留的调用点）────────────────────────────
  *   · app.js:236  `wbAccountsModel.isLimited`（顶栏「已限流」计数，含余额不足档）
@@ -27,233 +33,27 @@
  * （模型测试的候选清单、⋯ 菜单的「已在第一位」判定）。
  */
 
-import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
+import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type AccountSorting, type GroupSortRule, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
+import { providerFeatures, type ProviderFeatures } from './accounts-features'
 import { t } from '../i18n'
+import { limiterHit } from './accounts-limiter-model'
+import { accountReloginText } from './accounts-authorization'
+import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
+
+// 能力表与插件申报的读取在 accounts-features.ts（那边的模块头说明了查询顺序）。
+// 这里转出去，是因为域层的既有调用点（`providerFeatures` 被 app.js / report.js /
+// models-fetch-modal 当 `wbAccountsModel` 的成员用）都从本文件拿。
+export { adoptDeclaredFeatures, declaredAccountFeatures, providerFeatures } from './accounts-features'
 
 /** 缺省 provider id（后端注册表的默认项；旧账号记录没有该字段时的兜底） */
 export const DEFAULT_PROVIDER_ID = 'workbuddy'
 /** 小浣熊 provider id（只有它需要「桌面端实时登录态」这类专属标记） */
 export const RACCOON_PROVIDER_ID = 'raccoon'
 
-type ProviderFeatures = {
-  /** 这一家有没有余额 / 积分查询概念 */
-  usage: boolean
-  /** 有没有国内 / 国际版概念（决定提供商徽章是否拼版本后缀、有效期读哪个字段） */
-  edition: boolean
-  /** 账号标识落在记录里的哪个键（uid / userId / account） */
-  identifier: string
-  /** 有效期落在记录里的哪个键（expiresAt / tokenExpiresAt） */
-  expiry: string
-  /** 「这家的账号以邮箱报名字」（Qoder / AutoClaw 国际版 / Accio）。两处消费：
-   *  displayNameOf（**未设备注**账号的主名口径，设过备注的以备注名为主）与
-   *  models-fetch-modal 的 accountLabel（拉取模型的账号下拉） */
-  emailAsName?: boolean
-  /** 有没有「领体验套餐」这个动作（只有 ZCode 两家） */
-  claim?: boolean
-  /**
-   * 有没有「使用哪个套餐（上游通道）」这个设置（只有 ZCode 两家）。
-   *
-   * 它回答的是「这个账号的请求走哪条上游通道」：编码套餐（自己买的订阅，
-   * 开放平台的 OpenAI 端点）还是活动套餐（官方限时发放的额度，`zcode.z.ai`
-   * 的 Anthropic 端点）。两者是**两份独立额度**，而「套餐已到期」这类拒绝
-   * 只由其中一条给出 —— 所以它是设置项而不是自动探测（见后端
-   * `providers::zcode::plan` 的模块头）。
-   */
-  planChannel?: boolean
-  /**
-   * 余额列要不要用「套餐徽标 + 点击明细弹层」的两行形态（只有 CodeArts）。
-   *
-   * 本家的余额是**两台网关、两组口径**（订阅统计的积分类计量表 + 福利网关的
-   * token 池，见后端 `providers::codearts::balance` 的模块头），一行「可用 N 积分」
-   * 是各池剩余的加总 —— 两个权益不同的账号（试用版 / 免费版）在列里长得一样，
-   * 构成只有弹层才放得下。别的家的 wallets 形状不同（ZCode 走 usage-pool 两行、
-   * Loomy 双账户一行就够），按能力位开关而不是形状探测：弹层是**交互承诺**
-   * （点开一定有逐项读数），形状探测会让没把握的家也变成可点。
-   */
-  usageDetail?: boolean
-  /**
-   * 余额格的读数旁边要不要挂「积分明细」入口（逐份积分包：面额 / 已用 / 剩余 +
-   * 领取 → 到期）—— 已登记的有 WorkBuddy 两家、Trae、OfficeAce、AutoClaw 两家、
-   * ZCode 两家、Qoder 两家、Loomy、小浣熊。
-   *
-   * 与 `usageDetail` 的差别是**动不动排版**：那个会把这格换成「套餐徽标 + 读数
-   * 按钮」的整套两行形态（CodeArts 的余额是两台网关的加总，一行分不出权益差别，
-   * 所以值得换）；这些家的读数本身（单行读数的「可用 N」、主额度桶的套餐名 +
-   * 进度条 + 剩 x / 共 y）已经回答了用户最常问的那句，明细是**加一层**而不是
-   * 换一层 —— 换过去主额度桶那格会丢掉进度条。
-   *
-   * 判据同样按能力位而不是形状探测：后端 `credits[]` 是这些家（以及以后愿意
-   * 照这个行形状出数据的家）的**承诺** —— 点开一定有逐份读数，不是点开一个空框。
-   */
-  creditDetail?: boolean
-  /**
-   * 这一家「并发上限」的默认值（>0 = 本家**没有**「不限」这一档）。
-   * CodeArts 的 3 是上游硬顶（超过直接回 HTTP 400，且那是账号级冲突、不降级换号），
-   * 所以那一家把 `0` 解释成「按默认 3」而不是「不做并发过滤」；后端同一口径写在两处
-   * （公开形态把没配过的报成 3、准入闸按 3 判），界面上说了就得对上。
-   */
-  concurrencyDefault?: number
-}
-
-/**
- * provider 能力表：决定行上出现哪些按钮、哪行明细显示什么。
- *
- * 为什么是「按 provider 查表」而不是在渲染处写 if：账号页的每个分支（余额按钮、
- * 版本后缀、标识字段名）都要问同一个问题 ——「这家有没有这个概念」。
- * 散在各处写 if 的话，加一家就要翻一遍全文件，漏掉一处不报错、只静默少一个按钮。
- *
- * （签到**不在**这张表里：账号页已无签到按钮，签到中心的分组与可签判定在
- * 后端 —— `core::auto_checkin` 的 CHECKIN_PROVIDERS 与 `billing::checkin::
- * supports_checkin` 是唯一口径，各家的签到链路事实也记在那边的模块头里。）
- *
- * usage 各家都是 true（余额查询已扩到全部提供商），各由自己的适配器实现；前端只回答
- * 「这一家有没有这个概念」。CatPaw 的余额接口要单独配一个网页会话凭证（token2），
- * 没配置时后端返回可识别的「未配置」、余额列显示成中性提示 —— 所以它的按钮照样渲染，
- * 用户才有「去配置」的入口。
- */
-const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
-  // `creditDetail: true` —— 余额格读数旁边挂「积分明细」：后端 `query_usage` 在既有
-  //   积分简报之外还出 `credits[]`（逐份积分包的面额 / 已用 / 剩余 / 领取 / 到期，
-  //   见 providers::workbuddy::adapter 的 query_usage）。两地区能力一致，
-  //   两项都要登记（漏一个那一家就掉进 GENERIC_FEATURES）。
-  //   enterprise 账号没有资源包、后端不挂 `credits`，界面按空数组自然退回原样。
-  workbuddy: { usage: true, creditDetail: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
-  // WorkBuddy 国际版（拆家后的第二家，见 providers::workbuddy::region）：
-  //   `edition: false` 是因为注册名「WorkBuddy 国际版」自带地区，再拼一次会
-  //   得到「WorkBuddy 国际版 国际版」（`editionSuffix` 虽有「名字已含就不拼」
-  //   的兜底，这里直接写 false 更清楚，与 `zcode-intl` 同款）。
-  'workbuddy-intl': { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
-  // `creditDetail: true` —— 四个钱包桶（每日积分 / 每月会员积分 / 奖励积分 /
-  //   充值积分）各一行：上游只给余额一个数，没有面额 / 已用 / 到期（缺的键不出），
-  //   明细比读数多的只是「钱在哪个桶里」。
-  raccoon: { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
-  catpaw: { usage: true, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
-  // AutoClaw 两个地区能力完全一致，差别只在域名；两项都必须登记 —— 漏了哪一项，
-  // 那一家就会掉进 GENERIC_FEATURES（症状：余额按钮消失、标识列显示成空）
-  // `creditDetail: true` —— 逐钱包余额各一行，另加一条「即将过期」（上游给的是
-  //   相对时长文案，原样带出，不换算成时刻）。两个地区都要带上。
-  autoclaw: { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
-  'autoclaw-intl': { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt', emailAsName: true },
-  // Qoder 两个地区能力完全一致（拆家后是两家 provider，查表按 id 精确匹配，
-  // 只登记一个会让国际版掉进 GENERIC_FEATURES）；`edition` 列仍在 —— 两家各是
-  // 单一地区，但公开形态仍带 edition 供徽章显示
-  // `creditDetail: true` —— 三个桶各一行（套餐额度 / 个人资源包 / 组织资源包），
-  //   桶级口径、没有时刻；两个地区都要带上。
-  qoder: { usage: true, creditDetail: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  'qoder-intl': { usage: true, creditDetail: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  // Cline 两条键：同一家上游按计费通道拆成两个 provider，账号形态完全一样（见
-  // providers::cline::models）。查表按 id 精确匹配，只登记一个会让另一家掉进兜底
-  'cline-free': { usage: true, edition: false, identifier: 'account', expiry: 'expiresAt' },
-  'cline-pass': { usage: true, edition: false, identifier: 'account', expiry: 'expiresAt' },
-  // Accio 两个地区：额度可查（上游只给用量百分比）、有地区概念
-  accio: { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  'accio-cn': { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  // ZCode 两个地区：本家的运营动作是「限时套餐领取」（claim 位）。
-  // `usage: true` 对应 providers::zcode::balance —— 它是一条**候选令牌链**：
-  //   有套餐 JWT 时读 billing 网关的 `/zcode-plan/billing/balance`（余额桶 + 到期），
-  //   否则（或 JWT 被拒时）用 accessToken 读开放平台监控接口的窗口限额
-  //   （每 N 小时 / 每周的剩余比例，见 providers::zcode::monitor）。
-  //   两把凭证都没有时后端回可识别的「未配置」，余额列显示成中性提示而不是一片红，
-  //   所以这颗按钮照样渲染。
-  // `claim: true` 就是那颗「领套餐」：2026-09-28 起那期（ZCode Trust Build）是
-  //   **每天一份新套餐**（plan_id 带日期段），领过之后按钮当天显示「今日已领」、
-  //   次日自动恢复 —— 见 `claimedToday`。
-  // expiry 取 expiresAt 是给 add_zcode_account 的契约（落账号时要写访问令牌的过期时间）
-  // `creditDetail: true` —— 逐额度桶一行（总量 / 已用 / 剩余，认得出归属时还带套餐名）；
-  //   纯比例窗口（监控通道那条链）只有 `remainingPercent`、三个数全缺，整行跳过
-  //   （见 zcode::balance 的 credits_of）—— 那一档和现在一样不出入口。两个地区都要登记。
-  zcode: { usage: true, creditDetail: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
-  'zcode-intl': { usage: true, creditDetail: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
-  // CodeArts（华为云 AI 代码助手）。各位各有出处，别照着别家抄：
-  // `usage: true` —— 余额是**两份账**（订阅统计 + 福利网关，见 providers::codearts::balance），
-  //   界面上「读到 0」与「没读到」必须能分开，后端因此把失败的一侧写进 statisticsError /
-  //   benefitError 而不是整次失败（半次失败的呈现见 accounts-panels 的 usageSummary）。
-  // `usageDetail: true` —— 余额列的明细弹层形态（套餐徽标 + 点击逐项读数）：本家
-  //   的计量表一行放不下，「可用 N 积分」是加总，两个权益不同的账号看不出差别。
-  // 「领福利」不在能力表里：入口已整体迁到「签到中心」（api::checkin_center 按
-  //   provider 组装福利行，ui/codearts-welfare.js 的流程两边共用），账号页不再有
-  //   这颗按钮 —— 判据只留后端一处，界面不再查表。
-  // `edition: false` —— 没有版本/地区概念：region 固定在 cn-north-4 且必须与 token
-  //   签发地一致，不是用户可选项；`login_type`（WEB/IDE）也不是版本，别塞进这一列。
-  // `expiry: 'expiresAt'` —— 临时凭据约一小时到期，这一列对本家**是主要信息**。
-  codearts: {
-    usage: true, usageDetail: true, edition: false,
-    identifier: 'userId', expiry: 'expiresAt',
-    concurrencyDefault: 3,
-  },
-  // Trae（只有 SOLO 那一家）：`edition: false` 是事实 —— 国内 SOLO 与国际版是**两套协议**
-  // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id，不把它做成账号字段。
-  // `usage: true` 对应 providers::trae::usage（上游两份账：ide_user_ent_usage 的权益包/
-  // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
-  // `creditDetail: true` —— 同一份 ent_usage 里还读得到**逐份权益包**的
-  //   `start_time` / `expire_time`（领取 → 到期），后端摊成 `credits[]`
-  //   （见 providers::trae::usage 的 credit_rows）。签到发的包会按天堆起来，
-  //   哪一份先作废只有这份清单答得上来。
-  trae: { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
-  // Loomy（讯飞）。各位各有出处：
-  // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
-  //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
-  // `edition: false` —— 单一入口（手机验证码登录），没有国际版/地区概念。
-  // `expiry: 'expiresAt'` —— 落账号时按登录时刻 + 14 天估算（上游没有续期接口，
-  //   过期只能重新登录；这一列对它是「什么时候该重登」的提示）。
-  // `creditDetail: true` —— 双账户各一行（永久积分 / 每日赠送积分），后者标 `daily`
-  //   → 界面写「每日重置」而不是到期（读到 0 也不折进「已用完」，明天回满）。
-  loomy: { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
-  // KukuAI（百度文库库库 AI）。各位各有出处：
-  // `usage: true` —— 余额/积分查询（GET /bizapi/gfpro/getgfvipremain 的
-  //   totalPoint，见后端 providers::kuku::balance）。
-  // `edition: false` —— 单一入口（粘贴 Cookie / 导入本机登录态 / 网页登录），
-  //   没有国际版。
-  // `identifier: 'uid'` —— 账号标识存 uid（userreport 的 uk）。
-  // `expiry: ''` —— BDUSS 没有过期时间字段（无刷新接口，过期只能重登，
-  //   这一列对它是空，界面不渲染「有效期」）。
-  kuku: { usage: true, edition: false, identifier: 'uid', expiry: '' },
-  // OfficeAce（华为云果办 / OfficeClaw）。各位各有出处：
-  // `usage: true` —— 额度/积分要**控制面签名**（V11-HMAC-SHA256 打 `/v1/subscription`），
-  //   那条链已经实现（`officeace/balance.rs` + 适配器 `query_usage`），所以余额按钮与
-  //   积分列都开。⚠️ 只导入网关 Basic 那一对、没有控制面凭据的账号查不到余额，
-  //   服务端回 400 `usage_not_configured`，界面按「未配置查询」如实显示（不是报错）。
-  // `edition: false` —— 单一入口（自助 OAuth 浏览器登录 / 粘贴网关 Basic 凭据），
-  //   没有国际版。
-  // `expiry: 'expiresAt'` —— 控制面临时凭据约 2 小时到期；只导入网关 Basic
-  //   凭据时没有这个字段，界面不渲染「有效期」（那一半本来也不过期）。
-  // `identifier: 'id'` —— 账号标识渲染的是**账号 id**（`officeace-<hash>`，
-  //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
-  //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
-  // `creditDetail: true` —— 逐条套餐配额 + 逐条奖励活动各一行（奖励活动含已过期的
-  //   —— 弹层把它与「已用完」一起收进末尾折叠组），另加一条联网搜索（单位「次」，
-  //   与文档级的「积分」不同）。
-  officeace: { usage: true, creditDetail: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
-  // Antigravity（Google AI IDE）。各位各有出处：
-  // `usage: true` —— 额度是**两个模型组 × 两个窗口**（5 小时 / 每周）的剩余比例，
-  //   见后端 providers::antigravity::balance（retrieveUserQuotaSummary）；
-  //   上游只给比例、没有绝对数，钱包行走纯比例读数（`remainingPercent` +
-  //   `balanceView`），余额列显示「最紧张的窗口」，悬停列出全部窗口与重置时刻。
-  // `edition: false` —— 单一入口（Google OAuth 粘贴 / 网页登录），没有地区概念。
-  // `identifier: 'userId'` —— 身份键存的就是 email（见 account_store::antigravity_accounts 模块头）。
-  // `expiry: ''` —— refresh token 不过期、access token 自动续期，这一列对它没有可显示的事实
-  //   （与 kuku 同一处置：界面不渲染「有效期」）。
-  antigravity: { usage: true, edition: false, identifier: 'userId', expiry: '' },
-}
-
-/**
- * 未登记 provider 的兜底能力：不显示余额 / 版本 —— 这两个都是 provider 私有
- * 概念，未知的家不该被假定拥有。标识字段假定成 userId，取不到时明细行自动少一项。
- */
-const GENERIC_FEATURES: ProviderFeatures = {
-  usage: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt',
-  emailAsName: false,
-}
-
 /** 账号所属 provider（字段缺失 / 非字符串按默认 provider 兜底，与后端 store 口径一致） */
 export function providerOf(account: AccountRecord | null | undefined): string {
   const id = account?.provider
   return typeof id === 'string' && id ? id : DEFAULT_PROVIDER_ID
-}
-
-/** provider id → 能力表（未登记的家走 GENERIC_FEATURES） */
-export function providerFeatures(providerId: string | undefined): ProviderFeatures {
-  return (providerId && PROVIDER_FEATURES[providerId]) || GENERIC_FEATURES
 }
 
 /* ─── OpenCode Zen 判定（出网「轮询」档的唯一开放对象）─────────── */
@@ -347,22 +147,44 @@ export function providerSummaries(snapshot: AccountsSnapshot | null | undefined)
     if (known.has(id)) return
     known.set(id, { id, label: shared().wbProviders?.labelOf?.(id) || id, count })
   })
-  // 摘要还没到时的兜底项：名字优先问注册表，问不到才用字面量 —— 与
-  // add-provider-pick 那张卡的兜底同一口径（拆家后注册名带「国内版」）
-  if (!known.size) {
-    known.set(DEFAULT_PROVIDER_ID, {
-      id: DEFAULT_PROVIDER_ID,
-      label: shared().wbProviders?.labelOf?.(DEFAULT_PROVIDER_ID) || 'WorkBuddy 国内版',
-      count: 0,
-    })
-  }
+  // 首屏尚无摘要/账号时保持空表；不凭空创建未安装插件的提供商分组。
   return [...known.values()]
 }
 
-/** 账号标识（workbuddy 是 uid，小浣熊是 userId）；取不到返回空串 */
+/**
+ * 账号标识（workbuddy 是 uid，小浣熊是 userId）；取不到返回空串。
+ *
+ * 按申报的候选键**顺序取第一个有值的**：同一条账号可能来自插件新落的记录
+ * （键名由插件定）或升级上来的存量记录（键名是网关旧投影的历史契约），
+ * 两套键名都列在申报里，谁有值用谁。
+ */
 export function identifierOf(account: AccountRecord | null | undefined): string {
-  const key = providerFeatures(providerOf(account)).identifier
-  return String(account?.[key] || '')
+  return firstKeyOf(account, providerFeatures(providerOf(account)).identifier)
+}
+
+/**
+ * 账号标识**实际取自哪个键**（悬停气泡上显示 `uid 12345` 里的那个 `uid`）。
+ *
+ * 与 `identifierOf` 走同一套候选键：候选里第一个有值的那个就是标签。
+ * 全部没值时返回空串 —— 气泡那一行整条不渲染，不会留下「 uid」这种半截。
+ */
+export function identifierKeyOf(account: AccountRecord | null | undefined): string {
+  for (const key of providerFeatures(providerOf(account)).identifier) {
+    const value = account?.[key]
+    if (value === null || value === undefined || value === '') continue
+    return key
+  }
+  return ''
+}
+
+/** 按候选键顺序取第一个非空值（空串 / null / undefined 都算没有）。 */
+function firstKeyOf(account: AccountRecord | null | undefined, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = account?.[key]
+    if (value === null || value === undefined || value === '') continue
+    return String(value)
+  }
+  return ''
 }
 
 /**
@@ -382,10 +204,33 @@ export function expiryMillis(value: unknown): number {
   return raw < 1e11 ? raw * 1000 : raw
 }
 
-/** token 过期时间戳（毫秒，0 表示记录里没有这个字段） */
+/**
+ * token 过期时间戳（毫秒，0 表示记录里没有这个字段）。
+ *
+ * 按申报的候选键顺序取**第一个能解析出正数**的：插件新落的记录与存量旧投影
+ * 的键名不同（小浣熊是 `expiresAt` / `tokenExpiresAt`），两套都列在申报里。
+ * 注意判据是「能解析出正数」而不是「有值」—— 一个 `null` 或空串不该把后面
+ * 那个有值的键挡掉。
+ */
 export function tokenExpiryOf(account: AccountRecord | null | undefined): number {
-  const key = providerFeatures(providerOf(account)).expiry
-  return expiryMillis(account?.[key])
+  const keys = providerFeatures(providerOf(account)).expiry
+  for (const key of keys) {
+    const value = expiryMillis(account?.[key])
+    if (value > 0) return value
+  }
+  return 0
+}
+
+/**
+ * 这家的主凭证是不是**长期有效**（没有固定到期时刻，见 `ProviderFeatures.longLived`）。
+ *
+ * 有效期列据此把「—」换成「长期有效」：两者在界面上是**两件事** ——
+ * 「—」读作「这条记录里没有到期时间」（可能是数据缺失），而长期有效是
+ * 「本来就没有到期这回事」。只按 `expiry` 是否为空串判断做不到这个区分：
+ * KukuAI 也是空串，但它的 BDUSS 会被上游作废、只是读不出时刻。
+ */
+export function isLongLivedCredential(account: AccountRecord | null | undefined): boolean {
+  return providerFeatures(providerOf(account)).longLived === true
 }
 
 /**
@@ -399,8 +244,17 @@ export function tokenExpiryOf(account: AccountRecord | null | undefined): number
  * 「有方案但凭证没配」**照样算有**：后端那次查询回的是「未配置」的中性提示
  * （不是红色失败），按钮与「查询设置」段都得在，用户才有地方去补 —— 与
  * CatPaw / ZCode 的「未配置也给入口」同一取舍。
+ *
+ * ── 访客账号（`isGuest`）不参与（2026-10）─────────────────────
+ * 智谱清言的访客没有积分体系：上游那几个接口对访客一律 401，查询的结果**恒定
+ * 为失败**。它不是「这次没查到」而是「这条账号没有可查的东西」，与「这家没有
+ * 余额概念」是同一档事实 —— 所以这里一并返回 false：余额列显示「—」、
+ * 批量查询不把它算进分母、设置弹窗里也不出现「查询设置」段。后端
+ * `usage_query::supports_usage` 是同一判据（两处必须同口径，否则界面算的目标
+ * 集合与后端返回的行会对不上）。
  */
 export function supportsUsage(account: AccountRecord | null | undefined): boolean {
+  if (account?.isGuest === true) return false
   const provider = providerOf(account)
   if (provider.startsWith('custom-')) return Boolean(account?.balanceQuery?.scheme)
   return providerFeatures(provider).usage
@@ -440,26 +294,18 @@ export const TOKEN_PERIOD_MAX_SECONDS = 86_400
 /** 旧「余额不足处理」的缺省阈值（限制器上线后只作为旧记录的推导兜底） */
 export const DEFAULT_LOW_BALANCE_THRESHOLD = 1
 
-/** CodeArts 缺省 Token 规则的阈值：**每日** 950 万 Token（自然日 0 点重置）。
- * 不给满 1000 万：实际消耗停不到精确的额度上限，上游在 995 万左右就会开始
- * 报余额不足，压着 1000 万判定只会让请求撞报错，950 万是留足余量的判定线。 */
-export const DEFAULT_DAILY_TOKEN_LIMIT = 9_500_000
-
 /**
- * 各 provider 的**缺省限制规则** —— 与后端 `limiter::default_rules` 同一口径：
- * - **CodeArts → Token 自然日 950 万，跳过**：这家的余额读数常判不出
- *   （免费版账号没有积分类计量表，额度全在福利 token 池），余额规则形同虚设；
- *   「过了 0 点额度就回来」正是它的额度形态，按自然日 Token 判定才兜得住。
+ * 各 provider 的**缺省限制规则**。查询顺序：**插件申报 → 内置表**。
+ *
+ * 插件申报优先（`AccountFeatures::default_limiters`）：这是「这一家的额度形态
+ * 长什么样」的结论，属于 provider 知识。`undefined` = 插件没申报，走下面这张
+ * 内置表（与后端 `limiter::default_rules` 同一口径）：
  * - **Cline 免费池 → 无规则**（原「不处理」缺省的理由不变）。
- * - **其余 → 余额 < 1 跳过**（历史缺省不变）。
+ * - **其余 → 总余额 < 1 跳过**。
  */
 export function defaultLimiters(provider: string | undefined | null): LimiterRule[] {
-  if (provider === 'codearts') {
-    return [{
-      type: 'token', action: 'skip', threshold: DEFAULT_DAILY_TOKEN_LIMIT,
-      reset: 'daily', enabled: true,
-    }]
-  }
+  const declared = provider ? providerFeatures(provider).defaultLimiters : undefined
+  if (declared && (provider !== 'codearts' || declared.every(rule => rule.type === 'balance'))) return declared.slice()
   if (provider === 'cline-free') return []
   return [{ type: 'balance', action: 'skip', threshold: DEFAULT_LOW_BALANCE_THRESHOLD, enabled: true }]
 }
@@ -504,7 +350,7 @@ function limiterRuleValid(rule: unknown): rule is LimiterRule {
 /**
  * 记录上没有 `limiters` 键（旧版后端 / 旧记录）时的推导：有显式 `lowBalance`
  * （用户 / 旧版配过）就原样尊重；两者都没有时按 provider 给缺省规则
- * （`defaultLimiters`，CodeArts 拿到的是 Token 自然日规则）。
+ * （`defaultLimiters`）。
  * 与后端 `limiter::derive_from_legacy` 同一口径。
  */
 function legacyRulesOf(account: AccountRecord | null | undefined): LimiterRule[] {
@@ -583,6 +429,7 @@ export function balanceBlockedOf(
   account: AccountRecord | null | undefined,
   entry: UsageEntry,
 ): boolean {
+  if (Array.isArray(account?.limiterGroups)) return limiterHit(account, 'balance')
   const rules = limitersOf(account).filter(rule =>
     rule.type === 'balance' && rule.action === 'skip' && rule.enabled !== false && rule.threshold > 0)
   if (!rules.length) return false
@@ -611,6 +458,7 @@ export function tokenBlockedOf(
   account: AccountRecord | null | undefined,
   readings: TokenReading[] | undefined,
 ): boolean {
+  if (Array.isArray(account?.limiterGroups)) return limiterHit(account, 'token')
   const rules = limitersOf(account).filter(rule =>
     rule.type === 'token' && rule.action === 'skip' && rule.enabled !== false)
   if (!rules.length || !readings?.length) return false
@@ -631,6 +479,7 @@ export function tokenDisableTriggeredOf(
   account: AccountRecord | null | undefined,
   readings: TokenReading[] | undefined,
 ): boolean {
+  if (Array.isArray(account?.limiterGroups)) return limiterHit(account, 'token', 'disable')
   return limitersOf(account).some(rule => {
     if (rule.type !== 'token' || rule.action !== 'disable' || rule.enabled === false) return false
     const reading = tokenReadingForRule(rule, readings)
@@ -739,10 +588,10 @@ export function isEnabled(account: AccountRecord | null | undefined): boolean {
 
 /**
  * 账号是否处于限流状态（存在未到恢复时间的限额记录）。
- * 传入 model 时只判定该模型 —— 限额是按模型记的，一个账号可能对 A 模型限额、
- * 对 B 模型完全正常。
+ * 传入 model 时只判定该模型；账号级冷却则对全部模型生效。
  */
 export function isRateLimited(account: AccountRecord | null | undefined, model = ''): boolean {
+  if (upstreamCooldownOf(account)) return true
   const limits = account?.rateLimits || {}
   const now = Date.now()
   if (model) return Number(limits[model]?.resetAt) > now
@@ -752,19 +601,6 @@ export function isRateLimited(account: AccountRecord | null | undefined, model =
 /** 账号所属版本：cn=国内 / intl=国际（缺省视为国内，兼容旧账号记录） */
 export function accountEdition(account: AccountRecord | null | undefined): 'cn' | 'intl' {
   return account?.edition === 'intl' ? 'intl' : 'cn'
-}
-
-/**
- * 这个账号能不能「领取体验套餐」（ZCode 独有的动作）。两道判据缺一不可：
- *   ① 能力位（claim）—— 只有 ZCode 那两家登记了它；
- *   ② `canClaim` —— 后端公开形态给的字段，表示这个账号确实带着套餐令牌（jwt）。
- * 只填了 accessToken 的账号没有 jwt，界面上就不该给一个点了必然 400 的按钮。
- * `canClaim` 缺省按 true：取不到时宁可让按钮出现、由后端如实报错，
- * 那比「按钮消失且没有任何解释」更容易排查。
- */
-export function supportsClaim(account: AccountRecord | null | undefined): boolean {
-  if (!providerFeatures(providerOf(account)).claim) return false
-  return account?.canClaim !== false
 }
 
 /** ZCode 的两条上游通道取值（与后端 `providers::zcode` 的常量逐字一致） */
@@ -847,23 +683,6 @@ export function claimedPlanIdsToday(account: AccountRecord | null | undefined): 
 }
 
 /**
- * 今天是否领过至少一份。**只用于文案与悬停提示，不用来禁用按钮** ——
- * 「还有别的套餐能领吗」只有在弹窗里逐份比对才判得准（见 `claimedPlanIdsToday`）。
- */
-export function claimedToday(account: AccountRecord | null | undefined): boolean {
-  return claimedPlanIdsToday(account).length > 0
-}
-
-/** 「今天领过 N 份」的悬停说明：列出领过的套餐，并说清还能继续领别的 */
-export function claimDoneTitle(account: AccountRecord | null | undefined): string {
-  const planIds = claimedPlanIdsToday(account)
-  const names = planIds.length ? t('（{plans}）', { plans: planIds.join(t('、')) }) : ''
-  return t('今天（北京时间 {day}）已领取 {n} 份{names}；还有其他可领套餐时，点这里可以继续领；活动按自然日发新套餐，明天可再领', {
-    day: beijingDay(), n: planIds.length, names,
-  })
-}
-
-/**
  * 余额列要不要走「套餐徽标 + 点击明细弹层」的两行形态（见 ProviderFeatures.usageDetail）。
  */
 export function supportsUsageDetail(account: AccountRecord | null | undefined): boolean {
@@ -878,6 +697,86 @@ export function supportsUsageDetail(account: AccountRecord | null | undefined): 
  */
 export function supportsCreditDetail(account: AccountRecord | null | undefined): boolean {
   return Boolean(providerFeatures(providerOf(account)).creditDetail)
+}
+
+/**
+ * **账号最早一份「还能用」的积分包到期时刻**（毫秒）；读不到就是 `null`。
+ *
+ * 「还能用」= 未过期 + 剩余不为 0：已经作废的包不参与「快到期优先」，
+ * 否则一个上个月就过期的账号会永远霸占组首。
+ *
+ * ── 数据从哪来 ────────────────────────────────────────────────
+ * 余额读数（`UsageEntry`）里的 `credits[]`：后端逐份给出面额 / 已用 / 剩余 /
+ * 领取 / 到期（见 `billing::usage` 的 `credit_packs_from`）。只有登记了
+ * `creditDetail` 能力的家才会产出这个数组，其余家自然读到 `null`。
+ *
+ * ── 非到期积分包要跳过（与 creditRowsOf 的展示判据同源）────────
+ *   · `snapshot: true` —— 钱包余额或计数器读数，不是一份有到期的积分包。
+ *   · `daily: true` —— 每日回满而不是到期作废，它的 expireAt 是周期边界
+ *     （今天 24 点）；拿它参与排序会让日额度账号天天霸占组首。
+ *   · `record: true` —— 流水一笔（收支记录），不是一份还有余额的包。
+ *   · `unlimited: true` —— 没有「花完」的概念。
+ * 这些形态在 `creditRowsOf` 里也有对应判据（那边决定「要不要折进已用完」），
+ * 两处问的是同一件事：这份包现在还值不值得关心。
+ */
+export function creditExpiryOf(entry: UsageEntry, now = Date.now()): number | null {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const data = entry as Record<string, unknown>
+  const packs = Array.isArray(data.credits) ? data.credits as Array<Record<string, unknown>> : []
+  let best: number | null = null
+  for (const pack of packs) {
+    if (!pack || typeof pack !== 'object') continue
+    if (pack.snapshot === true || pack.record === true || pack.daily === true || pack.unlimited === true) continue
+    const expire = Number(pack.expireAt)
+    if (!Number.isFinite(expire) || expire <= 0 || expire <= now) continue
+    const remain = pack.remain
+    // 剩余读到 0 就是花完了；读不到（缺键）时不猜 —— 与 creditRowsOf 的 exhausted
+    // 判据同一取向：两侧都读不到就不下结论，宁可让它参与排序
+    if (remain !== null && remain !== undefined && remain !== '' && Number(remain) <= 0) continue
+    if (best === null || expire < best) best = expire
+  }
+  return best
+}
+
+/**
+ * 这一家能不能按「积分到期时间」排序（静态能力位，插件申报优先）。
+ *
+ * ── 为什么不能直接用 `creditDetail` ───────────────────────────
+ * `creditDetail` 只说「这一家有逐份积分明细」，**不保证明细里带到期时间**。
+ * 所以协议里另有一位 `creditExpiry`（插件握手时申报），本函数读它。
+ * 逐家核对后端产出（`credits[].expireAt`）之后的真实分布是：
+ *
+ *   ✅ 产出 `expireAt`（申报了这一位）：
+ *     · workbuddy / workbuddy-intl —— `billing::usage` 的 `credit_packs_from`
+ *       逐份给出 `DeductEndTime`（见 workbuddy/adapter.rs）
+ *     · trae —— `trae/usage.rs` 把权益包的 `expire_time`（缺则 `end_time`）写成
+ *       毫秒 `expireAt`，并按到期升序排好
+ *     · officeace —— `officeace/subscription.rs` 的套餐配额 / 奖励活动行都带
+ *       `expireAt`（毫秒，`expire_ms > 0` 才写）
+ *
+ *   ❌ 有明细、但**明细里没有到期时间**（不进名单）：
+ *     · raccoon —— 明细只有 `name` + `remain`（上游只给余额一个数）
+ *     · zcode —— `credits_of` 只写 total/used/remain，纯比例窗口整行跳过
+ *     · qoder —— 代码注释明确写着「不写 `expireAt` / `grantAt`：桶级没有这些字段」
+ *     · loomy —— 永久积分 / 每日赠送两行，都没有到期
+ *     · modelscope —— 魔粒余额两行，没有到期
+ *     · lobsterai —— 测试明确断言「未核实格式的字段一律不写」
+ *     · chatglm —— 只有**流水记录**（`record: true`）带 `expireAt`，
+ *       而流水不是「一份还有余额的包」，排序时被 creditExpiryOf 跳过
+ *     · autoclaw —— `credits[]` 里没有 `expireAt`；它的 `expireAt` 在
+ *       `subscription` 上（订阅到期，不是积分包到期），而「即将过期」那行只有
+ *       相对文案（“7 天”），拿它推时刻等于替上游编一个时间
+ *
+ * 这份分布是**契约**：后端哪天给某一家补上了逐份到期，插件那边要同步申报
+ * 这一位，否则那一家的设置项会一直显示「不可用」。
+ *
+ * 运行时还有第二道闸（方案 B，见 GroupSettingsDialog 的「暂无数据」）：
+ * 申报了的家如果这一组所有账号都还没查到到期（没点过「查询余额」），
+ * 设置项会标注「暂无数据」而不是假装可用。
+ */
+export function supportsCreditExpiry(provider: string | null | undefined): boolean {
+  if (!provider) return false
+  return providerFeatures(provider).creditExpiry === true
 }
 
 /**
@@ -1124,18 +1023,37 @@ export function activeLimits(account: AccountRecord | null | undefined): Array<R
 /**
  * 转发顺序位置表：accountId → `{ position, total }`（1 起）。
  *
- * **全局一条队列**：四家账号按优先级混排，序号就是整张表的行序，与后端选路
- * （全局优先级）、↑/↓ 的边界同源 —— 否则会出现「界面上不是第一位、但下移按钮
- * 已经点不动」这种对不上的情况。
+ * 有网关快照时使用有效消耗顺序；旧客户端回落到账号库的手动优先级。
  */
-export function positionMap(all: AccountRecord[] | null | undefined): Map<string, { position: number; total: number }> {
-  const ordered = (all || []).slice().sort(byPriorityOrder)
+export function positionMap(all: AccountRecord[] | null | undefined, sorting?: AccountSorting | null): Map<string, { position: number; total: number }> {
+  const positions = new Map((sorting?.providerOrder || []).flatMap(provider => sorting?.accountOrder[provider] || [])
+    .map((id, index) => [id, index]))
+  const ordered = (all || []).slice().sort(positions.size
+    ? (left, right) => (positions.get(left.id) ?? Infinity) - (positions.get(right.id) ?? Infinity)
+    : byPriorityOrder)
   const map = new Map<string, { position: number; total: number }>()
   ordered.forEach((account, index) => map.set(account.id, { position: index + 1, total: ordered.length }))
   return map
 }
 
 /* ─── 分组（账号页的显示口径）────────────────── */
+
+/**
+ * 组内排序规则的一项。**按数组顺序比较**（第一项相同才看第二项），
+ * 与设置弹窗里从上到下的优先级是同一个东西。
+ *
+ * 只登记「可比较的字段」这两项：`manual` 不是一条规则，它是所有规则都相等时的
+ * 兜底（保持拖出来的顺序），所以不在这里出现。
+ */
+export type { GroupSortRule } from './accounts-shared'
+
+/** 默认规则不依赖余额缓存，支持积分到期的提供商在查到数据后自动排序。 */
+export function defaultGroupSortRules(provider: string): GroupSortRule[] {
+  return [
+    { key: 'credit', on: supportsCreditExpiry(provider), dir: 'soon' },
+    { key: 'added', on: false, dir: 'new' },
+  ]
+}
 
 export type AccountGroup = {
   /** 这一组的家（provider id） */
@@ -1144,14 +1062,66 @@ export type AccountGroup = {
   label: string
   /** 组顺位（1 起）：拖动整组改变的就是它 */
   rank: number
-  /** 组内**全部**账号（按组内优先级升序，不受筛选影响）：组内序号、统计、以及
-   *  「整队重排」时拼队列都用它 —— 折叠起来的组在 DOM 里没有行，只有这里留着全量 */
+  /** 组内全部账号，按网关的全局消耗规则排序；筛选不改变序号。 */
   members: AccountRecord[]
+  /** 落库的手动顺序；自动规则只投影有效顺序，不覆盖手动兜底。 */
+  queueMembers: AccountRecord[]
   /** 组内**可见**的账号（members 里通过筛选的那些，顺序同上）：渲染用它 */
   accounts: AccountRecord[]
   enabled: number
   disabled: number
   limited: number
+}
+
+/**
+ * 一组账号按规则排序（不改变入参数组）。
+ *
+ * ── 为什么「没有值」恒排最后 ──────────────────────────────────
+ * 排序方向只决定**有值的那批**谁先谁后。把「读不到到期时间」当成 0 或者当成
+ * 无穷大，都会让方向一翻就把它甩到最前 —— 而「读不到」不是一个时间，它不该
+ * 因为用户点了「最晚到期优先」就跑到第一位。
+ *
+ * ── 全相等时保持手动顺序 ──────────────────────────────────────
+ * `Array.prototype.sort` 在 ES2019 起是稳定排序，这里不依赖它：显式带上原始下标，
+ * 让「所有规则都相等 → 保持拖出来的顺序」成为代码里看得见的一条，而不是引擎的实现细节。
+ */
+export function sortGroupMembers(
+  members: AccountRecord[],
+  rules: GroupSortRule[] | null | undefined,
+  usageOf?: UsageLookup,
+  now = Date.now(),
+): AccountRecord[] {
+  const active = (rules || []).filter(rule => rule.on)
+  if (!active.length) return members.slice()
+  const indexed = members.map((account, index) => ({ account, index }))
+  const expiry = new Map<string, number | null>()
+  for (const { account } of indexed) {
+    expiry.set(account.id, creditExpiryOf(usageOf?.(account), now))
+  }
+  indexed.sort((left, right) => {
+    for (const rule of active) {
+      const diff = rule.key === 'added'
+        ? compareAdded(rule.dir, left.account, right.account)
+        : compareExpiry(rule.dir, expiry.get(left.account.id) ?? null, expiry.get(right.account.id) ?? null)
+      if (diff !== 0) return diff
+    }
+    return left.index - right.index
+  })
+  return indexed.map(item => item.account)
+}
+
+function compareAdded(dir: 'new' | 'old', left: AccountRecord, right: AccountRecord): number {
+  const a = Number(left.addedAt) || 0
+  const b = Number(right.addedAt) || 0
+  // 缺 addedAt 的旧记录按 0 处理（= 最早），两侧都缺时相等
+  return dir === 'new' ? b - a : a - b
+}
+
+function compareExpiry(dir: 'soon' | 'late', a: number | null, b: number | null): number {
+  if (a === null && b === null) return 0
+  if (a === null) return 1
+  if (b === null) return -1
+  return dir === 'soon' ? a - b : b - a
 }
 
 /**
@@ -1164,12 +1134,17 @@ export type AccountGroup = {
  *
  * `keep` 是可见性谓词（筛选 / 搜索），**只过滤组内的行、不参与定组序**：筛选时
  * 组序不跳动，被筛掉的行也不会让整组消失（组头还在，只是组内空了）。
+ *
+ * 自动消耗规则由网关执行，`sorting` 提供实际生效的组内顺序。
+ * 没有该字段的旧网关才在前端按同一口径降级排序。
  */
 export function accountGroups(
   all: AccountRecord[] | null | undefined,
   keep?: ((account: AccountRecord) => boolean) | null,
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
+  sortOf?: ((provider: string) => GroupSortRule[] | null | undefined) | null,
+  sorting?: AccountSorting | null,
 ): AccountGroup[] {
   const ordered = (all || []).slice().sort(byPriorityOrder)
   const providers: string[] = []
@@ -1182,17 +1157,26 @@ export function accountGroups(
     }
     members.get(provider)!.push(account)
   }
+  if (sorting) {
+    const ranks = new Map(sorting.providerOrder.map((provider, index) => [provider, index]))
+    providers.sort((left, right) => (ranks.get(left) ?? Infinity) - (ranks.get(right) ?? Infinity))
+  }
   return providers.map((provider, index) => {
     const list = members.get(provider) || []
+    const ids = sorting?.accountOrder[provider]
+    const positions = new Map((ids || []).map((id, position) => [id, position]))
+    const shown = ids ? list.slice().sort((left, right) => (positions.get(left.id) ?? Infinity) - (positions.get(right.id) ?? Infinity))
+      : sortOf ? sortGroupMembers(list, sortOf(provider), usageOf) : list
     return {
       provider,
       label: shared().wbProviders?.labelOf?.(provider) || provider,
-      rank: index + 1,
-      members: list,
-      accounts: keep ? list.filter(keep) : list,
-      enabled: list.filter(isEnabled).length,
-      disabled: list.filter(account => !isEnabled(account)).length,
-      limited: list.filter(account =>
+      rank: sorting?.providerOrder.includes(provider) ? sorting.providerOrder.indexOf(provider) + 1 : index + 1,
+      members: shown,
+      queueMembers: list,
+      accounts: keep ? shown.filter(keep) : shown,
+      enabled: shown.filter(isEnabled).length,
+      disabled: shown.filter(account => !isEnabled(account)).length,
+      limited: shown.filter(account =>
         isEnabled(account) && isLimitedNow(account, usageOf?.(account), tokenUsageOf?.(account))).length,
     }
   })
@@ -1280,7 +1264,22 @@ export type AccountTag = { text: string; kind: 'plain' | 'bad'; title: string }
  * 禁用的账号开关明明是关着的，再标一枚是把同一件事说两遍）。
  */
 export function accountTags(account: AccountRecord): AccountTag[] {
+  const suspendedReason = upstreamSuspendedReasonOf(account)
   return [
+    suspendedReason
+      ? {
+        text: t('上游限制 · 已禁用'),
+        kind: 'bad' as const,
+        title: suspendedReason,
+      }
+      : null,
+    account.needsRelogin
+      ? {
+        text: t('需要重新登录'),
+        kind: 'bad' as const,
+        title: accountReloginText(account),
+      }
+      : null,
     // 没有转发能力的家：它的启用开关对转发没有意义，这里如实说明，而不是留一片空白
     // 让人以为「没标记就是好的」。判据是后端的 chatSupported，正常配置下不会出现 ——
     // 留着是为了「将来某家处于只有账号管理的过渡期」时界面能自己说清楚

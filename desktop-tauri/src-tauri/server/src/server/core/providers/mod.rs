@@ -25,10 +25,10 @@
 //! 给出分支，「注册了 provider 却忘了接线」在编译期就被拦住，不再需要运行期的
 //! 占位实现兜底。
 //!
-//! **加新 provider 的最小改动面**：`ProviderKind` 加变体 + 本文件 `PROVIDERS`
-//! 加条目 + `kind_from_id` / `kind_id` 各加一个分支 + `adapter.rs` 的
-//! `adapter_for` 接上真身适配器。账号层的参与由「注册表 + 各层
-//! 经 `kind_from_id` 判定」自动派生，不需要再改那些文件里的任何 id 清单。
+//! `ProviderKind` / `PROVIDERS` 保留旧提供商的身份与落盘契约；停用路线的
+//! 稳定 ID 由 `availability` 保存，不扩充枚举或注册执行体。
+//! 管理动作与目录调度问 `is_executable_provider` / `executable_provider_ids`，
+//! 执行仍统一经 `adapter::adapter_by_id`，不把未知 runtime id 当成 WorkBuddy。
 //!
 //! ── 静态注册表为什么用切片而不是 HashMap ─────────────────────
 //! provider 是**编译期内置**的（不是插件），数量有限（见 [`PROVIDERS`]）；
@@ -37,125 +37,72 @@
 //! 数组顺序稳定，便于比对与展示。
 //!
 //! ── 子模块 ─────────────────────────────────────────────────
-//!   adapter.rs  ProviderAdapter 契约：请求构造 / 错误分类 / 凭证 /
-//!               模型刷新（架构文档 §4.2；转发编排只通过它认识 provider）
-//!   workbuddy.rs WorkBuddy 实现（头集合、URL、system 注入、429/6004/11128、
-//!               token 刷新、模型清单与远程刷新）
-//!   raccoon/    小浣熊实现（W3-T4）：
-//!                 mod.rs         适配实现（Bearer JWT、429 限额、目录刷新）
-//!                 credentials.rs JWT 解码、桌面端实时登录态、单飞刷新与回写
-//!                 models.rs      模型清单（静态兜底 5 个 + /model_catalog 刷新）
-//!   catalog.rs  聚合模型目录：各家清单合并成 /v1/models 的单一视图，
-//!               并回答「某模型名由哪些 provider 提供」（能力判定）
-//!   router.rs   模型路由：候选集合 + config.json 的 providerRoute 优先级
-//!               → 逐家尝试的候选链（转发编排消费）
-//!   catpaw/      CatPaw（美团）实现（架构文档 §9）：上游不是 OpenAI 协议而是
-//!               自有 conversation 协议，需要消息归一化 / 指纹链 / 会话注册表。
-//!                 adapter.rs      ProviderAdapter 实现（W5-T-d4：is_stateful=true，
-//!                                 会话式转发入口 forward_conversation）
-//!                 credentials.rs  凭证（账号记录 / auth.json / CATPAW_COOKIE）
-//!   autoclaw/    AutoClaw（智谱 autoglm）适配实现（架构文档 §10）：
-//!                 adapter.rs     ProviderAdapter 实现（W4b-T-c2：无状态，
-//!                                双模型标识头 + X-Authorization + SSE model 回写）
-//!                 crypto.rs      Electron safeStorage 解密（DPAPI + AES-256-GCM）
-//!                 credentials.rs 凭证来源（auth.json / openclaw.json / 环境变量
-//!                                / 账号记录）+ mtime 缓存
-//!                 refresh.rs     刷新（单飞 + 400002 降级；**只读不回写**）
-//!                 models.rs      模型路由表（静态映射 + zai_auto 回退）
-//!   qoder/       Qoder（账号管理 **+ 推理转发**）：
-//!                 endpoints.rs   地区与鉴权端点（含推理网关基址）
-//!                 machine.rs     PKCE 随机串与本机标识（getrandom）
-//!                 oauth.rs       国际版 PKCE 设备授权
-//!                 credentials.rs 凭证格式（兼容 Qoder-Proxy 的 access/refresh）
-//!                 auth.rs        PAT 换取令牌 / 用户资料
-//!                 refresh.rs     续期（单飞 + 比较再写）
-//!                 balance.rs     额度查询（归一成账号页的统一形状）
-//!                 cosy.rs        COSY 请求签名 + 请求体编码（鉴权核心）
-//!                 models.rs      模型目录（两地区缓存 + 静态兜底 + 远程刷新）
-//!                 protocol.rs    OpenAI ↔ Qoder 协议转换
-//!                 stream.rs      上游 SSE 信封解包 + 思考标签拆解
-//!                 chat.rs        转发编排（构造 → 发送 → 翻译）
-//!   cline/       Cline（官方 api.cline.bot）：账号管理 **+ 推理转发**，
-//!                按**两个提供商**接入（`cline-free` 免费池 / `cline-pass` 订阅池）。
-//!                实现是参数化的：模块共用，实例按池给。
-//!                 credentials.rs 凭证格式（workos: 前缀 token）+ 桌面端登录态读取
-//!                 login.rs       设备授权登录（WorkOS RFC 8628）
-//!                 refresh.rs     续期（refresh_token 轮换 + 单飞）
-//!                 models.rs      模型目录（recommended-models + 两池清单 + 静态兜底）
-//!                 balance.rs     额度查询（credit 余额归一）
-//!                 adapter.rs     ProviderAdapter 实现（无状态，OpenAI 兼容，
-//!                                按池参数化）
-//!   accio/       Accio（`accio` 国际版 / `accio-cn` 国内版，同一份实现按地区
-//!                参数化）：账号管理 **+ 推理转发**。上游不是 OpenAI 协议而是
-//!                阿里 ADK 的 Gemini 风格信封（`/api/adk/llm/generateContent`，
-//!                SSE、token 在 body 里），因此 `is_stateful` 为 true。
-//!                子模块：endpoints / credentials / auth / refresh / oauth(PKCE)
-//!                / models（静态兜底 + `/api/llm/config/v2`）/ protocol /
-//!                stream / chat / balance
+//! 本文件之外，`core::providers` 下只剩三类东西：
+//!
+//! ```text
+//!   adapter.rs        ProviderAdapter 契约（转发编排只通过它认识 provider）
+//!   missing_plugin.rs 没装插件时的占位适配器（如实报 503 + 指路）
+//!   catalog.rs        模型目录聚合（各家清单合并成 /v1/models 的单一视图）
+//!   router.rs         模型路由（候选集合 + 路由优先级 → 逐家尝试的链）
+//!   catalog_*.rs      目录刷新的排期 / 缓存（各家的共用基础设施）
+//!   <provider>/       各家的**身份**：地区 ↔ provider id ↔ 枚举值、展示名
+//! ```
+//!
+//! **各家的转发与账号实现都不在这里** —— 它们整体位于独立的提供商插件
+//! （`agent2api-providers`，不随本仓库发布）。这是风险隔离的核心：主仓库不
+//! 持有「怎么伪装成官方客户端打某个上游」的任何知识，只剩身份、账号库、
+//! 用户配置与插件宿主。
+//!
+//! 因此 `<provider>/` 目录里出现下列内容就是**回退**（review 时直接拦下）：
+//!   - 上游域名 / 端点路径 / 客户端版本号 / UA 或产品面标识头；
+//!   - 请求体形状、协议转换、SSE 信封拆解；
+//!   - 凭证文件定位（官方客户端把登录态落在哪）、解密链、换码/续期逻辑。
+//!
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
 pub mod adapter;
+pub mod availability;
 pub mod accio;
-/// Antigravity（Google 的 AI IDE，推理走 **Google Cloud Code Assist**
-/// `v1internal`）。适配实现在 `antigravity/`：账号管理（粘贴 Google
-/// refresh token）+ token 刷新（Google OAuth 的 form 端点）+ 模型目录
-/// （`:fetchAvailableModels`，只列 Gemini）+ **会话转发**（`build_chat_request`
-/// 构造 v1internal 信封，响应走 `UpstreamResponse::AntigravityGemini` 那条
-/// Gemini SSE 翻译层）全部已接通；`is_stateful` 恒 false，见 `antigravity/mod.rs`）。
-pub mod antigravity;
 pub mod autoclaw;
 pub mod catalog;
 /// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
 /// 不进身份体系：它是各家的共用基础设施，只按 scope 字符串存取 JSON。
 pub mod catalog_cache;
+mod catalog_legacy;
 pub mod catalog_refresh;
-pub mod catpaw;
 pub mod cline;
-/// CodeArts（华为云 snap-access）。适配器实现在 `codearts/`，
-/// 语义来源与施工计划见 `cpa-deploy/notes/agent2api-codearts-port-plan.md`。
-/// 全链已接齐（账号 / 目录 / 会话式转发 / 余额 / 每日福利），见
-/// `codearts/mod.rs` 的模块头。
-pub mod codearts;
-/// Command Code（`api.commandcode.ai`）：无状态转发（一次 HTTP 请求 = 一次
-/// 生成）+ 粘贴式 `user_` API Key。上游响应是 **NDJSON** 而不是 SSE、且
-/// **HTTP 恒 200**（错误在流内），因此走
-/// `UpstreamResponse::CommandCodeNdjson` 那条翻译层，见 `commandcode/mod.rs`。
-pub mod commandcode;
 pub mod content_block;
-/// 自定义提供商的**运行期接线**（目录聚合的追加段 + Chat Completions 协议
-/// 转发）。它不进本文件的身份体系（`ProviderKind` / `PROVIDERS`，见
-/// `custom_providers` 的模块头），但目录合并与转发的分派点都以 id 字符串
-/// 形态调用它 —— 挂在这里与其它子模块并列，便于对照「内置家走适配器、
-/// 自定义家走独立通道」的两条路径。
+/// 自定义提供商（用户自己填 baseUrl + apiKey）的**运行期接线**：它不是内置家，
+/// 不进 `ProviderKind` / `PROVIDERS`（见 `custom_providers` 的模块头）。
+/// 网关对它的转发是通用 OpenAI 兼容路径 —— 这条路**不针对任何特定上游**，
+/// 用户填什么就打什么，没有内置的伪装知识。
 pub mod custom;
-pub mod kuku;
+pub mod images;
 pub mod loomy;
-/// MonkeyCode（长亭科技的开源 AI 开发平台）。适配实现在 `monkeycode/`：
-/// 账号管理（粘贴 session）+ 模型目录（`GET /api/v1/users/models`）+
-/// **会话转发**（上游是「建任务 → WebSocket 任务流」，ACP 事件翻译为 chat 帧，
-/// 含工具自动批准与提问自动应答）全部已接通；`is_stateful` 为 true，
-/// 见 `monkeycode/mod.rs` 的模块头。
+/// MonkeyCode 的两个站点：`monkeycode/` 里只剩**地区身份**
+/// （`monkeycode` / `monkeycode-intl` 是两家 provider）与展示名。
+/// 转发与账号实现在插件里。
 pub mod monkeycode;
-pub mod officeace;
-/// OrcaTerm（腾讯云遨驰终端桌面客户端）。适配实现在 `orcaterm/`：
-/// 账号管理（**粘贴 accessToken** / 导入桌面端 `data.bin` 登录态）+
-/// OAuth 续期（上游有真续期接口）+ **会话转发**（建会话 → assistant SSE，
-/// 多轮拍平为单条输入）+ 余额（月度 AI 配额）全部已接通；
-/// `is_stateful` 为 true（请求内会话，与 KukuAI 同形态），见 `orcaterm/mod.rs`。
-pub mod orcaterm;
+/// ModelScope（魔搭）的两个站点：`modelscope/region.rs` 里只剩**地区身份**
+/// （`modelscope` / `modelscope-intl` 是两家 provider）。转发、签到与账号实现
+/// 在插件里。
+pub mod modelscope;
 pub mod onboarding_memory;
 /// **本地就绪闸门**：一条通道在「还没出本机就注定发不出去」时，让选路绕开它
 /// （当前唯一的用户是 ZCode 活动套餐的令牌池，判据与取舍见模块头）。
 /// 不进身份体系：它是各家的共用设施，只按 provider id 记状态。
 pub mod readiness;
+pub mod policy;
+/// **未安装插件**时的占位适配器（如实报错 + 指路去装插件）。
+///
+/// 本项目把「怎么伪装成官方客户端打某个上游」的全部实现搬到了独立的提供商
+/// 插件里（不随本仓库发布），因此网关这边没有内置转发实现 —— 这个模块就是
+/// 「插件缺失」时的那条路径。见文件头的完整说明。
+pub mod missing_plugin;
 pub mod qoder;
-pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
-/// Trae（字节 AI IDE）。适配实现在 `trae/`：登录 / 凭据 / 目录 / 会话式转发
-/// 已接通（只支持国内 SOLO 通道；国际版是另一套协议，将来另立 kind），见
-/// `trae/mod.rs` 的模块头。
-pub mod trae;
+pub mod retry;
 pub mod workbuddy;
 pub mod zcode;
 
@@ -171,304 +118,91 @@ use serde_json::{json, Value};
 /// 加新家请加在**末尾**并同步 `PROVIDERS`。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ProviderKind {
-    /// WorkBuddy **国内版**（原唯一上游；`copilot.tencent.com`）
+    /// WorkBuddy **国内版**（provider id `workbuddy`）
     WorkBuddy,
-    /// WorkBuddy **国际版**（`www.workbuddy.ai`，`workbuddy-intl`）。
+    /// WorkBuddy **国际版**（`workbuddy-intl`）
     ///
-    /// ── 为什么两个地区是两家 provider（2026-10 拆分的由来）──────
-    /// 与 AutoClaw / Accio / ZCode 的两个地区、Cline 的两个额度池同一思路 ——
-    /// 本家是最后一个补齐的：早先「地区是账号上的 `edition` 字段」，
-    /// 后果是三处具体故障（完整论证见 `workbuddy::region` 的模块头）：
-    ///   1. 模型目录只有一份（单槽缓存 + 单条刷新排期），两个地区的清单
-    ///      互相覆盖，不可能同时存在（issue #74）；
-    ///   2. 模型规则只有一套 `(provider, id)` 命名空间，同名模型在两个地区
-    ///      无法区分、无法分别点名（issue #89）；
-    ///   3. 转发候选账号不含地区，请求可能落到另一个地区的账号上，而
-    ///      「模型不存在」的 400 是 `Fatal`、不会换账号，直接失败。
+    /// ── 两个地区为什么是两家 provider ──────────────────────────
+    /// 地区做成「账号上的 `edition` 字段」的后果是三处具体故障（完整论证见
+    /// `workbuddy::region` 的模块头）：模型目录只有一份（两个地区互相覆盖，
+    /// issue #74）、模型规则只有一套 `(provider, id)` 命名空间（同名模型无法
+    /// 区分，issue #89）、转发候选不含地区（请求可能落到另一个地区的账号上）。
+    /// 按两家建模后，目录、缓存槽、刷新排期、模型规则、别名、账号队列、报表
+    /// 全部按 provider id 自动分开。
     ///
-    /// ── provider id 为什么只有国际版是新 id ──────────────────────
-    /// 国内版保持 `"workbuddy"` 不动：它是存量账号的落盘契约（改名会让账号
-    /// 升级后变成「未知 provider」而静默消失）。国际版取 `"workbuddy-intl"`，
-    /// 存量国际版账号由 `account_store::migrate_startup` 原地归位。
-    ///
-    /// ── 实现是**一套**（与 AutoClaw 等各家同款）──────────────────
-    /// `workbuddy::adapter::WorkBuddyAdapter` 持有一个 `workbuddy::region::Region`，
-    /// 两个静态实例（`WORKBUDDY_ADAPTER` / `WORKBUDDY_INTL_ADAPTER`）由
-    /// `adapter_for` 按 kind 给出。地区 → provider 的互查在 `Region`
-    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
-    /// `"workbuddy-intl"` 这类字面量。
+    /// 国内版保持裸 `workbuddy`：它是存量账号的落盘契约（改名会让账号升级后
+    /// 变成「未知 provider」而静默消失）。
     WorkBuddyIntl,
-    /// 小浣熊（适配实现在 `raccoon/`：JWT 凭证 + `/model_catalog` + SSE 回写）
+    /// 小浣熊（`raccoon`）
     Raccoon,
-    /// CatPaw（美团；架构文档 §9）。适配实现在 `catpaw/adapter.rs`
-    /// （W5-T-d4 接线）：有状态会话式转发，`is_stateful()` 为 true。
+    /// CatPaw（美团）；`catpaw`
     CatPaw,
-    /// AutoClaw（智谱 autoglm）**国内版**；架构文档 §10。适配实现在
-    /// `autoclaw/adapter.rs`（W4b-T-c2 接线）：**无状态**（OpenAI 兼容 +
-    /// `X-Authorization`，与 raccoon 同构），`sse_model_rewrite()` 为 true。
+    /// AutoClaw（智谱 autoglm）**国内版**（`autoclaw`）
     ///
-    /// ── 与 [`ProviderKind::AutoClawIntl`] 是同一套协议的两个地区 ────
-    /// 两个构建（客户端里 `isOversea` 编译期常量）共用账号接口与签名指纹
-    /// （appId/appKey 两地逐字相同，已实测），只有站点不同。
-    /// **provider id 保持 `autoclaw` 不改名**：它是存量账号 `accounts.json` 里的
-    /// 落盘契约，改名会让那些账号升级后变成「未知 provider」而静默消失
-    /// （见 `autoclaw::region` 的模块头）。变的只有展示名。
+    /// **provider id 保持 `autoclaw` 不改名**：它是存量账号 `accounts.json`
+    /// 里的落盘契约。
     AutoClaw,
-    /// AutoClaw **国际版**（`autoclaw-intl`）。与 [`ProviderKind::AutoClaw`]
-    /// 同一套协议、不同站点（`autoglm-api.autoglm.ai`）。
-    ///
-    /// ── 为什么两个地区是两家 provider（与 Cline 两池同一思路）──────
-    /// 把地区做成「一家的一个字段」的后果与 Cline 那次一模一样：地区成了
-    /// **账号的属性**，界面上混在一起，而「哪个账号走哪个站点」在列表里
-    /// 看不出来；账号记录也无法按地区隔离。按两家建模之后，各自有独立的账号、
-    /// 清单、启停与映射，界面上各占一个分组、在添加弹窗里相邻。
-    ///
-    /// 实现是**一套**：`autoclaw::adapter::AutoClawAdapter` 持有一个
-    /// `autoclaw::region::Region`，两个静态实例（`AUTOCLAW_ADAPTER` /
-    /// `AUTOCLAW_INTL_ADAPTER`）由 `adapter_for` 按 kind 给出。地区 → provider
-    /// 的互查在 `autoclaw::region::Region`（`kind` / `provider_id` /
-    /// `from_provider_id`），别处不要再写 `"autoclaw-intl"` 这类字面量。
+    /// AutoClaw **国际版**（`autoclaw-intl`）：同一套产品、不同站点
     AutoClawIntl,
-    /// Qoder **中国版**（`qoder`，历史 id 不改名：存量账号的落盘契约）。适配实现
-    /// 在 `qoder/`：账号管理（设备授权登录 / PAT / 凭证续期 / 额度查询）**加推理
-    /// 转发**。上游鉴权不是 Bearer 而是一套自签名的 COSY 头、请求体要先编码再
-    /// 签名、响应还多包一层信封，因此 `is_stateful()` 为 true（一次发送由适配器
-    /// 自己完成，见 `qoder/mod.rs`）；它参与全局队列与模型广告，`supports_chat()`
-    /// 为 true。
-    ///
-    /// ── 与 [`ProviderKind::QoderIntl`] 是同一套协议的两个地区（2026-10 拆家）──
-    /// 与 AutoClaw / Accio / ZCode 同一思路：地区是**provider 身份**而不是账号
-    /// 属性。拆家前「地区是账号上的 `mode` 字段」的后果：模型管理里两地区账号
-    /// 混在一个「模型来源」下拉里、一次刷新只能刷到队首账号所属地区的目录、
-    /// 「获取模型」弹窗也只有一个 Qoder 行。地区互查在
-    /// `qoder::endpoints::Region`（`kind` / `provider_id` / `from_provider_id`）。
+    /// Qoder（智谱）**中国版**（`qoder`）
     Qoder,
-    /// Qoder **国际版**（`qoder-intl`）。与 [`ProviderKind::Qoder`] 同一套协议、
-    /// 不同站点（`openapi.qoder.sh` / `api3.qoder.sh`，见 `qoder::endpoints`）。
-    /// 国际版有独立的「每日 100 Credits」签到链路（需要设备风控身份，见
-    /// `qoder::checkin` 与 `qoder::risk`）。
+    /// Qoder **国际版**（`qoder-intl`）
     QoderIntl,
-    /// Cline **免费额度池**（`cline-free/...`）。官方 `api.cline.bot`。
-    ///
-    /// ── 为什么两池是两家而不是「一家的一个选项」（本次改动的核心）────
-    /// 早先的实现把它们当成**同一个账号上的两个额度池**：账号记录带一个
-    /// `pool` 字段，池过滤（`advertise_models`）按「账号库里有哪个池」决定
-    /// 广告哪一批。那套做法的后果是：池是**账号的属性**，界面上一家 Cline
-    /// 里混着两个池的模型（还随账号变化），而「哪个池能用」这件事在
-    /// 模型列表里完全看不出来。
-    ///
-    /// 现在按**两个提供商**建模：各自有独立的账号、清单、启停规则与映射，
-    /// 界面上各占一个分组。于是：
-    ///   - `cline-free` 只列免费池的模型，`cline-pass` 只列订阅池的；
-    ///   - 加了哪家的账号，哪家的模型才出现（`provider_available` 的既有口径）；
-    ///   - 上游模型 id 的池前缀**仍是原样转发**的通道选择器（见下），
-    ///     但「这家收哪个前缀的模型」已经由 provider 身份保证，
-    ///     不再需要按账号里的 `pool` 字段做二次过滤。
-    ///
-    /// ── 模型名的两池前缀（转发侧仍然存在）──────────────────────
-    /// 上游模型 id 形如 `cline-free/deepseek-v4.1-flash` 与
-    /// `cline-pass/glm-5.3`，**必须原样发给上游** —— 前缀就是它的计费通道
-    /// 选择器。对下游的友好名（剥掉前缀）由 `model_rules` 的默认映射种子给出，
-    /// 见 `cline::models` 的模块头。
-    ClineFree,
-    /// Cline **订阅池**（`cline-pass/...`）。与 [`ProviderKind::ClineFree`]
-    /// 同一上游、同一套协议，差别只有「收哪个前缀的模型」。
-    ///
-    /// ── 与 ClineFree 共享的东西（不要各自复制）──────────────────
-    /// 凭证格式、API 基址、错误分类、SSE 回写、余额查询、远程目录接口
-    /// （`GET {apiBase}/ai/cline/recommended-models` **拉一次就能拿到两个池**）
-    /// 全部共用 —— 因此 `cline/` 下的实现是参数化的：
-    /// `ClineAdapter` 持有一个 `Pool`，`adapter_for` 按 kind 给出该池的实例。
-    /// 远程目录缓存也共用一份（`models::REMOTE`），两家只是按池过滤它。
-    ClinePass,
-    /// Accio **国际版**（`accio`）。适配实现在 `accio/`：账号管理（PKCE 网页
-    /// 登录 / 粘贴凭证 / 续期 / 额度查询）**加推理转发**。
-    ///
-    /// ── 上游长什么样（从客户端安装包逆向，见 `accio/mod.rs` 的模块头）──
-    /// 推理不是 OpenAI 协议而是阿里 ADK 的 **Gemini 风格**信封
-    /// （`POST {gw}/api/adk/llm/generateContent?sg_k=<md5(requestId)>`，body 是
-    /// protobuf-JSON：`contents` / `system_instruction` / `tools`，鉴权靠 body 里的
-    /// `token` 字段），因此 `is_stateful()` 为 true —— 与 Qoder 同一处境
-    /// （「一次发送要适配器自己完成」）。
-    Accio,
-    /// Accio **国内版**（`accio-cn`）。与 [`ProviderKind::Accio`] 同一套协议、
-    /// 同一个网关（`phoenix-gw.alibaba.com`）、同一个 `client_id`（`accio-work`），
-    /// 只有**登录站点**（`www.accio-ai.com`）、文件域名与 `x-package-region`
-    /// 请求头不同（`CN` vs `GLOBAL`）。
-    ///
-    /// ── 为什么两个地区是两家 provider（与 AutoClaw / Cline 同一思路）──────
-    /// 把地区做成「一家的一个字段」的后果与那两次一模一样：地区成了**账号的
-    /// 属性**，界面上混在一起，而「哪个账号走哪个站点」在列表里看不出来。
-    /// 两家共用**一份实现**：`accio::adapter::AccioAdapter` 持有一个
-    /// `accio::endpoints::Region`，两个静态实例（`ACCIO_ADAPTER` /
-    /// `ACCIO_CN_ADAPTER`）由 `adapter_for` 按 kind 给出。
-    /// 地区 → provider 的互查在 `accio::endpoints::Region`（`kind` /
-    /// `provider_id` / `from_provider_id`），别处不要再写 `"accio-cn"` 字面量。
-    AccioCn,
-    /// ZCode（智谱 / Z.AI 的编码代理客户端）**国内版**；适配实现在 `zcode/`：
-    /// 账号管理 **加推理转发**（OpenAI 兼容、Bearer 鉴权、无状态）。
-    ///
-    /// ── 这一家的特别之处：zcode 平面两地相同、推理平面两地不同 ──
-    /// 登录与「限时套餐」领取都在 ZCode 自己的服务端（`zcode.z.ai`），两地
-    /// 客户端用的是同一个域；真正跑推理的是各自开放平台的编码套餐端点
-    /// （国内 `open.bigmodel.cn` / 国际 `api.z.ai`）。所以「地区」在这一家
-    /// 只影响推理平面与账号归属 —— 与 AutoClaw（两地各一整套域名）不同。
-    ///
-    /// ── 与 [`ProviderKind::ZcodeIntl`] 同一份实现按地区参数化 ────
-    /// `zcode::adapter::ZcodeAdapter` 持有一个 `zcode::region::Region`，
-    /// 两个静态实例（`ZCODE_ADAPTER` / `ZCODE_INTL_ADAPTER`）由 `adapter_for`
-    /// 按 kind 给出。地区 → provider 的互查在 `zcode::region::Region`
-    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
-    /// `"zcode"` / `"zcode-intl"` 这类字面量。
-    Zcode,
-    /// ZCode **国际版**（`zcode-intl`）。与 [`ProviderKind::Zcode`] 同一套协议、
-    /// 同一个 zcode 平面，只有推理平面（`api.z.ai`）与 OAuth 的 `provider`
-    /// 取值（`zai`）不同。
-    ///
-    /// ── 为什么两个地区是两家 provider（与 AutoClaw / Cline / Accio 同一思路）──
-    /// 把地区做成「一家的一个字段」的后果那三次已经各说过一遍：地区成了**账号
-    /// 的属性**，界面上混在一起、无法按地区隔离账号记录。
-    ///
-    /// ── 本家**没有签到**，接的是「限时套餐领取」────────────────
-    /// 其余各家都在 `core::auto_checkin` 的提供商清单里，本家不在 ——
-    /// 它没有签到活动，运营玩法是限时发放的体验套餐（2026-09-28 那期是
-    /// 每天一份新套餐，见 `zcode::claim` 的模块头）。
-    ZcodeIntl,
-    /// CodeArts（华为云 AI 代码助手 / snap-access）。适配实现在 `codearts/`：
-    /// 请求要华为云 SDK-HMAC-SHA256 签名、对话是有状态的（每账号只允许 3 路
-    /// 并发会话，靠 chat-session 心跳占槽），因此 `is_stateful()` 为 true。
+    /// CodeArts（华为云）；`codearts`
     CodeArts,
-    /// Trae（字节跳动 AI IDE 的 SOLO 通道）。适配实现在 `providers::trae/`。
+    /// Cline **免费池**（`cline-free`）
     ///
-    /// ── 为什么只有一家、没有"国际版"伴生 ─────────────────────
-    /// AutoClaw / Accio / ZCode 的两地是**同一套协议换域名**，所以做成两家
-    /// 按地区参数化。Trae 不是：国内 SOLO 走
-    /// `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（自定义信封 +
-    /// SSE 无 `[DONE]`），国际版走 `chat_sessions` → `events` 另一套协议、
-    /// 另一个 Origin —— 那是**两个协议**，不是一个地区的两种拼法。
-    /// 因此本 kind 只代表国内 SOLO，国际版将来接入时另立 kind
-    /// （`trae-intl`），不要往本家塞 `region` 字段：那会让"用哪套协议"
-    /// 变成账号的属性（这正是本文件反复拒绝的那个坑）。
+    /// ── 两个额度池为什么是两家 provider ─────────────────────────
+    /// 上游是同一个账号上的两个额度池，但本项目把它们当两家接入：各自有独立
+    /// 的账号、清单、启停规则与映射。拆分后界面能分别启停，模型规则也能按池
+    /// 点名（同一条短名可以同时映射到两池，路由时一起进候选链）。
+    ClineFree,
+    /// Cline **订阅池**（`cline-pass`）
+    ClinePass,
+    /// Accio **国际版**（`accio`）
+    Accio,
+    /// Accio **国内版**（`accio-cn`）
+    AccioCn,
+    /// ZCode **国内版**（`zcode`）
+    Zcode,
+    /// ZCode **国际版**（`zcode-intl`）
+    ZcodeIntl,
+    /// Trae（`trae`）
     ///
-    /// ── 本家没有签到活动可自动领 ────────────────────────────
-    /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
-    /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
+    /// ── 为什么只有一家 ────────────────────────────────────────
+    /// 国内 SOLO 与国际版是**两个协议、两个 Origin**（不是同协议换域名），
+    /// 因此不是一个 provider 的两个地区。将来接国际版时另立 kind。
     Trae,
-    /// Loomy（讯飞系桌面客户端）。适配实现在 `loomy/`：账号管理（手机号验证码
-    /// 登录 / 粘贴 session）**加推理转发**（OpenAI 兼容、无状态、`token` +
-    /// `Bearer` 双头鉴权）。
-    ///
-    /// ── 上游长什么样（从安装包 app.asar 逆向，见 `loomy/mod.rs` 的模块头）──
-    /// 三套平面：账号 CAccount（`account.xfinfr.com`，HMAC-SHA1 签名头、密钥是
-    /// 客户端内置的 AccessKey 对）、集成网关（`loomyad.xunfei.cn`，积分与每日
-    /// 登录刷新）、模型网关（集成网关 + `/api/v1`，OpenAI 协议）。
-    ///
-    /// ── 两处与别家不同、值得先知道的事实 ───────────────────────
-    ///   1. **没有续期**（`supports_refresh = false`）：session 14 天，上游没有
-    ///      refresh 接口，过期只能重新短信登录；
-    ///   2. **没有桌面端导入**：登录态不在可读文件里（与 Accio / ZCode 同一
-    ///      处境），入口是「短信登录」与「粘贴 session」。
-    ///
-    /// ── 签到形态与别家不同 ──────────────────────────────────
-    /// 本家没有独立的签到接口，「每日赠送积分」由**每日首次登录**触发刷新
-    /// （`POST /api/v1/points/first-login`）。它已接进 `core::auto_checkin`
-    /// （清单里列 `loomy`），claim 见 `loomy::checkin`。
+    /// Loomy（讯飞）；`loomy`
     Loomy,
-    /// KukuAI（百度文库「库库 AI / GenFlowPro」，`kuku.baidu.com`）。适配实现
-    /// 在 `kuku/`：账号管理（粘贴 Cookie / 导入本机客户端登录态）**加推理转发**
-    /// （建会话 → 分配算力 → SSE 的自有三步时序，`is_stateful()` 为 true，
-    /// 会话是**请求内**的、不跨请求保持状态）。
-    ///
-    /// ── 上游长什么样（从客户端 app.asar 逆向 + 参考实现实测，见模块头）──
-    /// 认证是三个 Cookie（`BDUSS` / `STOKEN` / `gfprotpl=genflowpro`），
-    /// **没有刷新接口**（`supports_refresh = false`，过期只能重新登录/重新导入，
-    /// 与 CatPaw 同一处境）；模型是 `/wenchain/genflowpro/model_list` 的
-    /// `model_name`（静态兜底 + 远程刷新）；余额是
-    /// `/bizapi/gfpro/getgfvipremain`（`data.list[0].totalPoint`）。
-    ///
-    /// ── 签到形态 ────────────────────────────────────────────
-    /// 「免费领积分」活动的每日任务（每日登录 / 完成一次对话），已接进
-    /// `core::auto_checkin`（清单里列 `kuku`），claim 见 `kuku::checkin`。
-    /// 业务会话靠换发的 genflowpro STOKEN（`kuku::engine`）。
+    /// KukuAI（百度文库「库库 AI / GenFlowPro」）；`kuku`
     Kuku,
-    /// MonkeyCode（长亭科技）**国内版**（`monkeycode-ai.com`）。适配实现在
-    /// `monkeycode/`：账号管理（**粘贴 session cookie**）、模型目录
-    /// （`GET /api/v1/users/models`）与**会话转发**（建任务 → WebSocket 任务流
-    /// → ACP 事件翻译为 chat 帧）全部已接通；`is_stateful()` 为 true。
-    ///
-    /// ── 与 [`ProviderKind::MonkeyCodeIntl`] 是同一套协议的两个站点 ────
-    /// 与 AutoClaw / Qoder / ZCode 的两地同一思路：地区是**provider 身份**
-    /// 而不是账号属性。地区 → 域名 / 身份的互查在 `monkeycode::Region`
-    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
-    /// `"monkeycode-intl"` 这类字面量。
+    /// MonkeyCode **国内版**（`monkeycode`）
     MonkeyCode,
-    /// MonkeyCode **国际版**（`monkeycode-ai.net`，官方托管入口）。与
-    /// [`ProviderKind::MonkeyCode`] 同一套协议、不同站点。
-    ///
-    /// ── 参考资料的覆盖面（一处必须知道的事实）────────────────────
-    /// 逆向参考只覆盖国内站 `.com`；`.net` 的站点存在由官方发布渠道确认，
-    /// 但参考没有 `.net` 的实测端点 / cookie 名差异记录。本家按「同协议换站点」
-    /// 建模，差异待实测（见 `monkeycode/region.rs` 的模块头）。
+    /// MonkeyCode **国际版**（`monkeycode-intl`）
     MonkeyCodeIntl,
-    /// Command Code（`api.commandcode.ai`）。适配实现在 `commandcode/`：
-    /// 账号管理（**粘贴 `user_` 开头的 API Key**）**加推理转发**。
-    ///
-    /// ── 上游长什么样（规格 `_recon/commandcode-spec.md`，参考
-    /// `Acankao/commandcode-proxy/`）──────────────────────────────
-    /// 单一域名、单一 API Key（无 OAuth / 设备码 / 续期）。生成走
-    /// `POST /alpha/generate`、请求体是自有 8 键信封；响应是
-    /// **NDJSON**（`application/x-ndjson`，一行一个 JSON 事件）且 **HTTP 恒
-    /// 200**，错误在流内以 `{"type":"error"}` 表达；发正式请求前还要先上报
-    /// 「设备指纹 + 生命周期」两条预请求（指纹由 apiKey 确定性派生）。
-    ///
-    /// ── 为什么是**一家**（没有地区伴生）─────────────────────────
-    /// 规格 §9 明确：参考里出现的 Command Code 主机只有
-    /// `https://api.commandcode.ai`，没有 cn / intl 双域名、没有 region 头、
-    /// 模型 id 也不分地区 —— 拆地区没有依据（出口 IP 风控是代理层选项，
-    /// 不是协议里的地区）。
-    ///
-    /// ── 转发路线（为什么无状态却能说两套协议）──────────────────
-    /// 本家是**无状态**（一次 HTTP 请求 = 一次生成），只是响应协议是 NDJSON：
-    /// 走 [`adapter::UpstreamResponse::CommandCodeNdjson`] 那条翻译层
-    /// （`upstream::translate::CommandCodeToChatStream`），`is_stateful` 恒
-    /// false —— 账号轮换 / 冷却 / 重试 / usage / 取消全部由编排层承担。
+    /// Command Code（`commandcode`）
     CommandCode,
-    /// Antigravity（Google 的 AI IDE）。适配实现在 `antigravity/`：
-    /// 账号管理（**粘贴 Google refresh token**）、token 刷新、模型目录
-    /// （**只接 Gemini**）、**会话转发**（`build_chat_request` 构造 v1internal
-    /// 信封）全部已接通，见 `antigravity/mod.rs` 的模块头）。
-    ///
-    /// ── 上游长什么样（规格 `_recon/antigravity-spec.md`，参考
-    /// `Acankao/Antigravity-Manager` + `Acankao/9router`）────────────
-    /// 推理走 **Google Cloud Code Assist**（`v1internal`，不是
-    /// `generativelanguage.googleapis.com`）：`POST {base}:streamGenerateContent?alt=sse`，
-    /// 鉴权是 Google OAuth 的 Bearer 令牌，每帧 SSE 都裹一层
-    /// `{"response":{…gemini 响应…}}` 信封；鉴权链是 Google 的
-    /// `oauth2.googleapis.com/token`（refresh_token 换 access_token）。
+    /// Antigravity（Google 的 AI IDE）；`antigravity`
     ///
     /// ── 为什么是**一家**（没有地区伴生）─────────────────────────
-    /// 规格 §6：本家没有 region 参数、端点全球统一（`sandbox`/`daily`/`prod`
-    /// 是**环境**不是地区），因此不需要地区拆分，也不需要 `region.rs`。
-    ///
-    /// ── 转发路线（已落地）─────────────────────────────────────
-    /// 上游是**无状态**（一次 HTTP 请求 = 一次生成），只是响应帧是 Gemini 方言：
-    /// 照 Command Code / ZCode 的先例给了
-    /// [`adapter::UpstreamResponse`] 一个新变体（`AntigravityGemini`）+ 一层
-    /// 翻译器（`protocol::antigravity_outbound` / `antigravity_stream`），
-    /// **`is_stateful` 保持 false**（不走 `forward_conversation`）。
+    /// 本家没有 region 参数、端点全球统一（`sandbox`/`daily`/`prod` 是**环境**
+    /// 不是地区），因此不需要地区拆分，也不需要 `region.rs`。
     Antigravity,
-    /// OfficeAce（华为云果办 / OfficeClaw / jiuwenclaw）。
-    ///
-    /// 上游是 OpenAI 兼容的华为 AgentArts 模型网关（`Basic` 鉴权，见
-    /// `officeace/mod.rs` 的模块头）—— **无状态**：`build_chat_request` 一条路，
-    /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
-    /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
+    /// OfficeAce（华为云果办 / OfficeClaw / jiuwenclaw）；`officeace`
     OfficeAce,
-    /// OrcaTerm（腾讯云遨驰终端桌面客户端）。适配实现在 `orcaterm/`：
-    /// 账号管理（粘贴 accessToken / 导入桌面端登录态）+ OAuth 续期 +
-    /// 会话转发（建会话 → assistant SSE）+ 余额（月度 AI 配额）；
-    /// `is_stateful` 为 true（请求内会话），见 `orcaterm/mod.rs` 的模块头。
+    /// OrcaTerm（腾讯云遨驰终端）；`orcaterm`
     OrcaTerm,
+    /// 智谱清言（`chatglm.cn`）；`chatglm`
+    Chatglm,
+    /// ModelScope（魔搭）**国内站**（`modelscope`）
+    Modelscope,
+    /// ModelScope **国际站**（`modelscope-intl`）
+    ModelscopeIntl,
+    /// AtomCode（AtomGit / GitCode）；`atomcode`
+    Atomcode,
+    /// LobsterAI（网易有道「有道龙虾」）；`lobsterai`
+    LobsterAi,
 }
 
 /// 一个提供商的静态元数据。
@@ -493,78 +227,40 @@ pub struct ProviderMeta {
 /// 注册表顺序只用于**展示**（providers 摘要、模型目录合并时同名模型的去重顺序）
 /// 与旧数据迁移（把按家分队的优先级合并成全局队列时，作为旧默认路由顺序的依据）。
 pub const PROVIDERS: &[ProviderMeta] = &[
-    // WorkBuddy 两个地区都带上版本后缀（与 AutoClaw / ZCode 同款）：拆家后它们
-    // 是**两家独立的提供商**，名字是用户区分它们的唯一线索 —— 只给国际版加后缀
-    // 会让「WorkBuddy」读起来像「两地通吃的那一家」，而那正是拆家前的误解
-    // （issue #74 / #89 的根子）。业务口径不受影响：归谁家一律看 provider id，
-    // 没有任何判定读展示名。
-    //
-    // 例外（有意，别顺手统一）：壳侧登录窗口标题的品牌名仍是中性「WorkBuddy」，
-    // 由它自己拼版本后缀（拼成「登录 WorkBuddy 国内版账号」）；`/health` 的
-    // `product` 字段也仍是 "WorkBuddy" —— 桌面端靠它认出自家网关的端口。
-    // 这两处都不是「这一家在界面上的名字」，各自有各自的契约。
+    // 顺序 = 展示顺序，也决定模型目录合并时同名模型先归谁家。
+    // 成对/成组的提供商**相邻**排列（同一条产品线的两个版本，中间隔着别家
+    // 会让「找国际版」变成一次扫描），国内版在前（与存量账号的归属一致）。
     ProviderMeta { id: "workbuddy", label: "WorkBuddy 国内版" },
-    // 两个地区**相邻**排列（与 AutoClaw / Accio / ZCode 同一理由：同一条产品线的
-    // 两个版本，中间隔着别家会让「找国际版」变成一次扫描）。
-    // 顺序也决定模型目录合并时同名模型先归谁家 —— 国内版在前，与存量账号的
-    // 归属一致。
     ProviderMeta { id: "workbuddy-intl", label: "WorkBuddy 国际版" },
     ProviderMeta { id: "raccoon", label: "小浣熊" },
     ProviderMeta { id: "catpaw", label: "CatPaw" },
-    // AutoClaw 两个地区**相邻**排列（本次改动的要求）：界面上它们是同一条产品线的
-    // 两个版本，中间隔着别的家会让「找国际版」变成一次扫描。顺序也决定模型目录
-    // 合并时同名模型先归谁家 —— 国内版在前，与存量账号的归属一致。
     ProviderMeta { id: "autoclaw", label: "AutoClaw 国内版" },
     ProviderMeta { id: "autoclaw-intl", label: "AutoClaw 国际版" },
-    // Qoder 两个地区**相邻**排列（与 AutoClaw / Accio / ZCode 同一理由）：拆家后
-    // 是**两家独立的提供商**，国内版保持裸 `qoder`（存量账号的落盘契约，只改
-    // 展示名），国际版取 `qoder-intl`。顺序也决定模型目录合并时同名模型先归
-    // 谁家 —— 国内版在前，与存量账号的归属一致。
     ProviderMeta { id: "qoder", label: "Qoder 中国版" },
     ProviderMeta { id: "qoder-intl", label: "Qoder 国际版" },
     ProviderMeta { id: "cline-free", label: "Cline Free" },
     ProviderMeta { id: "cline-pass", label: "Cline Pass" },
-    // Accio 两个地区**相邻**排列（与 AutoClaw 同一理由：同一条产品线的两个
-    // 版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
-    // 合并时同名模型先归谁家 —— 国际版在前（用户装的、默认用的是它）。
     ProviderMeta { id: "accio", label: "Accio" },
     ProviderMeta { id: "accio-cn", label: "Accio 国内版" },
-    // ZCode 两个地区**相邻**排列（与 AutoClaw / Accio 同一理由：同一条产品线的
-    // 两个版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
-    // 合并时同名模型先归谁家 —— 国内版在前（国内网络环境下更常被添加的那个）。
     ProviderMeta { id: "zcode", label: "ZCode 国内版" },
     ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
     ProviderMeta { id: "codearts", label: "CodeArts" },
     ProviderMeta { id: "trae", label: "Trae" },
-    // Loomy（讯飞）：单一地区、单一入口（手机号验证码登录），没有国际版伴生。
     ProviderMeta { id: "loomy", label: "Loomy" },
-    // KukuAI（百度文库库库 AI）：单一地区、单一入口（粘贴 Cookie / 导入本机
-    // 客户端登录态），没有国际版伴生。排在末尾（2026-10 接入，后到居后）。
     ProviderMeta { id: "kuku", label: "KukuAI" },
-    // MonkeyCode（长亭科技）的两个站点**相邻**排列（与 AutoClaw / Qoder /
-    // ZCode 同一理由：同一条产品线的两个版本，中间隔着别家会让「找国际版」
-    // 变成一次扫描）。顺序也决定模型目录合并时同名模型先归谁家 ——
-    // 国内版在前（用户直觉里「MonkeyCode 就是国内那个站」）。
     ProviderMeta { id: "monkeycode", label: "MonkeyCode" },
     ProviderMeta { id: "monkeycode-intl", label: "MonkeyCode 国际版" },
-    // Command Code：单一域名、单一入口（粘贴 user_ API Key），没有国际版伴生
-    // （规格 §9：参考里只有 api.commandcode.ai 一个主机）。排在末尾
-    // （2026-10 接入，后到居后，与 Kuku 同一处置）。
     ProviderMeta { id: "commandcode", label: "Command Code" },
-    // Antigravity（Google）：单一入口（粘贴 Google refresh token）、没有地区
-    // 伴生（规格 §6：没有 region 参数，sandbox/daily/prod 是环境不是地区）。
-    // 排在末尾（2026-10 接入，后到居后，与 Kuku / Command Code 同一处置）。
     ProviderMeta { id: "antigravity", label: "Antigravity" },
-    // OfficeAce（华为云果办 / OfficeClaw）：排末尾（新家按约定追加在末尾）。
-    // 它的可用名单与 codearts / catpaw / trae / zcode 大面积同名（glm-5.2 /
-    // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
-    // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
+    // 以下各家排在末尾：它们与前面几家的模型名大面积同名，注册表顺序决定
+    // 目录合并时同名模型先归谁家 —— 放末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
-    // OrcaTerm（腾讯云遨驰终端桌面客户端）：单一入口（粘贴 accessToken /
-    // 导入桌面端登录态），没有地区伴生。排在末尾（2026-10 接入，后到居后）。
-    // 它的模型名（glm-5.3 / kimi-k3 / deepseek-v4-* 等）与 codearts / catpaw /
-    // zcode 大面积同名，同样靠末位让同名模型优先归已有各家。
     ProviderMeta { id: "orcaterm", label: "OrcaTerm" },
+    ProviderMeta { id: "chatglm", label: "智谱清言" },
+    ProviderMeta { id: "modelscope", label: "ModelScope 国内版" },
+    ProviderMeta { id: "modelscope-intl", label: "ModelScope 国际版" },
+    ProviderMeta { id: "atomcode", label: "AtomCode" },
+    ProviderMeta { id: "lobsterai", label: "LobsterAI" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -649,6 +345,11 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
         "orcaterm" => Some(ProviderKind::OrcaTerm),
+        "chatglm" => Some(ProviderKind::Chatglm),
+        "modelscope" => Some(ProviderKind::Modelscope),
+        "modelscope-intl" => Some(ProviderKind::ModelscopeIntl),
+        "atomcode" => Some(ProviderKind::Atomcode),
+        "lobsterai" => Some(ProviderKind::LobsterAi),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -691,21 +392,36 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
         ProviderKind::OrcaTerm => "orcaterm",
+        ProviderKind::Chatglm => "chatglm",
+        ProviderKind::Modelscope => "modelscope",
+        ProviderKind::ModelscopeIntl => "modelscope-intl",
+        ProviderKind::Atomcode => "atomcode",
+        ProviderKind::LobsterAi => "lobsterai",
     }
 }
 
-/// 这个 id 是不是**注册表里已登记的 provider**（W4a 起的唯一「provider 白名单」口径）。
+/// 这个 id 是否已知（旧身份、停用身份与真实插件的并集）。
 ///
-/// 语义与 `kind_from_id(id).is_some()` 完全相同，单独给个名字是为了让调用点
-/// 表达出「这里在校验一个 id 认不认识」而不是「这里要拿枚举」：账号层的添加
-/// 分支、配置层的 `providerRoute` 键校验、脱敏的 `providers` 数组校验都该用
-/// 这一句 —— 于是将来加 provider 时**这些校验点一行都不用改**（注册表是唯一
-/// 事实来源，见 `PROVIDERS`），也不会出现「某个模块忘了加新 id」的静默失配。
-///
-/// 反过来说：**不要**在任何地方另写 `matches!(id, "workbuddy" | "raccoon")`
-/// 之类的清单 —— 那正是本函数要消灭的东西。
+/// 缺执行体的 ID 仍可识别，便于导入存量数据；管理动作是否可用
+/// 必须另问 `is_executable_provider`。
 pub fn is_known_provider_id(id: &str) -> bool {
-    kind_from_id(id).is_some()
+    kind_from_id(id).is_some() || availability::is_suspended(id) || is_executable_provider(id)
+}
+
+/// 使用独立 FULL-auth 边界的稳定身份；停用不改变存量账号与错误分类语义。
+pub(crate) fn is_scoped_runtime_provider(id: &str) -> bool {
+    availability::is_runtime_identity(id)
+}
+
+/// 此刻有真实执行体的 provider（不含旧身份的 MissingPlugin 占位）。
+/// 自定义 `custom-` 提供商有独立的存储与直连路径，由消费方另行判断。
+pub fn is_executable_provider(id: &str) -> bool {
+    !availability::is_suspended(id) && crate::server::core::plugin_host::serves_provider(id)
+}
+
+/// 真实执行体的 ID；保留插件排序，不包含停用身份。
+pub fn executable_provider_ids() -> Vec<String> {
+    crate::server::core::plugin_host::installed_ids()
 }
 
 /// provider id → 给人看的名字；未登记的 id 原样回显。
@@ -737,58 +453,23 @@ pub fn label_of(id: &str) -> String {
         return id.to_string();
     }
     match kind_from_id(id) {
+        // 内置家优先读注册表：那是既有文案契约（插件接管后也不该改字）。
         Some(kind) => meta(kind).label.to_string(),
-        None => id.to_string(),
+        // runtime id 不靠占位 kind 取名：插件登记优先，最后回显原 ID。
+        None => crate::server::core::plugin_host::lookup(id)
+            .map(|adapter| adapter.label().to_string())
+            .unwrap_or_else(|| id.to_string()),
     }
 }
 
-/// 「这家有一段**网关自带**的提示词」的说明（`None` = 这家没有这回事）。
-///
-/// 消费者只有一个：设置页「系统提示词 → 按提供商」那张表。它的存在同时决定
-/// **界面上这一家默认就出现在列表里**（有内置段的家不需要用户先去「添加」才
-/// 看得见那个开关 —— 否则这个开关等于藏起来了）。返回的文本是**说明**而不是
-/// 「不可改」的宣告：开关本身可以关，这段文字负责讲清「关掉意味着什么、
-/// 依据是哪次实测」（ZCode 的记录见 `zcode::OFFICIAL_PROMPT_NOTE`）。
-///
-/// 放在注册表这一层是因为它**就是**一条 provider 能力（与 `is_stateful` /
-/// `usage` 同类），而实现由那家自己给 —— 别处不要另写
-/// `match id { "zcode" => ... }`。
-pub fn gateway_prompt_note(id: &str) -> Option<&'static str> {
-    match kind_from_id(id)? {
-        // 国内版 / 国际版是同一条通道形态（活动套餐端点两地相同），要求一致
-        ProviderKind::Zcode | ProviderKind::ZcodeIntl => Some(zcode::OFFICIAL_PROMPT_NOTE),
-        _ => None,
-    }
-}
-
-/// 这家自带提示词的**装配规模**（字符数）—— 界面把它显示成只读子行的
-/// 「约 N 字符」，让用户对「关掉的是什么」有量化概念。
-///
-/// 与 [`gateway_prompt_note`] 一样按家分派；不认识的家、以及算不出规模的家
-/// （内置资源解析失败时是 0）都给 `None` —— 界面此时不显示那一行，
-/// 而不是显示一个 0 或一个假数字。
-pub fn gateway_prompt_chars(id: &str) -> Option<usize> {
-    match kind_from_id(id)? {
-        ProviderKind::Zcode | ProviderKind::ZcodeIntl => {
-            Some(zcode::official_prompt_approx_chars()).filter(|chars| *chars > 0)
-        }
-        _ => None,
-    }
-}
-
-/// 这家自带提示词的**正文模板**（三段；`None` = 这家没有自带段、或资源坏了）。
-///
-/// 与上面两个函数同一分派口径，消费者是 `/api/prompt` 的响应：设置页的编辑器拿
-/// 它当「官方原文」显示（`{cwd}` 这类占位符保持原样，编辑时看得见哪些值由运行时
-/// 填），用户改过的段存在配置里、发请求时逐段合并（见
-/// `core::prompt::GatewayBlocks::or`）。资源坏了给 `None` 而不是空文本 ——
-/// 一份空文本放上界面，用户一保存就等于把官方原文清空了。
-pub fn gateway_prompt_blocks(id: &str) -> Option<crate::server::core::prompt::GatewayBlocks> {
-    match kind_from_id(id)? {
-        ProviderKind::Zcode | ProviderKind::ZcodeIntl => zcode::official_prompt_blocks(),
-        _ => None,
-    }
-}
+// ── 「这家有一段网关自带提示词」的三个查询已删除（2026-10 插件化）──────────
+// 它们原先在这里按 kind 分派到 `zcode::OFFICIAL_PROMPT_NOTE` /
+// `official_prompt_approx_chars` / `official_blocks_template`。ZCode 的活动
+// 套餐通道随实现搬到提供商插件后，那段说明（上游按结构认身份 + 实测记录）与
+// 官方三段正文都属于上游协议知识，也跟着搬走了。
+//
+// 现在由 `api::prompt` 直接问插件的 `prompt.info` 管理动作 —— 名单也不再在
+// 网关里维护（哪几家有自带提示词取决于实现，写死在注册表里必然漂移）。
 
 /// `ProviderKind` → 元数据。
 ///
@@ -805,25 +486,66 @@ pub fn meta(kind: ProviderKind) -> &'static ProviderMeta {
         .unwrap_or(&PROVIDERS[0])
 }
 
-/// 注册表的摘要 JSON 形态：`[{id, label, count}, ...]`。
+/// 管理入口是否列出这家提供商（保留既有函数名与计数回调签名）。
 ///
-/// `count` 由调用方传入的计数函数给出（账号存储那边按 provider 数账号总数）。
-/// 用它而不是让本模块去读账号文件：本模块是**纯静态元数据**，不认识磁盘，
-/// 于是它可以在任何初始化顺序下被调用。
-pub fn summary_json<F>(count: F) -> Vec<Value>
+/// 只看真实执行体，不因残留账号显示缺失插件或暂停的家。
+/// 自定义提供商由各消费方按 `custom-` 独立分流。
+pub fn serves_or_has_accounts<F>(id: &str, count: F) -> bool
 where
     F: Fn(&str) -> usize,
 {
-    PROVIDERS
+    let _ = count;
+    is_executable_provider(id)
+}
+
+/// 注册表摘要：旧身份保持展示顺序，再追加插件 runtime ID。
+///
+/// 每行包含 `{id, label, count, category, source}`；插件保留宿主申报的
+/// category / `plugin`。缺执行体的残留账号不列。
+/// `account_providers` 参数保留既有公开签名。
+pub fn summary_json<F>(count: F, account_providers: &[String]) -> Vec<Value>
+where
+    F: Fn(&str) -> usize,
+{
+    let mut list: Vec<Value> = PROVIDERS
         .iter()
         .filter_map(|meta| kind_from_id(meta.id))
-        .map(|kind| {
-            let detail = meta(kind);
+        .map(|kind| meta(kind))
+        .filter(|detail| serves_or_has_accounts(detail.id, &count))
+        .map(|detail| {
+            let plugin = crate::server::core::plugin_host::serves_provider(detail.id);
             json!({
                 "id": detail.id,
                 "label": detail.label,
                 "count": count(detail.id),
+                "category": if plugin {
+                    json!(crate::server::core::plugin_host::provider_category(detail.id))
+                } else { json!("agent") },
+                "source": if plugin { "plugin" } else { "builtin" },
             })
         })
-        .collect()
+        .collect();
+    let known = |list: &Vec<Value>, id: &str| {
+        list.iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+    };
+    // 第 2 类：当前装着的插件家（label 来自握手）
+    for id in crate::server::core::plugin_host::installed_ids() {
+        if known(&list, &id) {
+            continue;
+        }
+        let Some(adapter) = crate::server::core::plugin_host::lookup(&id) else {
+            continue;
+        };
+        list.push(json!({
+            "id": id,
+            "label": adapter.label(),
+            "count": count(&id),
+            "category": crate::server::core::plugin_host::provider_category(&id),
+            "source": "plugin",
+        }));
+    }
+    // 缺插件的残留账号仍不列，记录留在账号库里等待执行体恢复。
+    let _ = account_providers;
+    list
 }

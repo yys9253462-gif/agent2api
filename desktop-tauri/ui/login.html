@@ -30,11 +30,12 @@
       }
       document.documentElement.lang = locale;
       if (locale === 'zh-Hans') return; // 简体无词典：查不到即显示简体原文
-      document.write('<script src="i18n/manifest.js"><\/script>');
-      var domains = window.__WB_I18N_DOMAINS || [];
-      for (var d = 0; d < domains.length; d++) {
-        document.write('<script src="i18n/' + locale + '/' + domains[d] + '.js"><\/script>');
-      }
+      // 登录页只用到 login（标题 / 卡片文案 / 验证状态）与 accounts（「账号」）
+      // 两个域。标记告诉 i18n.js「词典已注入」，否则它会按 manifest 把主面板
+      // 二十多份词典（约 700 KB）再拉一遍 —— 登录页的首屏就白等一截。
+      window.__WB_I18N_INJECTED = true;
+      document.write('<script src="i18n/' + locale + '/login.js"><\/script>');
+      document.write('<script src="i18n/' + locale + '/accounts.js"><\/script>');
     })();
   </script>
   <!-- 组件库产物（ui-kit + Tailwind，由 ui-islands 构建）：与主面板同一份。
@@ -66,72 +67,20 @@
        同一手法）—— 中间多一层 div 的话，卡片的 min(400px,100%) 会按那一层的收缩宽度
        计算，窄窗口下就偏了 */
     #login-app { display: contents; }
-    /* 机器人校验组件（ui/panel-captcha.js 定义的 <panel-captcha>）：浅色 DOM、
-       样式留在页面这一层，观感与迁移前的 altcha widget 一致 —— 一行居中、
-       圆角描边方框、左侧指示圈（求解中转圈 / 通过打勾 / 失败描红）。
-       组件只在开启校验时占位：校验关闭后它被隐藏，间距随 display:none 一起消失，
-       与按钮之间的间隔改由 #submit 自己的 margin-top 撑住（两侧各 20px）。 */
-    panel-captcha { display: block; margin: 20px 0 0; }
+    panel-captcha { display: flex; justify-content: center; }
     #submit { margin-top: 20px; }
-    panel-captcha .pc-box {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      width: fit-content;
-      max-width: 100%;
-      margin: 0 auto;
-      padding: 10px 14px;
-      border: 1px solid var(--ui-border);
-      border-radius: 8px;
-      background: var(--ui-card);
-      font-size: 13px;
-      cursor: pointer;
-      user-select: none;
-    }
-    panel-captcha .pc-box:hover { border-color: var(--ui-border-strong); }
-    panel-captcha .pc-indicator {
-      width: 18px;
-      height: 18px;
-      flex: none;
-      border: 2px solid var(--ui-border-strong);
-      border-radius: 4px;
-    }
-    panel-captcha[state='verifying'] .pc-indicator {
-      border-radius: 50%;
-      border-color: color-mix(in srgb, var(--ui-border-strong) 40%, transparent);
-      border-top-color: var(--ui-primary);
-      animation: pc-spin 0.7s linear infinite;
-    }
-    panel-captcha[state='verified'] .pc-indicator {
-      border-color: var(--ui-success);
-      background: var(--ui-success);
-    }
-    panel-captcha[state='verified'] .pc-indicator::after {
-      content: '';
-      display: block;
-      width: 5px;
-      height: 9px;
-      margin: 0 auto 2px;
-      border: solid var(--ui-success-foreground);
-      border-width: 0 2px 2px 0;
-      transform: rotate(45deg);
-    }
-    panel-captcha[state='verified'] .pc-label { color: var(--ui-success); }
-    panel-captcha[state='error'] .pc-indicator { border-color: var(--ui-destructive); }
-    panel-captcha[state='error'] .pc-label { color: var(--ui-destructive); }
-    @keyframes pc-spin { to { transform: rotate(360deg); } }
   </style>
   <!-- 多语言运行时（词典已在上面 head 的引导脚本里同步注入）：排在所有 css 之后，
-       且早于 body 末尾的 islands/ui.js 与 panel-captcha.js。 -->
+       且早于 body 末尾的 islands/login.js 与 panel-captcha.js。 -->
   <script src="i18n.js"></script>
 </head>
 <body>
-  <!-- 整页界面由 React 岛渲染（ui-islands/src/islands/login-page.tsx，随 islands/ui.js
-       一起加载；岛直接渲染卡片本身，不在这里写静态骨架）。
+  <!-- 整页界面由 React 岛渲染（ui-islands/src/islands/login-page.tsx，由
+       islands/login.js 单独打包；岛直接渲染卡片本身，不在这里写静态骨架）。
        这个 <script> 必须排在 #login-app 之后、且不能加 defer/async：下面那段登录脚本
        要同步拿到岛渲染出来的 #username / #password / #submit / #error / #mode-tip。 -->
   <div id="login-app"></div>
-  <script src="islands/ui.js"></script>
+  <script src="islands/login.js"></script>
 
   <!-- 机器人校验组件（自定义元素定义，协议见 server::altcha 与文件头注释）。
        必须排在下面那段内联脚本之前：脚本挂在元素上的 verified/expired 监听、
@@ -158,13 +107,32 @@
           return typeof value === 'string' && value ? value : '';
         } catch (e) { return ''; }
       }
-      function storePanelTokens(access, refresh) {
+      function storePanelTokens(access, refresh, expiresIn) {
         try {
-          localStorage.setItem(PANEL_AUTH, JSON.stringify({ access: access, refresh: refresh }));
+          // `expiresAt` 让面板页一加载就知道什么时候该主动续期（见 web_shim 的
+          // `ensureFreshSession`）—— 不带它的话，登录后第一次过期仍要等一条
+          // 401 才发现。服务端恒定下发 expiresIn（直连 cookie 模式也有）。
+          var seconds = Number(expiresIn);
+          var expiresAt = isFinite(seconds) && seconds > 0
+            ? Date.now() + seconds * 1000
+            : 0;
+          localStorage.setItem(PANEL_AUTH, JSON.stringify({
+            access: access, refresh: refresh, expiresAt: expiresAt,
+          }));
         } catch (e) { /* 隐私模式等：存不了就只能依赖 cookie */ }
       }
 
-      // ── 会话传输探测：cookie 在本环境能不能往返 ─────────────────
+      // ── 桌面形态（Tauri 壳内）──────────────────────────────────
+      // 桌面窗口的页面源是 `tauri://localhost`，网关在 `127.0.0.1:{port}` ——
+      // 跨源，登录响应的 HttpOnly cookie 到不了网关，cookie 通道在这里**必然**
+      // 不可用。所以桌面形态固定走「令牌进响应体 + 交给壳保管」这条通道：
+      // 登录成功后 `panelSessionStore` 把令牌加密写进桌面设置，壳之后每个管理
+      // 请求自动带 `x-panel-token` 头（见 panel_session）。
+      // 定义**必须**在 headerMode 之前：下面的探测在桌面形态下整段跳过。
+      var desktop = window.workbuddyDesktop && window.workbuddyDesktop.platform !== 'web'
+        ? window.workbuddyDesktop
+        : null;
+
       // fnOS docker 管理页这类宿主中转入口会把 Set-Cookie/Cookie 掐掉。
       // 服务端种**两枚**探针 cookie（`/api/panel/cookie-probe` 连打
       // 两发，第二发两枚都读得回 = roundtrip:true）。探测通过 → 纯 cookie
@@ -177,13 +145,15 @@
       // 对得上），登录却弹回 —— 它把两条拼成一条逗号分隔的，`Path=/` 因此
       // 降级成一个名叫 `path` 的 cookie（回带名单里 path|domain|max-age|
       // expires|session|version 那几项就是碎片），新会话没按 `/` 存进罐子。
-      var headerMode = false;
+      var headerMode = !!desktop;
       // 探针改**值比对**：cookie 按主机算、不分端口 —— 从 fnOS（:5666）中转
       // 进来时，浏览器会把直连 :3065 时存下的**旧探针**一起带上；只判「有没
       // 有」会被它骗成「通道完好」（实测弹回登录页）。所以第一发记住服务端
       // 刚发的值，第二发用 ?expect= / ?expect-b= 让服务端比对 —— 旧探针的值
       // 对不上才算不通。两发都用 POST：与登录同动词，防中转按方法区别对待 Set-Cookie。
-      var probeDone = fetch('/api/panel/cookie-probe?step=1', { method: 'POST', cache: 'no-store' })
+      var probeDone = desktop
+        ? Promise.resolve()
+        : fetch('/api/panel/cookie-probe?step=1', { method: 'POST', cache: 'no-store' })
         .then(function (resp) { return resp.json(); })
         .then(function (payload) {
           var data = payload && payload.data;
@@ -205,7 +175,34 @@
 
       // 已登录（access 会话有效）→ 直接进面板；401 → 留在本页。
       // 手里存有令牌就带上：中转环境 cookie 缺席，服务端靠这个头认会话。
+      //
+      // 跳转带 `from=login`：服务端在 `/` 上会拦「会话无效的导航」并送回本页
+      // （见 server::http::panel_boot_redirect）。而中转环境里会话只存在于
+      // localStorage 的 `x-panel-token` 头，**顶层导航带不了自定义头** ——
+      // 不带这个标记的话，登录成功后的这一跳会被判成未登录、又弹回本页，
+      // 本页再判「已登录」跳回 `/`，形成无限循环。
+      // ── 登录成功后回哪一页 ──────────────────────────────────
+      // 手机端（`/m`）被踢回登录页时会带 `?next=/m`：它要回的是手机面板，
+      // 不是桌面面板。白名单校验，只认 `/` 与 `/m` 两个站内路径 ——
+      // 拿 `next` 做开放重定向是登录页最典型的漏洞，这里不给自己留口子。
+      function postLoginTarget() {
+        var next = '';
+        try { next = new URLSearchParams(window.location.search).get('next') || ''; } catch (e) { /* 老浏览器 */ }
+        if (next === '/m') return '/m?from=login';
+        // 桌面壳内：回到应用自己的界面（tauri://localhost/index.html）
+        if (desktop) return '/index.html';
+        return '/?from=login';
+      }
+
+      // 已登录探测：桌面形态问壳（它会用存好的令牌真的打一次 /api/session，
+      // 顺带完成续期）；网页端照旧带头打一次。
       (function () {
+        if (desktop && typeof desktop.panelSessionStatus === 'function') {
+          desktop.panelSessionStatus().then(function (state) {
+            if (state && state.authenticated) window.location.href = postLoginTarget();
+          }).catch(function () { /* 未登录，留在本页 */ });
+          return;
+        }
         var headers = {};
         var token = readPanelToken('access');
         if (token) {
@@ -214,7 +211,7 @@
           headers['Authorization'] = 'Bearer ' + token;
         }
         fetch('/api/session', { headers: headers }).then(function (resp) {
-          if (resp.ok) window.location.href = '/';
+          if (resp.ok) window.location.href = postLoginTarget();
         }).catch(function () { /* 未登录，留在本页 */ });
       })();
 
@@ -277,11 +274,32 @@
             // 同一份）；纯 cookie 模式下 body 里没有令牌，这里不落任何东西，
             // 会话只存在于 HttpOnly cookie。
             var data = result.payload && result.payload.data;
-            if (data && typeof data.accessToken === 'string' && data.accessToken
-              && typeof data.refreshToken === 'string' && data.refreshToken) {
-              storePanelTokens(data.accessToken, data.refreshToken);
+            var hasTokens = data && typeof data.accessToken === 'string' && data.accessToken
+              && typeof data.refreshToken === 'string' && data.refreshToken;
+            if (hasTokens) {
+              storePanelTokens(data.accessToken, data.refreshToken, data.expiresIn);
+              // 桌面形态：令牌同时交给壳（加密落盘），之后每个管理请求由壳自动
+              // 带上 —— 浏览器 localStorage 在 tauri:// 下也读得到，但壳重启后
+              // 只有它自己存的那份还在（见 panel_session）。
+              if (desktop && typeof desktop.panelSessionStore === 'function') {
+                desktop.panelSessionStore(data.accessToken, data.refreshToken, data.expiresIn)
+                  .catch(function () { /* 存不进：本次会话仍可用，下次启动重新登录 */ });
+              }
+            } else if (data && Number(data.expiresIn) > 0) {
+              // 纯 cookie 模式：令牌不落任何地方（这正是我们想保住的性质），
+              // 但**到期时刻要记**——面板页靠它判断何时该主动续期。不记的话
+              // 直连环境登录后第一次过期仍要等一条 401，那正是本次要消掉的噪音。
+              try {
+                localStorage.setItem(PANEL_AUTH, JSON.stringify({
+                  expiresAt: Date.now() + Number(data.expiresIn) * 1000,
+                }));
+              } catch (e) { /* 隐私模式：退回「401 → 续期」的老路径，不影响可用性 */ }
             }
-            window.location.href = '/';
+            // `from=login` 的作用见上面「已登录探测」那段：中转环境里会话只在
+            // localStorage 的请求头里，顶层导航带不上，服务端据此放行这一趟。
+            // 手机端来的请求带 `?next=/m`，回手机面板（见 postLoginTarget）。
+            // 桌面壳内没有服务端那道导航判定（页面来自 tauri://），直接回主界面。
+            window.location.href = postLoginTarget();
             return;
           }
           var detail = result.payload && (result.payload.error || result.payload);

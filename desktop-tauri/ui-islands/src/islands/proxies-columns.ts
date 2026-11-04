@@ -36,28 +36,20 @@ export type ProxyColumn = { key: string; label: string; align?: Align }
  */
 export const PROXY_COLUMNS: readonly ProxyColumn[] = [
   { key: 'pick', label: t('选择'), align: 'center' },
-  { key: 'name', label: t('节点') },
+  { key: 'name', label: t('代理名称') },
   { key: 'addr', label: t('地址') },
+  { key: 'usage', label: t('使用情况') },
   { key: 'state', label: t('启用'), align: 'center' },
-  { key: 'test', label: t('连通性') },
+  { key: 'test', label: t('最近检测') },
   { key: 'act', label: t('操作'), align: 'right' },
 ]
 
-/**
- * 各列的**默认宽度类**（写在 `<col>` 上，没拖过的列走它）。
- *
- * 是普通 CSS 类而不是 Tailwind 工具类，位置在 css/page-gateway.css 的
- * `.proxies-table .p-*`：组件库的 Tailwind 是 `!important` 导出的，工具类的
- * `width: 196px !important` 会压住列宽层写下的 inline 宽度 —— 拖完一松手列宽
- * 就弹回原值。其余三张表的默认列宽（`.c-*` / `.k-*`）也是同一口径。
- *
- * 节点列**不给宽度**：它是全表唯一内容长度不可控的列（名字 + 协议 + 引用数），
- * 该吃掉剩余宽度；连通性列给 28% —— 失败原因有两行（结论 + 上游错误原文）。
- */
+
 export const COL_CLASS: Record<string, string> = {
   pick: 'p-pick',
   name: '',
   addr: 'p-addr',
+  usage: 'p-usage',
   state: 'p-state',
   test: 'p-test',
   act: 'p-act',
@@ -82,6 +74,7 @@ type ColumnsWindow = {
       label?: string
       columns: readonly { key: string; label?: string; align?: Align }[]
       mount?: () => Element | null
+      buttonPlacement?: 'first' | 'last'
       onChange?: () => void
     }): ColSettingsHandle
     close?(): void
@@ -136,6 +129,7 @@ export function setupColumns(onChange: () => void): boolean {
       align: column.align ?? 'left',
     })),
     mount: () => document.querySelector('.page[data-page="proxies"] .panel-head .head-actions'),
+    buttonPlacement: 'last',
     // 改动落地：整页重画一次，表头与表体按同一份可见列产出（列宽层由页面那侧的
     // repaintColumnWidths 跟上，见 proxies-page 的布局副作用）
     onChange: () => onColumnsChanged?.(),

@@ -6,6 +6,12 @@
 //! 的点击发起写请求。这与 ZCode 的限时套餐领取同一形状（`api::zcode_claim`），
 //! 也与本仓「不可逆动作要有预览」的既有做法一致。
 //!
+//! ── 这里只做转发 ────────────────────────────────────────────
+//! 执行体在**提供商插件**里（`codearts::welfare`，动作 `welfare.preview` /
+//! `welfare.claim`）：活动接口长什么样、幂等键怎么算、6 次/10 分钟两道写闸
+//! 怎么判，都是「怎么打华为云的活动接口」的知识 —— 按项目的风险隔离要求，
+//! 这类实现不留在本仓库。网关这边只剩账号归属校验、`auto` 标志的解析与信封。
+//!
 //! ── 自动调度：已并入每日签到（2026-10，按用户要求）─────────────
 //! 参考实现把它挂在 cron 上（北京时间 `5-55/10 * * * *`，每天最多 6 次）。
 //! 本仓最初**不自动发写请求**（手动点击是唯一入口），理由是「无人值守地花掉
@@ -15,30 +21,63 @@
 //! 本文件这两个端点**原样保留** —— 预读 → 确认 → 领取那套手动形态仍在
 //! （`ui/codearts-welfare.js` 也留着），只是签到中心界面不再挂它。
 //!
-//! 自动路径的两道写闸（每天 ≤6 次、间隔 ≥10 分钟）在 `welfare` 里，靠
-//! `claim_account` 的 `manual` 参数分档：定时与启动补签传 false（受闸），
-//! 用户在面板上点传 true（不受闸）—— 闸保护的是无人值守的重试，不是点击。
+//! 自动路径的两道写闸（每天 ≤6 次、间隔 ≥10 分钟）在插件的 `welfare` 里，
+//! 靠 `welfare.claim` 的 `auto` 参数分档：定时与启动补签传 true（受闸），
+//! 用户在面板上点传 false（不受闸）—— 闸保护的是无人值守的重试，不是点击。
 
 use axum::body::Bytes;
 use axum::response::Response;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::server::core::providers::codearts::welfare;
-use crate::server::http::{ok_json, parse_body};
 use crate::server::errors::management_error;
+use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;
+
+/// 取账号记录（不属于 CodeArts 一律 404）。
+fn codearts_account_of(state: &ServerState, account_id: &str) -> Result<Value, Response> {
+    state
+        .store()
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|account| {
+                account.get("id").and_then(Value::as_str) == Some(account_id)
+                    && account.get("provider").and_then(Value::as_str) == Some("codearts")
+            })
+        })
+        .cloned()
+        .ok_or_else(|| management_error(404, "未找到 CodeArts 账号"))
+}
+
+/// 调一次福利动作。
+async fn call_action(
+    state: &ServerState,
+    account_id: &str,
+    action: &str,
+    payload: &Value,
+) -> Result<Value, Response> {
+    codearts_account_of(state, account_id)?;
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id("codearts") else {
+        return Err(management_error(
+            400,
+            "CodeArts 的提供商插件没有安装，无法执行福利动作",
+        ));
+    };
+    adapter
+        .admin_action(state.store(), account_id, action, payload)
+        .await
+        .map_err(|error| management_error(error.status_code, error.message))
+}
 
 /// `POST /api/accounts/{id}/codearts-welfare/preview` —— **动作是只读的**，
 /// 一个写请求都不发；用 POST 只是因为本仓的「账号 + 子动作」路由后缀全部挂在
 /// POST 那条分派上（ZCode 的 `zcode-claim/preview` 同一形状）。
 /// 上游那一侧确实只有一次 `GET /v1/ops/delivery`。
 pub async fn preview(state: &ServerState, account_id: &str) -> Response {
-    if state.store().codearts_account_record(account_id).is_none() {
-        return management_error(404, "未找到 CodeArts 账号");
-    }
-    match welfare::preview(state.store(), account_id, welfare_base(), crate::server::logging::now_ms()).await {
+    match call_action(state, account_id, "welfare.preview", &Value::Null).await {
         Ok(document) => ok_json(document),
-        Err(error) => management_error(error.status_code, error.message),
+        Err(response) => response,
     }
 }
 
@@ -48,28 +87,37 @@ pub async fn preview(state: &ServerState, account_id: &str) -> Response {
 /// 保护的是无人值守的重试）。将来接调度时传 `auto:true` 就会走那 6 次 / 10 分钟
 /// 两道闸。
 pub async fn claim(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
-    if state.store().codearts_account_record(account_id).is_none() {
-        return management_error(404, "未找到 CodeArts 账号");
-    }
     let Ok(parsed) = parse_body(body) else {
         return management_error(400, "请求体不是合法 JSON");
     };
     let auto = auto_requested(&parsed);
-    let now_ms = crate::server::logging::now_ms();
-    match welfare::claim_account(state.store(), account_id, welfare_base(), now_ms, !auto).await {
-        Ok(outcome) => {
-            // 领完顺手把余额读回来：面板上「领到了」与「积分确实变了」是两件事，
-            // 一次点击能同时回答最好。余额读失败不影响领取结果（给 null）。
-            let usage = welfare::refresh_usage(state.store(), account_id, now_ms).await;
-            ok_json(json!({
-                "result": outcome.label(),
-                "confirmed": matches!(outcome, welfare::Outcome::Confirmed),
-                "usage": usage,
-                "welfare": state.store().codearts_welfare_ledger(account_id),
-                "note": "领取到账的是套餐赠送积分，不增加福利模型 token 池",
-            }))
+    match call_action(
+        state,
+        account_id,
+        "welfare.claim",
+        &json!({ "auto": auto }),
+    )
+    .await
+    {
+        Ok(mut outcome) => {
+            // 台账由插件写 `ledger_put` 落回记录（键 `pluginLedger.codeartsWelfare`），
+            // 网关这里只读出来给界面看「今天领了几次」。
+            //
+            // ── 为什么读插件台账而不是账号记录的顶层键 ──────────────
+            // 拆家后台账归插件管：它按 `ctx.ledger_*` 写，落点是
+            // `pluginLedger.<kind>`（见 `account_store::plugin_accounts`）。
+            // 读顶层 `codeartsWelfare` 只对**存量内置记录**有效，新账号永远是 null。
+            if let Some(object) = outcome.as_object_mut() {
+                object.insert(
+                    "welfare".to_string(),
+                    state
+                        .store()
+                        .plugin_ledger(account_id, "codeartsWelfare"),
+                );
+            }
+            ok_json(outcome)
         }
-        Err(error) => management_error(error.status_code, error.message),
+        Err(response) => response,
     }
 }
 
@@ -81,11 +129,6 @@ pub async fn claim(state: &ServerState, account_id: &str, body: &Bytes) -> Respo
 /// 非布尔（`"true"` / `1`）也按手动处理 —— 认字符串会让手滑的调用方**绕过**限流。
 fn auto_requested(body: &Value) -> bool {
     body.get("auto").and_then(Value::as_bool).unwrap_or(false)
-}
-
-/// 活动接口挂在区域 API 上（不是福利网关），与转发/目录同一个 base。
-fn welfare_base() -> &'static str {
-    crate::server::core::providers::codearts::models::DEFAULT_BASE_URL
 }
 
 #[cfg(test)]

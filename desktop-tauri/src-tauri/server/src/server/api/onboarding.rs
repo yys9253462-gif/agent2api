@@ -12,10 +12,14 @@
 //! 的 GET 后缀段与 POST 后缀段各一条。
 //!
 //! ── 按提供商分派 ────────────────────────────────────────────
-//! 新手任务目前三家有：Loomy（任务表 + 逐项上报，`loomy::onboarding`）、
-//! 小浣熊（首次登录奖励双任务探测 —— 电脑端 / 手机端各一条端点，
-//! `raccoon::onboarding`），以及 CodeArts（运营活动里的**新人注册礼**这一条，
-//! `codearts::onboarding` —— 与每日福利共用 delivery/claim/confirm 执行体）。
+//! 所有提供商的执行体都已搬到提供商插件，统一走下面的 `plugin_status` /
+//! `plugin_claim` 分流：小浣熊（首次登录奖励双任务探测 —— 电脑端 / 手机端各
+//! 一条端点）、CodeArts（运营活动里的**新人注册礼**）、OfficeAce（它的
+//! 「新手任务」与每日签到是同一个上游动作）、智谱清言（任务中心的 `newbie`
+//! 分类，逐条 click + complete）。
+//!
+//! 网关这边只剩**分派**：查一条账号的 provider，把请求交给该家的插件执行体。
+//! 分派表里没有任何一家的任务形状或上游路径 —— 那些都在插件里。
 //! 分派键是账号记录里的 provider 字段；查不到记录或缺省一律走 Loomy ——
 //! 与既有行为一致（`loomy_account_record` 会对别家 id 报 404，兜底语义不变）。
 //!
@@ -48,26 +52,9 @@ use serde_json::Value;
 use axum::response::Response;
 
 use crate::server::core::account_store::AccountStore;
-use crate::server::core::providers::{
-    codearts::onboarding as codearts_onboarding, loomy::onboarding as loomy_onboarding,
-    officeace::onboarding as officeace_onboarding, raccoon::onboarding as raccoon_onboarding,
-};
 use crate::server::errors::management_error;
 use crate::server::http::ok_json;
 use crate::server::ServerState;
-
-/// 小浣熊（raccoon）新手任务的分派键（`providers::ProviderMeta` 的 id）
-const RACCOON_PROVIDER_ID: &str = "raccoon";
-/// CodeArts 的分派键：它的新手任务是运营活动里的**新人注册礼**那一条，
-/// 走 `providers::codearts::onboarding`（与每日福利共用执行体，只换挑哪一条活动）。
-/// 常量与本家共用一处，免得界面认的 id 和存储写的 id 分叉。
-const CODEARTS_PROVIDER_ID: &str =
-    crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID;
-/// OfficeAce 的分派键：它的新手任务与每日签到是**同一个上游动作**
-/// （`POST /v1/subscription/bonus/claim` 一次发当天所有奖励），见
-/// `officeace::onboarding` 的模块头。
-const OFFICEACE_PROVIDER_ID: &str =
-    crate::server::core::account_store::OFFICEACE_PROVIDER_ID;
 
 /// 从账号存储里查一条账号的 provider id（查不到账号给空串 —— 分派会落到
 /// Loomy 分支，由 `loomy_account_record` 报 404，与既有兜底行为一致）。
@@ -87,22 +74,51 @@ fn provider_of_account(state: &ServerState, account_id: &str) -> String {
         .to_string()
 }
 
-/// 账号的「已结算」记忆视图（签到中心快照用；已结算 ⇒ 零上游直接渲染，见
-/// `core::providers::onboarding_memory`）。三家形状一致，消费方不必按 provider
-/// 分叉；没结算 / 未领完 → None。
+/// 插件家的任务状态查询。
 ///
-/// 分派键与下面两个端点同一口径：provider 字符串直接来自账号记录，未知一律
-/// 走 Loomy（`loomy_account_record` 会对别家 id 返回 None，天然给出 None）。
-pub fn settled_view(store: &AccountStore, account_id: &str, provider: &str) -> Option<Value> {
-    match provider {
-        RACCOON_PROVIDER_ID => {
-            raccoon_onboarding::settled_view(store.raccoon_account_record(account_id).as_ref())
+/// ── 为什么抽出来 ────────────────────────────────────────────
+/// 两条入口（`status` 与 `claim`）都要在「这个 provider 由插件服务」时走这里，
+/// 而各自的兜底不同（`status` 在 provider 为空时走 Loomy 的 404）。抽成一个
+/// 具名函数，是为了让「插件分支只有一份」这件事在代码上看得见。
+async fn plugin_status(
+    state: &ServerState,
+    provider: &str,
+    account_id: &str,
+    refresh: bool,
+) -> Result<Value, crate::server::errors::GatewayError> {
+    match crate::server::core::providers::adapter::adapter_by_id(provider) {
+        Some(adapter) => {
+            adapter
+                .claim_status(state.store(), account_id, refresh)
+                .await
         }
-        CODEARTS_PROVIDER_ID => {
-            codearts_onboarding::settled_view(store.codearts_account_record(account_id).as_ref())
-        }
-        _ => loomy_onboarding::settled_view(store.loomy_account_record(account_id).as_ref()),
+        None => Err(crate::server::errors::GatewayError::with_status(
+            400,
+            format!("未知的提供商：{provider}"),
+        )),
     }
+}
+
+/// 插件家的领取入口（`claim` 的插件分支，理由同上）。
+async fn plugin_claim(
+    state: &ServerState,
+    provider: &str,
+    account_id: &str,
+) -> Result<Value, crate::server::errors::GatewayError> {
+    match crate::server::core::providers::adapter::adapter_by_id(provider) {
+        Some(adapter) => adapter.claim(state.store(), account_id, "").await,
+        None => Err(crate::server::errors::GatewayError::with_status(
+            400,
+            format!("未知的提供商：{provider}"),
+        )),
+    }
+}
+
+/// 已结清的本地快照；不同版本插件使用两种台账名，形状均为
+/// `{at, tasks, earned, total}`。存量账号顶层记忆由 `plugin_ledger` 兼容读取。
+pub fn settled_view(store: &AccountStore, account_id: &str) -> Option<Value> {
+    let snapshot = store.plugin_ledger(account_id, "onboarding");
+    snapshot.is_object().then_some(snapshot)
 }
 
 /// `GET /api/accounts/{id}/onboarding` —— 任务状态快照。
@@ -110,18 +126,8 @@ pub fn settled_view(store: &AccountStore, account_id: &str, provider: &str) -> O
 /// `refresh`（`?refresh=1`）强制实查上游：只在用户手点「查询任务」时置位，
 /// 其余（进页面、签到后自动补领）都吃结算记忆。
 pub async fn status(state: &ServerState, account_id: &str, refresh: bool) -> Response {
-    let result = match provider_of_account(state, account_id).as_str() {
-        RACCOON_PROVIDER_ID => {
-            raccoon_onboarding::get_tasks(state.store(), account_id, refresh).await
-        }
-        CODEARTS_PROVIDER_ID => {
-            codearts_onboarding::get_tasks(state.store(), account_id, refresh).await
-        }
-        OFFICEACE_PROVIDER_ID => {
-            officeace_onboarding::get_tasks(state.store(), account_id, refresh).await
-        }
-        _ => loomy_onboarding::get_tasks(state.store(), account_id, refresh).await,
-    };
+    let provider = provider_of_account(state, account_id);
+    let result = plugin_status(state, &provider, account_id, refresh).await;
     match result {
         Ok(data) => ok_json(data),
         Err(error) => management_error(error.status_code, error.message),
@@ -131,12 +137,8 @@ pub async fn status(state: &ServerState, account_id: &str, refresh: bool) -> Res
 /// `POST /api/accounts/{id}/onboarding/claim` —— 领取全部未完成任务。
 /// 三家执行体自身都幂等，重复调用不会重复加分。
 pub async fn claim(state: &ServerState, account_id: &str) -> Response {
-    let result = match provider_of_account(state, account_id).as_str() {
-        RACCOON_PROVIDER_ID => raccoon_onboarding::claim_all(state.store(), account_id).await,
-        CODEARTS_PROVIDER_ID => codearts_onboarding::claim_all(state.store(), account_id).await,
-        OFFICEACE_PROVIDER_ID => officeace_onboarding::claim_all(state.store(), account_id).await,
-        _ => loomy_onboarding::claim_all(state.store(), account_id).await,
-    };
+    let provider = provider_of_account(state, account_id);
+    let result = plugin_claim(state, &provider, account_id).await;
     match result {
         Ok(data) => ok_json(data),
         Err(error) => management_error(error.status_code, error.message),

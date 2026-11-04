@@ -1,10 +1,7 @@
 use super::*;
-use crate::server::core::providers::zcode::adapter::{ZCODE_ADAPTER, ZCODE_INTL_ADAPTER};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-const QUOTA_BODY: &str = r#"{"code":1005,"msg":"exceed quota limit","logid":"test-request"}"#;
 
 async fn mock_upstream(
     status: u16,
@@ -47,155 +44,20 @@ async fn mock_upstream(
     )
 }
 
-#[tokio::test]
-async fn zcode_http_200_quota_json_is_classified_before_streaming_without_resend() {
-    for adapter in [&ZCODE_ADAPTER, &ZCODE_INTL_ADAPTER] {
-        let (transport, hits, task) =
-            mock_upstream(200, "application/json; charset=utf-8", QUOTA_BODY).await;
-        let mut budget = RetryBudget::new(3);
-        let capture = crate::server::core::debug_traffic::TrafficCapture::begin("quota-test");
-        let result = send_with_retry(
-            adapter,
-            &transport,
-            &mut budget,
-            Some(&capture),
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let failure = match result {
-            Err(failure) => failure,
-            Ok(_) => panic!("HTTP 200 quota envelope must not enter the success stream"),
-        };
-        assert!(matches!(
-            failure.class,
-            UpstreamErrorClass::QuotaLimited {
-                status: 429,
-                upstream_code: Some(1005),
-                reset_at: None,
-                ..
-            }
-        ));
-        assert_eq!(failure.error.status_code, 429);
-        assert_eq!(failure.error.upstream_code, Some(1005));
-        assert!(failure.error.message.contains("exceed quota limit"));
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-        assert_eq!(budget.remaining, 3);
-        assert_eq!(capture.captured_body(), QUOTA_BODY);
-    }
-}
-
-#[test]
-fn zcode_header_detection_handles_mime_parameters_without_requiring_sse_headers() {
-    use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
-    for (mime, expected) in [
-        (None, false),
-        (Some("application/json"), true),
-        (Some("Application/JSON; charset=utf-8"), true),
-        (Some("text/event-stream; charset=utf-8"), false),
-        (Some("application/octet-stream"), false),
-    ] {
-        let mut headers = HeaderMap::new();
-        if let Some(mime) = mime {
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static(mime));
-        }
-        assert_eq!(ZCODE_ADAPTER.is_error_response(200, &headers), expected);
-        assert!(ZCODE_ADAPTER.is_error_response(401, &headers));
-        assert!(ZCODE_ADAPTER.is_error_response(429, &headers));
-    }
-}
-
-#[tokio::test]
-async fn zcode_http_auth_and_quota_errors_keep_their_status() {
-    for (status, body) in [(401, ""), (429, r#"{"msg":"rate limited"}"#)] {
-        let (transport, _, task) = mock_upstream(status, "application/json", body).await;
-        let result = send_with_retry(
-            &ZCODE_ADAPTER,
-            &transport,
-            &mut RetryBudget::new(0),
-            None,
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let failure = match result {
-            Err(failure) => failure,
-            Ok(_) => panic!("HTTP error must not be accepted"),
-        };
-        assert_eq!(failure.error.status_code, i32::from(status));
-        if status == 401 {
-            assert!(matches!(
-                failure.class,
-                UpstreamErrorClass::TokenExpired { .. }
-            ));
-        } else {
-            assert!(matches!(
-                failure.class,
-                UpstreamErrorClass::QuotaLimited { .. }
-            ));
-        }
-    }
-}
-
-#[tokio::test]
-async fn zcode_unknown_or_malformed_success_json_returns_an_error() {
-    for body in [r#"{"code":9999,"msg":"unexpected rejection"}"#, "not json"] {
-        let (transport, _, task) = mock_upstream(200, "application/json", body).await;
-        let result = send_with_retry(
-            &ZCODE_ADAPTER,
-            &transport,
-            &mut RetryBudget::new(0),
-            None,
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let failure = match result {
-            Err(failure) => failure,
-            Ok(_) => panic!("non-SSE ZCode response must not be accepted"),
-        };
-        assert_eq!(failure.error.status_code, 502);
-        assert!(failure.error.message.contains(if body == "not json" {
-            "not json"
-        } else {
-            "unexpected rejection"
-        }));
-    }
-}
-
-#[tokio::test]
-async fn zcode_success_sse_and_other_providers_json_remain_unconsumed() {
-    let sse = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\"}}\n\n";
-    let cases: [(&dyn ProviderAdapter, &str, &str); 2] = [
-        (&ZCODE_ADAPTER, "text/event-stream", sse),
-        (
-            adapter_for(ProviderKind::WorkBuddy),
-            "application/json",
-            QUOTA_BODY,
-        ),
-    ];
-    for (adapter, content_type, body) in cases {
-        let (transport, _, task) = mock_upstream(200, content_type, body).await;
-        let result = send_with_retry(
-            adapter,
-            &transport,
-            &mut RetryBudget::new(0),
-            None,
-            &RequestTelemetry::new(),
-            false,
-        )
-        .await;
-        task.abort();
-        let response = match result {
-            Ok(response) => response,
-            Err(failure) => panic!("valid response rejected: {}", failure.error.message),
-        };
-        assert_eq!(response.text().await.unwrap(), body);
-    }
-}
+// ── ZCode 的响应判定与错误分类（测试随实现搬到插件）────────────────────────
+//
+// 这里原有五条用例钉的是 ZCode 适配器的两件事：
+//   · `is_error_response`：HTTP 200 + `application/json` 是**业务拒绝**而不是
+//     SSE 正文（`1005 exceed quota limit` 走 200 回来），网关必须先读错误体；
+//   · `classify_error`：401 → TokenExpired、429 / 业务码 1005 → QuotaLimited。
+//
+// 这两条判据都跟着 ZCode 的实现搬到 `agent2api-providers` 了，因此用例也一起
+// 搬走 —— 留在网关只会编译不过（`ZCODE_ADAPTER` 已不存在）。插件侧的同名用例
+// 在 `zcode::mod` 的 `classify` 附近。
+//
+// 顺带说明**为什么这段注释留着**：`provider_loop` 的「HTTP 200 也可能是错误」
+// 与「401/429 各自的动作」这两条**编排层**语义没有变，下面几条用例
+// （会话式路径的限额记账）仍在验证它们。
 
 // ── 会话式路径的限额记账（`mark_conversation_limited`）──────────────────────
 //
@@ -461,8 +323,12 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         mock_upstream(413, "application/json; charset=utf-8", APIG_TOO_LARGE_BODY).await;
     let mut budget = RetryBudget::new(3);
     let capture = crate::server::core::debug_traffic::TrafficCapture::begin("payload-too-large");
+    // 适配器只提供「怎么判上游错误」这一半；413 的处置在**编排层**
+    // （`transport::RetryBudget` + `fallback_retry_advice`），因此随便挑一个
+    // 内置家即可。原先这里用 ZCode 的实例，它随实现搬到插件了 —— 换成本家
+    // 走得通的 WorkBuddy，断言的仍是同一处语义。
     let result = send_with_retry(
-        &ZCODE_ADAPTER,
+        adapter_for(ProviderKind::WorkBuddy),
         &transport,
         &mut budget,
         Some(&capture),

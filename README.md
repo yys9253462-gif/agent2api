@@ -1,6 +1,6 @@
 # Agent2API（二次开发分支）
 
-把多家 AI 桌面客户端的登录态转成一个本地 OpenAI 兼容网关。本仓库 fork 自 [aimod-cc/agent2api](https://github.com/aimod-cc/agent2api)（当前基线 3.0.8），在其上做二次开发。
+把多家 AI 桌面客户端的登录态转成一个本地 OpenAI 兼容网关。本仓库 fork 自 [aimod-cc/agent2api](https://github.com/aimod-cc/agent2api)（当前基线 3.4.1），在其上做二次开发。
 
 > 本项目以非官方客户端形态复用账号登录态，可能违反上游服务条款，账号有被风控或封禁的风险。上游 LICENSE 在 MIT 之上追加了禁止商用、禁止二次分发牟利、禁止批量账号运营等限制，二次开发同样受其约束，详见 [LICENSE](./LICENSE)。
 

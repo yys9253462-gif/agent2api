@@ -49,13 +49,14 @@
         // 展示名需要翻译时由各展示处自行处理，别在这里动。
         label: typeof item.label === 'string' && item.label ? item.label : item.id,
         count: Number(item.count) || 0,
+        category: item.category === 'web' ? 'web' : 'agent',
       }));
   }
 
   /** 主状态里的那份摘要（app.js 的 refresh 一直在维护它，读它零成本） */
   function fromAppState() {
     const list = window.wbApp?.getState?.()?.accounts?.providers;
-    return Array.isArray(list) ? normalize(list) : [];
+    return Array.isArray(list) ? normalize(list) : null;
   }
 
   /**
@@ -64,7 +65,7 @@
    */
   function all() {
     const live = fromAppState();
-    if (live.length) return live;
+    if (live !== null) return live;
     return fallback || [];
   }
 
@@ -86,6 +87,7 @@
   let customInflight = null;
   /** 最近一次 GET /api/custom-providers 的列表（后端按 createdAt 升序） */
   let customItems = [];
+  let customRevisions = new Map();
   /** id → 展示名；添加 / 编辑 / 删除后由 refreshCustom() 更新 */
   const customNames = new Map();
 
@@ -97,6 +99,15 @@
     for (const item of customItems) {
       customNames.set(item.id, typeof item.name === 'string' && item.name ? item.name : item.id);
     }
+  }
+
+  function absorbCustom(provider) {
+    if (!provider || typeof provider.id !== 'string' || !provider.id.startsWith('custom-')) return;
+    customRevisions.set(provider.id, (customRevisions.get(provider.id) || 0) + 1);
+    const next = customItems.filter(item => item.id !== provider.id);
+    next.push(provider);
+    next.sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0));
+    absorbCustomProviders(next);
   }
 
   /**
@@ -130,10 +141,14 @@
    */
   function fetchCustomProviders() {
     if (!customInflight) {
+      const revisions = new Map(customRevisions);
       customInflight = customRequest('GET', '/api/custom-providers')
         .then(data => {
+          const updated = customItems.filter(item => customRevisions.get(item.id) !== revisions.get(item.id));
+          const changedIds = new Set(updated.map(item => item.id));
+          const incoming = (Array.isArray(data?.providers) ? data.providers : []).filter(item => !changedIds.has(item?.id));
           const before = [...customNames.entries()];
-          absorbCustomProviders(data?.providers);
+          absorbCustomProviders([...incoming, ...updated].sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0)));
           const changed = before.length !== customNames.size
             || before.some(([id, name]) => customNames.get(id) !== name);
           // 账号数据还没就绪（首次 refresh 未返回）时不补重绘：那会把列表容器里
@@ -189,7 +204,7 @@
       inflight = api.getState()
         .then(data => {
           const list = normalize(data?.accounts?.providers);
-          if (list.length) fallback = list;
+          if (Array.isArray(data?.accounts?.providers)) fallback = list;
           return list;
         })
         .finally(() => { inflight = null; });
@@ -206,7 +221,7 @@
    */
   async function load({ force = false } = {}) {
     const live = fromAppState();
-    if (live.length && !force) return live;
+    if (live !== null && !force) return live;
     try {
       const fetched = await fetchProviders();
       return fetched.length ? fetched : all();
@@ -216,10 +231,15 @@
     }
   }
 
-  // 加载期拉一次自定义提供商目录：账号表 / 筛选器首屏就要显示 custom id 的
-  // 展示名，等用户打开某个面板再拉就晚了。失败静默（console.warn），下一次
-  // refreshCustom（添加 / 删除后）或重启会再试。
-  void fetchCustomProviders();
+  // 自定义提供商目录只用于把 custom id 换成展示名，不影响首屏骨架。等首屏
+  // 画完再拉（与 app.js 的 afterFirstPaint 同一取向）：启动时少一发请求，
+  // 失败静默（console.warn），下一次 refreshCustom（添加 / 删除后）或重启会再试。
+  const startCustomCatalog = () => { void fetchCustomProviders(); };
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(startCustomCatalog, 0)));
+  } else {
+    setTimeout(startCustomCatalog, 120);
+  }
 
   window.wbProviders = {
     all,
@@ -228,6 +248,7 @@
     // 自定义提供商目录（custom- 前缀）：列表缓存、刷新与通用管理 API 调用。
     // 添加 / 编辑表单与账号页的管理弹窗都从这里取数，保证同一份目录只有一处实现
     customList,
+    absorbCustom,
     refreshCustom,
     customRequest,
     // 协议下拉的选项（添加表单与编辑弹窗共用，见上面 PROTOCOL_OPTIONS 的说明）

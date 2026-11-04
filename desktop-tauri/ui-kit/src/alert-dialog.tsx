@@ -137,7 +137,7 @@ function AlertDialogFooter({ className, ...props }: React.ComponentProps<'div'>)
     <div
       data-slot='alert-dialog-footer'
       className={cn(
-        'flex items-center gap-2 border-t border-hairline bg-surface-2 px-5 py-[13px]',
+        'flex items-center justify-end gap-2 border-t border-hairline bg-surface-2 px-5 py-[13px]',
         className
       )}
       {...props}

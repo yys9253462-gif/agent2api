@@ -3,12 +3,11 @@
 //!
 //! ── 为什么以 Chat 为枢纽，而不是在每个适配器里各写一套 ────────
 //! 本项目各内置上游**在适配器 / 翻译层边界上最终都归一为 OpenAI Chat 协议**：
-//! 有状态家（CatPaw 的 conversation 会话协议、Qoder 的 COSY 信封等）在各自的
-//! `forward_conversation` 里被翻译成 OpenAI chunk 下发（见 `providers/catpaw`、
-//! `providers/qoder` 的模块头）；无状态但响应异形的三家（ZCode 活动套餐的
-//! Anthropic、Command Code 的 NDJSON、Antigravity 的 Gemini v1internal 信封）
-//! 由 `upstream::translate` 的翻译层折回 chat SSE。也就是说，
-//! 「上游说 Chat」这件事在边界上**已经成立**。
+//! 有状态家（会话型上游）在插件侧的 `conversation` 里被翻译成 OpenAI chunk
+//! 下发；无状态但响应异形的家（NDJSON、Gemini v1internal SSE 等）由
+//! `upstream::translate` 的翻译层折回 chat SSE —— 插件在 `chat` 回复里申报
+//! `UpstreamKind`，网关据此选翻译器。也就是说，「上游说 Chat」这件事在边界上
+//! **已经成立**。
 //!
 //! 于是协议转换只有两个可能的位置：
 //!   ① 在每家适配器里各写一遍（每家 × 2 协议）；
@@ -31,21 +30,17 @@
 //!   anthropic.rs         Anthropic Messages ↔ Chat（同上）
 //!   responses_outbound.rs chat → Responses 上游的出站翻译（自定义提供商转发）
 //!   anthropic_outbound.rs chat → Anthropic 上游的出站翻译（同上）
-//!   commandcode_outbound.rs 上游 Command Code NDJSON → chat SSE（内置家：
-//!                         `api.commandcode.ai` 的 `/alpha/generate` 返回
-//!                         `application/x-ndjson`，HTTP 恒 200、错误在流内；
-//!                         见该文件模块头）
-//!   antigravity_outbound.rs chat → Antigravity 的 Gemini v1internal 信封请求
-//!                         （内置家：Google Cloud Code Assist；见该文件模块头）
-//!   antigravity_schema.rs 工具参数 JSON Schema 清洗（规格坑 #13 的纯函数库，
-//!                         从 antigravity_outbound 拆出）
-//!   antigravity_stream.rs 上游 Gemini v1internal SSE → chat SSE（同上拆出）
+//!   ai_sdk_ndjson.rs      上游 **AI SDK v5 风格 NDJSON** → chat SSE
+//!                         （公开流格式；插件报 `UpstreamKind::Ndjson` 时用它，
+//!                         网关只认事件词表，见该文件模块头）
+//!   antigravity_stream.rs 上游 Gemini v1internal SSE → chat SSE
+//!                         （Antigravity 的实现已搬到插件，这里只留**响应**
+//!                         翻译：请求信封与 schema 清洗随插件走了）
 //!   history.rs           内部 Chat 体的历史 sanitize（客户端带来的畸形工具历史）
 //!
 //! 出站几个文件与回程两个文件方向相反：回程服务「下游说 X」的入口
 //! （`api::protocol`），出站服务「上游说 X」的转发（自定义家
-//! `providers::custom::forward` 与内置的 ZCode / Command Code / Antigravity
-//! 通道）。单开文件而不是塞回原文件：两个
+//! `providers::custom::forward` 与插件家申报的异形上游通道）。单开文件而不是塞回原文件：两个
 //! 回程文件早已超过项目约定的单文件行数（各自 1000+ 行），出站方向
 //! 又是完整独立的一套（请求转换 + SSE 状态机），分开后各自内聚。
 //!
@@ -55,11 +50,10 @@
 
 pub mod anthropic;
 pub mod anthropic_outbound;
-pub mod antigravity_outbound;
-pub mod antigravity_schema;
 pub mod antigravity_signature_cache;
 pub mod antigravity_stream;
-pub mod commandcode_outbound;
+pub mod chatglm_stream;
+pub mod ai_sdk_ndjson;
 pub mod freeform;
 pub mod history;
 pub mod native_tool;

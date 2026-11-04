@@ -1,89 +1,33 @@
-/**
- * Agent2API · 账号页（**按家分组**的一张表 + 批量栏 + 两个弹窗）—— React 岛。
- *
- * 替换 ui/accounts-table.js + ui/accounts-view.js + ui/accounts-filters.js +
- * ui/accounts-columns.js + ui/accounts-groups.js + ui/accounts-model.js +
- * ui/usage-actions.js + ui/account-panel.js + ui/proxy-form.js 九个文件。
- * 本文件只放**页面骨架与挂载**：行与单元格在 accounts-panels.tsx，两个弹窗在
- * accounts-dialogs.tsx，状态与动作在 accounts-data.ts，纯逻辑在 accounts-domain.ts，
- * 顺序拖拽在 accounts-queue-drag.ts。
- *
- * ── 对外契约（必须原样保留，调用点逐个 grep 确认过）─────────────
- *   · `window.wbAccountsView` —— app.js:147 syncConnections / app.js:575 render /
- *     app.js:622 refreshCaches / app.js:811 与 tasks-panel.tsx:559 syncBalancesSnapshot /
- *     providers.js:138 render
- *   · `window.wbAccountsModel` —— app.js:178 isRateLimited / app.js:663 isDesktopAccount /
- *     report.js:307 editionSuffix / models-fetch-modal.tsx:245 providerFeatures、
- *     :255 byPriorityOrder
- *   · `window.wbAccountPanel` —— app.js:623 invalidate / app.js:645 open
- *   注册都在 accounts-data.ts 的 installAccountsApi()（模块求值即完成）。
- *
- * ── 分组模式（2026-10）：一张表，**一组一个 `<tbody>`** ─────────
- * 账号按家分组显示：每个 `<tbody class="acct-group" data-provider=…>` = 一家，
- * 首行是通栏的分组带（`GroupBandRow`），其余行是这一家的账号。为什么仍然用一张
- * `<table>` 而不是改成 div 网格：列宽拖拽、列设置（显隐 / 顺序 / 对齐）都是按
- * `thead th[data-col]` 与 `colgroup col[data-col]` 就地重排既有元素实现的，
- * 换成网格等于把这两套机制全部重写一遍；多个 tbody 是 HTML 本来就允许的形状。
- *
- * 顺序也不再由「优先级」列承载，而是**拖出来的**：
- *   · 拖分组带（`.queue-grip`）= 改这一家的**组顺位**；
- *   · 拖行里的把手（`.order-grip`）= 改它在这一家内的**组内顺位**。
- * 两者合并成一条队列交给后端整队重编号（`POST /api/accounts/reorder`，见
- * accounts-data.ts 的 reorderQueue）。**组顺位**在筛选 / 搜索 / 分页生效时不可拖
- * （别家的组整组不可见，落点没法定位），此时**锁定拖拽**并给一次提示；**组内顺位**
- * 不锁 —— 落点按渲染出来的行算出锚点、再换算回完整 members（见 onDrop），可见与
- * 全量的映射是确定的，拖动不会错位。
- *
- * ── 静态表头（本页最容易出错的地方）────────────────────
- * `<colgroup>` 的 `col[data-col]` 与 `<thead>` 的 `th[data-col]`（见 accounts-panels.tsx
- * 的 TableHead）是**字面量**渲染，永远按列定义的原始顺序渲染全部列、且不随任何状态
- * 变化：列的显隐与顺序靠 `wbColSettings.syncStaticHead` **就地重排既有元素**
- * （隐藏的列是从 DOM 里摘掉而不是 display:none），不能按状态重建 —— `<col>` 上带着列宽
- * 拖拽写进去的 inline 宽度，`<th>` 里插着列宽把手，重建会把两者一起丢掉。React 只在
- * 「同一位置、同一类型的子节点」上做属性 diff，这些节点的 props 与文本逐字不变，
- * 重渲染时一次 DOM 写都不会发生。数据行（tbody）相反：完全按 visibleColumns() 逐列渲染。
- *
- * ── 列宽（accounts-columns）与列设置（wbColSettings）是两套 ──────
- * 前者管宽度（拖表头右缘的把手），后者管显隐 / 顺序 / 对齐。列的集合只有一份
- * （accounts-columns.ts 的 ACCOUNT_COLUMNS），两套都按 `data-col` 认列。
- *
- * ── 挂载必须**同步**（flushSync）───────────────────────────
- * 账号页的「添加账号」按钮（`#btn-add-account-2`）由 ui/add-account.js:196 用
- * `$('btn-add-account-2').addEventListener(...)` **非可选链**地绑定，而那个脚本排在
- * islands/ui.js 之后、同步执行。React 的首次渲染默认是异步的（走 Scheduler 的宏任务），
- * 那时按钮还不存在 → 那一行会抛 TypeError，把 add-account.js 后面所有监听一起带崩。
- * 所以首次挂载用 flushSync 强制同步提交（DOM 与布局 effect 都落地），后续更新照常异步。
- *
- * ── 隐藏优先条件渲染 ───────────────────────────────────────
- * 组件库的工具类是**分层 + !important** 的，tokens.css 的 `[hidden] { display:none
- * !important }` 未分层；按 Cascade 5，important 的层序反转 —— 分层压过未分层。
- * 组件库 globals.css 已补同层的 `[hidden][hidden]` 兜底，属性式显隐因此可用；
- * 但能条件渲染就条件渲染（少一批常驻 DOM），属性式留给「节点必须常驻」的场合
- * （登录引擎的段落与取消按钮，见 add-provider-blocks.tsx）。
- */
+
 
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import { t } from '../i18n'
-import { Button, Checkbox, Input, SegmentedControl, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, cn } from '@ui'
+import { Button, Checkbox, Input, ResponsiveSheet, SegmentedControl, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, cn, Card, Label, Empty, Table, TableBody, TableRow, TableCell } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import { shared, toast, type AccountRecord, type ColSettingsHandle } from './accounts-shared'
 import { isDesktopAccount, isEnabled, providerOf, supportsUsage } from './accounts-domain'
 import { ACCOUNT_COLUMNS, bindColumnGrips, columnWidths, tableMinWidth } from './accounts-columns'
 import {
-  allAccounts, clearFilter, clearLimits, clearSelection, ensureProxyPoolOptions, filterActive,
-  getStore, groupView, installAccountsApi, normalizeProviderFilter, openBatchDialog, panelOpen,
-  providerSummaryList, queryAllUsage, reorderQueue, rowContext, seats, segmentCounts,
+  allAccounts, bump, clearFilter, clearLimits, clearSelection, ensureProxyPoolOptions,
+  filterActive, getStore, groupSortRules, groupView, hiddenAccounts, installAccountsApi, normalizeProviderFilter, openBatchDialog,
+  providerSummaryList, queryAllUsage, refreshList, reorderQueue, rowContext, seats, segmentCounts,
   setAllGroupsCollapsed, setAllPicked, setProviderFilter, setSearchFilter, setSegmentFilter,
-  snapshot, startConnectionsPolling, subscribe, tokenUsageOf, togglePick, usageEntryOf,
+  snapshot, startConnectionsPolling, subscribe, subscribeProxyPool, syncGroupTotalPreference,
+  tokenUsageOf, togglePick, usageEntryOf, GROUP_TOTAL_FILTERED_KEY,
 } from './accounts-data'
 import {
   AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, GroupBandRow, LimitsCell, OrderCell,
-  PanelsRow, ProxyCell, StatusCell, TableHead, UsageCell,
+  ProxyCell, StatusCell, TableHead, UsageCell,
 } from './accounts-panels'
 import { bindQueueDrag, type QueueDrop } from './accounts-queue-drag'
 import { AccountsDialogs } from './accounts-dialogs'
+import { HiddenAccountsNotice } from './accounts-hidden-notice'
+import { activeGroupSortRules, manualOrderBlockedMessage } from './accounts-group-settings'
+import { Badge, Spinner } from '@ui'
+import { Alert } from '@ui'
 
 /** 列设置的句柄（注册在挂载后的布局 effect 里，见下方说明） */
 let colHandle: ColSettingsHandle | null = null
@@ -107,6 +51,12 @@ let headSignature = ''
 /** 当前可见列（顺序即配置顺序；列设置未就绪时退回全部列） */
 function visibleColumns(): Array<(typeof ACCOUNT_COLUMNS)[number] & { align: 'left' | 'center' | 'right' }> {
   return colHandle ? colHandle.apply(ACCOUNT_COLUMNS) : ACCOUNT_COLUMNS
+}
+
+/** 该账号所属组的排序规则是否生效（生效时组内把手锁定：拖了也会被规则排回去） */
+function sortActiveIn(account: AccountRecord): boolean {
+  const provider = providerOf(account)
+  return activeGroupSortRules(provider, groupSortRules(provider)).length > 0
 }
 
 /** 触发一次重绘（store 换快照 → 订阅者重画） */
@@ -146,6 +96,7 @@ function AccountsPage() {
 
   const loaded = Boolean(snapshot())
   const all = allAccounts()
+  const hidden = hiddenAccounts()
   // groups = 要渲染的（当前筛选下一条都看不见的组不留空壳）；allGroups = 全部组，
   // 拼队列与「折叠 / 展开全部」都用它
   const { groups, allGroups } = groupView(usageEntryOf, tokenUsageOf)
@@ -178,18 +129,38 @@ function AccountsPage() {
    */
   const paging = useClientPaging(shown.length, 'accounts', { defaultSize: 'all' })
   const pageRows = paging.paged ? paging.slice(shown) : shown
-  /** 组顺位的锁（组内行不锁，落点可按可见行换算）：提示语要说清是卡在哪一条上 */
-  const groupLocked = filterActive() || paging.paged
-  const lockReason = filterActive() ? t('清除筛选') : t('把每页调回「全部」')
+  /** 整组允许仅按启用状态筛选；其他筛选或分页仍锁定，组内行不受筛选限制。 */
+  const groupFilterLocked = store.filter.provider !== 'all'
+    || store.filter.q.trim() !== ''
+    || store.filter.limit !== 'all'
+  const groupLocked = groupFilterLocked || paging.paged
+  const lockReason = groupFilterLocked ? t('清除筛选') : t('把每页调回「全部」')
 
   // 代理列的选项（「网络代理」页的池条目）没就绪就补拉（节流 30 秒，失败不缓存）。
   // Clash 出口那一组已经不在这一页了 —— 出口统一由代理页的「同步 Clash Verge」
   // 导入池，这里只读池（见 accounts-panels 的 ProxyCell）
   React.useEffect(() => { ensureProxyPoolOptions() })
 
+  // 池列表是账号页与「网络代理」页共用的一份缓存（见 proxy-pool-cache.ts）：那一页
+  // 禁用节点 / 删除订阅 / 同步 Clash 之后会把新列表写进来，这里订阅到就重画 ——
+  // 代理下拉的选项因此不会停在旧数据上（曾经它是一次性缓存，删掉的节点还留在
+  // 下拉里，选中才被后端拒绝）
+  React.useEffect(() => subscribeProxyPool(() => { bump() }), [])
+
   // 存盘里筛的那一家已经不在摘要里（账号删光、家也删了）就复位成「全部」—— 否则下拉
   // 找不到那一项、回落显示「全部」，列表却仍按它过滤（见 store 的 normalizeProviderFilter）
   React.useEffect(() => { normalizeProviderFilter() }, [store.version])
+
+  // 设置页拨了「积分合计只统计当前筛选出来的账号」之后，本页要立刻按新口径重画。
+  // 本页自己的写入走 store（同文档内 localStorage 不触发自己的 storage 事件），
+  // 这条监听只接**别处**（设置页 / 另一个窗口）的写入。
+  React.useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === GROUP_TOTAL_FILTERED_KEY) syncGroupTotalPreference()
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
 
   // 列设置的注册必须在挂载后：按钮要插进本岛渲染出来的 `.batch-actions`，而
   // syncStaticHead 要求登记表已存在（它按 id 查配置）。用布局 effect 是为了让首屏的
@@ -247,7 +218,14 @@ function AccountsPage() {
   // 「折叠全部 / 展开全部」看的是**全部**组（与按钮实际作用的对象同一份口径）：
   // 只看可见组的话，被筛掉的那几家会与标签对不上（见 setAllGroupsCollapsed 的说明）
   const allCollapsed = allGroups.length > 0 && allGroups.every(group => store.collapsed.has(group.provider))
-
+  /** 宽屏平铺、窄屏抽屉，筛选值始终由同一份 store 维护。 */
+  const [filterOpen, setFilterOpen] = React.useState(false)
+  /** 当前生效的筛选条数：给「筛选」按钮上的角标用，让用户知道列表被收窄了 */
+  const activeFilterCount =
+    (store.filter.provider !== 'all' ? 1 : 0)
+    + (String(store.filter.q || '').trim() ? 1 : 0)
+    + (store.filter.enabled !== 'all' ? 1 : 0)
+    + (store.filter.limit !== 'all' ? 1 : 0)
   /**
    * 拖拽的落点处理：把「谁挪到了第几位」翻成一条**完整队列**再交给后端。
    *
@@ -276,28 +254,38 @@ function AccountsPage() {
   const onDrop = React.useCallback((drop: QueueDrop) => {
     const { displayed, all: current } = dragRef.current
     if (drop.kind === 'group') {
+      if (dragHandlers.current.locked) return
       const from = current.findIndex(group => group.provider === drop.provider)
-      if (from < 0) return
+      const visibleFrom = displayed.findIndex(group => group.provider === drop.provider)
+      if (from < 0 || visibleFrom < 0) return
+      const visible = displayed.filter(group => group.provider !== drop.provider)
+      if (!visible.length || drop.index < 0 || drop.index > visible.length || drop.index === visibleFrom) return
       const moved = current[from]
       const rest = current.filter((_, position) => position !== from)
-      // 落点下标来自**渲染出来的**那些组（中点比出来的），而全量列表里还夹着
-      // 不显示的组 —— 所以按「锚点」换算：插到第 N 个可见组之前 = 完整列表里
-      // 那个组的下标之前；N 等于可见组数 = 插到队尾（不显示的组留在原处）
-      const anchor = drop.index < displayed.length ? displayed[drop.index].provider : null
-      const at = anchor === null ? -1 : rest.findIndex(group => group.provider === anchor)
-      const to = anchor === null || at < 0 ? rest.length : at
+      // index 按移除被拖组后的可见列表计数；末尾落点只放在最后一个可见组之后。
+      const anchor = visible[drop.index] || visible[visible.length - 1]
+      const at = rest.findIndex(group => group.provider === anchor.provider)
+      if (at < 0) return
+      const to = at + (drop.index === visible.length ? 1 : 0)
       if (to === from) return
       const next = [...rest.slice(0, to), moved, ...rest.slice(to)]
-      const queue = next.flatMap(group => group.members.map(account => account.id))
+      // 整组移动不覆盖组内手动兜底；自动消耗规则仍由网关动态执行。
+      const queue = next.flatMap(group => group.queueMembers.map(account => account.id))
       void reorderQueue(queue, t('{name} 移到第 {rank} 顺位', { name: moved.label, rank: to + 1 }))
+      return
+    }
+    const orderRules = activeGroupSortRules(drop.provider, groupSortRules(drop.provider))
+    if (orderRules.length > 0) {
+      toast(manualOrderBlockedMessage(orderRules), 'err')
       return
     }
     const group = current.find(item => item.provider === drop.provider)
     if (!group) return
-    const from = group.members.findIndex(account => account.id === drop.accountId)
+    // 自动规则开启时不接受组内拖动；关闭后调整的是手动消耗顺序。
+    const from = group.queueMembers.findIndex(account => account.id === drop.accountId)
     if (from < 0) return
-    const moved = group.members[from]
-    const rest = group.members.filter((_, position) => position !== from)
+    const moved = group.queueMembers[from]
+    const rest = group.queueMembers.filter((_, position) => position !== from)
     // 落点下标来自**渲染出来的**那些行（筛选 / 搜索 / 分页会把组内的行裁掉一部分），
     // 而重排要的是完整 members —— 按锚点换算：插到第 N 个渲染行之前 = 完整 members
     // 里那行所在的下标之前；N 等于渲染行数 = 插到组尾（被裁掉的行留在原处）。
@@ -310,8 +298,10 @@ function AccountsPage() {
     const to = anchor === null || at < 0 ? rest.length : at
     if (to === from) return
     const nextMembers = [...rest.slice(0, to), moved, ...rest.slice(to)]
-    const next = current.map(item => item.provider === drop.provider ? { ...item, members: nextMembers } : item)
-    const queue = next.flatMap(item => item.members.map(account => account.id))
+    const next = current.map(item => item.provider === drop.provider
+      ? { ...item, members: nextMembers, queueMembers: nextMembers }
+      : item)
+    const queue = next.flatMap(item => item.queueMembers.map(account => account.id))
     void reorderQueue(queue, t('{name} 移到 {group} 组内第 {rank} 位', {
       name: String(moved.name || moved.id), group: t(group.label), rank: to + 1,
     }))
@@ -328,6 +318,11 @@ function AccountsPage() {
         t('当前视图不能调整组顺位：{reason} 之后再拖动', { reason: dragHandlers.current.lockReason }),
         'err',
       ),
+      isRowLocked: provider => activeGroupSortRules(provider, groupSortRules(provider)).length > 0,
+      onRowLockedAttempt: provider => toast(
+        manualOrderBlockedMessage(activeGroupSortRules(provider, groupSortRules(provider))),
+        'err',
+      ),
       onDrop: drop => dragHandlers.current.onDrop(drop),
     })
   }, [])
@@ -342,7 +337,7 @@ function AccountsPage() {
             onCheckedChange={next => togglePick(account.id, next)} />
         )
       case 'order':
-        return <OrderCell account={account} rank={ctx.rank} />
+        return <OrderCell account={account} rank={ctx.rank} sortActive={sortActiveIn(account)} />
       case 'account':
         return <AccountCell account={account} namesHidden={store.namesHidden} />
       case 'proxy':
@@ -352,7 +347,7 @@ function AccountsPage() {
       case 'status':
         return <StatusCell account={account} />
       case 'limits':
-        return <LimitsCell account={account} open={ctx.limitsOpen} />
+        return <LimitsCell account={account} onClear={model => void clearLimits(account.id, model)} />
       case 'expiry':
         return <ExpiryCell account={account} />
       case 'usage':
@@ -366,8 +361,22 @@ function AccountsPage() {
 
   return (
     <>
-      <section className='panel account-table'>
+      <Card render={<section />} className='panel account-table'>
         <div className='toolbar'>
+          {/* 窄屏「筛选」入口：只在 ≤767px 显示（桌面由 CSS 隐藏）。
+              按钮上的角标是当前生效的筛选条数 —— 筛选条件收进抽屉后，
+              列表被收窄这件事必须仍然可见，否则用户会以为账号丢了。 */}
+          <Button size='default' variant='ghost' type='button' className='acct-filter-open hidden max-[767px]:inline-flex'
+            onClick={() => setFilterOpen(true)}
+            aria-label={t('打开筛选')}>
+            {t('筛选')}
+            {activeFilterCount > 0 ? <Badge variant='brand' shape='tag' className='acct-filter-badge'>{activeFilterCount}</Badge> : null}
+          </Button>
+
+          {/* 筛选值受控，切换布局不会改变条件。 */}
+          <ResponsiveSheet open={filterOpen} onOpenChange={setFilterOpen} title={t('筛选')}
+            inlineClassName='contents' bodyClassName='acct-filter-body'
+            actions={<Button variant='ghost' size='sm' disabled={activeFilterCount === 0} onClick={() => clearFilter()}>{t('清空')}</Button>}>
           {/* 提供商：分组模式把「哪一家」画在了页面上（一家一段），但「只看某一家」仍是
               常用动作 —— 分组带收得掉一家、收不掉其余那几家。用下拉而不是分段按钮：家数
               是**动态**的（后端注册表加一家就多一项），分段按钮会随家数增长把工具条挤成
@@ -376,10 +385,7 @@ function AccountsPage() {
           <div className='group' data-provider-group='1'>
             <span className='label'>{t('提供商')}</span>
             <Select value={store.filter.provider} onValueChange={value => setProviderFilter(String(value))}>
-              {/* 宽度：桌面锁 200px（同排搜索框对齐）；手机上工具条改纵向排列，
-                  触发器要撑满整行，否则右边缘比同排的搜索框短 14px（见
-                  ui/css/mobile.css 的 .toolbar 段）。用 min-[768px]: 变体分隔，
-                  比在 mobile.css 里用 !important 跟 Tailwind 的任意值类斗优先级可靠。 */}
+
               <SelectTrigger className='max-w-none min-w-0 w-full min-[768px]:max-w-[200px] min-[768px]:min-w-[130px] min-[768px]:w-auto' aria-label={t('按提供商筛选账号')}>
                 <SelectValue>
                   {providerOptions.find(item => item.value === store.filter.provider)?.label || t('全部')}
@@ -429,8 +435,14 @@ function AccountsPage() {
             ]} value={store.filter.limit} onValueChange={value => setSegmentFilter('limit', value)}
               aria-label={t('限额状态')} />
           </div>
+          </ResponsiveSheet>
 
           <div className='actions'>
+            <Button id='btn-refresh-accounts' variant='outline' disabled={store.listBusy}
+              title={t('重新读取账号列表和插件状态，不刷新 Token 或查询余额')}
+              onClick={() => void refreshList({ feedback: true })}>
+              {store.listBusy ? t('刷新中…') : t('刷新')}
+            </Button>
             {/* 折叠是「只看某几家」的入口：一家几十条时，收起不关心的那些比筛选更顺手。
                 「全部」就是全部 —— 作用对象是全部组，不按当前筛选收窄（见 store 里
                 setAllGroupsCollapsed 的说明） */}
@@ -438,7 +450,7 @@ function AccountsPage() {
               disabled={!allGroups.length}
               title={allCollapsed ? t('展开全部分组') : t('折叠全部分组（只留组头）')}
               onClick={() => setAllGroupsCollapsed(allGroups.map(group => group.provider), !allCollapsed)}>
-              {allCollapsed ? t('展开全部') : t('折叠全部')}
+              {allCollapsed ? t('展开') : t('折叠')}
             </Button>
             {/* 「添加账号」的打开逻辑归 add-account.js（它按同一个 id 绑了监听），这里再挂
                 一次 onClick 是**冗余保险**：万一那个脚本的绑定因加载顺序没接上，按钮仍可用
@@ -455,15 +467,28 @@ function AccountsPage() {
           </div>
         </div>
 
+        {store.listError ? (
+          <Alert variant='destructive' className='acct-load-error' role='alert'>
+            {loaded
+              ? t('刷新账号列表失败，当前仍显示上一次成功读取的数据：{message}', { message: store.listError })
+              : t('账号列表加载失败，请点击「刷新」重试：{message}', { message: store.listError })}
+          </Alert>
+        ) : null}
+
+        {loaded && all.length > 0 && hidden.total > 0 ? (
+          <HiddenAccountsNotice hidden={hidden} compact />
+        ) : null}
+
+
         <div className={cn('batch-bar', active && 'active')} id='batch-bar'>
-          <label className='batch-select-all'>
+          <Label className='batch-select-all'>
             <Checkbox id='batch-select-all' checked={allPicked} indeterminate={!allPicked && somePicked}
               disabled={!visibleIds.length} aria-label={t('全选当前筛选结果')}
               onCheckedChange={next => setAllPicked(visibleIds, next)} />
             <span id='batch-select-label'>
               {visibleIds.length ? t('全选当前筛选结果（{n} 个）', { n: visibleIds.length }) : t('没有可全选的账号')}
             </span>
-          </label>
+          </Label>
           <span className='batch-count'>
             {t('已选')} <b id='batch-count'>{store.selected.size}</b> {t('个 · 共')} <b id='accounts-count'>{all.length}</b> {t('个')}
           </span>
@@ -475,7 +500,7 @@ function AccountsPage() {
           </span>
           {/* 锁定条只管**组顺位**（组内行按可见行换算落点，筛选下照常拖得动） */}
           {groupLocked ? (
-            <span className='batch-hidden' title={t('筛选 / 搜索 / 分页生效时组顺位不可拖动（别家的组整组不可见，落点没法定位）')}>
+            <span className='batch-hidden' title={lockReason}>
               {t('组顺位已锁定')}
             </span>
           ) : null}
@@ -501,18 +526,24 @@ function AccountsPage() {
 
         <div className='acct-scroll' id='account-list' ref={listRef}>
           {!loaded ? (
-            <div className='empty'><span className='spinner' />{t('正在加载…')}</div>
+            <Empty className='empty'>
+              {store.listError
+                ? t('账号列表加载失败，请点击「刷新」重试')
+                : <><Spinner />{t('正在加载…')}</>}
+            </Empty>
           ) : !all.length ? (
-            <div className='empty'>{t('暂无账号，请点击右上角「添加账号」')}</div>
+            hidden.total > 0
+              ? <HiddenAccountsNotice hidden={hidden} />
+              : <Empty className='empty'>{t('暂无账号，请点击右上角「添加账号」')}</Empty>
           ) : !shown.length ? (
-            <div className='empty'>
+            <Empty className='empty'>
               {t('当前筛选条件下没有账号')}
               {filterActive() ? (
-                <button type='button' className='link-btn' onClick={() => clearFilter()}>{t('清除筛选')}</button>
+                <Button size='default' variant='ghost' type='button' className='link-btn' onClick={() => clearFilter()}>{t('清除筛选')}</Button>
               ) : null}
-            </div>
+            </Empty>
           ) : (
-            <table className='acct-table' ref={setTableElement}
+            <Table container={false} className='acct-table' ref={setTableElement}
               style={{ minWidth: `${tableMinWidth(columns.map(column => column.key))}px` }}>
               {/* 上面那条 min-width 是「弹性列压到只剩 FLEX_MIN_WIDTH、再窄就横滚」的那条线，
                   由列宽算出（不再由 CSS 写死，见 accounts-columns 的 tableMinWidth） */}
@@ -523,7 +554,7 @@ function AccountsPage() {
                 const collapsed = store.collapsed.has(group.provider)
                 const rows = pageRows.filter(account => providerOf(account) === group.provider)
                 return (
-                  <tbody key={group.provider} className='acct-group' data-provider={group.provider}>
+                  <TableBody key={group.provider} className='acct-group' data-provider={group.provider}>
                     <GroupBandRow group={group} collapsed={collapsed} colSpan={columns.length} />
                     {collapsed ? null : rows.map(account => {
                       // 组内序号取**全量成员**里的位次（不是当前页 / 当前可见里的位次）：
@@ -532,25 +563,22 @@ function AccountsPage() {
                       const ctx = rowContext(account, seatMap, rank > 0 ? rank : 1)
                       return (
                         <React.Fragment key={account.id}>
-                          <tr className={cn('acct-row', !isEnabled(account) && 'disabled', ctx.picked && 'selected')}
+                          <TableRow className={cn('acct-row', !isEnabled(account) && 'disabled', ctx.picked && 'selected')}
                             data-id={account.id} data-provider={group.provider}
                             data-desktop={isDesktopAccount(account) ? '1' : undefined}>
                             {columns.map(column => (
-                              <td key={column.key} className={`cell-${column.key} ta-${column.align}`}>
+                              <TableCell key={column.key} className={`cell-${column.key} ta-${column.align}`}>
                                 {cell(column.key, account, ctx)}
-                              </td>
+                              </TableCell>
                             ))}
-                          </tr>
-                          <PanelsRow account={account} colSpan={columns.length}
-                            limitsOpen={panelOpen(account.id, 'limits')}
-                            onClear={(id, model) => void clearLimits(id, model)} />
+                          </TableRow>
                         </React.Fragment>
                       )
                     })}
-                  </tbody>
+                  </TableBody>
                 )
               })}
-            </table>
+            </Table>
           )}
         </div>
 
@@ -566,7 +594,7 @@ function AccountsPage() {
           onSizeChange={paging.setSize}
           onPageChange={paging.goto}
         />
-      </section>
+      </Card>
       <AccountsDialogs />
     </>
   )
@@ -626,7 +654,5 @@ function mount(): void {
 installAccountsApi()
 startConnectionsPolling()
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('accounts', PAGE_SELECTOR, mount)

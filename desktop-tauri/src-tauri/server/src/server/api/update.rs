@@ -10,12 +10,13 @@
 //!   POST /api/update/token                 保存 / 清除 GitHub 令牌 { token: string | null }
 //!   GET  /api/update/beta                  「加入 beta 版」开关 { enabled }
 //!   POST /api/update/beta                  写「加入 beta 版」{ enabled: bool }
+//!   GET  /api/update/channels              关注通道 { stable, beta }
+//!   POST /api/update/channels              部分更新关注通道 { stable?, beta? }
 //!
-//! ── 容器内更新的三条（Linux headless / Docker 专有）──────────
+//! ── 容器内更新（Linux headless / Docker 专有）───────────────
 //!   POST /api/update/install               校验并应用已下载的更新包（替换二进制与 ui）
-//!   POST /api/update/rollback              回滚到上一版本（用 install 留下的备份）
 //!   POST /api/update/restart               重启进程（容器由 restart 策略拉起）
-//! 三条都要求 `AGENT2API_SELF_UPDATE=1`，否则 400；机制见 `core::update::selfupdate`。
+//! 两条都要求 `AGENT2API_SELF_UPDATE=1`，否则 400；机制见 `core::update::selfupdate`。
 //! `check` 的 `current` 缺省（网页端不传）时用服务端自己的版本号 —— 桌面壳一定
 //! 会传（后端不知道自己被哪个壳打包，那个口径不能变），所以只有网页端走缺省。
 //!
@@ -76,6 +77,12 @@ async fn dispatch(
     query: &str,
     body: &Bytes,
 ) -> Response {
+    if method == Method::GET && full_path == "/api/update/policy" {
+        let current = query.split('&').filter_map(|pair| pair.split_once('='))
+            .find(|(key, _)| *key == "current").map(|(_, value)| percent_decode(value)).unwrap_or_default();
+        let current = if current.is_empty() { crate::server::core::update::CURRENT_VERSION } else { &current };
+        return ok_json(state.update().refresh_policy(current).await);
+    }
     if method == Method::GET && full_path == "/api/update/check" {
         // `url.searchParams.get('current') || ''`：缺省是空串（不是 null）
         let current = query
@@ -102,6 +109,48 @@ async fn dispatch(
         // 读这里亮侧栏徽标，自己不再打 GitHub —— 匿名限额 60 次/小时）。
         // 本进程还没查过时是 {checked:false}，前端按「未知」处理，不亮标。
         return ok_json(state.update().last_check());
+    }
+
+    if method == Method::GET && full_path == "/api/update/github" {
+        return ok_json(json!(config::github_access()));
+    }
+
+    if method == Method::POST && full_path == "/api/update/github" {
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
+        };
+        let patch = match serde_json::from_value::<config::GithubAccessPatch>(payload) {
+            Ok(patch) => patch,
+            Err(error) => return GatewayError::bad_request(format!("GitHub 访问设置无效：{error}")).into_response(),
+        };
+        return match config::set_github_access(patch) {
+            Ok((settings, saved, changed)) => {
+                if changed {
+                    state.update().reset_source_preference();
+                    crate::server::core::plugin_host::update::clear_cooldown();
+                    crate::server::core::plugin_host::catalog::schedule_now();
+                }
+                let mut value = json!(settings);
+                value["saved"] = json!(saved);
+                ok_json(value)
+            }
+            Err(message) => GatewayError::bad_request(message).into_response(),
+        };
+    }
+
+    if method == Method::POST && full_path == "/api/update/download-plan" {
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
+        };
+        let Some(url) = payload.get("url").and_then(Value::as_str) else {
+            return GatewayError::bad_request("下载方案缺少 url").into_response();
+        };
+        return match crate::server::core::update::download_plan(url).await {
+            Ok(value) => ok_json(value),
+            Err(error) => update_error(error),
+        };
     }
 
     if method == Method::GET && full_path == "/api/update/proxy" {
@@ -142,11 +191,14 @@ async fn dispatch(
                 let saved = config::set_update_proxy(normalized);
                 if changed {
                     state.update().clear_check_cooldown();
+                    state.update().reset_source_preference();
+                    crate::server::core::plugin_host::update::clear_cooldown();
                 }
+                let current = config::update_proxy();
                 // 落库失败仍返回新值（内存快照已生效，本次运行照走新线路），
                 // saved 字段如实带上，调用方要提醒就用它
                 ok_json(json!({
-                    "proxy": describe_account_proxy(config::update_proxy().as_ref()),
+                    "proxy": describe_account_proxy(current.as_ref()),
                     "saved": saved,
                 }))
             }
@@ -186,6 +238,8 @@ async fn dispatch(
                 // 令牌不作数（token::stored_token 逐字比较，见 TokenUpdate 说明）
                 if update.changed {
                     state.update().clear_check_cooldown();
+                    state.update().reset_source_preference();
+                    crate::server::core::plugin_host::update::clear_cooldown();
                 }
                 // 落库失败仍返回新状态（内存已生效，本次运行照用），saved 如实带
                 let mut status = status_json();
@@ -199,32 +253,41 @@ async fn dispatch(
         };
     }
 
+    if method == Method::GET && full_path == "/api/update/channels" {
+        return ok_json(json!(config::update_channels()));
+    }
+
+    if method == Method::POST && full_path == "/api/update/channels" {
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
+        };
+        let patch = match serde_json::from_value::<config::UpdateChannelsPatch>(payload) {
+            Ok(patch) => patch,
+            Err(error) => return GatewayError::bad_request(format!("更新通道设置无效：{error}")).into_response(),
+        };
+        return save_channels(state, patch, false);
+    }
+
     if method == Method::GET && full_path == "/api/update/beta" {
-        // 「加入 beta 版」开关（设置页「更新设置」弹窗里那一枚的读数）。
-        // 只报当前值：开关的效果体现在**下一次检查**上（后端每次检查现读这个键），
-        // 这里不做任何事，也不动缓存里那份上次检查结果。
         return ok_json(json!({ "enabled": config::update_beta() }));
     }
 
     if method == Method::POST && full_path == "/api/update/beta" {
-        // 写：`{enabled: true|false}`。缺字段 / 非布尔一律 400 —— 与 token 那条
-        // 同一纪律（开关就该显式给值，免得某个调用方手滑发个 `{}` 把它关掉）。
         let payload = match parse_body(body) {
             Ok(value) => value,
-            Err(error) => return GatewayError::new(error.message).into_response(),
+            Err(error) => return GatewayError::bad_request(error.message).into_response(),
         };
         let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
             return GatewayError::bad_request("请求体缺少 enabled 字段（须为 true / false）")
                 .into_response();
         };
-        let saved = config::set_update_beta(enabled);
-        // 不做 clear_check_cooldown：那条冷却记的是 GitHub **配额桶**的恢复时刻，
-        // 换通道既没换出口也没换身份，桶还是同一个（与换线路 / 换令牌不同）。
-        // 落库失败仍返回新值（内存已生效，本次运行照走新通道），saved 如实带上。
-        return ok_json(json!({
-            "enabled": config::update_beta(),
-            "saved": saved,
-        }));
+        // 旧界面关闭 beta 时仍表示切回正式版，不能留下两个通道都关闭的状态。
+        let patch = config::UpdateChannelsPatch {
+            beta: Some(enabled),
+            stable: if enabled { None } else { Some(true) },
+        };
+        return save_channels(state, patch, true);
     }
 
     if method == Method::POST && full_path == "/api/update/download" {
@@ -256,22 +319,14 @@ async fn dispatch(
     }
 
     // ── 容器内更新（Linux headless / Docker）────────────────────
-    // 三条都不接受请求体：装什么、回滚到哪儿、重启谁，全部由服务端自己决定
+    // 两条都不接受请求体：装什么、重启谁，全部由服务端自己决定
     // （更新包按固定名从下载目录取，路径不从请求里进 —— 见 core::update::mod）。
     // 界面目录取自 ServerState（headless 入口 set_ui_dir 装进去的），
-    // 桌面包没有它（None）—— 桌面形态本来也不会走到这三条。
+    // 桌面包没有它（None）—— 桌面形态本来也不会走到这两条。
 
     if method == Method::POST && full_path == "/api/update/install" {
         let ui_dir = state.ui_dir().map(|path| path.as_path());
         return match state.update().install_downloaded(ui_dir).await {
-            Ok(data) => ok_json(data),
-            Err(error) => update_error(error),
-        };
-    }
-
-    if method == Method::POST && full_path == "/api/update/rollback" {
-        let ui_dir = state.ui_dir().map(|path| path.as_path());
-        return match state.update().rollback(ui_dir) {
             Ok(data) => ok_json(data),
             Err(error) => update_error(error),
         };
@@ -287,6 +342,26 @@ async fn dispatch(
     // 未命中任何一条 → 全局 404 的文案（Node 落到最外层 `sendJson(res, 404, …)`），
     // 注意这个 body **没有 success 字段**
     crate::server::errors::not_found_response(method.as_str(), full_path)
+}
+
+fn save_channels(
+    state: &ServerState,
+    patch: config::UpdateChannelsPatch,
+    legacy: bool,
+) -> Response {
+    let plugins_before = crate::server::core::plugin_host::settings::current();
+    match config::set_update_channels(patch) {
+        Ok((channels, saved, changed)) => {
+            if changed {
+                state.update().invalidate_channel();
+                crate::server::core::plugin_host::settings::notify_changed(plugins_before);
+            }
+            let mut result = if legacy { json!({ "enabled": channels.beta }) } else { json!(channels) };
+            result["saved"] = json!(saved);
+            ok_json(result)
+        }
+        Err(message) => GatewayError::bad_request(message).into_response(),
+    }
 }
 
 /// JS `String(value)`：非字符串也照转（手改的请求体里 name 可能是数字）。

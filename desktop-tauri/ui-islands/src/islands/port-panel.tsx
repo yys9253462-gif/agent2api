@@ -11,8 +11,11 @@ import {
   DialogTitle,
   Input,
   Label,
+  StatusDot,
+  type StatusDotProps,
 } from '@ui'
 import { t } from '../i18n'
+import { API_ENDPOINTS } from '../../../ui-shared/docs-api-endpoints'
 
 /**
  * Agent2API · 端口状态面板（React 岛）。
@@ -145,6 +148,7 @@ type PortBridge = {
   restartApp(): Promise<unknown>
   /** 订阅启动失败事件；返回值即退订函数（见 bridge.rs 的 on） */
   onBackendError?(callback: (payload: unknown) => void): (() => void) | void
+  onBackendReady?(callback: () => void): (() => void) | void
 }
 
 /**
@@ -209,6 +213,10 @@ function getSnapshot(): PortSnapshot {
   return snapshot
 }
 
+export function useGatewayBase(): string {
+  return React.useSyncExternalStore(subscribe, getSnapshot).gatewayBase
+}
+
 function subscribe(listener: () => void): () => void {
   subscribers.add(listener)
   return () => {
@@ -244,11 +252,9 @@ function paintGatewayAddress(base: string): void {
     const el = document.getElementById(id)
     if (el) el.textContent = text
   }
-  paint('api-base', `${base}/v1`)
-  paint('api-chat', `POST ${base}/v1/chat/completions`)
-  paint('api-responses', `POST ${base}/v1/responses`)
-  paint('api-messages', `POST ${base}/v1/messages`)
-  paint('api-models', `GET ${base}/v1/models`)
+  for (const endpoint of API_ENDPOINTS) {
+    paint(endpoint.id, `${endpoint.method ? `${endpoint.method} ` : ''}${base}${endpoint.path}`)
+  }
 }
 
 /** 防止并发重复请求（轮询与切页可能同时触发） */
@@ -338,13 +344,13 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
 
   // ── 状态灯与那一行文案：三种状态 + 「还没查过」 ──
   // 文案里的端口用 portLabel()（与顶栏徽标同一份读数），短标签由后端给
-  let dotClass = 'live off'
+  let dotVariant: StatusDotProps['variant'] = 'muted'
   let text = t('正在检查… · {port}', { port })
   if (ready === true) {
-    dotClass = 'live pulse'
+    dotVariant = 'success'
     text = t('网关运行中 · {port}', { port })
   } else if (failure) {
-    dotClass = 'live bad'
+    dotVariant = 'destructive'
     text = t('{label} · {port}', { label: failure.label || t('网关启动失败'), port })
   } else if (ready === false) {
     text = t('网关启动中… · {port}', { port })
@@ -357,9 +363,7 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
       ? t('本地网关正在监听 {url}，可直接调用 OpenAI 兼容接口', { url: gatewayBase })
       : t('正在确认网关是否已就绪')
 
-  // 挂载时自问一次后端状态：app.js 的首屏 sync() 排在 islands/ui.js **之前**
-  // 执行（index.html 里 app.js 先加载），那一次调用什么也没做（wbPortPanel
-  // 还没注册），状态条得自己拉第一份 —— 否则要等 20 秒的主轮询才有真值。
+  // 启动失败事件可能早于订阅，挂载时读取当前状态补齐。
   React.useEffect(() => {
     void sync()
   }, [])
@@ -370,10 +374,9 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
    *（事件可能在界面订阅之前就发过了）。
    */
   React.useEffect(() => {
-    const unsubscribe = shared().workbuddyDesktop?.onBackendError?.(() => {
-      void sync()
-    })
-    return typeof unsubscribe === 'function' ? unsubscribe : undefined
+    const api = shared().workbuddyDesktop
+    const subscriptions = [api?.onBackendError?.(() => { void sync() }), api?.onBackendReady?.(() => { void sync() })]
+    return () => { for (const unsubscribe of subscriptions) if (typeof unsubscribe === 'function') unsubscribe() }
   }, [])
 
   // title 写在 root 容器上（React 不管容器的属性）；完整说明不截断
@@ -457,20 +460,10 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
   return (
     <>
       <div className='status-line'>
-        <span className={dotClass} />
+        <StatusDot variant={dotVariant} pulse={ready === true} />
         <span className='txt'>{text}</span>
       </div>
-      {/* 出口：有端口冲突时才露出。两个按钮的显隐条件**不同**，不能一起判断：
-            · 端口被别的进程占着 → 两个都给（结束进程能拿回端口，换端口是备选）
-            · 端口被系统保留     → 只给「更换端口」（那里没有进程可杀，
-                                   给个点了必然失败的按钮比不给更糟）
-            · 非端口原因起不来   → 都不给（换端口解决不了配置迁移失败这类问题）
 
-          这里用条件渲染而不是 hidden 属性：组件库的 Button 自带 Tailwind 的
-          `inline-flex`，而 Tailwind 工具类是带 !important 的**分层**样式，在
-          important 的反转层序里它压过 tokens.css 那条**未分层**的
-          `[hidden] { display: none !important }` —— 挂在这类元素上的 hidden
-          会失效。条件渲染不依赖层叠胜负。 */}
       {failure?.conflict ? (
         <div className='status-actions'>
           {failure.canEndOccupant === true ? (
@@ -489,6 +482,7 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
 
 /** 侧栏状态条的 React root：常驻（页面生命周期内不卸），只挂一次 */
 let sidebarRoot: ReturnType<typeof createRoot> | null = null
+let sidebarContainer: HTMLElement | null = null
 
 /**
  * 把状态条挂到页面骨架里的 `#sidebar-status` 上。
@@ -500,13 +494,17 @@ let sidebarRoot: ReturnType<typeof createRoot> | null = null
  *     契约方法照常注册，顶栏徽标与文档页地址不受状态条缺席影响。
  */
 function mountSidebarStatus(): void {
-  if (sidebarRoot) return
   const container = document.getElementById('sidebar-status')
+  if (sidebarContainer === container) return
+  sidebarRoot?.unmount()
+  sidebarRoot = null
+  sidebarContainer = container
   if (!container) return
   container.replaceChildren()
   sidebarRoot = createRoot(container)
   sidebarRoot.render(<SidebarStatus container={container} />)
 }
+window.addEventListener('wb:shell-layout', mountSidebarStatus)
 
 /* ─── 第二块：「更换端口」弹窗（按需建、关闭即卸）── */
 
@@ -721,7 +719,7 @@ if (document.readyState === 'loading') {
   mountSidebarStatus()
 }
 
-window.wbPortPanel = { render, sync, portLabel, isReady }
+window.wbPortPanel = { render, sync, portLabel, isReady, gatewayBase: () => snapshot.gatewayBase }
 
 declare global {
   interface Window {
@@ -735,6 +733,12 @@ declare global {
       portLabel(): string
       /** 网关进程是否在监听，顶栏徽标用 */
       isReady(): boolean
+      /**
+       * 网关基址（含协议）。插件页的 iframe 用它拼绝对地址 —— 桌面端的页面
+       * 来自 `tauri://` 协议，`/plugins/...` 这样的相对路径会打到壳的资源
+       * 目录而不是网关。
+       */
+      gatewayBase(): string
     }
   }
 }

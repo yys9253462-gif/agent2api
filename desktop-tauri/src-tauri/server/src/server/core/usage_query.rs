@@ -39,7 +39,6 @@ use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::limiter;
-use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::usage_records;
 
 use crate::server::logging;
@@ -139,6 +138,7 @@ pub fn resolve_batch_targets(
 async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
+    let started = std::time::Instant::now();
     // 凭证与 provider 都从目标集合里的账号对象读，**不回读账号文件**：
     // 20 个账号并发时那次回读会变成 20 次整库读盘，而答案已在手上。
     // `hasCredentials` 是 store 逐条给出的统一判据（缺省视为有）。
@@ -162,22 +162,37 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
     } else {
         Err(UsageFailure::NoCredentials)
     };
-    match outcome {
+    let row = match outcome {
         Ok(usage) => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
         // Node 的这条早退 `return` **不含 name 键**（只有 catch 分支才带）
         Err(UsageFailure::NoCredentials) => {
             json!({ "id": id, "usage": Value::Null, "error": "没有可用凭证" })
         }
         Err(UsageFailure::Request(message, code)) => {
-            let display = account
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&id);
-            logging::verbose("[Accounts]", &format!("账号「{display}」余额查询失败: {message}"));
             json!({ "id": id, "name": name, "usage": Value::Null, "error": message, "code": code })
         }
-    }
+    };
+    let provider = account.get("provider").and_then(Value::as_str)
+        .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    let error = row.get("error").and_then(Value::as_str);
+    let not_configured = row.get("code").and_then(Value::as_str)
+        == Some(crate::server::core::providers::adapter::USAGE_NOT_CONFIGURED_CODE)
+        || matches!(error, Some("没有可用凭证"));
+    let level = if error.is_none() || not_configured { "debug" } else { "warn" };
+    let summary = if error.is_none() { "余额查询完成" } else if not_configured { "余额查询未配置" } else { "余额查询失败" };
+    logging::log_event(level, "account", summary, Some(json!({
+        "provider": provider,
+        "providerLabel": crate::server::core::providers::label_of(provider),
+        "account": id,
+        "accountName": name,
+        "action": "usage.query",
+        "summary": summary,
+        "outcome": if error.is_none() { "success" } else { "failed" },
+        "detail": error,
+        "code": row.get("code"),
+        "durationMs": started.elapsed().as_millis() as u64,
+    })));
+    row
 }
 
 /// 查询一个账号的余额 / 积分（**按账号所属 provider 分流到适配器**）。
@@ -213,19 +228,23 @@ async fn query_usage_inner(
             .map_err(|error| UsageFailure::Request(error.message, error.code));
     }
     // 注册表里没有的 id（前端比后端新、或手改过的账号文件）：明确报「未知的
-    // 提供商」，不猜成任何一家（与全仓的 provider 口径一致）
-    let Some(kind) = crate::server::core::providers::kind_from_id(provider_id) else {
+    // 提供商」，不猜成任何一家（与全仓的 provider 口径一致）。
+    //
+    // ── 插件家在这里分流 ────────────────────────────────────────
+    // 它们的 id 不在枚举里，但**在运行时注册表里** —— 用 `adapter_by_id`
+    // 同时覆盖两类，而不是只认 `kind_from_id`（那会让插件家的余额查询
+    // 报「未知的提供商」，而界面上明明有那张卡片）。
+    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider_id) else {
         return Err(UsageFailure::Request(
             format!("未知的提供商 {provider_id}，无法查询余额"),
             None,
         ));
     };
-    let adapter = adapter_for(kind);
     match adapter.query_usage(store, id).await {
         Ok(usage) => Ok(usage),
         Err(error) => {
             // 不支持刷新的家直接返回原错误（CatPaw：重试必然失败，见上）
-            if error.status_code != 401 || !adapter.supports_refresh() {
+            if error.status_code != 401 || !adapter.supports_refresh() || store.needs_relogin(id) {
                 return Err(UsageFailure::Request(error.message, error.code));
             }
             if let Err(refresh_error) = adapter.refresh_access_token(store, id).await {
@@ -250,7 +269,17 @@ async fn query_usage_inner(
     }
 }
 
-/// 该账号所属 provider 是否声明了余额能力（`ProviderAdapter::supports_usage`）。
+/// 这条账号是不是**访客形态**（公开形态上的 `isGuest`）。
+///
+/// 判据只读公开形态：插件账号由插件的 `account_view` 给，存量内置记录由
+/// `store_view::public_account` 注入（见 `chatglm_accounts::guest_of_record`）。
+/// 网关不解析凭证，所以这里不自己看 JWT。
+fn is_guest(account: &Value) -> bool {
+    account.get("isGuest").and_then(Value::as_bool) == Some(true)
+}
+
+/// 该账号所属 provider 是否声明了余额能力（`ProviderAdapter::supports_usage`），
+/// **并且**这条账号本身有余额可查。
 ///
 /// 为什么批量查询要过滤掉「不支持」的家：不支持的实现会给**每个账号**产出一行
 /// 501 —— 用户看到一片红，而那不是故障、只是能力缺失（当前四家都支持，
@@ -260,16 +289,33 @@ async fn query_usage_inner(
 /// 自定义提供商（含「预置 API」卡片建的那些）**不在注册表里**，能力来自提供商
 /// 记录上的余额方案（`balanceScheme`，七种方案见 `providers::custom::balance`）：
 /// 有方案 = 这一家有余额查询（凭证没配上时那次查询给「未配置」，不是不支持）。
+///
+/// ── 访客账号排除在这条判据之外（2026-10）─────────────────────
+/// 智谱清言的访客没有积分体系（上游那几个接口对访客一律 401），查询的结果
+/// **恒定为失败**，唯一的产物是余额列上一格红字。它不是「这次没查到」，而是
+/// 「这条账号不存在可查的东西」—— 与「这家没有余额概念」是同一档事实，
+/// 所以按账号形态一并排除：自动调度不再给它排期、批量查询不再把它算进分母。
+/// 单账号路径（`?id=`）**不**过这条判据（见 `query_all`），用户手点那一行时
+/// 仍会得到插件给的中性说明，而不是一个说不清理由的静默。
 fn supports_usage(account: &Value) -> bool {
+    if is_guest(account) {
+        return false;
+    }
     let provider_id = account
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    supports_usage_provider(provider_id)
+}
+
+pub(crate) fn supports_usage_provider(provider_id: &str) -> bool {
     if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
         return crate::server::core::providers::custom::balance::supports_usage(provider_id);
     }
-    crate::server::core::providers::kind_from_id(provider_id)
-        .map(|kind| adapter_for(kind).supports_usage())
+    // 用 `adapter_by_id` 而不是 `kind_from_id`：插件家的 id 不在枚举里，
+    // 但它们同样声明了 `supports_usage`（见上面那条注释）。
+    crate::server::core::providers::adapter::adapter_by_id(provider_id)
+        .map(|adapter| adapter.supports_usage())
         .unwrap_or(false)
 }
 
@@ -312,13 +358,21 @@ pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, 
         .iter()
         .map(|account| query_usage_for(store, account))
         .collect();
-    let results = futures::future::join_all(futures).await;
+    let mut results = futures::future::join_all(futures).await;
     // 每行结论落记录表 + 跑「余额不足自动禁用」钩子：手动与自动两条路径在
     // 这里汇合（见模块头）。账号对象与结果行按构造顺序一一对齐
     // （`queried` 与 `results` 同源同序），配置就在手上，不必回读账号列表。
-    for (account, row) in queried.iter().zip(results.iter()) {
+    for (account, row) in queried.iter().zip(results.iter_mut()) {
         write_row_record(row);
         enforce_low_balance_disable(store, account, row);
+        if let Some(id) = account.get("id").and_then(Value::as_str) {
+            let record = usage_records::load(id);
+            row["at"] = json!(record.last_attempt_at);
+            row["lastSuccessAt"] = json!(record.last_success_at);
+            if row.get("error").and_then(Value::as_str).is_some() {
+                row["lastUsage"] = json!(record.usage);
+            }
+        }
     }
     Ok(json!({ "results": results, "skipped": skipped }))
 }
@@ -355,6 +409,10 @@ fn write_row_record(row: &Value) {
 /// **不自动恢复**：余额回升后需手动启用；自动查询继续跑（禁用只表示不参与
 /// 转发），余额列保持新鲜，用户看着读数决定何时恢复。
 fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Value) {
+    if account.get("limiterGroups").is_some() {
+        limiter::enforce_disable(store, std::slice::from_ref(account));
+        return;
+    }
     if matches!(account.get("enabled"), Some(Value::Bool(false))) {
         return;
     }
@@ -408,6 +466,7 @@ fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Valu
 fn enforce_token_disable(store: &AccountStore, accounts: &[Value], now: i64) {
     let facts = limiter::token_facts();
     for account in accounts {
+        if account.get("limiterGroups").is_some() { continue; }
         if matches!(account.get("enabled"), Some(Value::Bool(false))) {
             continue;
         }
@@ -489,6 +548,8 @@ async fn sweep_due(store: &AccountStore) {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    limiter::refresh(&all_accounts);
+    limiter::enforce_disable(store, &all_accounts);
     let kinds = limiter::enabled_token_kinds(&all_accounts);
     if !kinds.is_empty() {
         limiter::refresh_token_facts(&kinds);
@@ -500,6 +561,7 @@ async fn sweep_due(store: &AccountStore) {
     }
     .into_iter()
     .filter(supports_usage)
+    .filter(|account| account.get("needsRelogin").and_then(Value::as_bool) != Some(true))
     .filter_map(|account| {
         let interval = usage_records::query_interval_of(&account)?;
         let id = account.get("id").and_then(Value::as_str)?;
@@ -533,10 +595,9 @@ async fn sweep_due(store: &AccountStore) {
 /// `{at: 0, results: [], skipped: 0}` —— 界面据此显示「还没有查询结果」，
 /// 而不是把空数组当成「一个账号都没有」。
 ///
-/// 形状与手动查询响应兼容（前端 `applyBalances` 同一份解析），每行多带自己的
-/// `at`（这一行的结论时刻）：按账号到期的写法下各行时刻天然不同，失败行的
-/// 时效判定必须按行算，不能再拿一个整轮的 `at` 盖所有人（前端 `applyBalances`
-/// 因此优先取行级 `at`）。
+/// 形状与手动查询响应兼容（前端 `applyBalances` 同一份解析），每行的 `at`
+/// 表示本次尝试时刻，`lastSuccessAt` 表示最近成功时刻。失败保持 `usage: null`，
+/// 历史成功读数另放在 `lastUsage`，不能因历史读数存在就抹掉本次错误。
 ///
 /// ── Token 限制器读数（`tokenAt` / `tokenUsage`）──────────────
 /// 余额读数只在查询到期时变化，`at` 不动就说明整份快照没新东西；Token 周期
@@ -550,6 +611,12 @@ async fn sweep_due(store: &AccountStore) {
 ///   - 失败行只在「这次尝试不早于账号记录的最后改动」时端出 —— 重新登录 /
 ///     重导入 / 刷过 token 之后，「当时查不到」那条断言就不再成立。成功读数
 ///     不受影响：「可用 5147 积分」是一次读数的事实，凭证换了也不会变假话。
+///
+/// ── 第三条：访客账号的行整条丢掉（2026-10）──────────────────
+/// 访客没有积分体系（见 `supports_usage` 的说明），它名下的记录**只可能**是
+/// 历史失败行。留着就会在余额列上留一格红字，而那是「这条账号不该有读数」，
+/// 不是「这次没查到」。升级前写进记录表的那些行因此在这里一并滤掉，不必等
+/// 一次专门的迁移。
 pub fn snapshot(store: &AccountStore) -> Value {
     let records = usage_records::load_all();
     let accounts = store.list_accounts();
@@ -563,34 +630,37 @@ pub fn snapshot(store: &AccountStore) -> Value {
             })
         });
         let Some(account) = account else { continue };
+        if is_guest(account) {
+            continue;
+        }
         at = at.max(record.last_attempt_at);
         let name = account.get("name").cloned().unwrap_or(Value::Null);
-        match record.usage.as_ref() {
-            Some(usage) => rows.push(json!({
+        let changed = account
+            .get("updatedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(account.get("addedAt").and_then(Value::as_i64).unwrap_or(0));
+        let error = record.error.as_deref().filter(|_| record.last_attempt_at >= changed);
+        if let Some(error) = error {
+            rows.push(json!({
+                "id": id,
+                "name": name,
+                "usage": Value::Null,
+                "error": error,
+                "code": record.code,
+                "at": record.last_attempt_at,
+                "lastUsage": record.usage,
+                "lastSuccessAt": record.last_success_at,
+            }));
+        } else if let Some(usage) = record.usage.as_ref() {
+            rows.push(json!({
                 "id": id,
                 "name": name,
                 "usage": usage,
                 "error": Value::Null,
                 "at": record.last_attempt_at,
-            })),
-            None => {
-                let Some(error) = record.error.as_deref() else { continue };
-                let changed = account
-                    .get("updatedAt")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    .max(account.get("addedAt").and_then(Value::as_i64).unwrap_or(0));
-                if record.last_attempt_at >= changed {
-                    rows.push(json!({
-                        "id": id,
-                        "name": name,
-                        "usage": Value::Null,
-                        "error": error,
-                        "code": record.code,
-                        "at": record.last_attempt_at,
-                    }));
-                }
-            }
+                "lastSuccessAt": record.last_success_at,
+            }));
         }
     }
     // Token 限制器读数：按账号投影内存事实表（没有配 Token 规则的账号不出现，
@@ -607,12 +677,35 @@ pub fn snapshot(store: &AccountStore) -> Value {
             token_usage.insert(id.to_string(), Value::Array(entries));
         }
     }
+    if let Some(accounts) = list { limiter::counter::refresh(accounts); }
+    let source_facts = limiter::sources::facts();
+    let counts = limiter::counter::facts();
+    let mut limiter_states = serde_json::Map::new();
+    let mut quota_sources = serde_json::Map::new();
+    let mut limiter_models = serde_json::Map::new();
+    for account in list.into_iter().flatten() {
+        let Some(id) = account.get("id").and_then(Value::as_str) else { continue };
+        let provider = crate::server::core::routing::provider_of(account);
+        quota_sources.insert(id.to_string(), limiter::sources::rows_for(account, &source_facts));
+        limiter_states.insert(id.to_string(), limiter::types::json_of(&limiter::evaluate::states(account, &source_facts, &counts, now)));
+        limiter_models.entry(provider.to_string()).or_insert_with(|| Value::Array(limiter::sources::account_models(provider)));
+    }
+    let visible_accounts: Vec<Value> = list.into_iter().flatten()
+        .filter(|account| crate::server::core::account_store::store_view::account_visible(
+            crate::server::core::routing::provider_of(account),
+        )).cloned().collect();
     json!({
         "at": at,
         "results": rows,
         "skipped": 0,
         "tokenAt": now,
         "tokenUsage": token_usage,
+        "limiterStates": limiter_states,
+        "quotaSources": quota_sources,
+        "limiterModels": limiter_models,
+        "sorting": crate::server::core::account_order::sorting(
+            &visible_accounts, now,
+        ),
     })
 }
 

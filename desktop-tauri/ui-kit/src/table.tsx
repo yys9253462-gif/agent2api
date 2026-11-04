@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { Button } from './button'
 import { cn } from './lib/cn'
 
 /**
@@ -17,19 +18,15 @@ import { cn } from './lib/cn'
  * 不冲突：组件不写 col 宽度，谁也不覆盖谁。
  */
 
-function Table({ className, containerClassName, ...props }: React.ComponentProps<'table'> & {
-  /** 外层滚动容器的类名（需要自定义高度上限时用，如弹窗里的表） */
+function Table({ className, containerClassName, container = true, ...props }: React.ComponentProps<'table'> & {
   containerClassName?: string
+  /** 已有滚动宿主或表头拖拽依赖直接子节点时，不再增加滚动层。 */
+  container?: boolean
 }) {
-  return (
-    <div data-slot='table-container' className={cn('relative w-full overflow-auto', containerClassName)}>
-      <table
-        data-slot='table'
-        className={cn('w-full caption-bottom border-collapse text-[12.5px]', className)}
-        {...props}
-      />
-    </div>
-  )
+  const table = <table data-slot='table' className={cn('w-full caption-bottom border-collapse text-[12.5px]', className)} {...props} />
+  return container
+    ? <div data-slot='table-container' className={cn('relative w-full overflow-auto', containerClassName)}>{table}</div>
+    : table
 }
 
 function TableHeader({ className, ...props }: React.ComponentProps<'thead'>) {
@@ -64,17 +61,41 @@ function TableRow({ className, ...props }: React.ComponentProps<'tr'>) {
   )
 }
 
-function TableHead({ className, ...props }: React.ComponentProps<'th'>) {
+type TableSortDirection = 'asc' | 'desc'
+type TableHeadProps = React.ComponentProps<'th'> & {
+  sortDirection?: TableSortDirection | false
+  onSortChange?: (direction: TableSortDirection) => void
+  sortLabel?: string
+}
+
+function TableHead({ className, children, sortDirection = false, onSortChange, sortLabel, ...props }: TableHeadProps) {
   return (
     <th
       data-slot='table-head'
       className={cn(
-        'sticky top-0 z-[2] whitespace-nowrap border-b border-border bg-surface-2 px-3.5 py-2',
+        'sticky top-0 z-[2] whitespace-nowrap border-b border-border bg-[var(--ui-table-head-bg)] px-2 py-2',
         'text-left text-[10.5px] font-semibold tracking-[.05em] text-muted-foreground',
         className
       )}
       {...props}
-    />
+      aria-sort={onSortChange
+        ? (sortDirection === 'asc' ? 'ascending' : sortDirection === 'desc' ? 'descending' : 'none')
+        : props['aria-sort']}
+    >
+      {onSortChange ? (
+        <Button type='button' variant='ghost' size='xs' data-table-sort=''
+          className='h-auto max-w-full gap-1 border-0 px-0 py-0 align-middle [font-size:inherit] font-semibold tracking-[inherit] text-inherit hover:bg-transparent active:translate-y-0'
+          aria-label={sortLabel} title={[sortLabel, props.title].filter(Boolean).join('\n') || undefined}
+          onClick={() => onSortChange(sortDirection === 'asc' ? 'desc' : 'asc')}>
+          <span className='min-w-0 truncate'>{children}</span>
+          <svg viewBox='0 0 24 24' className='size-3' aria-hidden='true'
+            fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+            <path d='m8 9 4-4 4 4' className={sortDirection === 'asc' ? 'text-primary-fg' : 'opacity-35'} />
+            <path d='m8 15 4 4 4-4' className={sortDirection === 'desc' ? 'text-primary-fg' : 'opacity-35'} />
+          </svg>
+        </Button>
+      ) : children}
+    </th>
   )
 }
 
@@ -82,7 +103,7 @@ function TableCell({ className, ...props }: React.ComponentProps<'td'>) {
   return (
     <td
       data-slot='table-cell'
-      className={cn('border-b border-hairline px-3.5 py-2 align-middle', className)}
+      className={cn('border-b border-hairline px-2 py-2 align-middle', className)}
       {...props}
     />
   )
@@ -98,4 +119,7 @@ function TableCaption({ className, ...props }: React.ComponentProps<'caption'>) 
   )
 }
 
-export { Table, TableHeader, TableBody, TableFooter, TableHead, TableRow, TableCell, TableCaption }
+export {
+  Table, TableHeader, TableBody, TableFooter, TableHead, TableRow, TableCell, TableCaption,
+  type TableHeadProps, type TableSortDirection,
+}

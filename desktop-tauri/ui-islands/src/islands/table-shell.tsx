@@ -1,5 +1,6 @@
 import * as React from 'react'
 import {
+  CardFooter,
   Input,
   Pager,
   Select,
@@ -29,7 +30,7 @@ import { t } from '../i18n'
  * 时有时无的控件比一个灰着的框更让人困惑。
  *
  * ── 两种分页口径 ───────────────────────────────────────────
- *   · **客户端分页**（事件日志 / 模型管理 / 网关 Key / 账号）：数据一次全取回，
+   *   · **客户端分页**（模型管理 / 网关 Key / 账号）：数据一次全取回，
  *     本文件负责页码状态与切片（useClientPaging），「每页条数」里可以选「全部」。
  *   · **服务端真分页**（请求日志）：明细条数无上限，offset/limit 由后端执行，
  *     页码状态在页面自己手里（本文件只渲染页脚）；不给「全部」这一档
@@ -225,7 +226,7 @@ function TableFooter({
       : t('共 {total} 条（全部显示）', { total })
 
   return (
-    <div className={className ? `panel-foot table-foot-bar ${className}` : 'panel-foot table-foot-bar'}>
+    <CardFooter className={className ? `panel-foot table-foot-bar ${className}` : 'panel-foot table-foot-bar'}>
       {leading}
       <div className='spacer' />
       <div className='table-foot-ctl'>
@@ -268,7 +269,7 @@ function TableFooter({
         </span>
         <Pager page={page} pageCount={pageCount} onPageChange={onPageChange} disabled={disabled} />
       </div>
-    </div>
+    </CardFooter>
   )
 }
 

@@ -39,6 +39,15 @@ const HERE = path.dirname(fileURLToPath(import.meta.url)) // desktop-tauri/i18n
 const DESKTOP = path.resolve(HERE, '..') // desktop-tauri
 const UI = path.join(DESKTOP, 'ui')
 const ISLANDS_SRC = path.join(DESKTOP, 'ui-islands', 'src')
+const UI_KIT_SRC = path.join(DESKTOP, 'ui-kit', 'src')
+const SHARED_SRC = path.join(DESKTOP, 'ui-shared')
+/**
+ * 手机端源码目录（`desktop-tauri/mobile/src`）。
+ *
+ * 手机端是独立工程（自己的 Vite + React），产物落 `ui/m/` —— 那是压缩后的
+ * bundle，键名早被压没了，扫它没有意义。这里扫源码，与 ui-islands 同一口径。
+ */
+const MOBILE_SRC = path.join(DESKTOP, 'mobile', 'src')
 const SRC_DIR = path.join(HERE, 'i18n-src')
 
 /** 目标语言目录（简体不建目录：查不到就回落简体原文，不需要词典） */
@@ -49,7 +58,7 @@ const LOCALES = ['en', 'zh-Hant', 'ja', 'ko', 'pt-BR']
  * 调整顺序会改变某些跨界键的归属，非必要不要动。
  */
 const DOMAIN_ORDER = [
-  'common', 'login', 'accounts', 'add-account', 'models', 'settings', 'assistant', 'update',
+  'common', 'login', 'accounts', 'account-settings', 'add-account', 'models', 'routing', 'agent', 'tools', 'settings', 'assistant', 'update',
   'keys', 'proxies', 'docs', 'report', 'checkin', 'tasks', 'logs', 'requests',
   'tables', 'port',
 ]
@@ -59,26 +68,40 @@ const DOMAIN_ORDER = [
  * 未命中的文件归入 'common' 并在报告里 warning（提示把新文件登记进来）。
  */
 const DOMAIN_RULES = [
-  { domain: 'common', files: ['index.html', 'titlebar.js', 'tooltip.js', 'clipboard.js', 'filter-memory.js', 'app.js', 'confirm-dialog.tsx', 'input.tsx', 'input-control.tsx', 'segmented.tsx', 'index.tsx', 'markdown.js', 'icons.js'] },
+  { domain: 'common', files: ['index.html', 'm.html', 'desktop-shell.tsx', 'desktop-titlebar.tsx', 'desktop-tooltip.tsx', 'island-registry.ts', 'clipboard.js', 'filter-memory.js', 'app.js', 'confirm-dialog.tsx', 'input.tsx', 'input-control.tsx', 'segmented.tsx', 'index.tsx', 'markdown.js', 'icons.js', 'App.tsx', 'main.tsx', 'Shell.tsx', 'NavBar.tsx', 'Icon.tsx', 'ProviderLogo.tsx', 'ui.tsx', 'PullToRefresh.tsx', 'AppUpdatePanel.tsx', 'CommunitySheet.tsx', 'i18n.ts', 'client.ts', 'gateway.ts', 'format.ts', 'providers.ts', 'providerFacts.ts', 'usePolling.ts', 'pwa.ts', 'usePwa.ts', 'appUpdate.ts', 'community.ts', 'servers.ts', 'auth.ts', 'store.ts', 'routes.ts'] },
   { domain: 'login', files: ['login.html', 'login-page.tsx', 'panel-captcha.js'] },
-  { domain: 'accounts', files: ['accounts-page.tsx', 'accounts-shared.ts', 'accounts-columns.ts', 'accounts-store.ts', 'accounts-panels.tsx', 'accounts-queue-drag.ts', 'accounts-dialogs.tsx', 'accounts-dialog-limiter.tsx', 'accounts-dialog-usage.tsx', 'accounts-credit-detail.tsx', 'accounts-data.ts', 'accounts-domain.ts', 'zcode-plans-modal.tsx', 'balance-query.tsx'] },
-  { domain: 'add-account', files: ['add-custom-provider.tsx', 'custom-provider-ui.js', 'providers.js', 'preset-providers.js', 'web-login.js', 'sms-login.js', 'autoclaw-oauth.js', 'aliyun-captcha.js', 'zcode-claim.js', 'zcode-captcha-pool.js', 'codearts-welfare.js'], prefixes: ['add-account-', 'add-provider-'] },
-  { domain: 'models', files: ['model-capability.ts', 'model-capability-dialog.tsx', 'model-test-dialog.tsx'], prefixes: ['models-'] },
-  { domain: 'settings', files: ['units.js'], prefixes: ['settings-'] },
+  { domain: 'account-settings', files: ['accounts-settings-dialog.tsx', 'accounts-settings-fields.tsx'] },
+  { domain: 'accounts', files: ['accounts-page.tsx', 'accounts-hidden-notice.tsx', 'HiddenAccountsNotice.tsx', 'accounts-refresh.ts', 'accounts-update.ts', 'AccountsPage.tsx', 'AccountSheet.tsx', 'AccountsFilterSheet.tsx', 'accounts-shared.ts', 'accounts-columns.ts', 'accounts-store.ts', 'accounts-panels.tsx', 'accounts-queue-drag.ts', 'accounts-dialogs.tsx', 'accounts-batch-dialog.tsx', 'accounts-zcode-plan.tsx', 'accounts-proxy-form.tsx', 'accounts-dialog-limiter.tsx', 'accounts-dialog-usage.tsx', 'accounts-credit-detail.tsx', 'credential-expiry.ts', 'usage-readings.ts', 'usage-query-state.ts', 'accounts-usage.ts', 'accounts-usage-cache.ts', 'accounts-limit-detail.tsx', 'accounts-data.ts', 'accounts-domain.ts', 'accounts-group-settings.tsx', 'usage.ts', 'zcode-plans-modal.tsx', 'balance-query.tsx'], prefixes: ['accounts-limiter-', 'accounts-usage-', 'accounts-export', 'accounts-authorization'] },
+  { domain: 'add-account', files: ['add-dynamic-provider.tsx', 'add-custom-provider.tsx', 'custom-provider-ui.js', 'providers.js', 'preset-providers.js', 'web-login.js', 'sms-login.js', 'autoclaw-oauth.js', 'aliyun-captcha.js', 'zcode-claim.js', 'zcode-captcha-pool.js', 'codearts-welfare.js'], prefixes: ['add-account-', 'add-provider-', 'add-doubaowork-'] },
+  { domain: 'models', files: ['ModelsPage.tsx', 'model-capability.ts', 'model-capability-dialog.tsx', 'model-test-dialog.tsx', 'model-test-result.tsx'], prefixes: ['models-'] },
+  { domain: 'routing', prefixes: ['routing-'] },
+  // 「Agent」页：本机 AI 客户端的配置接管（客户端清单 / 配置编辑 / 写入预览）
+  { domain: 'agent', files: ['AgentPage.tsx'], prefixes: ['agent-'] },
+  // 「工具服务」页：网络搜索 / 视觉分析（服务列表 / 详情 / 上游配置 / 本机接入）
+  { domain: 'tools', files: ['ToolsPage.tsx'], prefixes: ['tools-'] },
+  // 「设置 → 版本信息」面板（桌面端 system-info-pane.tsx 与手机端
+  // SystemInfoSheet.tsx 共用同一批文案：版本 / 环境 / 路径 / 开关）。
+  // 归 settings 域 —— 它读的就是设置页的分类之一，文案与设置页其它面板同类。
+  { domain: 'settings', files: ['units.js', 'SettingsPage.tsx', 'MorePage.tsx', 'PwaNotice.tsx', 'ServersPage.tsx', 'LoginPage.tsx', 'system-info-pane.tsx', 'SystemInfoSheet.tsx', 'sidebar-layout.js'], prefixes: ['settings-', 'sidebar-'] },
   // AI 助手（侧边栏「智能」组的一级页 + 设置页「AI 助手」分类）：
   // 对话页、工具集、设置面板三块
-  { domain: 'assistant', prefixes: ['assistant-'] },
-  { domain: 'update', files: ['upgrade-panel.js'], prefixes: ['update-'] },
-  { domain: 'keys', files: ['keys-page.tsx'] },
-  { domain: 'proxies', files: ['proxies-page.tsx', 'proxies-columns.ts', 'proxies-state.ts', 'proxies-dialogs.tsx', 'proxies-sub-state.ts', 'proxies-sub-view.tsx', 'proxies-kernel-dialog.tsx', 'sponsor.ts'] },
-  { domain: 'docs', files: ['docs-page.tsx'] },
-  { domain: 'report', files: ['report-page.tsx', 'report-charts.ts'] },
-  { domain: 'checkin', files: ['checkin-page.tsx', 'checkin-state.ts', 'checkin-schedule-tab.tsx', 'checkin-records-tab.tsx', 'checkin-schedules-state.ts'] },
-  { domain: 'tasks', files: ['tasks-panel.tsx'] },
-  { domain: 'logs', files: ['logs-panel.tsx'] },
-  { domain: 'requests', files: ['requests-page.tsx', 'request-detail.tsx', 'request-hover.tsx', 'request-clear-modal.tsx', 'conversation-preview.js'] },
+  { domain: 'assistant', files: ['AssistantPage.tsx', 'AssistantHistory.tsx', 'AssistantModelPicker.tsx', 'assistant.ts', 'assistantTools.ts', 'MarkdownLite.tsx'], prefixes: ['assistant-'] },
+  { domain: 'update', files: ['upgrade-panel.js', 'GithubAccessSettings.tsx', 'RequiredUpdateGate.tsx', 'updates.ts'], prefixes: ['update-'] },
+  { domain: 'keys', files: ['keys-page.tsx', 'KeysPage.tsx', 'model-api-key.ts', 'model-api-key-field.tsx', 'model-api-key-memory.ts', 'use-model-api-keys.ts'] },
+  { domain: 'proxies', files: ['ProxiesPage.tsx', 'proxies-page.tsx', 'proxies-columns.ts', 'proxies-state.ts', 'proxies-dialogs.tsx', 'proxy-editor-sheet.tsx', 'proxy-retirement-dialog.tsx', 'sponsor.ts'] },
+  { domain: 'docs', files: ['docs-page.tsx', 'DocsPage.tsx', 'DocsProviderData.ts', 'provider-docs-view.tsx'], prefixes: ['docs-provider-', 'docs-api-'] },
+  { domain: 'report', files: ['report-page.tsx', 'report-charts.ts', 'ReportPage.tsx', 'HomePage.tsx', 'chart-data.ts', 'chart-labels.tsx', 'chart-tooltips.tsx', 'report-recharts.tsx', 'source-stats.tsx', 'api-key-detail.tsx', 'daily-trend-panel.tsx', 'SourceUsageSection.tsx', 'MobileReportTrend.tsx'] },
+  { domain: 'checkin', files: ['checkin.ts', 'zcode.ts', 'zcode-plans.ts', 'CheckinPage.tsx', 'ZcodeCaptchaPanel.tsx'], prefixes: ['checkin-', 'Checkin'] },
+  { domain: 'tasks', files: ['tasks-panel.tsx', 'TasksPage.tsx'] },
+  { domain: 'logs', files: ['logs.ts', 'LogsPage.tsx'], prefixes: ['logs-'] },
+  { domain: 'requests', files: ['RequestsPage.tsx', 'requests-page.tsx', 'request-detail.tsx', 'request-raw-panes.tsx', 'request-hover.tsx', 'request-clear-modal.tsx', 'conversation-preview.js', 'source-filters.tsx', 'request-cells.tsx', 'request-phase.ts'] },
   { domain: 'tables', files: ['table-columns.js', 'table-col-settings.tsx', 'table-shell.tsx'] },
   { domain: 'port', files: ['port-panel.tsx'] },
+  // 提供商插件页（一级菜单）：整页文案都在这一个文件里，量不大（三十来条），
+  // 单开一个域会让 i18n-src 多出五份几乎空的 JSON —— 归 common，与它实际
+  // 的规模相称。菜单名「提供商插件」在 sidebar-layout.js 里，归 settings 域
+  // （侧边栏布局那条规则已经收了它）。
+  { domain: 'common', files: ['plugins.ts', 'PluginsPage.tsx', 'PluginCards.tsx', 'PluginSettingsSheet.tsx'], prefixes: ['plugins-'] },
 ]
 
 /* ─── 文件枚举 ─────────────────────────────── */
@@ -90,6 +113,7 @@ const DOMAIN_RULES = [
 const EXCLUDED = new Set([
   path.join(UI, 'i18n.js'),
   path.join(ISLANDS_SRC, 'i18n.ts'),
+  path.join(UI_KIT_SRC, 'i18n.ts'),
 ])
 
 /** ui/ 顶层的经典脚本（不递归：子目录是资产与产物，不是源） */
@@ -111,11 +135,52 @@ function islandSources() {
     }
   }
   walk(ISLANDS_SRC)
+  if (fs.existsSync(SHARED_SRC)) {
+    for (const entry of fs.readdirSync(SHARED_SRC, { withFileTypes: true })) {
+      if (entry.isFile() && (entry.name === 'logs.ts' || entry.name === 'credential-expiry.ts' || entry.name === 'usage-readings.ts' || entry.name === 'usage-query-state.ts' || entry.name === 'zcode-plans.ts' || entry.name === 'use-model-api-keys.ts' || entry.name === 'updates.ts' || entry.name === 'proxy-retirement-dialog.tsx' || /^(assistant-|agent-|docs-api-|model-api-key).*\.tsx?$/.test(entry.name))) {
+        out.push(path.join(SHARED_SRC, entry.name))
+      }
+    }
+  }
+  return out.filter(file => !EXCLUDED.has(file))
+}
+
+/**
+ * mobile/src 下所有 .ts / .tsx（递归）。
+ *
+ * 目录不存在时返回空数组：手机端是后加的工程，别的分支 / 旧检出里没有它，
+ * 扫描器不该因为一个可选目录直接崩掉。
+ */
+function mobileSources() {
+  if (!fs.existsSync(MOBILE_SRC)) return []
+  const out = []
+  const walk = dir => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(full)
+      else if (/\.tsx?$/.test(entry.name)) out.push(full)
+    }
+  }
+  walk(MOBILE_SRC)
+  return out.filter(file => !EXCLUDED.has(file))
+}
+
+function componentSources() {
+  const out = []
+  const walk = dir => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(full)
+      else if (/\.tsx?$/.test(entry.name)) out.push(full)
+    }
+  }
+  if (fs.existsSync(UI_KIT_SRC)) walk(UI_KIT_SRC)
   return out.filter(file => !EXCLUDED.has(file))
 }
 
 /** 域解析：先精确名、再前缀；都命不中返回 null（调用方归 common + warning） */
 function domainOf(file) {
+  if (file.startsWith(`${UI_KIT_SRC}${path.sep}`)) return 'common'
   const base = path.basename(file)
   for (const rule of DOMAIN_RULES) {
     if (rule.files && rule.files.includes(base)) return rule.domain
@@ -218,7 +283,18 @@ function extractFromHtml(source, file, warnings) {
 function scan() {
   const perDomain = new Map(DOMAIN_ORDER.map(domain => [domain, new Set()]))
   const warnings = []
-  const files = [...uiScripts(), path.join(UI, 'index.html'), path.join(UI, 'login.html'), ...islandSources()]
+  const files = [
+    ...uiScripts(),
+    path.join(UI, 'index.html'),
+    path.join(UI, 'login.html'),
+    // 手机端入口页（`/m` 直接命中它）。它的文案是 data-i18n 与内联 t()，
+    // 与 index.html 同一套提取通道。
+    path.join(UI, 'm.html'),
+    ...islandSources(),
+    path.join(SHARED_SRC, 'provider-docs-view.tsx'),
+    ...componentSources(),
+    ...mobileSources(),
+  ]
 
   for (const file of files) {
     if (!fs.existsSync(file)) continue
@@ -312,13 +388,17 @@ function writeJson(file, object) {
 
 /* ─── 主流程 ───────────────────────────────── */
 
+const ONLY_DOMAIN = process.argv.find(arg => arg.startsWith('--domain='))?.slice('--domain='.length)
+if (ONLY_DOMAIN && !DOMAIN_ORDER.includes(ONLY_DOMAIN)) throw new Error(`Unknown i18n domain: ${ONLY_DOMAIN}`)
+const ACTIVE_DOMAINS = ONLY_DOMAIN ? [ONLY_DOMAIN] : DOMAIN_ORDER
+
 function runScan() {
   const { perDomain, warnings } = scan()
   const { owner, json } = readExisting()
   const { assigned } = assign(perDomain, owner)
 
   let totalAdded = 0
-  for (const domain of DOMAIN_ORDER) {
+  for (const domain of ACTIVE_DOMAINS) {
     const keys = assigned.get(domain)
     if (keys.length === 0) continue
     for (const locale of LOCALES) {
@@ -371,7 +451,7 @@ function runCheck() {
   for (const locale of LOCALES) {
     let localeMissing = 0
     let localeEmpty = 0
-    for (const domain of DOMAIN_ORDER) {
+    for (const domain of ACTIVE_DOMAINS) {
       const expected = assigned.get(domain)
       if (expected.length === 0) continue
       const data = json.get(`${locale}/${domain}`) || {}
@@ -391,7 +471,7 @@ function runCheck() {
   // 孤儿键：JSON 有、全量扫描扫不到
   const orphans = []
   for (const locale of LOCALES) {
-    for (const domain of DOMAIN_ORDER) {
+    for (const domain of ACTIVE_DOMAINS) {
       const data = json.get(`${locale}/${domain}`)
       if (!data) continue
       for (const key of Object.keys(data)) {
