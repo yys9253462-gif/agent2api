@@ -1,3 +1,5 @@
+pub(crate) mod global_accounts;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,12 +26,17 @@ pub fn save_workspace(
     let available = if model.is_empty() { routing_scope::available_providers(&visible) }
         else { crate::server::core::providers::catalog::forwarding_providers(model) };
     let mut next = super::current();
+    if next.routing_profiles.group_for_model(model).is_some() { return Err("此模型 ID 已被自定义路由组占用".into()); }
     let effective = routing_scope::materialize_profile_with(&visible, &available, model, &next.routing_profiles);
     let current_settings = next.routing_profiles.settings_for(model, next.routing);
     if revision(&effective, current_settings, next.routing_profiles.model_profile(model).is_some()) != expected {
         return Err("路由配置已在其他位置修改，请刷新当前配置后重试；草稿未丢失".to_string());
     }
     let mut profiles: RoutingProfiles = (*next.routing_profiles).clone();
+    if model.is_empty() && (profiles.global.as_ref().is_some_and(global_accounts::has_restrictions)
+        || profile.as_ref().is_some_and(global_accounts::has_restrictions)) {
+        return Err("全局默认已改为账号启停，请先转换旧版全局参与设置；模型独立路由仍可设置参与名单".into());
+    }
     if !model.is_empty() && profile.is_some() && !profiles.models.contains_key(model) && profiles.models.len() >= super::routing_profiles::MAX_ROUTING_MODELS {
         return Err("模型独立配置数量已达上限".to_string());
     }
@@ -84,7 +91,9 @@ pub fn save_workspace(
         tx.commit()
     }).map_err(|error| error.to_string())?;
     next.routing_profiles = Arc::new(profiles);
+    crate::server::core::providers::catalog::invalidate();
     *CONFIG.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);
+    crate::server::core::providers::catalog::invalidate();
     drop(guard);
     crate::server::core::cloud_sync::auto_sync::notify_change();
     Ok(())

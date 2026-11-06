@@ -1,5 +1,5 @@
 import { t } from '../i18n'
-import type { AccountRecord, AccountSorting } from './accounts-shared'
+import type { AccountRecord, AccountSorting, BatchAccountsPayload, BatchAccountsResult } from './accounts-shared'
 
 export type RouteOrderChange = { kind: 'provider' } | { kind: 'account'; provider: string }
 
@@ -14,7 +14,18 @@ export type RouteProfile = {
   strategy?: string
   sticky?: string
 }
+export type RouteMember = { id: string; provider: string; model: string; included: boolean; accounts: string[] }
+export type RouteGroup = { id: string; name: string; model: string; description: string; strategy: string; sticky: string; members: RouteMember[] }
+export type RouteModelChoice = { provider: string; providerLabel: string; model: string; name: string; accountCount: number;
+  capabilities: { supportsToolCall?: boolean | null; supportsImages?: boolean | null; supportsVideo?: boolean | null; supportsReasoning?: boolean | null; maxInputTokens?: number | null; maxOutputTokens?: number | null } }
+export type RouteGroups = { groups: Array<{ group: RouteGroup; revision: string }>; newRevision: string; catalog: RouteModelChoice[] }
+export type RoutePreviewInput = { model: string; group?: RouteGroup; profile?: RouteProfile; global?: boolean; needs?: { tools?: boolean; images?: boolean; video?: boolean }; failFirst?: boolean }
+export type RoutePreview = Pick<RoutingWorkspace, 'model' | 'customized' | 'settings' | 'queue'> & { group?: RouteGroup | null; preview: boolean }
+
 export type RouteEntry = {
+  candidateId?: string
+  memberId?: string | null
+  model?: string | null
   id: string
   name: string
   provider: string
@@ -29,11 +40,12 @@ export type RouteDecision = {
   sticky?: string
   stickyHit?: boolean
   picked?: string
+  pickedCandidate?: string
   scope?: string
   stickyId?: string
   sessionId?: string
   sessionSource?: string
-  configSnapshot?: { capturedAt: number; scope: string; strategy: string; sticky: string; providerScope?: RouteProviderScope; accountCount?: number; providerCount?: number }
+  configSnapshot?: { groupId?: string; groupName?: string; members?: Array<Omit<RouteMember, 'accounts'> & { accountCount: number }>; capturedAt: number; scope: string; strategy: string; sticky: string; providerScope?: RouteProviderScope; accountCount?: number; providerCount?: number }
   orderedTotal?: number
   blockedTotal?: number
   ordered?: RouteEntry[]
@@ -53,6 +65,8 @@ export type RoutingWorkspace = {
   model: string | null
   customized: boolean
   globalCustomized: boolean
+  globalAccountControl?: boolean
+  legacyGlobalParticipation?: { revision: string; accounts: Array<{ id: string; name: string; provider: string; providerLabel: string }> } | null
   configuredModels: string[]
   models: string[]
   profile: RouteProfile
@@ -79,6 +93,8 @@ export type RoutingWorkspace = {
   updatedAt: number
 }
 export type RouteAttempt = {
+  candidateId?: string
+  memberId?: string
   provider?: string
   providerLabel?: string
   account?: string
@@ -109,6 +125,8 @@ export type ReplayRow = {
   accountId?: string
   accountName?: string
   client?: string
+  clientLabel?: string
+  clientEvidence?: import('../../../ui-shared/client-identification').ClientEvidence
   status: number
   error?: string | null
   durationMs?: number
@@ -146,9 +164,13 @@ export type StickyEntry = {
   hits: number
 }
 export type RoutingBridge = {
+  getRoutingGroups(): Promise<RouteGroups>
+  saveRoutingGroup(payload: { id: string; group: RouteGroup | null; revision: string }): Promise<RouteGroups>
+  previewRouting(payload: RoutePreviewInput): Promise<RoutePreview>
   getRoutingWorkspace(model?: string): Promise<RoutingWorkspace>
   getRoutingFlow(query: import('./routing-flow-types').FlowQuery): Promise<import('./routing-flow-types').FlowSnapshot & import('./routing-flow-types').FlowDetails>
-  saveRoutingProfile(payload: { model: string | null; profile: RouteProfile | null; orderChange?: RouteOrderChange; revision?: string }): Promise<RoutingWorkspace>
+  saveRoutingProfile(payload: { model: string | null; profile: RouteProfile | null; orderChange?: RouteOrderChange; revision?: string } | { migrateGlobalAccounts: string }): Promise<RoutingWorkspace>
+  batchAccounts(payload: BatchAccountsPayload): Promise<BatchAccountsResult | null | undefined>
   setRoutingConfig(patch: Partial<RouteSettings>): Promise<RouteSettings>
   getRoutingReplays(query: { model?: string; offset: number; limit: number; status?: string }): Promise<{ entries: ReplayRow[]; matched: number; available?: boolean }>
   getRoutingTrace(query: { model?: string; offset: number; limit: number; status?: string; search?: string; startDate?: string; endDate?: string }): Promise<{ entries: ReplayRow[]; matched: number; available?: boolean }>
